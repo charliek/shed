@@ -73,7 +73,31 @@ shedctl (no internal deps)
   `discovery::load_discovered_servers`), `target` (`ServerTarget`) and `time` (the RFC3339
   helpers). `shed-broker` re-exports every module under its old path (`status`,
   `discovery` and `config` re-export the helpers), so no broker caller or embedder moved.
-  Reaches only `shed-core`/`shed-lane`, never `saphyr-parser`. Its `test-support` feature
+  Plan 039 A6 adds the delivery side: `discovery` (the shed CLI config's servers as
+  `ServerTarget`s through shed-core's reader; an entry with no explicit `ssh_port` has
+  port 0, no SSH endpoint, so nothing is minted for it, where shed-core alone reads 22;
+  `discovery::resolver()` plugs into the control-token provider), `delivery` (the
+  delivery stream client: `GET /api/delivery/requests` with the machine headers, the
+  stream id kept for the stream's life, each request handed to an `Answerer`, the answer
+  posted on that stream; a request dies with its stream and is never answered on the
+  next; reconnect 1 s to 30 s, reset after a 60 s hold, never under a `429`'s
+  `Retry-After`; 30 s for a stream's headers, then 45 s of silence is a dead stream;
+  ONE certificate per stream — each stream has a transport of its own fixed at open,
+  and a `401` or a credential due for renewal ends the stream rather than re-sending an
+  answer on another identity; plain `http` only to a loopback host, else pinned
+  `https`; a `StreamStatus` of state, error CLASS and counters, and refusal codes and
+  rules only from the contract's closed lists, never a server's text; tests against an
+  in-process fake server, mTLS included), `credentials` (`SourceCredentials`: the
+  credentials-scope certificate from the durable store, fenced by its stream task's stop
+  signal so a retired task writes nothing), `tasks` (`SourceTasks`: one stream per server, reconciled with the
+  list) and `token_minter` (`SourceTokenMinter`: shed-core's `TokenMinter` over the
+  control-token provider, the credential-shape rules of shed-app's `credential_shape`).
+  `minter`'s `CredentialSource` takes a process-wide turn per store, server and scope
+  around its mint and store write and re-reads the store first (adopting a fresher
+  certificate another source stored), so the broker's bus and the delivery source never
+  mint twice at once; a source whose group was stopped gives up its turn at once.
+  Reaches only `shed-core`/`shed-lane`/`shed-provision` (the contract's documents and
+  the stream's framing), never `saphyr-parser`. Its `test-support` feature
   (the minter's test seams and `minter::tests` helpers) is enabled only by
   `shed-broker`'s `[dev-dependencies]`, never in a shipped build. The control-token
   provider's tests stay in the broker (`controltoken_tests.rs`), since they resolve
@@ -116,7 +140,7 @@ shedctl (no internal deps)
   workspace crate, `shed-provision-providers` only `shed-provision`, neither
   `saphyr-parser`/`tokio`/`reqwest`, and `shed-core`, `shed-lane`,
   `shed-roost`, `shed-craze` and default `shed-app` reach neither (shed-mobile
-  links those). `shed-source` reaches only `shed-core`/`shed-lane` and no
+  links those). `shed-source` reaches only `shed-core`/`shed-lane`/`shed-provision` and no
   `saphyr-parser`, and the same mobile crates do not reach it.
 - **`shed-provision`** (plan 039) — the source side of the provision contract
   `tests/provision-contract/v1/`: the documents and every rule that judges
@@ -141,8 +165,19 @@ shedctl (no internal deps)
   follows links on purpose; its docs say what a disk reader must do (open
   non-blocking, check the opened descriptor is a regular file, read at most
   the limit). Default member. `shed-desktop-core` depends on
-  both (re-exported as `shed_desktop_core::delivery`); the runtime that answers
-  a server's delivery stream is plan 039 A6's.
+  both and on `shed-source` (re-exported under `shed_desktop_core::delivery`), whose
+  `delivery` module is the source runtime (plan 039 A6): `DeliveryRuntime` holds one
+  stream per configured server beside the embedded broker, answers each request from
+  `delivery.toml` (re-read per request) through `DiskReader` (the `Reader` contract:
+  non-blocking open, `fstat` on the descriptor, bounded read; commands by argv in their
+  own process group, killed past their timeout or output bound, registered so the
+  shutdown's drain refuses new ones and kills and reaps the running groups), fingerprints under
+  `<state>/delivery/fingerprint.key` (32 random bytes, `0600`, made once by link), and
+  exposes status, settings (`settings_file`: a JSON view, one provider changed and the
+  whole file written back `0600`, the read-modify-write under a mutex and a lock file,
+  through a unique temporary file), the preview of a shed (`preview`) and the servers'
+  activity merged (`activity`). Its drain runs in the shutdown's phase 0 after the
+  broker's (`Shutdown::set_source_drain`).
 - **The opencode adapter crate was removed in plan 038.** Craze is the only agent lane.
   An opencode roost tab still renders as a passive status row (`RcKind::Opencode`);
   interactive opencode sessions belong to the `roost` app.
@@ -514,7 +549,7 @@ cargo test -p shed-lane --features test-support      # exports lane::conformance
 cargo test -p shed-roost --features test-support     # exports testing::FakeRoost
 cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
 cargo test -p shed-broker -p shed-broker-harness --all-targets   # the broker + its wire-harness host
-cargo test -p shed-source                            # the extracted identity/credstore/minter
+cargo test -p shed-source                            # identity/credstore/minter + the delivery client
 cargo clippy -p shed-broker-harness --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-craze                             # the craze adapter (recipe cells skip)

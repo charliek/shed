@@ -27,6 +27,7 @@ pub mod api_keys;
 pub mod envsecrets;
 pub mod files;
 pub mod github;
+mod render;
 pub mod settings;
 pub mod ssh_key;
 

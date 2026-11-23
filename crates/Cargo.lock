@@ -3068,6 +3068,7 @@ version = "0.10.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "shed-app",
@@ -3077,6 +3078,7 @@ dependencies = [
  "shed-provision",
  "shed-provision-providers",
  "shed-roost",
+ "shed-source",
  "tempfile",
  "tokio",
  "tracing",

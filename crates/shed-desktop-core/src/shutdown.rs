@@ -19,7 +19,7 @@
 //!
 //! | phase | what |
 //! |---|---|
-//! | 0 | optional broker drain; `hosts.begin_closing()` + `lanes.begin_closing()`; `gate.close(GATE_CLOSE_WAIT)`; `hosts.join_clients(CLIENTS_JOIN_WAIT)` |
+//! | 0 | optional broker drain and source drain (plan 039: the delivery runtime's streams); `hosts.begin_closing()` + `lanes.begin_closing()`; `gate.close(GATE_CLOSE_WAIT)`; `hosts.join_clients(CLIENTS_JOIN_WAIT)` |
 //! | 1 | `lanes.shutdown()` + `gate.close_slots()` on a dedicated OS thread |
 //! | 2 | `hosts.stop_crazes()` + `gate.kill_exits(CHILDREN_KILL_WAIT)` |
 //! | 3 | `hosts.shutdown_reaches()` (no outer timeout; roost bounds its own teardown) |
@@ -59,6 +59,8 @@ pub struct Shutdown {
     hosts: Arc<ShedHosts>,
     lanes: Arc<ShedLanes>,
     broker: Mutex<Option<BrokerDrain>>,
+    /// The delivery runtime's drain (plan 039): run in phase 0 with the broker's.
+    source: Mutex<Option<BrokerDrain>>,
     log: Mutex<Option<ShutdownLog>>,
     handle: tokio::runtime::Handle,
     started: OnceLock<()>,
@@ -78,6 +80,7 @@ impl Shutdown {
             hosts,
             lanes,
             broker: Mutex::new(broker),
+            source: Mutex::new(None),
             log: Mutex::new(None),
             handle,
             started: OnceLock::new(),
@@ -90,6 +93,15 @@ impl Shutdown {
     pub fn set_broker_drain(&self, broker: BrokerDrain) {
         if self.started.get().is_none() {
             *self.broker.lock().unwrap_or_else(|e| e.into_inner()) = Some(broker);
+        }
+    }
+
+    /// Install or replace the delivery runtime's drain (plan 039) before shutdown starts:
+    /// a non-blocking stop of its streams, run in phase 0 beside the broker's drain.
+    /// No-op if shutdown has already begun.
+    pub fn set_source_drain(&self, source: BrokerDrain) {
+        if self.started.get().is_none() {
+            *self.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(source);
         }
     }
 
@@ -110,6 +122,19 @@ impl Shutdown {
             let this = Arc::clone(self);
             self.handle.spawn(async move {
                 let broker = this.broker.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let source = this.source.lock().unwrap_or_else(|e| e.into_inner()).take();
+                // Phase 0's drains, in order: the broker's, then the source's.
+                let broker: Option<BrokerDrain> = match (broker, source) {
+                    (None, None) => None,
+                    (b, s) => Some(Box::new(move || {
+                        if let Some(b) = &b {
+                            b();
+                        }
+                        if let Some(s) = &s {
+                            s();
+                        }
+                    })),
+                };
                 let log = this.log.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let report = shutdown_children_with_log(
                     &this.gate,

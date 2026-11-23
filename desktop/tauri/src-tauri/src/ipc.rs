@@ -1035,6 +1035,41 @@ impl Handler {
                 Ok(crate::source::status(&self.backend, rt.as_deref()).await)
             }
             "source.use" => self.source_use(params).await,
+            // -- provisioning by delivery (plan 039 A6; `crate::delivery`) --
+            "delivery.status" => Ok(self.delivery_rt()?.status()),
+            "delivery.settings" => Ok(self.delivery_rt()?.settings()),
+            "delivery.set" => {
+                let provider = req_str(params, "provider")?;
+                let config = params
+                    .get("config")
+                    .ok_or_else(|| err("bad_request", "missing 'config' (null removes)"))?;
+                crate::delivery::set(&*self.delivery_rt()?, provider, config)
+            }
+            "delivery.preview" => {
+                let server = req_str(params, "server")?;
+                let shed = opt_str(params, "shed")?;
+                crate::delivery::preview(&*self.delivery_rt()?, &self.backend, server, shed).await
+            }
+            "shed.delivery" => {
+                let (server, shed) = (req_str(params, "server")?, req_str(params, "shed")?);
+                crate::delivery::shed_delivery(&self.backend, server, shed).await
+            }
+            "shed.provision" => {
+                let (server, shed) = (req_str(params, "server")?, req_str(params, "shed")?);
+                crate::delivery::shed_provision(&self.backend, server, shed).await
+            }
+            "activity.server_list" => {
+                let limit = match params.get("limit") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .ok_or_else(|| err("bad_request", "'limit' must be an integer"))?,
+                    ),
+                };
+                let cursor = opt_str(params, "cursor")?;
+                let shed = opt_str(params, "shed")?;
+                crate::delivery::activity(&self.backend, limit, cursor, shed).await
+            }
             // The Preferences row's "Use this machine" press — TEST-MODE ONLY, see
             // [`press_source_use_door`]. Acts on a Preferences window already open.
             "ui.press_source_use" => {
@@ -2178,6 +2213,16 @@ impl Handler {
     /// same path as the Preferences "Use this machine" button), wake the embedded
     /// broker, and tell an open Preferences window to read the rows again. See
     /// [`crate::source::use_this_machine`] for the refusals.
+    /// The source runtime (plan 039), or `not_ready` before setup has made it.
+    fn delivery_rt(
+        &self,
+    ) -> Result<Arc<shed_desktop_core::delivery::DeliveryRuntime>, (String, String)> {
+        self.app
+            .try_state::<Arc<shed_desktop_core::delivery::DeliveryRuntime>>()
+            .map(|s| Arc::clone(&s))
+            .ok_or_else(|| err("not_ready", "the delivery runtime has not started"))
+    }
+
     async fn source_use(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = req_str(params, "host")?;
         let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
@@ -2547,6 +2592,7 @@ mod tests {
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
+            delivery_settings_path: PathBuf::from("/run/user/0/shed/delivery.toml"),
             log_file: None,
             log_debug: false,
         }

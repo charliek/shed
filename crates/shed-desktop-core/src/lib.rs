@@ -26,13 +26,12 @@ pub mod shed_lanes;
 pub mod shutdown;
 pub mod slash;
 
-/// The provision contract's source side (plan 039): the documents, the
-/// answer builder and its preview, the five providers and `delivery.toml`.
-/// The runtime that answers a server's delivery stream builds on these.
-pub mod delivery {
-    pub use shed_provision as provision;
-    pub use shed_provision_providers as providers;
-}
+/// The provision contract's source side (plan 039): the runtime that holds a
+/// delivery stream per configured server and answers each request from
+/// `delivery.toml`'s providers, the disk reader, the fingerprint key, the
+/// settings file, the preview of a shed, and the activity feed merged across
+/// servers.
+pub mod delivery;
 
 use std::sync::Arc;
 
@@ -164,6 +163,12 @@ impl ShedDesktopRuntime {
     /// [`Shutdown`] coordinator (before shutdown begins).
     pub fn set_broker_drain(&self, broker: BrokerDrain) {
         self.shutdown.set_broker_drain(broker);
+    }
+
+    /// Register the delivery runtime's drain (plan 039: stop its streams) on this
+    /// runtime's single [`Shutdown`] coordinator; phase 0 runs it after the broker's.
+    pub fn set_source_drain(&self, source: BrokerDrain) {
+        self.shutdown.set_source_drain(source);
     }
 
     /// Register an optional shutdown log sink on this runtime's single

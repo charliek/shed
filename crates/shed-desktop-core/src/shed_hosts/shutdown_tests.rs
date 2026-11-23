@@ -556,6 +556,18 @@ async fn shutdown_coordinator_is_idempotent_across_concurrent_callers() {
         })
     };
     runtime.set_broker_drain(drain);
+    // The delivery runtime's drain runs once too, after the broker's.
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source_drains = Arc::new(AtomicUsize::new(0));
+    runtime.set_source_drain({
+        let source_drains = Arc::clone(&source_drains);
+        let drains = Arc::clone(&drains);
+        let order = Arc::clone(&order);
+        Box::new(move || {
+            order.lock().unwrap().push(drains.load(Ordering::SeqCst));
+            source_drains.fetch_add(1, Ordering::SeqCst);
+        })
+    });
     let coord_a = runtime.shutdown_coordinator();
     let coord_b = runtime.shutdown_coordinator();
     assert!(Arc::ptr_eq(&coord_a, &coord_b));
@@ -567,4 +579,6 @@ async fn shutdown_coordinator_is_idempotent_across_concurrent_callers() {
     // Subsequent calls return immediately without re-running.
     let _ = runtime.shutdown_children().await;
     assert_eq!(drains.load(Ordering::SeqCst), 1);
+    assert_eq!(source_drains.load(Ordering::SeqCst), 1);
+    assert_eq!(*order.lock().unwrap(), vec![1], "the broker drained first");
 }

@@ -12,6 +12,7 @@
 mod applog;
 mod approval;
 mod broker;
+mod delivery;
 mod env;
 mod ipc;
 mod prefs;
@@ -1177,6 +1178,89 @@ async fn source_use(
         .map_err(|(_, message)| message)
 }
 
+// -- provisioning by delivery (plan 039 A6): the same ops as the IPC socket's -------
+
+fn delivery_runtime(
+    app: &tauri::AppHandle,
+) -> Result<Arc<shed_desktop_core::delivery::DeliveryRuntime>, String> {
+    app.try_state::<Arc<shed_desktop_core::delivery::DeliveryRuntime>>()
+        .map(|s| Arc::clone(&s))
+        .ok_or_else(|| "the delivery runtime has not started".to_string())
+}
+
+/// `delivery.status`.
+#[tauri::command]
+fn delivery_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    Ok(delivery_runtime(&app)?.status())
+}
+
+/// `delivery.settings`.
+#[tauri::command]
+fn delivery_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    Ok(delivery_runtime(&app)?.settings())
+}
+
+/// `delivery.set`.
+#[tauri::command]
+fn delivery_set(
+    app: tauri::AppHandle,
+    provider: String,
+    config: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    delivery::set(&*delivery_runtime(&app)?, &provider, &config).map_err(|(_, m)| m)
+}
+
+/// `delivery.preview`.
+#[tauri::command]
+async fn delivery_preview(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+    server: String,
+    shed: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let rt = delivery_runtime(&app)?;
+    delivery::preview(&rt, &backend, &server, shed.as_deref())
+        .await
+        .map_err(|(_, m)| m)
+}
+
+/// `shed.delivery`.
+#[tauri::command]
+async fn shed_delivery(
+    backend: tauri::State<'_, Arc<Backend>>,
+    server: String,
+    shed: String,
+) -> Result<serde_json::Value, String> {
+    delivery::shed_delivery(&backend, &server, &shed)
+        .await
+        .map_err(|(_, m)| m)
+}
+
+/// `shed.provision`.
+#[tauri::command]
+async fn shed_provision(
+    backend: tauri::State<'_, Arc<Backend>>,
+    server: String,
+    shed: String,
+) -> Result<serde_json::Value, String> {
+    delivery::shed_provision(&backend, &server, &shed)
+        .await
+        .map_err(|(_, m)| m)
+}
+
+/// `activity.server_list`.
+#[tauri::command]
+async fn activity_server_list(
+    backend: tauri::State<'_, Arc<Backend>>,
+    limit: Option<u64>,
+    cursor: Option<String>,
+    shed: Option<String>,
+) -> Result<serde_json::Value, String> {
+    delivery::activity(&backend, limit, cursor.as_deref(), shed.as_deref())
+        .await
+        .map_err(|(_, m)| m)
+}
+
 // -- menu-bar popover footer commands (B1b) — a 2nd webview can't call the IPC ops
 //    or emit the main-window events, so the footer invokes these dedicated commands
 //    (test-mode-safe: they only show/emit/exit, never spawn or write). --
@@ -1384,6 +1468,13 @@ pub fn run() {
             broker_status,
             source_status,
             source_use,
+            delivery_status,
+            delivery_settings,
+            delivery_set,
+            delivery_preview,
+            shed_delivery,
+            shed_provision,
+            activity_server_list,
             open_dashboard,
             open_preferences,
             app_exit,
@@ -1540,6 +1631,20 @@ pub fn run() {
             // The broker drain is the shutdown's first step, so a tray quit,
             // `RunEvent::Exit`, and a signal all drain it.
             shutdown::install_broker_drain(&runtime, app.handle());
+            // The source runtime (plan 039 A6): a delivery stream per configured server,
+            // beside the broker's bus. Its drain runs in phase 0, after the broker's.
+            let delivery_rt = tauri::async_runtime::block_on(async {
+                let handle = tokio::runtime::Handle::current();
+                let env = env.clone();
+                tokio::task::spawn_blocking(move || delivery::start(&env, &handle))
+                    .await
+                    .expect("the delivery runtime starts")
+            });
+            {
+                let rt = delivery_rt.clone();
+                runtime.set_source_drain(Box::new(move || rt.drain()));
+            }
+            app.manage(delivery_rt);
             app.manage(runtime.clone());
             shutdown::spawn_signal_thread(app.handle().clone(), runtime.shutdown_coordinator());
 
