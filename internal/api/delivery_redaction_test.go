@@ -349,6 +349,16 @@ func TestDeliveryRedaction(t *testing.T) {
 	machine := refsource.NewMachineID()
 	var evMu sync.Mutex
 	source := func(canned refsource.Canned) func() {
+		// The server drops a stopped source's stream only when it sees the
+		// connection close; a new one before that is a duplicate (409).
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			if _, held := reg.DeliveryStream(""); !held {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the previous source's stream was never dropped")
+			}
+		}
 		src := startSource(t, ts.URL, refsource.Config{MachineID: machine, Canned: canned, Report: func(e refsource.Event) {
 			b, _ := json.Marshal(e)
 			evMu.Lock()
@@ -356,6 +366,9 @@ func TestDeliveryRedaction(t *testing.T) {
 			evMu.Unlock()
 		}})
 		src.next("stream")
+		if _, held := reg.DeliveryStream(""); !held {
+			t.Fatal("the source's stream is not registered under the implicit user")
+		}
 		return src.stop
 	}
 	call := func(method, path, body string, stream bool) string {
