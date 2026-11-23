@@ -70,6 +70,8 @@ impl Fake {
     }
 
     /// A plain-HTTP fake bound to `addr` (`ip:port`), or `None` when it cannot be bound.
+    /// (Its one user binds 127.0.0.3, which only Linux has.)
+    #[cfg(target_os = "linux")]
     pub async fn start_at(addr: &str) -> Option<Fake> {
         TcpListener::bind(addr).await.ok()?;
         Some(Self::start_with(addr, None).await)

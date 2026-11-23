@@ -37,7 +37,7 @@ ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout
 ==> stopping the builder
 gcloud compute instances stop shed-image-builder-20260101-000000 --project example-project --zone example-zone-a
 ==> creating image shed-remote-extensions-v0-0-0-test-20260101-000000 in family shed-extensions-amd64
-gcloud compute images create shed-remote-extensions-v0-0-0-test-20260101-000000 --project example-project --source-disk shed-image-builder-20260101-000000 --source-disk-zone example-zone-a --family shed-extensions-amd64 --labels shed_layout=1,shed_protocol=1,shed_arch=amd64,shed_variant=extensions,shed_version=v0-0-0-test --description 'shed remote guest layout 1, agent protocol 1, variant extensions, amd64, shed v0.0.0-test, from <newest ubuntu-2404-lts-amd64>'
+gcloud compute images create shed-remote-extensions-v0-0-0-test-20260101-000000 --project example-project --source-disk shed-image-builder-20260101-000000 --source-disk-zone example-zone-a --family shed-extensions-amd64 --labels shed_layout=1,shed_protocol=2,shed_arch=amd64,shed_variant=extensions,shed_version=v0-0-0-test --description 'shed remote guest layout 1, agent protocol 2, variant extensions, amd64, shed v0.0.0-test, from <newest ubuntu-2404-lts-amd64>'
 ==> deleting the builder
 gcloud compute instances delete shed-image-builder-20260101-000000 --project example-project --zone example-zone-a --quiet
 rm -rf "${WORK}"

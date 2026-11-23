@@ -244,17 +244,31 @@ impl Reader for DiskReader {
         if registry.cancelled {
             return Err(RunError::Failed);
         }
-        let mut child = std::process::Command::new(&program)
-            .args(&command.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => RunError::NotFound,
-                _ => RunError::Failed,
-            })?;
+        let spawn = || {
+            std::process::Command::new(&program)
+                .args(&command.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+        };
+        // ETXTBSY: the program was just written and another thread's fork still holds
+        // its write descriptor until that child execs. It clears within moments.
+        let mut spawned = spawn();
+        for _ in 0..50 {
+            match &spawned {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    spawned = spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut child = spawned.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => RunError::NotFound,
+            _ => RunError::Failed,
+        })?;
         let pid = child.id() as libc::pid_t;
         registry.running.insert(pid);
         drop(registry);
