@@ -264,20 +264,21 @@ func TestCloneWithholdsServerEnvForAUserWhoIsNotAnAdmin(t *testing.T) {
 		if got := e.settled("box"); got.Status != config.StatusRunning || got.ID != id {
 			t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
 		}
-		// A create resumed after a restart runs no step on its own: the
-		// clone stays owed for `shed provision`, which withholds the
-		// server's variables too (the flag is on the record).
-		if got := rec.calls(); len(got) != 0 {
-			t.Fatalf("the resumed create cloned on its own: %v", got)
+		// No source would be asked for this shed (the server has no
+		// delivery), so the resumed create clones on its own, and withholds
+		// the server's variables (the flag is on the record).
+		if got := rec.calls(); len(got) != 1 || !got[0] {
+			t.Fatalf("the resumed create's clone: owned %v, want [true]", got)
 		}
-		if st := e.storedRecord("box").Delivery.Steps.Clone.State; st != delivery.StepOwed {
-			t.Fatalf("resumed create's clone is %s, want owed", st)
+		if st := e.storedRecord("box").Delivery.Steps.Clone.State; st != delivery.StepDone {
+			t.Fatalf("resumed create's clone is %s, want done", st)
 		}
+		// A provision finds it done and does not clone again.
 		if _, err := e.b.ProvisionShed(ctxT(t), "box"); err != nil {
 			t.Fatalf("provision: %v", err)
 		}
-		if got := rec.calls(); len(got) != 1 || !got[0] {
-			t.Errorf("provision's clone: owned %v, want [true]", got)
+		if got := rec.calls(); len(got) != 1 {
+			t.Errorf("provision cloned again: %v", got)
 		}
 	})
 }

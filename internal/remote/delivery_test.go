@@ -40,6 +40,7 @@ type fakeGuest struct {
 	cloned    bool
 	other     bool // something else stands at the project directory
 	installed bool
+	failClone bool // every clone attempt fails
 	clones    int
 	installs  int
 	removes   int
@@ -125,6 +126,9 @@ func deliveryEnv(t *testing.T, opts ...envOpt) (*env, *fakeGuest, *deliverytest.
 			g.mu.Lock()
 			defer g.mu.Unlock()
 			g.clones++
+			if g.failClone {
+				return errors.New("clone failed")
+			}
 			g.cloned = true
 			return nil
 		}
@@ -301,6 +305,167 @@ func TestRemoteCreateInterruptedByARestart(t *testing.T) {
 			defer g.mu.Unlock()
 			if g.clones != 1 || g.installs != 1 || g.removes != 0 {
 				t.Fatalf("clones %d, installs %d, removes %d: want one each, nothing removed", g.clones, g.installs, g.removes)
+			}
+		})
+	}
+}
+
+// noSource is a create for which no source would be asked: a service
+// client's shed, a script key's create, a user with no bound machine.
+type noSource struct {
+	name string
+	req  func(r *config.CreateShedRequest)
+	src  func(src *deliverytest.Source)
+}
+
+var noSources = []noSource{
+	{"a service client's shed", func(r *config.CreateShedRequest) { r.Owner = "nocturn" }, nil},
+	{"a script key's create", func(r *config.CreateShedRequest) { r.ScriptKey = true }, nil},
+	{"a user with no bound machine", nil, func(src *deliverytest.Source) { src.Set("", deliverytest.Unbound, nil) }},
+}
+
+func (e *env) createWithNoSource(ns noSource, src *deliverytest.Source, name string) {
+	e.t.Helper()
+	if ns.src != nil {
+		ns.src(src)
+	}
+	req := config.CreateShedRequest{Name: name, Repo: testRepo}
+	if ns.req != nil {
+		ns.req(&req)
+	}
+	if _, err := e.b.CreateShed(ctxT(e.t), req); err != nil {
+		e.t.Fatalf("create %s: %v", name, err)
+	}
+}
+
+// TestRemoteResumedCreateWithNoSourceRunsItsSteps: a create for which no
+// source would be asked, interrupted by a restart (and, once back, by a cloud
+// read that fails, which the periodic pass heals), runs its owed steps when
+// it resumes: the stages are skipped not_applicable and the repository is
+// cloned and its install hook run, with no request and no `shed provision`.
+// Its counterpart, where a source would be asked, is
+// TestRemoteCreateInterruptedByARestart.
+func TestRemoteResumedCreateWithNoSourceRunsItsSteps(t *testing.T) {
+	points := []struct {
+		point string
+		// prepare changes the record while the create is held, to stand for
+		// an earlier interruption: before stage 1 was decided, or a record
+		// a server from before delivery wrote.
+		prepare func(r *state.Record)
+		// heal: the next server's first read of the instance fails, and the
+		// create is kept until a periodic pass.
+		heal bool
+	}{
+		{point: "clone"},
+		{point: "clone", heal: true},
+		{point: "install"},
+		{point: "install", heal: true},
+		{point: "label"},
+		{point: "clone", prepare: func(r *state.Record) { r.Delivery = delivery.NewRecord() }},
+		{point: "clone", prepare: func(r *state.Record) { r.Delivery, r.Cloned, r.Provisioned = nil, false, false }},
+	}
+	for _, ns := range noSources {
+		for _, pt := range points {
+			label := pt.point
+			switch {
+			case pt.heal:
+				label += ", then a failed read"
+			case pt.prepare != nil:
+				label += ", record rewound"
+			}
+			t.Run(ns.name+" at "+label, func(t *testing.T) {
+				h := &hookProvider{}
+				e, g, src := deliveryEnv(t, hooked(h))
+				if pt.point == "label" {
+					h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]string) error {
+						if labels[provider.LabelState] == string(provider.ShedStateReady) {
+							return g.at(ctx, "label")
+						}
+						return nil
+					}
+				}
+				g.hold(pt.point)
+				e.createWithNoSource(ns, src, "box")
+				g.waitAt(t, pt.point)
+				if pt.prepare != nil {
+					id := e.settledID("box")
+					e.b.update("box", id, pt.prepare)
+				}
+				if pt.heal {
+					if err := e.b.Close(); err != nil {
+						t.Fatal(err)
+					}
+					e.prov.FailNext(fake.OpGet, errCloudDown)
+					e.b = e.open()
+					e.idle()
+					if r := e.storedRecord("box"); r.Shed.StatusReason != config.StatusReasonCloudUnreadable || r.Job != state.JobCreate {
+						t.Fatalf("after the failed read: %q job %q, want the create kept", r.Shed.StatusReason, r.Job)
+					}
+					e.sweep()
+				} else {
+					e.restart()
+				}
+				if got := e.settled("box"); got.Status != config.StatusRunning {
+					t.Fatalf("resumed create settled %q (%q)", got.Status, got.StatusReason)
+				}
+				e.idle()
+				rec := e.storedRecord("box").Delivery
+				if got := stepsOf(rec); got != "skipped/not_applicable done skipped/not_applicable done" || rec.State != delivery.StateNotApplicable {
+					t.Fatalf("after the resume: %s %s", got, rec.State)
+				}
+				if err := rec.Validate(); err != nil {
+					t.Fatal(err)
+				}
+				if n := len(src.Requests()); n != 0 {
+					t.Fatalf("%d requests, want none", n)
+				}
+				g.mu.Lock()
+				defer g.mu.Unlock()
+				if g.clones != 1 || g.installs != 1 {
+					t.Fatalf("clones %d, installs %d: want one each", g.clones, g.installs)
+				}
+			})
+		}
+	}
+}
+
+// TestRemoteResumedCreateNeverRetriesAFailedStep: a create for which no
+// source would be asked, whose clone failed and that is interrupted before
+// its ready label, does not clone again when it resumes; the failed clone
+// (and the install hook it holds back) are left for `shed provision`.
+func TestRemoteResumedCreateNeverRetriesAFailedStep(t *testing.T) {
+	for _, ns := range noSources {
+		t.Run(ns.name, func(t *testing.T) {
+			h := &hookProvider{}
+			e, g, src := deliveryEnv(t, hooked(h))
+			h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]string) error {
+				if labels[provider.LabelState] == string(provider.ShedStateReady) {
+					return g.at(ctx, "label")
+				}
+				return nil
+			}
+			g.mu.Lock()
+			g.failClone = true
+			g.mu.Unlock()
+			g.hold("label")
+			e.createWithNoSource(ns, src, "box")
+			g.waitAt(t, "label")
+			g.mu.Lock()
+			clones := g.clones
+			g.mu.Unlock()
+			e.restart()
+			if got := e.settled("box"); got.Status != config.StatusRunning {
+				t.Fatalf("resumed create settled %q (%q)", got.Status, got.StatusReason)
+			}
+			e.idle()
+			rec := e.storedRecord("box").Delivery
+			if got := stepsOf(rec); got != "skipped/not_applicable failed/clone_failed skipped/not_applicable owed" {
+				t.Fatalf("after the resume: %s", got)
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if g.clones != clones || g.installs != 0 || len(src.Requests()) != 0 {
+				t.Fatalf("clones %d (was %d), installs %d, requests %d: want no retry", g.clones, clones, g.installs, len(src.Requests()))
 			}
 		})
 	}

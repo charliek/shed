@@ -238,8 +238,9 @@ pub struct RecordItem {
 /// The state the contract gives a record, from its steps, last delivery and
 /// items, in order: none (no steps, or every step skipped as adopted),
 /// not_applicable (no request made and no failure), delivered (every step
-/// done or skipped, and no problem), partial (an item written), else
-/// not_delivered.
+/// done or skipped, no failure and no problem: an image too old for
+/// delivery skips both stages with a failure), partial (an item written),
+/// else not_delivered.
 pub fn derive_state(r: &Record) -> State {
     let Some(steps) = &r.steps else {
         return State::None;
@@ -259,7 +260,11 @@ pub fn derive_state(r: &Record) -> State {
     let settled = list
         .iter()
         .all(|s| matches!(s.state, StepState::Done | StepState::Skipped));
-    if settled && r.last.as_ref().is_none_or(|l| l.problems.is_empty()) {
+    if settled
+        && r.last
+            .as_ref()
+            .is_none_or(|l| l.failure.is_none() && l.problems.is_empty())
+    {
         return State::Delivered;
     }
     if r.items.iter().any(|it| it.result == ItemResult::Ok) {
@@ -271,13 +276,14 @@ pub fn derive_state(r: &Record) -> State {
 fn skip_reasons(step: &str) -> &'static [StepReason] {
     use StepReason::*;
     match step {
-        "stage1" => &[NotApplicable, NoItems, FromSnapshot, Adopted],
+        "stage1" => &[NotApplicable, NoItems, ImageTooOld, FromSnapshot, Adopted],
         "clone" => &[NoRepo, LocalDir, FromSnapshot, Adopted],
         "stage2" => &[
             NotApplicable,
             NoItems,
             NoProjectDir,
             LocalDir,
+            ImageTooOld,
             FromSnapshot,
             Adopted,
         ],
@@ -294,10 +300,9 @@ fn fail_reasons(step: &str) -> &'static [StepReason] {
             SourceDisconnected,
             AnswerRefused,
             WriteFailed,
-            ImageTooOld,
         ],
         "clone" => &[CloneFailed, ProjectDirExists],
-        "stage2" => &[WriteFailed, ImageTooOld],
+        "stage2" => &[WriteFailed],
         _ => &[HookFailed],
     }
 }

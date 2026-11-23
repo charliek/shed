@@ -4,6 +4,9 @@ The desktop app is a person's **credential source**: when a shed is created, or 
 
 The app answers only for a server whose credential source is this machine. **Preferences → Provisioning** shows each configured server's source row and **Use this machine** (the same binding `shed source use` makes). The app holds one delivery stream per server and answers each request on its own, with no prompt.
 
+!!! warning "Set `only.servers` on every provider"
+    You do not have to choose a server for it to ask: the first machine that connects for you on a server becomes your source there, and the app opens a delivery stream to **every server in your shed config**. Of the [`only` rules](#the-only-rules), only `servers` is checked by the app against the server that actually asked. `backends` and `repos` are matched against what the server wrote in its request, so a dishonest server can satisfy them. A provider that is on with no `only.servers` delivers its items to any configured server that asks. Give each provider you enable an `only.servers` list of the servers you trust with it.
+
 ## The Provisioning section
 
 Preferences gains a **Provisioning** section with:
@@ -77,6 +80,8 @@ repos = ["example/*"]               # owner/name, `*` within a part
 ```
 
 Every list given must match, an absent list does not restrict, and a list is never empty. A `files` entry is held to its provider's rules and its own. The file is read again for each request, so a change applies to the next create.
+
+Only `servers` holds against a dishonest server: the app knows which server's stream a request came in on. `backends` and `repos` are read from the request, which the server writes. Use `backends` and `repos` to keep an honest server's sheds tidy, and `servers` to decide who can draw a provider's items at all.
 
 ## Preview
 

@@ -315,8 +315,11 @@ func TestDeliveryWriteThroughAHostileAgent(t *testing.T) {
 		{notify: probeReply(0, func(id string) []byte { return []byte(sentinel) })},
 	} {
 		r := svc.Write(context.Background(), NewAgentClient(d, runConsolePort, runNotifyPort), 1, bundle, "")
-		if r.State != delivery.StepFailed {
-			t.Fatalf("a hostile agent's stage = %+v, want failed", r)
+		// A protocol below the bound (whatever number) is image_too_old,
+		// which skips the stage; anything else it sends fails it.
+		tooOld := r.State == delivery.StepSkipped && r.Reason == delivery.ReasonImageTooOld
+		if r.State != delivery.StepFailed && !tooOld {
+			t.Fatalf("a hostile agent's stage = %+v, want failed or skipped image_too_old", r)
 		}
 		texts = append(texts, fmt.Sprintf("%+v %#v", r, r))
 		if r.Failure != nil {

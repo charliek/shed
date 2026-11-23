@@ -592,7 +592,7 @@ and these say why a document is not one.
 |---|---|
 | `none` | no record (the shed predates delivery), or a cloud shed adopted at start-up whose history the server does not know (every step `skipped`, reason `adopted`) |
 | `not_applicable` | the last delivery made no request and did not fail: the user has no bound machine, the shed was created by a service client or with a script key, or restored from a snapshot |
-| `delivered` | every step is `done` or `skipped`, and the last answer reported no problem |
+| `delivered` | every step is `done` or `skipped`, the last delivery recorded no failure, and the last answer reported no problem |
 | `partial` | not the above, and some item is in the shed as written (result `ok`) |
 | `not_delivered` | none of the above: nothing is in the shed |
 
@@ -629,13 +629,23 @@ items), `install` (the repository's install hook).
 | `source_disconnected` | | `stage1`: the stream ended before an answer |
 | `answer_refused` | | `stage1`: the answer broke a rule |
 | `write_failed` | | `stage1`, `stage2`: an item could not be written |
-| `image_too_old` | | `stage1`, `stage2`: the shed's image cannot take items |
+| `image_too_old` | `stage1`, `stage2`: the shed's image cannot take items (with that failure recorded, below) | |
 | `clone_failed` | | `clone` |
 | `project_dir_exists` | | `clone`: the project directory exists and is not the repository's work tree |
 | `hook_failed` | | `install` |
 
 The six from `source_offline` to `image_too_old` are also the **failure
 reasons** of `last.failure`, as the warning a person sees names them.
+
+`image_too_old` is the one failure recorded on a **skipped** step: an image
+whose agent cannot take items can never take a delivery, so the stage it
+stops is skipped and the steps after it run (the clone, and the install
+hook as a shed with no delivery would run it). When it stops stage 1, stage
+2 is skipped `image_too_old` too. `last.failure` is `image_too_old`, so the
+shed is not `delivered` (above): it reads `not_delivered`, or `partial`
+when an item an earlier delivery wrote is still recorded `ok`, and the
+warning tells the person to recreate the shed from a current image, not to
+run `shed provision`.
 
 ### Outcomes
 

@@ -66,10 +66,9 @@ type job struct {
 	// deliver is set on the job a create request started: its delivery
 	// steps run and its source is asked. Like repoURL it is never stored:
 	// a create resumed after a restart has lost its bundle and asks no
-	// source on its own (its unfinished steps stay owed). scriptKey is the
-	// create's (no request for a script key's shed).
-	deliver   bool
-	scriptKey bool
+	// source on its own. Its unfinished steps stay owed when a source would
+	// be asked; when none would be (createSteps), they run.
+	deliver bool
 	// actor is who made the create (the access guard's actor on the
 	// request), for the delivery's audit event; hasActor says there was
 	// one. Never stored, like deliver.

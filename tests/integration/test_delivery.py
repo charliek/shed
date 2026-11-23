@@ -41,8 +41,10 @@ What it shows, live (the plan's case numbers):
      404, an admin: 403 and the record withheld); a second provision while
      one runs is 409;
   8. `shed start` with an expired item: one warning, no request;
-  9. a published image (where the image gate is unset): `image_too_old`, no
-     request, and no second agent process in the shed;
+  9. a published image (where the image gate is unset): both stages skipped
+     `image_too_old` with the failure recorded (`not_delivered`), the
+     install step run, the recreate warning, no request, and no second agent
+     process in the shed;
  10. activity: two users, a deleted shed, its name reused, paging.
 
 **Gates.**
@@ -1133,9 +1135,10 @@ def test_start_warns_once_per_expired_item_and_asks_no_source(delivery_env, main
 @pytest.mark.local_vm_only(CORE_ONLY)
 def test_an_image_whose_agent_cannot_take_items_is_image_too_old(delivery_env):
     """The server reads the agent's protocol before it asks anyone: an image
-    whose agent is older ends `image_too_old`, makes no request, and never
-    runs the subcommand (which an old agent would take for a second
-    daemon)."""
+    whose agent is older skips both stages as `image_too_old` (the failure
+    kept, the warning saying to recreate the shed), makes no request, never
+    runs the subcommand (which an old agent would take for a second daemon),
+    and still runs the steps after them, so nothing is left owed."""
     d = delivery_env
     alice = d.alice
     old = os.environ.get("SHED_DELIVERY_OLD_IMAGE", "").strip()
@@ -1150,8 +1153,9 @@ def test_an_image_whose_agent_cannot_take_items_is_image_too_old(delivery_env):
         assert reqs == [], f"a request was made for an image whose agent cannot take items: {reqs}"
         assert dl.delivery_warnings(r.stdout + r.stderr) == [dl.delivery_warning(name, "image_too_old")], r.stderr
         rec = _record(d, alice, name)
-        _assert_steps(rec, {"stage1": ("failed", "image_too_old"), "clone": ("skipped", "no_repo"),
-                            "stage2": ("owed", None), "install": ("owed", None)}, name)
+        _assert_steps(rec, {"stage1": ("skipped", "image_too_old"), "clone": ("skipped", "no_repo"),
+                            "stage2": ("skipped", "image_too_old"), "install": ("skipped", "no_hook")}, name)
+        assert rec.get("state") == "not_delivered", rec
         last = rec.get("last") or {}
         assert (last.get("outcome"), last.get("failure")) == ("not_requested", {"reason": "image_too_old"}), last
         assert "source" not in last, last

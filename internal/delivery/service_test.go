@@ -801,11 +801,11 @@ func TestWrite(t *testing.T) {
 			t.Fatalf("files written, env file not = %+v", r)
 		}
 	})
-	t.Run("an old agent is image_too_old, never tried", func(t *testing.T) {
+	t.Run("an old agent is skipped image_too_old, never tried", func(t *testing.T) {
 		for _, p := range []int{0, guest.ApplyItemsProtocol - 1} {
 			a := &fakeAgent{protocol: p}
 			r := svc.Write(ctx, a, 1, full, "/home/shed/box")
-			if r.State != StepFailed || r.Reason != ReasonImageTooOld || a.runs != 0 || r.Failure.Reason != ReasonImageTooOld ||
+			if r.State != StepSkipped || r.Reason != ReasonImageTooOld || a.runs != 0 || r.Failure.Reason != ReasonImageTooOld ||
 				fmt.Sprint(r.Items) != "[{key not_written} {cfg not_written} {tok not_written}]" {
 				t.Fatalf("protocol %d: result = %+v, runs %d", p, r, a.runs)
 			}

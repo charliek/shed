@@ -80,15 +80,15 @@ var StepReasons = []StepReason{
 // skipped and when failed.
 var (
 	skipReasons = map[string][]StepReason{
-		StepStage1:  {ReasonNotApplicable, ReasonNoItems, ReasonFromSnapshot, ReasonAdopted},
+		StepStage1:  {ReasonNotApplicable, ReasonNoItems, ReasonImageTooOld, ReasonFromSnapshot, ReasonAdopted},
 		StepClone:   {ReasonNoRepo, ReasonLocalDir, ReasonFromSnapshot, ReasonAdopted},
-		StepStage2:  {ReasonNotApplicable, ReasonNoItems, ReasonNoProjectDir, ReasonLocalDir, ReasonFromSnapshot, ReasonAdopted},
+		StepStage2:  {ReasonNotApplicable, ReasonNoItems, ReasonNoProjectDir, ReasonLocalDir, ReasonImageTooOld, ReasonFromSnapshot, ReasonAdopted},
 		StepInstall: {ReasonNoHook, ReasonNoProvision, ReasonFromSnapshot, ReasonAdopted},
 	}
 	failReasons = map[string][]StepReason{
-		StepStage1:  {ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonAnswerRefused, ReasonWriteFailed, ReasonImageTooOld},
+		StepStage1:  {ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonAnswerRefused, ReasonWriteFailed},
 		StepClone:   {ReasonCloneFailed, ReasonProjectDirExists},
-		StepStage2:  {ReasonWriteFailed, ReasonImageTooOld},
+		StepStage2:  {ReasonWriteFailed},
 		StepInstall: {ReasonHookFailed},
 	}
 )
@@ -219,8 +219,9 @@ func (s *Steps) list() []struct {
 //   - none: no steps (the shed has no record), or every step skipped as
 //     adopted;
 //   - not_applicable: the last delivery made no request and did not fail;
-//   - delivered: every step done or skipped, and the last answer reported no
-//     problem;
+//   - delivered: every step done or skipped, the last delivery recorded no
+//     failure, and the last answer reported no problem (an image too old
+//     for delivery skips both stages with a failure: not delivered);
 //   - partial: an item was written by the last delivery (result ok);
 //   - not_delivered: otherwise.
 func DeriveState(r *Record) State {
@@ -242,7 +243,7 @@ func DeriveState(r *Record) State {
 	if r.Last != nil && r.Last.Outcome == OutcomeNotRequested && r.Last.Failure == nil {
 		return StateNotApplicable
 	}
-	if settled && (r.Last == nil || len(r.Last.Problems) == 0) {
+	if settled && (r.Last == nil || (r.Last.Failure == nil && len(r.Last.Problems) == 0)) {
 		return StateDelivered
 	}
 	for _, it := range r.Items {

@@ -18,9 +18,14 @@ import (
 // provision`, both through delivery.Run.
 //
 // The record's steps are saved after each. A create resumed after a server
-// restart has lost its bundle: it runs no step, asks no source (N3), and
+// restart (or a cloud read that failed) has lost its bundle and asks no
+// source (N3). When a source would be asked for the shed, it runs no step and
 // leaves what it had not recorded done or skipped owed for `shed provision`.
-// A job never retries a step recorded failed.
+// When none would be (a service client's shed, a script key's create, a user
+// with no bound machine), it runs the steps still owed: the stages are
+// skipped not_applicable and the clone and install hook run, as a create
+// before delivery resumed them. A resumed job never retries a step recorded
+// failed.
 
 var _ backend.Provisioner = (*Backend)(nil)
 
@@ -33,11 +38,17 @@ func requestShed(rec *state.Record) delivery.RequestShed {
 	return config.DeliveryRequestShed(rec.Shed.Name, rec.Shed.ID, delivery.BackendRemote, rec.Shed.Repo, "", rec.Shed.LandingDir)
 }
 
-// createSteps runs a create's tracked steps. Only the job the create
-// request started runs them (j.deliver); a resumed one runs none. It returns
-// errSuperseded when the job's context ended or the shed went.
+// createSteps runs a create's tracked steps. The job the create request
+// started runs them (j.deliver); a resumed one runs those still owed only
+// when no source would be asked (resumable). It returns errSuperseded when
+// the job's context ended or the shed went.
 func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, agent *vmutil.AgentClient, owned bool) error {
-	if !j.deliver {
+	owner, user := ownership(rec)
+	params := delivery.Params{
+		User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "", ScriptKey: rec.ScriptKey,
+	}
+	resumed := !j.deliver
+	if resumed && !b.resumable(rec, params) {
 		// A record from before delivery: its old flags say what ran.
 		if rec.Delivery == nil {
 			steps := rec.LegacySteps()
@@ -62,19 +73,20 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 	if j.hasActor {
 		ctx = audit.WithActor(ctx, j.actor)
 	}
-	owner, user := ownership(rec)
+	if resumed {
+		b.logf("remote: create of shed %s resumed: no source is asked for it, so its owed steps run", j.name)
+	}
 	h := &remoteHost{
 		b: b, name: j.name, id: j.id, agent: agent, rec: rec, owner: owner, user: user,
 		last: rec.Delivery.Clone(), repo: repo, withheld: owned || rec.NoServerEnv,
 	}
 	run := &delivery.Run{
-		Service: b.deliverySvc,
-		Reason:  delivery.ReasonCreate,
-		Params: delivery.Params{
-			User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "", ScriptKey: j.scriptKey,
-		},
+		Service:     b.deliverySvc,
+		Reason:      delivery.ReasonCreate,
+		Params:      params,
 		HasRepo:     rec.Shed.Repo != "",
 		NoProvision: rec.NoProvision,
+		Resumed:     resumed,
 		Prior:       rec.Delivery,
 		Initial:     rec.LegacySteps(),
 		Host:        h,
@@ -88,6 +100,23 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 		b.logf("Warning: create of shed %s: the delivery steps ended early: %v", j.name, err)
 	}
 	return nil
+}
+
+// resumable reports whether a resumed create runs its owed steps: when no
+// source would be asked for the shed now (delivery not applicable), and its
+// stage 1 is owed or was skipped as not applicable. A stage 1 that a source
+// was asked for at the create (done, failed, or skipped for another reason)
+// leaves the rest for `shed provision`, as a shed whose source would be
+// asked does.
+func (b *Backend) resumable(rec *state.Record, p delivery.Params) bool {
+	if b.deliverySvc.Applicable(p) {
+		return false
+	}
+	if rec.Delivery == nil || rec.Delivery.Steps == nil {
+		return true
+	}
+	s := rec.Delivery.Steps.Stage1
+	return s.State == delivery.StepOwed || (s.State == delivery.StepSkipped && s.Reason == delivery.ReasonNotApplicable)
 }
 
 // BeginProvision admits `shed provision` on a running cloud shed

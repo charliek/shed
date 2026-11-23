@@ -372,14 +372,32 @@ func TestRunImageTooOldAsksNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := steps(rec); got != "failed/image_too_old done owed owed" {
+	// Both stages are skipped, with the failure kept: the clone and the
+	// install hook run as they would with no delivery, and the shed reads
+	// not_delivered.
+	if got := steps(rec); got != "skipped/image_too_old done skipped/image_too_old done" {
 		t.Fatalf("steps = %s", got)
 	}
-	if len(src.Requests()) != 0 || rec.Last.Outcome != delivery.OutcomeNotRequested {
-		t.Fatalf("requests %d, outcome %s", len(src.Requests()), rec.Last.Outcome)
+	if rec.State != delivery.StateNotDelivered {
+		t.Fatalf("state = %s", rec.State)
 	}
-	if len(p.warn) != 1 || !strings.Contains(p.warn[0], "(image_too_old)") {
+	if len(src.Requests()) != 0 || rec.Last.Outcome != delivery.OutcomeNotRequested ||
+		rec.Last.Failure == nil || rec.Last.Failure.Reason != delivery.ReasonImageTooOld {
+		t.Fatalf("requests %d, last %+v", len(src.Requests()), rec.Last)
+	}
+	want := "Credentials were not delivered (image_too_old). Recreate the shed from a current image."
+	if len(p.warn) != 1 || p.warn[0] != want {
 		t.Fatalf("warnings = %v", p.warn)
+	}
+	// A provision on the same image asks nothing and changes nothing.
+	run := createRun(svc, h, p)
+	run.Reason, run.Prior = delivery.ReasonProvision, rec
+	again, err := run.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := steps(again); got != "skipped/image_too_old done skipped/image_too_old done" || len(src.Requests()) != 0 {
+		t.Fatalf("provision: steps %s, %d requests", got, len(src.Requests()))
 	}
 	checkSaved(t, h)
 }
@@ -722,5 +740,26 @@ func TestRunWritesItsAuditEvent(t *testing.T) {
 	_ = json.Unmarshal([]byte(got[2]), &ev)
 	if ev.ShedOwner != "ci" || ev.ShedUser != "" || ev.Identity.Kind != audit.KindClient || ev.Identity.Name != "ci" || ev.Delivery.State != "not_applicable" {
 		t.Errorf("a client's shed's event = %+v", ev)
+	}
+}
+
+// TestResumedRunNeverAsksASource: a resumed create (a job that lost the
+// create request) asks no source even when one is bound and connected by
+// the time it runs: its stages read not applicable and nothing is sent.
+func TestResumedRunNeverAsksASource(t *testing.T) {
+	src, svc := source(t, 5*time.Second)
+	src.Set("alice", deliverytest.Answer, canned)
+	h, p := newHost(), &progress{}
+	run := createRun(svc, h, p)
+	run.Resumed = true
+	rec, err := run.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(src.Requests()); n != 0 {
+		t.Fatalf("a resumed run sent %d request(s)", n)
+	}
+	if got := steps(rec); got != "skipped/not_applicable done skipped/not_applicable done" {
+		t.Fatalf("steps = %s", got)
 	}
 }

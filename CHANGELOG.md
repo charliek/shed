@@ -59,14 +59,22 @@ All notable changes to this project will be documented in this file.
   - **Behaviour changes.** The install hook now waits for the clone and for delivery: it runs
     only after stage 1, the clone and stage 2 are done or skipped, so a bound source that is
     offline holds it back until `shed provision`. A create on the remote backend resumed after a
-    server restart runs no step until `shed provision` (its bundle was in memory only). The audit
-    log is on by default in `mtls` mode (`audit.enabled: false` turns it off) and now records shed
-    lifecycle and delivery events. The agent protocol is 2: a shed from an older image still boots,
-    but delivery to it ends as `image_too_old`. `shed reset` clears delivered items and names
+    server restart (or a failed cloud read) asks no source: when one would be asked, its owed
+    steps wait for `shed provision` (its bundle was in memory only); when none would be (a service
+    client's shed, a script key's create, a user with no bound machine), they run as before. The
+    audit log is on by default in `mtls` mode (`audit.enabled: false` turns it off) and now records
+    shed lifecycle and delivery events. The agent protocol is 2: a shed from an older image still
+    boots, its stages are skipped as `image_too_old` (warning to recreate the shed), and its clone
+    and hooks run as before. `shed reset` clears delivered items and names
     `shed provision`. `--no-provision` skips the install hook only, not delivery, and `shed provision` does not run a hook skipped that way.
   - **Follow-ups.** Actions the server takes on its own (remote sweeps and reconcile) are not
     audited yet. The ask-per-use credential helpers stay in this release; their removal and the
-    two-variant image change are a later part of the same plan.
+    two-variant image change are a later part of the same plan. The first machine that connects
+    for a user is bound as their source, and the app streams to every configured server; of the
+    `only` rules only `only.servers` is judged on the person's machine (`only.backends` and
+    `only.repos` match what the server wrote), so a provider enabled with no `only.servers`
+    delivers to any configured server that asks. Set `only.servers` on every provider; whether a
+    provider with no `only.servers` should deliver nowhere is an open decision.
 
 ## v0.10.1 — 2026-11-20
 

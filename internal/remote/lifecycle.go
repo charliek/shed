@@ -177,6 +177,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		// Every step owed until the create job decides it.
 		Delivery:    delivery.NewRecord(),
 		NoServerEnv: req.NoServerEnv,
+		ScriptKey:   req.ScriptKey,
 		Size:        size.Name,
 		DiskGB:      diskGB,
 		MaxRun:      maxRun,
@@ -204,7 +205,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	b.records[req.Name] = rec
 	j := b.newJobLocked(state.JobCreate, req.Name, id)
 	j.repoURL = repoURL
-	j.deliver, j.scriptKey = true, req.ScriptKey
+	j.deliver = true
 	j.actor, j.hasActor = audit.ActorFrom(ctx)
 	j.fastWindow = true
 	first := b.shedOf(rec)

@@ -90,6 +90,10 @@ type Record struct {
 	// is not an admin). It is kept so a create resumed after a restart
 	// withholds them too.
 	NoServerEnv bool `json:"no_server_env,omitempty"`
+	// ScriptKey says the create was called with a script key, for which no
+	// delivery applies. It is kept so a create resumed after a restart
+	// knows no source would be asked, and runs its clone and hooks.
+	ScriptKey bool `json:"script_key,omitempty"`
 
 	// Address is the last address the cloud reported; AddressAt is when.
 	Address   string    `json:"address,omitempty"`

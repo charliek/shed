@@ -75,9 +75,11 @@ type StageResult struct {
 //   - Stage 2 with no item is skipped (no_items) without asking the agent
 //     anything.
 //   - Otherwise the agent's protocol is probed first: an agent below
-//     guest.ApplyItemsProtocol cannot take items, and the stage fails as
-//     image_too_old with nothing sent (a stage 1 with no item is then
-//     skipped, no_items: there is nothing to write). The writer is never
+//     guest.ApplyItemsProtocol cannot take items, and the stage is skipped
+//     as image_too_old, with that failure and nothing sent (a stage 1 with
+//     no item is then skipped, no_items: there is nothing to write). It is
+//     a skip, not a failure, so the steps after it run: such an image can
+//     never take a delivery. The writer is never
 //     tried to find out.
 //   - The writer runs once, within 60 seconds, as the shed user, with the
 //     stage's items on stdin. A stage 1 runs even with no item, so that a
@@ -142,7 +144,7 @@ func (s *Service) Write(ctx context.Context, agent Agent, stage int, bundle *Bun
 		log.Printf("delivery: stage %d: the shed's agent speaks a protocol below %d: its image cannot take items",
 			stage, guest.ApplyItemsProtocol)
 		notWritten()
-		res.State, res.Reason = StepFailed, ReasonImageTooOld
+		res.State, res.Reason = StepSkipped, ReasonImageTooOld
 		res.Failure = &Failure{Reason: ReasonImageTooOld}
 		return res
 	}

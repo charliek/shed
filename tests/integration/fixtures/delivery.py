@@ -68,9 +68,11 @@ ENV_FILE = ".config/environment.d/50-shed-delivery.conf"
 
 # The server's own words (checked against the Go source by
 # test_fixture_units.py): the warning a failed delivery prints
-# (internal/delivery/lifecycle.go: Warning), and the one `shed start` prints
-# per expired item (cmd/shed/provision.go: warnExpiredItems).
+# (internal/delivery/lifecycle.go: Warning), its form for an image too old to
+# take a delivery (which no `shed provision` finishes), and the one `shed
+# start` prints per expired item (cmd/shed/provision.go: warnExpiredItems).
 WARNING_FORMAT = "Credentials were not delivered ({failure}). Run: shed provision {shed}"
+IMAGE_TOO_OLD_FORMAT = "Credentials were not delivered ({failure}). Recreate the shed from a current image."
 EXPIRED_FORMAT = "Warning: delivered item {item} has expired. Run: shed provision {shed}"
 # The feature tokens a server with delivery advertises (internal/api/overview.go).
 FEATURES = ("delivery", "activity")
@@ -365,6 +367,8 @@ def failure_text(reason: str, *, rule: Optional[str] = None, item: Optional[str]
 
 def delivery_warning(shed: str, reason: str, **kw) -> str:
     """The fixed warning of a failed delivery."""
+    if reason == "image_too_old":
+        return IMAGE_TOO_OLD_FORMAT.format(failure=failure_text(reason, **kw))
     return WARNING_FORMAT.format(failure=failure_text(reason, **kw), shed=shed)
 
 

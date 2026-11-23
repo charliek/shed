@@ -66,6 +66,11 @@ type Run struct {
 	// NoProvision is a create's --no-provision: the install hook is
 	// skipped.
 	NoProvision bool
+	// Resumed is a create run again by a job that lost the create
+	// request's (a server restart, a cloud read that failed). Only steps
+	// recorded owed are tried: one recorded failed is left for `shed
+	// provision`.
+	Resumed bool
 	// Prior is the shed's record before the run; nil for a shed with no
 	// record. Initial, when Prior is nil, is the steps to start from (the
 	// remote backend's reading of a record from before delivery); nil is
@@ -164,6 +169,11 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 			failure = st.Failure
 		case res.Reason == ReasonNotApplicable:
 			rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonNotApplicable}
+		case res.Reason == ReasonImageTooOld:
+			// The image can never take a delivery: skipped, with the
+			// failure warned of, so the clone and the hooks still run.
+			rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonImageTooOld}
+			failure = &Failure{Reason: ReasonImageTooOld}
 		default:
 			rec.Steps.Stage1 = Step{State: StepFailed, Reason: res.Reason}
 			failure = &Failure{Reason: res.Reason, Rule: res.Rule}
@@ -192,7 +202,7 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 	}
 
 	// The clone.
-	if attempt(rec.Steps.Clone) {
+	if r.attempt(rec.Steps.Clone) {
 		if err := r.Host.Step(ctx, func(ctx context.Context) error {
 			switch {
 			case p.Shed.LocalDir != "":
@@ -209,13 +219,15 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 	}
 
 	// Stage 2: when owed or failed, and always when a bundle arrived.
-	if attempt(rec.Steps.Stage2) || bundle != nil {
+	if r.attempt(rec.Steps.Stage2) || bundle != nil {
 		if err := r.Host.Step(ctx, func(ctx context.Context) error {
 			switch {
 			case res.Outcome == OutcomeNotRequested && res.Reason == ReasonNotApplicable:
 				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonNotApplicable}
 			case p.Shed.LocalDir != "":
 				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonLocalDir}
+			case rec.Steps.Stage1 == Step{State: StepSkipped, Reason: ReasonImageTooOld}:
+				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonImageTooOld}
 			case bundle == nil || !settled(rec.Steps.Clone):
 				rec.Steps.Stage2 = Step{State: StepOwed}
 			case p.Shed.ProjectDir == "":
@@ -245,7 +257,7 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 	// The install hook, then the startup hook when it is due: on create
 	// after an install step that is done (or found no install hook), and on
 	// provision after an install hook that ran for the first time.
-	if attempt(rec.Steps.Install) {
+	if r.attempt(rec.Steps.Install) {
 		if err := r.Host.Step(ctx, func(ctx context.Context) error {
 			switch {
 			case r.NoProvision:
@@ -276,7 +288,9 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 // or a request the service could not make, is an error.
 func (r *Run) request(ctx context.Context, p Params) (Result, error) {
 	now := r.now().UTC()
-	if r.Service == nil || !r.Service.Applicable(p) {
+	// A resumed run never asks a source (N3), even if one was bound after
+	// the job decided it could resume: its stages read not applicable.
+	if r.Resumed || r.Service == nil || !r.Service.Applicable(p) {
 		return Result{Outcome: OutcomeNotRequested, Reason: ReasonNotApplicable, At: now}, nil
 	}
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
@@ -336,8 +350,10 @@ func (r *Run) save(ctx context.Context, rec *Record) error {
 }
 
 // attempt reports whether a step that is not stage 1 is tried: when it is
-// owed or failed.
-func attempt(s Step) bool { return s.State == StepOwed || s.State == StepFailed }
+// owed, or failed and the run is not a resumed create's.
+func (r *Run) attempt(s Step) bool {
+	return s.State == StepOwed || (s.State == StepFailed && !r.Resumed)
+}
 
 // settled reports whether what depends on s may run: s is done or skipped.
 func settled(s Step) bool { return s.State == StepDone || s.State == StepSkipped }

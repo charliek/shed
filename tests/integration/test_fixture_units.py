@@ -5021,6 +5021,9 @@ def test_delivery_texts_are_the_servers_own():
     life = _GO_LIFECYCLE.read_text()
     assert 'fmt.Sprintf("Credentials were not delivered (%s). Run: shed provision %s", FailureText(f), shed)' in life
     assert dlv.WARNING_FORMAT.replace("{failure}", "%s").replace("{shed}", "%s") in life
+    assert ('fmt.Sprintf("Credentials were not delivered (%s). Recreate the shed from a current image.", FailureText(f))'
+            in life)
+    assert dlv.IMAGE_TOO_OLD_FORMAT.replace("{failure}", "%s") in life
     for form in ('"%s: %s", f.Reason, f.Rule', '"%s: %s %s", f.Reason, f.Item, f.Result', '"%s: the env file %s"'):
         assert form in life, form
     cli = _GO_CLI_PROVISION.read_text()
@@ -5046,6 +5049,13 @@ def test_delivery_texts_are_the_servers_own():
 def test_delivery_warning_text(reason, kw, want):
     assert dlv.failure_text(reason, **kw) == want
     assert dlv.delivery_warning("s1", reason, **kw) == f"Credentials were not delivered ({want}). Run: shed provision s1"
+
+
+def test_image_too_old_warning_names_a_recreate():
+    """An image too old to take a delivery is never finished by `shed
+    provision`, so its warning does not send the person there."""
+    assert dlv.delivery_warning("s1", "image_too_old") == (
+        "Credentials were not delivered (image_too_old). Recreate the shed from a current image.")
 
 
 def test_delivery_warnings_are_picked_from_cli_output():

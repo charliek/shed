@@ -1,0 +1,35 @@
+{
+  "name": "delivered-image-too-old",
+  "description": "delivered, with both stages skipped as image_too_old and that failure recorded: every step is settled, but a recorded failure is never delivered.",
+  "record": {
+    "state": "delivered",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "image_too_old"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "image_too_old"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested",
+      "failure": {
+        "reason": "image_too_old"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "state_mismatch"
+  }
+}

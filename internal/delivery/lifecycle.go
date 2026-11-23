@@ -165,8 +165,12 @@ func FailureText(f *Failure) string {
 }
 
 // Warning is the fixed text a failed delivery is warned with, naming the
-// command that finishes it.
+// command that finishes it; for an image too old to take a delivery, which
+// no `shed provision` can finish, the recreate that does.
 func Warning(shed string, f *Failure) string {
+	if f != nil && f.Reason == ReasonImageTooOld {
+		return fmt.Sprintf("Credentials were not delivered (%s). Recreate the shed from a current image.", FailureText(f))
+	}
 	return fmt.Sprintf("Credentials were not delivered (%s). Run: shed provision %s", FailureText(f), shed)
 }
 

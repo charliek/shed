@@ -22,11 +22,25 @@ The server asks the source of the **shed's user**, and only that user can cause 
 
 No request is made, and the state is `not_applicable` with no warning, when:
 
-- the user has no bound machine (a person who never ran `shed source use` sees the behaviour that existed before delivery);
+- the user has no bound machine: none was bound with `shed source use`, and no machine has connected as their source yet (the first that does is bound; see [below](#what-limits-a-sources-answers)). Such a person sees the behaviour that existed before delivery;
 - the shed was created by a service client, or the create used a script key (`shed provision` with a script key, or by a service client, is refused with `403`);
 - the shed was restored from a snapshot.
 
 A bound machine that is not connected ends the delivery at once as `source_offline`. The server waits only for a connected source, up to [`delivery.timeout`](#configuration), because a source may have to run a passphrase command.
+
+### What limits a source's answers
+
+A person does not have to bind a machine on purpose: the **first machine that connects** for a user (the desktop app, signed in to that server) becomes the user's source. The desktop app opens a delivery stream to **every server in its shed config**, and answers each request without a prompt. So with a provider enabled, any server in that config can ask for that provider's items.
+
+A provider's `only` rules (in the app's `delivery.toml`, see [Provisioning](../desktop/provisioning.md#the-only-rules)) are what narrow this, and they do not all protect the same way:
+
+| Rule | Judged by | Holds against a dishonest server |
+|---|---|---|
+| `only.servers` | the source: the server the request came in on, by its name in the source's own config | Yes |
+| `only.backends` | matched against the backend the request says the shed is on | No: the server writes the request |
+| `only.repos` | matched against the repository the request names | No: the server writes the request |
+
+A provider enabled with no `only.servers` therefore delivers to any configured server that asks, for any shed name, backend and repository it puts in the request. **Give every enabled provider an `only.servers` list** naming the servers you trust with it. Whether a provider with no `only.servers` should deliver nowhere instead is an open decision.
 
 ## The four steps
 
@@ -75,6 +89,7 @@ So a create whose source is offline ends with stage 1 `failed`, the clone `done`
 | `no_project_dir` | stage 2 |
 | `no_hook` | install |
 | `no_provision` | install: created with `--no-provision` |
+| `image_too_old` | stage 1, stage 2: the shed's image has an agent that cannot take items (the failure is recorded; see [Old images](#old-images)) |
 | `from_snapshot` | every step |
 | `adopted` | every step (a cloud shed adopted at server start-up whose history is unknown) |
 
@@ -93,7 +108,7 @@ The server keeps a record per shed and returns it in the shed document as `deliv
 | `expired` | the names of items whose `expires_at` has passed (the shed document, not the contract's record) |
 | `owed` | the steps that are owed, in the order they run (the shed document) |
 
-The states are decided in this order: `none` (no record, or an adopted cloud shed), `not_applicable` (no request was made and nothing failed), `delivered` (every step done or skipped and no problem reported), `partial` (something is in the shed as written), `not_delivered` (nothing is).
+The states are decided in this order: `none` (no record, or an adopted cloud shed), `not_applicable` (no request was made and nothing failed), `delivered` (every step done or skipped, no failure recorded and no problem reported), `partial` (something is in the shed as written), `not_delivered` (nothing is).
 
 An admin viewing another user's shed sees the `state` alone, with `withheld: true`.
 
@@ -107,6 +122,12 @@ A delivery that cannot finish prints a fixed warning that names the command that
 
 ```text
 Credentials were not delivered (<reason>). Run: shed provision <name>
+```
+
+For `image_too_old`, which no `shed provision` can finish, the warning names the recreate instead:
+
+```text
+Credentials were not delivered (image_too_old). Recreate the shed from a current image.
 ```
 
 | Reason | Meaning |
@@ -133,6 +154,8 @@ The create streams the warning as progress. On the remote backend, whose create 
 
 The agent writes each item with its own file mode (`0600` or `0400`), under the shed user's home or the project directory, without following a symbolic link at any step of the path. Environment values go to one file, `~/.config/environment.d/50-shed-delivery.conf` (`0600`), replaced whole at each delivery. The agent reads that directory after `/etc/environment.d` when it builds a command's environment, so the values reach commands and sessions started afterwards. A process already running (a tmux server, a roost session, a craze hub) keeps the environment it started with. That includes a new tmux session or window opened inside a tmux server that was already running: it inherits the server's environment, not the new values. To pick up a re-delivered value there, end that tmux server (`tmux kill-server`) or run the command through `shed exec`.
 
+The agent reads every `*.conf` file in `~/.config/environment.d`, not only the delivered one, so a person can add their own. It reads them **literally**, unlike systemd's `environment.d`: each line is `KEY=VALUE`, trimmed at its ends, with blank lines and `#` comments ignored, and the value is everything after the first `=`, byte for byte. There is no quoting and no `${VAR}` expansion: a value written `"abc"` or `${HOME}/bin` reaches commands with the quotes or the `${HOME}` in it. A variable the contract refuses (`PATH`, `HOME`, `LD_*`, `SHED_*` and the rest) is skipped. Files are read in lexical order and a later line for the same key wins.
+
 The files are plain files. They are in snapshots and on a stopped cloud shed's disk.
 
 ### What "no values" covers
@@ -147,7 +170,11 @@ It does not cover:
 
 ## Old images
 
-The agent's protocol number is 2. The server checks it before it sends any value. An agent below 2 ends the delivery as `image_too_old`; the shed still starts. Recreate the shed from a current image to receive delivery. The `delivery` token in `features` ([HTTP API](api.md)) says a server does delivery.
+The agent's protocol number is 2. The server checks it before it asks a source or sends any value. An agent below 2 can never take a delivery, so both stages are **skipped** as `image_too_old`, with that failure recorded (state `not_delivered`, or `partial` if an earlier delivery's item is still recorded as written) and the warning above. Because they are skipped rather than failed, the clone, the install hook and the startup hook run on that image as they did before delivery, and nothing is left owed. Recreate the shed from a current image to receive delivery. The `delivery` token in `features` ([HTTP API](api.md)) says a server does delivery.
+
+### Sheds created before delivery
+
+A shed created before delivery has no record (state `none`). `shed provision` on it runs the four steps from what the server knows: on the remote backend the record's old flags say the clone and the install hook ran. On Firecracker and VZ the server kept no `--no-provision` flag, so `shed provision` on such a shed created with `--no-provision` **runs its install hook**, which never ran there (after that, the hook's state file stops it running again). Recreate the shed instead if that hook must not run.
 
 ## Configuration
 
