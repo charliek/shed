@@ -25,18 +25,18 @@ import (
 // file.
 var roostProviderCmd = &cobra.Command{
 	Use:   "roost-provider [list|activate]",
-	Short: "roost palette provider: start an agent on a shed or machine",
+	Short: "roost palette provider: start an agent on a shed",
 	Long: `Implements roost's provider contract (see roost's docs/guides/extending.md)
 so roost's own command palette can start an agent — claude or opencode — on a
-running shed or a configured machines: entry, opened as a tab in that host's
-own roost-session. Every other agent (codex, cursor, gx, grok, and anything
-else craze drives) is started through craze instead, not through this menu.
+running shed, opened as a tab in that shed's own roost-session. Every other
+agent (codex, cursor, gx, grok, and anything else craze drives) is started
+through craze instead, not through this menu.
 
 Phases (run by roost itself, not typed by a person):
 
-  shed roost-provider list      Print the top-level menu (running sheds and
-                                 machines: entries). No ssh; stays inside
-                                 roost's 5s default provider timeout.
+  shed roost-provider list      Print the top-level menu (running sheds). No
+                                 ssh; stays inside roost's 5s default provider
+                                 timeout.
   shed roost-provider activate  Act on ROOST_SELECTED_ID (env, or the same
                                  key on stdin JSON): probe the chosen host,
                                  list agents, list workdirs, and open a tab.
@@ -203,8 +203,7 @@ func runRoostProviderList() error {
 	defer cancel()
 
 	inv := roostprovider.Inventory(ctx, clientConfig.Servers, roostprovider.DefaultPerServerTimeout)
-	machines := clientConfig.DecodeMachines()
-	return printMenu(roostprovider.ListMenu(inv, machines))
+	return printMenu(roostprovider.ListMenu(inv))
 }
 
 // ---- activate ----
@@ -428,21 +427,11 @@ func newRemote() (*roostprovider.Remote, *roostprovider.Row) {
 // UnreachableRow, so the two are not wrong relative to each other — this one
 // just gets there without spending the ssh timeout to learn it.
 //
-// A non-nil *Row here means the host could not be resolved to something worth
-// dialing (a shed no longer running, or a server/machine hand-edited out of
-// config.yaml since `list`); the caller prints it and returns, same as any
-// other non-actionable state.
+// A non-nil *Row here means the shed could not be resolved to something worth
+// dialing (no longer running, or its server hand-edited out of config.yaml
+// since `list`); the caller prints it and returns, same as any other
+// non-actionable state.
 func resolveTarget(ctx context.Context, host roostprovider.Token) (roostprovider.Target, string, *roostprovider.Row) {
-	if !host.IsShed() {
-		for _, m := range clientConfig.DecodeMachines() {
-			if m.Name == host.Machine {
-				return roostprovider.MachineTarget(m), "", nil
-			}
-		}
-		row := roostprovider.UnreachableRow(host, fmt.Sprintf("machine %q is no longer in ~/.shed/config.yaml", host.Machine))
-		return roostprovider.Target{}, "", &row
-	}
-
 	entry, ok := clientConfig.Servers[host.Server]
 	if !ok {
 		row := roostprovider.UnreachableRow(host, fmt.Sprintf("server %q is no longer in ~/.shed/config.yaml", host.Server))
@@ -567,20 +556,39 @@ func exitRow(row roostprovider.Row) error {
 
 // ---- --install / --uninstall / --dry-run ----
 
-// roostProviderLauncherPrefix is every line of plan 019 §3.1's launcher
-// script EXCEPT the final `exec` line, which is the one line that varies (the
-// shed binary's absolute path). It is also the file's "did shed write this"
-// marker (see hasRoostProviderLabel): `--uninstall` only ever removes a file
-// whose content starts with exactly this text, and `--install` only ever
-// overwrites one that does.
-const roostProviderLauncherPrefix = `#!/bin/sh
+// roostProviderTitle is the @roost.title this build writes. The legacy title
+// is what shed wrote before plan 038 dropped machine targets. A launcher
+// installed by that shed is still ours: `--install` updates it and
+// `--uninstall` removes it. The two headers differ only in this one line.
+const (
+	roostProviderTitle       = "Start an agent on a shed"
+	roostProviderLegacyTitle = "Start an agent on a shed or machine"
+)
+
+// roostProviderLauncherHead and roostProviderLauncherTail bracket the title
+// line. Everything else in the header is shared, and is the ownership marker
+// (see hasRoostProviderLabel).
+const (
+	roostProviderLauncherHead = `#!/bin/sh
 # @roost.label: shed
-# @roost.title: Start an agent on a shed or machine
+# @roost.title: `
+
+	roostProviderLauncherTail = `
 # Written by ` + "`shed roost-provider --install`" + `; re-run it if shed moves. Roost runs
 # this by absolute path with its own (possibly minimal) PATH, so the shed binary
 # is pinned here and the usual install dirs are prefixed, as roost's example does.
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:$HOME/.local/bin:$PATH"; export PATH
 `
+)
+
+// roostProviderLauncherPrefix is every line of plan 019 §3.1's launcher
+// script EXCEPT the final `exec` line, which is the one line that varies (the
+// shed binary's absolute path). roostProviderLegacyLauncherPrefix is the same
+// header with the pre-038 title. Either prefix marks a file shed wrote.
+const (
+	roostProviderLauncherPrefix       = roostProviderLauncherHead + roostProviderTitle + roostProviderLauncherTail
+	roostProviderLegacyLauncherPrefix = roostProviderLauncherHead + roostProviderLegacyTitle + roostProviderLauncherTail
+)
 
 // roostProviderLauncherContent renders the launcher for shedPath, which must
 // already be absolute (resolvedShedExecutable's job).
@@ -598,6 +606,12 @@ func roostProviderLauncherContent(shedPath string) string {
 // `--uninstall` ever removes a file, and before `--install` ever overwrites
 // one, at `<dir>/providers/shed`.
 //
+// Two headers count as ours: the one this build writes, and the one shed
+// wrote before plan 038, whose only difference is `@roost.title` ("Start an
+// agent on a shed or machine"). A launcher installed by that shed must still
+// be updated by `--install` and removed by `--uninstall`. A different title
+// is somebody else's script and is refused.
+//
 // A prefix match, not an exact match on the whole file: the one line the
 // prefix excludes (the final `exec '<path>' …` line) is the line that is
 // SUPPOSED to differ from one install to the next as the shed binary moves,
@@ -605,7 +619,12 @@ func roostProviderLauncherContent(shedPath string) string {
 // shed-written launcher unrecognizable as soon as `shed` moved once — exactly
 // the case `--install`'s re-run story exists to handle safely.
 func hasRoostProviderLabel(content string) bool {
-	return len(content) >= len(roostProviderLauncherPrefix) && content[:len(roostProviderLauncherPrefix)] == roostProviderLauncherPrefix
+	for _, prefix := range []string{roostProviderLauncherPrefix, roostProviderLegacyLauncherPrefix} {
+		if len(content) >= len(prefix) && content[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // roostProviderDir returns the directory a launcher's `providers/` subdir

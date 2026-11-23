@@ -27,7 +27,6 @@ function built(over = {}) {
         { name: "mock", reachable: true },
         { name: "down", reachable: false },
       ],
-      machines: [],
     },
     mode: "dark",
     hostErrors: [{ server: "down", summary: "down: connection refused" }],
@@ -43,7 +42,7 @@ test("with no report built yet, the initial report is the seed for the current p
     refreshToken: 0,
     modal: null,
     badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
-    sidebar: { servers: [], machines: [] },
+    sidebar: { servers: [] },
     hostErrors: [],
   });
   assert.deepEqual(sent, seededReport("agents"));
@@ -74,7 +73,7 @@ test("a built report that really is empty is still re-sent, not replaced by the 
   const latest = built({
     sheds: [],
     badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
-    sidebar: { servers: [], machines: [] },
+    sidebar: { servers: [] },
     hostErrors: [],
     modal: "create",
     refreshToken: 7,

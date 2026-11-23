@@ -24,7 +24,7 @@
 //!   fresh `Reset … Ready`. `hub_closing`, EOF, a read error, or a dial that
 //!   handed back no connection within [`DIAL_DEADLINE`] is
 //!   `Offline{Unreachable}` and a redial with backoff ([`BACKOFF_BASE`] →
-//!   [`BACKOFF_MAX`], `shed_core::lane::backoff`, back to the floor once a
+//!   [`BACKOFF_MAX`], `shed_lane::lane::backoff`, back to the floor once a
 //!   cycle reached `Ready`). A new hub — a new `epoch` — reseeds by
 //!   construction: every connection seeds afresh.
 //! - **Protocol faults are lost connections, never skipped notifications.** The
@@ -201,14 +201,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use shed_core::lane::backoff::{jittered, next_backoff};
-use shed_core::lane::{
+use shed_lane::lane::backoff::{jittered, next_backoff};
+use shed_lane::lane::{
     AgentLane, AgentSource, LaneCreateOptions, LaneCreateRequest, LaneCreated, LaneError,
     LanePromptOutcome, LaneProvider, LaneProviderState, LaneReopenError, LaneReopened,
     LaneSavedSession, LaneSavedSessions, LaneSession, LaneStop, Publish, SourceCapabilities,
     SourceEvent, SourceOffline, SourcePublisher, SourceSubscription, MAX_SOURCE_ROWS,
 };
-use shed_core::rc::RcActivity;
+use shed_lane::rc::RcActivity;
 
 use crate::conn::{lock, CallError, Conn, HubHello, Notifications, HELLO_DEADLINE};
 use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
@@ -816,7 +816,7 @@ fn lane_saved_session(s: &SavedSession) -> Option<LaneSavedSession> {
     if s.id.is_empty() {
         return None;
     }
-    let at = |t: &Option<String>| t.as_deref().and_then(shed_core::time::rfc3339_unix_ms);
+    let at = |t: &Option<String>| t.as_deref().and_then(shed_lane::time::rfc3339_unix_ms);
     Some(LaneSavedSession {
         id: s.id.clone(),
         provider: s.provider.clone(),
@@ -974,12 +974,12 @@ pub fn lane_session(r: &RosterRow) -> LaneSession {
     };
     let since = row
         .and_then(|w| w.since.as_deref())
-        .and_then(shed_core::time::rfc3339_unix_ms);
+        .and_then(shed_lane::time::rfc3339_unix_ms);
     let started = r
         .host
         .started_at
         .as_deref()
-        .and_then(shed_core::time::rfc3339_unix_ms);
+        .and_then(shed_lane::time::rfc3339_unix_ms);
     let start_error = row.filter(|w| w.start_failed).map(|w| {
         some(w.start_err.as_ref())
             .unwrap_or_else(|| crate::errors::START_FAILED_FALLBACK.to_string())

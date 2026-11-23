@@ -4,8 +4,12 @@ There are three places configuration lives, with deliberately little overlap:
 
 1. **The Preferences window** — the handful of user-facing settings, persisted to a
    `prefs.json` in the app's config directory.
-2. **`~/.shed/config.yaml`** — the host list, owned by the `shed` CLI and read by the app,
-   which only ever appends a `machines:` entry.
+2. **`~/.shed/config.yaml`** — the host list, owned by the `shed` CLI and read by the app.
+   The app reads `servers:` and `default_server` only. A `machines:` block, if one is still
+   in the file, is left alone: the CLI preserves it as an opaque YAML subtree on save
+   (formatting and indentation may be normalized on re-encode), and the desktop does not
+   list those hosts. Interactive sessions on a machine that is not a shed belong in the
+   `roost` app.
 3. **Environment variables** — overrides for testing, packaging, and release. Not something
    a normal user sets.
 
@@ -33,7 +37,7 @@ The approval sections appear only for the providers the broker delegates to shed
 
 The full policy model is in [Credential approvals](approvals.md). Registries (Docker) and
 roles (AWS) are **not** configurable here — they live in `extensions.yaml`. Server hosts are
-managed with the `shed` CLI (no Preferences UI); machines are added from the Machines pane.
+managed with the `shed` CLI (no Preferences UI).
 
 ## Credential sources
 
@@ -78,9 +82,8 @@ once every five seconds. After a move whose read-back shows this machine `· not
 
 ## Host list (`~/.shed/config.yaml`)
 
-The app reads the **same file the `shed` CLI writes** to discover hosts. It is parsed
-read-only, apart from the Machines pane's **Add machine**, which appends a `machines:` entry
-after backing the file up. Shape (the server fields the app reads):
+The app reads the **same file the `shed` CLI writes** to discover shed servers. It does not
+write the file. Shape (the server fields the app reads):
 
 ```yaml
 servers:
@@ -255,8 +258,8 @@ Limits, each refused rather than misread:
   a path.
 - A value the CLI writes with a `!!binary` tag (a string that is not valid UTF-8) makes the app
   refuse that entry.
-- `machines:` entries are read by the older, more tolerant reader and carry no
-  `identity_file`.
+- A `machines:` block is not a host list the app reads. The CLI preserves it on save.
+  Hosts named there are not shown; use the `roost` app for an interactive session on one.
 - An entry whose `host` is an empty string (`host: ""`) is read as an entry with an empty
   host, as before.
 - **The refusals above are the app's own.** An entry the app refuses sends nothing from the
@@ -276,13 +279,6 @@ Limits, each refused rather than misread:
   file with a repeated key, an alias, or a line indented with a tab is an error for the
   broker: it logs it and keeps the servers it read before. An entry with a null `host` is one
   the broker skips.
-
-When **Add machine** writes a host or a user, it writes the value bare only when it is a plain
-token (letters, digits and `. _ - / @ :`, beginning with a letter, `_` or `/`, and not a word
-such as `yes` or `null`), and double-quoted otherwise, so any YAML reader reads back the text
-you typed. It refuses a value holding a control character, a line break, or a character YAML
-does not allow in a file at all (such as U+FFFE or U+FFFF), and it does not add to a file it
-does not read.
 
 ## Credential broker (`extensions.yaml`)
 
@@ -312,7 +308,7 @@ The log file's location and rotation are in [Architecture](architecture.md#state
 The file is private (`0600`, under your own directories) and holds host names, paths and
 diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's
 own stderr. The remaining test seams (`SHED_TAURI_MOCK_UNREACHABLE_HOSTS`,
-`SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_CRAZE_PATH`, `SHED_TAURI_SSH_BIN`) are described in
+`SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SSH_BIN`) are described in
 [IPC → Test mode](ipc.md#test-mode).
 
 ### Build / release (read by `scripts/` + the release workflow)

@@ -46,7 +46,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use shed_core::lane::{LaneChoice, LaneModelEffort, LaneSetting, LaneSettings, LaneUsage};
+use shed_lane::lane::{LaneChoice, LaneModelEffort, LaneSetting, LaneSettings, LaneUsage};
 
 use crate::wire::{CatalogModel, Catalogs, ModeInfo, SessionInfo};
 

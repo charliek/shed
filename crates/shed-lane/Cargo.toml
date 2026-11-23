@@ -1,0 +1,30 @@
+[package]
+name = "shed-lane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-lane — pure agent-lane, RC DTO, slash-menu, craze command ladder, and text/time leaf crate shared by shed-core, shed-craze, shed-roost, shed-desktop-core, and shed-mobile. Zero shed-core, zero reqwest, zero roost-ipc, zero chrono."
+
+[lib]
+name = "shed_lane"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+regex = "1"
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+# Exports `lane::conformance` — the shared conformance kit every adapter's
+# tests run their streams through. NON-default so a shipped binary never carries it.
+test-support = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "test-util"] }

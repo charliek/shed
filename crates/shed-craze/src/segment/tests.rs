@@ -5,7 +5,7 @@
 //! clock gx kept in its watcher.
 
 use super::*;
-use shed_core::lane::feed::{FEED_ROLE_ASSISTANT, FEED_TYPE_REASONING, FEED_TYPE_TEXT};
+use shed_lane::lane::feed::{FEED_ROLE_ASSISTANT, FEED_TYPE_REASONING, FEED_TYPE_TEXT};
 
 const A: &str = FEED_ROLE_ASSISTANT;
 const T: &str = FEED_TYPE_TEXT;

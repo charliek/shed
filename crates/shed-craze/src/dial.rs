@@ -79,7 +79,7 @@
 //!
 //! # The find-only probe
 //!
-//! `craze providers --hub --json` (`shed_core::craze::providers_hub_argv`)
+//! `craze providers --hub --json` (`shed_lane::craze::providers_hub_argv`)
 //! never starts a hub. [`classify_probe`] sorts its output — by STDERR TEXT,
 //! never by exit code alone, because "no hub is running" and v0.0.1's refusal
 //! both exit 1 (Amendment A2) — and [`probe_process`] runs it locally.
@@ -89,7 +89,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use shed_core::lane::{LaneError, SourceOffline};
+use shed_lane::lane::{LaneError, SourceOffline};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
@@ -429,12 +429,13 @@ pub struct ExitWatch {
     pid: Option<u32>,
 }
 
-struct KillSwitch(Mutex<Option<oneshot::Sender<()>>>);
+struct KillSwitch(Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>);
 
 impl KillSwitch {
     fn pull(&self) {
-        if let Some(tx) = lock(&self.0).take() {
-            let _ = tx.send(());
+        let kill = lock(&self.0).take();
+        if let Some(kill) = kill {
+            kill();
         }
     }
 }
@@ -466,9 +467,25 @@ impl ExitWatch {
             };
             let _ = status_tx.send(Some(exit));
         });
+        Self::from_parts(pid, status, move || {
+            let _ = kill_tx.send(());
+        })
+    }
+
+    /// Build an [`ExitWatch`] backed by an external process watcher (for
+    /// instance a runner-tracked SSH duplex whose `Child` is owned inside the
+    /// runner's spawn gate).
+    pub fn from_parts<F>(
+        pid: Option<u32>,
+        status: watch::Receiver<Option<Exit>>,
+        on_kill: F,
+    ) -> ExitWatch
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
         ExitWatch {
             status,
-            switch: Arc::new(KillSwitch(Mutex::new(Some(kill_tx)))),
+            switch: Arc::new(KillSwitch(Mutex::new(Some(Box::new(on_kill))))),
             pid,
         }
     }
@@ -570,7 +587,7 @@ pub enum EnvPolicy {
 pub const SHELL: &str = "/bin/sh";
 
 /// A local `craze` child per connection: `["sh", "-c", <script>]` from
-/// `shed_core::craze`, run as [`SHELL`] by absolute path under an
+/// `shed_lane::craze`, run as [`SHELL`] by absolute path under an
 /// [`EnvPolicy`].
 #[derive(Debug, Clone)]
 pub struct ProcessDial {
@@ -591,15 +608,15 @@ impl ProcessDial {
     }
 
     /// The production local dial: craze's published ladder running `craze
-    /// bridge --hub` (`shed_core::craze::bridge_hub_argv`).
+    /// bridge --hub` (`shed_lane::craze::bridge_hub_argv`).
     pub fn bridge_hub(env: EnvPolicy) -> ProcessDial {
-        ProcessDial::new(shed_core::craze::bridge_hub_argv(), env)
+        ProcessDial::new(shed_lane::craze::bridge_hub_argv(), env)
     }
 
     /// The jailed ladder (rungs 1–2, no PATH enhancement) — test mode only, so
     /// nothing the run did not put on its own `HOME` or `PATH` can answer.
     pub fn bridge_hub_jailed(env: EnvPolicy) -> ProcessDial {
-        ProcessDial::new(shed_core::craze::bridge_hub_argv_jailed(), env)
+        ProcessDial::new(shed_lane::craze::bridge_hub_argv_jailed(), env)
     }
 
     /// Run the child in `dir` (default: the caller's working directory).
@@ -759,7 +776,7 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// few KiB.
 const PROBE_STDOUT_MAX: u64 = 1 << 20;
 
-/// Run the probe locally — `argv` is `shed_core::craze::providers_hub_argv()`
+/// Run the probe locally — `argv` is `shed_lane::craze::providers_hub_argv()`
 /// (or its jailed twin), its `sh` run as [`SHELL`] — and classify it.
 pub async fn probe_process(argv: Vec<String>, env: EnvPolicy) -> Probe {
     match run_probe(argv, env).await {

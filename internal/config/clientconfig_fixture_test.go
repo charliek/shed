@@ -7,8 +7,9 @@ package config
 // (ClientConfig.Save) writes for ordinary values: every ServerEntry field set
 // on one entry, entry names with a colon and names the saver must quote,
 // values with a `#`, a quote and non-ASCII letters, several entries, and the
-// other top-level sections (default_server, sheds, create_timeout, machines).
-// expected.json records, from the structs, what each entry IS to the CLI.
+// other top-level sections (default_server, sheds, create_timeout) plus a
+// legacy `machines:` block the save preserves opaquely and does not decode.
+// expected.json records, from the structs, what each server entry IS to the CLI.
 // The Rust readers (shed-core's config reader and the broker's discovery)
 // read the same files and must read every entry's host, ssh_port, user and
 // identity_file as recorded. It lives under crates/ because the Docker core
@@ -28,9 +29,9 @@ import (
 
 const clientConfigFixtureDir = "../../crates/fixtures/clientconfig"
 
-// clientConfigFixtureMachines is the `machines:` section the file starts with,
-// as the desktop app's Add machine writes it; the CLI loads it and keeps it on
-// save (ClientConfig.Machines).
+// clientConfigFixtureMachines is a legacy `machines:` section the file starts
+// with. The CLI does not decode it; loading and saving must keep it
+// (ClientConfig.Machines), which is what proves the opaque passthrough.
 const clientConfigFixtureMachines = `machines:
     mini3:
         host: mini3.example.test
@@ -119,18 +120,10 @@ type clientConfigFixtureEntry struct {
 	IdentityFile string `json:"identity_file"`
 }
 
-type clientConfigFixtureMachine struct {
-	Name    string `json:"name"`
-	Host    string `json:"host"`
-	User    string `json:"user"`
-	SSHPort int    `json:"ssh_port"`
-}
-
 type clientConfigFixtureJSON struct {
-	Comment       []string                     `json:"_comment"`
-	DefaultServer string                       `json:"default_server"`
-	Servers       []clientConfigFixtureEntry   `json:"servers"`
-	Machines      []clientConfigFixtureMachine `json:"machines"`
+	Comment       []string                   `json:"_comment"`
+	DefaultServer string                     `json:"default_server"`
+	Servers       []clientConfigFixtureEntry `json:"servers"`
 }
 
 // buildClientConfigFixture computes the two generated files: config.yaml (the
@@ -160,16 +153,21 @@ func buildClientConfigFixture(t *testing.T) map[string][]byte {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Save must keep the legacy section. expected.json does not record it:
+	// shed no longer decodes `machines:`, and a fixture that dropped the
+	// block would still satisfy the server assertions.
+	if !bytes.Contains(configYAML, []byte("machines:")) || !bytes.Contains(configYAML, []byte("mini3.example.test")) {
+		t.Fatalf("Save did not preserve the machines: section:\n%s", configYAML)
+	}
 
 	expected := clientConfigFixtureJSON{
 		Comment: []string{
 			"Written by internal/config/clientconfig_fixture_test.go (UPDATE_CLIENTCONFIG=1 go test ./internal/config -run TestClientConfigFixture); do not edit by hand.",
-			"config.yaml is what the CLI's save path (config.ClientConfig.Save) writes for these values; servers and machines are what the CLI holds for each entry.",
+			"config.yaml is what the CLI's save path (config.ClientConfig.Save) writes for these values; servers are what the CLI holds for each entry. A machines: section in config.yaml is an opaque passthrough and is not decoded.",
 			"Each Rust reader (shed-core's config reader, the broker's discovery) must read every server's host, ssh_port, user and identity_file as recorded here. See README.md.",
 		},
 		DefaultServer: cfg.DefaultServer,
 		Servers:       []clientConfigFixtureEntry{},
-		Machines:      []clientConfigFixtureMachine{},
 	}
 	names := make([]string, 0, len(servers))
 	for name := range servers {
@@ -181,12 +179,6 @@ func buildClientConfigFixture(t *testing.T) map[string][]byte {
 		expected.Servers = append(expected.Servers, clientConfigFixtureEntry{
 			Name: name, Host: e.Host, SSHPort: e.SSHPort, User: e.User, IdentityFile: e.IdentityFile,
 		})
-	}
-	for _, m := range cfg.DecodeMachines() {
-		expected.Machines = append(expected.Machines, clientConfigFixtureMachine{Name: m.Name, Host: m.Host, User: m.User, SSHPort: m.SSHPort})
-	}
-	if len(expected.Machines) != 1 {
-		t.Fatalf("the machines section decodes to %d machines, want 1", len(expected.Machines))
 	}
 
 	var buf bytes.Buffer

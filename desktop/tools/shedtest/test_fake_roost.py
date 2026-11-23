@@ -1,10 +1,10 @@
 """The Python fake roost-session, checked on its own wire.
 
 `fake_roost.FakeRoost` is the Python twin of
-`shed_core::roost::testing::FakeRoost` (`crates/shed-core/src/roost/testing.rs`),
+`shed_roost::testing::FakeRoost` (`crates/shed-roost/src/testing.rs`),
 and the two drifting apart is the failure mode this file exists to prevent.
 
-**Why it cannot be left to `test_tauri_machines.py`.** That suite drives the fake
+**Why it cannot be left to `test_agents.py`.** That suite drives the fake
 through the real app, and the app is an *observer*: it identifies, subscribes,
 lists, and folds batches. It never asks for a filtered subscribe and never
 drives two connections against `session.set_agent_hooks` concurrently — the

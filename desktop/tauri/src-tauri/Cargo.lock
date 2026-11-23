@@ -4391,8 +4391,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "libc",
- "roost-ipc",
  "serde",
  "serde_json",
  "shed-broker",
@@ -4449,11 +4447,11 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
- "roost-ipc",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shed-lane",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
@@ -4467,9 +4465,27 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
- "shed-core",
+ "shed-lane",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "shed-desktop-core"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "shed-app",
+ "shed-core",
+ "shed-craze",
+ "shed-lane",
+ "shed-roost",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -4486,14 +4502,14 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-local-authentication",
- "reqwest 0.12.28",
- "roost-ipc",
  "serde",
  "serde_json",
  "shed-app",
  "shed-core",
  "shed-craze",
- "shed-opencode",
+ "shed-desktop-core",
+ "shed-lane",
+ "shed-roost",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -4507,19 +4523,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "shed-opencode"
+name = "shed-lane"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "shed-roost"
 version = "0.10.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
+ "roost-ipc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shed-core",
+ "shed-lane",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

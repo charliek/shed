@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/charliek/shed/internal/config"
 )
 
 func TestResolveSSHPrefersPath(t *testing.T) {
@@ -152,52 +150,12 @@ func TestShedTargetArgv(t *testing.T) {
 	assertSeq(t, "argv", got, want)
 }
 
-// TestMachineTargetArgv pins shed-core's own deferral semantics: a `machines:`
-// entry states what it states and `~/.ssh/config` decides the rest.
-func TestMachineTargetArgv(t *testing.T) {
-	r := &Remote{SSHBin: "ssh"}
-
-	t.Run("unpinned, default port, no user", func(t *testing.T) {
-		got := mustArgv(t, r, MachineTarget(config.MachineEntry{Name: "mini2", Host: "mini2", SSHPort: 22}), "cmd")
-		assertSeq(t, "argv", got, []string{
-			"ssh",
-			"-o", "BatchMode=yes",
-			"-o", "ConnectTimeout=5",
-			"-T",
-			"mini2",
-			"--", "cmd",
-		})
-	})
-
-	t.Run("pinned known_hosts, a user and a port", func(t *testing.T) {
-		got := mustArgv(t, r, MachineTarget(config.MachineEntry{
-			Name: "mini2", Host: "mini2.local", User: "charliek", SSHPort: 2222,
-			KnownHosts: "/home/me/.ssh/roost_known_hosts",
-		}), "cmd")
-		assertSeq(t, "argv", got, []string{
-			"ssh",
-			"-o", "BatchMode=yes",
-			"-o", "StrictHostKeyChecking=yes",
-			"-o", "UserKnownHostsFile=/home/me/.ssh/roost_known_hosts",
-			"-o", "ConnectTimeout=5",
-			"-T",
-			"-p", "2222",
-			"charliek@mini2.local",
-			"--", "cmd",
-		})
-	})
-}
-
-// TestArgvRefusesAnOptionShapedTarget is the second half of the option-shaped
-// destination guard (the first is internal/config's `machines:` decoder, which
-// never lets one out of config.yaml).
-//
-// OpenSSH parses options BEFORE the destination word, so a `host:` of
-// `-oProxyCommand=…` reaches ssh as an option and runs that command on THIS
-// machine. The trailing `--` does not help — TestFakeSSHParsesArgvLikeOpenSSH
-// demonstrates the mis-parse on a fake that parses argv the way ssh does. Argv
-// is where a Target becomes a command line, so it is where the refusal has to
-// be: a Target built by hand, or by a future constructor, gets no free pass.
+// TestArgvRefusesAnOptionShapedTarget: OpenSSH parses options BEFORE the
+// destination word, so a destination of `-oProxyCommand=…` reaches ssh as an
+// option and runs that command on THIS machine. The trailing `--` does not
+// help — TestFakeSSHParsesArgvLikeOpenSSH demonstrates the mis-parse on a fake
+// that parses argv the way ssh does. Argv is where a Target becomes a command
+// line, so it is where the refusal has to be.
 func TestArgvRefusesAnOptionShapedTarget(t *testing.T) {
 	r := &Remote{SSHBin: "ssh"}
 
@@ -209,10 +167,6 @@ func TestArgvRefusesAnOptionShapedTarget(t *testing.T) {
 		{"a short option as the destination", Target{Dest: "-F/dev/null", Port: 22}},
 		{"an option-shaped user", Target{Dest: "-oProxyCommand=id@mini2", Port: 22}},
 		{"an option-shaped host behind a user", Target{Dest: "me@-oProxyCommand=id", Port: 22}},
-		{
-			"a machines: entry that somehow got past the decoder",
-			MachineTarget(config.MachineEntry{Name: "evil", Host: "-oProxyCommand=id", SSHPort: 22}),
-		},
 		{
 			"a shed whose server host is option-shaped",
 			ShedTarget(RunningShed{
@@ -259,10 +213,11 @@ func TestArgvRefusesAnOptionShapedTarget(t *testing.T) {
 // path is per-target: two different far sides must never share a master.
 func TestArgvControlMasterOptions(t *testing.T) {
 	r := &Remote{SSHBin: "ssh", ControlDir: "/run/user/1000/shed-roost-provider"}
-	a := MachineTarget(config.MachineEntry{Name: "a", Host: "a", SSHPort: 22})
-	b := MachineTarget(config.MachineEntry{Name: "b", Host: "b", SSHPort: 22})
-	// Same host, different port — still a different far side.
-	aOther := MachineTarget(config.MachineEntry{Name: "a", Host: "a", SSHPort: 2222})
+	a := Target{Dest: "a", Port: 22}
+	b := Target{Dest: "b", Port: 22}
+	// Same host, different port — still a different far side. EmitPort is part
+	// of the mux key: with it false, ~/.ssh/config's Port can win.
+	aOther := Target{Dest: "a", Port: 2222, EmitPort: true}
 
 	argv := mustArgv(t, r, a, "cmd")
 	joined := strings.Join(argv, " ")
@@ -312,7 +267,7 @@ func TestArgvControlMasterOptions(t *testing.T) {
 	// Target value rather than the same variable, so the check is about the
 	// FIELDS deciding the path — a static analyzer is right that `pathOf(a) !=
 	// pathOf(a)` compares one expression with itself.)
-	if pathOf(a) != pathOf(MachineTarget(config.MachineEntry{Name: "a", Host: "a", SSHPort: 22})) {
+	if pathOf(a) != pathOf(Target{Dest: "a", Port: 22}) {
 		t.Errorf("the control path is not stable for one target")
 	}
 	if !strings.HasSuffix(pathOf(a), ".ctl") {
@@ -322,7 +277,7 @@ func TestArgvControlMasterOptions(t *testing.T) {
 
 func TestArgvWithoutControlDirHasNoMuxOptions(t *testing.T) {
 	r := &Remote{SSHBin: "ssh"}
-	for _, arg := range mustArgv(t, r, MachineTarget(config.MachineEntry{Name: "a", Host: "a", SSHPort: 22}), "cmd") {
+	for _, arg := range mustArgv(t, r, Target{Dest: "a", Port: 22}, "cmd") {
 		if strings.HasPrefix(arg, "Control") {
 			t.Errorf("mux option %q leaked in with no ControlDir", arg)
 		}
@@ -566,7 +521,7 @@ func TestBridgeRowPrecedence(t *testing.T) {
 	// roost-session either way, so every probe failure is already a
 	// reachability failure (RowForError, not BridgeRow).
 	t.Run("the probe leg still forces unreachable on its own", func(t *testing.T) {
-		host := Token{Machine: "mini2"}
+		host := Token{Shed: "dev", Server: "srv"}
 		row, ok := RowForError(host, &ReachError{
 			Phase: PhaseProbe, Op: "probe", Class: ClassNotFound,
 			LastLine: "bash: command not found", ExitCode: &code127,

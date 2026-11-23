@@ -4,22 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "shed-core — pure Rust shed-server protocol client, TLS/mTLS auth, config reader, and wire DTOs. Zero roost-ipc, zero machines:."
 
 [lints]
 workspace = true
 
 [dependencies]
-# `net` (UnixStream/TcpStream) + `io-util` (`copy_bidirectional` for the loopback-TCP
-# pump in `roost::conn`) + `process` (the local `roost-session identify` the bootstrap
-# source ladder's sibling rung runs, `roost::bootstrap::source`) on top of the
-# workspace's rt/macros/sync/time. These are BUILD-time features now, not just
-# dev-time: `roost::conn` and `roost::bootstrap` need them in the shipped lib.
-# `process` is ALSO unified in by `roost-ipc`, so naming it here adds no crate to
-# the lock — it is named because shed-core calls `tokio::process` directly, and a
-# feature a crate depends on by unification is a feature that disappears the day
-# the dependency stops needing it. Unification with `roost-ipc` still supplies
-# `fs` and `signal`, which shed-core does not use itself.
-tokio = { workspace = true, features = ["net", "io-util", "process"] }
+shed-lane = { path = "../shed-lane" }
+tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,23 +23,10 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
-# Pane classifier + claude.ai URL extraction for the RC module (rc.rs). Already
-# in the workspace lock tree (via httpmock), so no new crates are pulled.
+# TLS fingerprint validation (`token.rs`).
 regex = "1"
-# The roost IPC wire (`roost` module). Git, rev-pinned — see the long comment on
-# the workspace dependency in ../Cargo.toml for why the rev lives in a manifest.
-roost-ipc = { workspace = true }
-# `getuid(2)` for the `/tmp/roost-session-<uid>` socket fallback (`roost::paths`).
-# Already in the tree via roost-ipc; named here because we call it directly.
+# `O_NONBLOCK` FIFO guard (`identityfile.rs`).
 libc = "0.2"
-
-[features]
-# The in-process fake roost-session (`roost::testing`) exported for ANOTHER crate's
-# tests — `shed-app`'s roost watcher/reach tests. NON-default and named
-# `test-support` so it is unmistakable: the module is `#[cfg]`'d in only under
-# `test` or this feature, so a shipped binary never carries it. Mirrors the same
-# feature on `shed-app`.
-test-support = []
 
 [dev-dependencies]
 httpmock = { workspace = true }

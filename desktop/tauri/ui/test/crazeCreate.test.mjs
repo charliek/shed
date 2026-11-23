@@ -18,7 +18,6 @@ import {
   createTitle,
   crazeCreateGate,
   crazeCreateOffered,
-  crazeCreateTargets,
   crazeCreateUpdateNote,
   crazeSheetNote,
   crazeStatusFor,
@@ -372,7 +371,7 @@ test("the sheet is offered on a live hub that can create, or a dormant machine",
   assert.equal(crazeCreateOffered({ state: "offline", cause: "unreachable" }), false);
   assert.equal(crazeCreateOffered({ state: "absent", cause: "not_installed" }), false);
   assert.equal(crazeCreateOffered(null), false);
-  assert.match(crazeCreateUpdateNote({ state: "live", create: true, create_options: false }), /update craze on this machine/);
+  assert.match(crazeCreateUpdateNote({ state: "live", create: true, create_options: false }), /update craze on this shed/);
   assert.equal(crazeCreateUpdateNote({ state: "live", create: true, create_options: true }), null);
 });
 
@@ -479,11 +478,4 @@ test("CONTROL: a host with no status row reads its craze from its shed_craze ent
 test("a listed host's status row is read first", () => {
   const listed = { name: "roost:mock/a", origin: "roost:mock/a", craze: LIVE };
   assert.deepEqual(crazeStatusFor("roost:mock/a", [listed], [dormantShed]), LIVE);
-});
-
-test("CONTROL: Where offers listed hosts, then shed_craze entries, whose craze can create", () => {
-  const notOffered = { name: "mini4", origin: "machine:mini4", craze: TOO_OLD };
-  const names = crazeCreateTargets([listedMachine, notOffered], [dormantShed, oldShed]).map((h) => h.name);
-  assert.deepEqual(names, ["mini3", "roost:mock/a"], "a too-old shed is not offered; a dormant one is");
-  assert.deepEqual(crazeCreateTargets([], []), []);
 });

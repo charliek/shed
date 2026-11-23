@@ -778,6 +778,6 @@ func TestInventory_TracksWhichServersAnswered(t *testing.T) {
 	allDown := Inventory(context.Background(), map[string]config.ServerEntry{
 		"down": downEntry,
 	}, 2*time.Second)
-	m := ListMenu(allDown, nil)
+	m := ListMenu(allDown)
 	assertNoneRow(t, m.Items[0], "no shed-server answered", "down")
 }

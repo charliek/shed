@@ -88,7 +88,7 @@ test-broker-wire:
 
 # The machine-transport differential (plan 012 AC2). The FOURTH pytest suite,
 # and — like the other three — never merged with them. SSH has no argv API, so a
-# remote command is one string the far side re-parses; `shed-core`/the Tauri app
+# remote command is one string the far side re-parses; `shed-lane`/the Tauri app
 # compose it in Rust and shed-mobile composes it in Dart, and two implementations
 # of one wire contract drift silently. This suite owns the shared contract
 # (tests/machine-transport/scenarios.json + goldens/) and runs the LIVE leg:
@@ -98,7 +98,7 @@ test-broker-wire:
 # liveness-only check passes with a completely dead feed — that was a real bug).
 #
 # The other two legs live where their implementations do: Rust in
-# `cargo test -p shed-core --test machine_transport_contract`, Dart in
+# `cargo test -p shed-lane --test machine_transport_contract`, Dart in
 # shed-mobile. Needs uv and an sshd (skips cleanly without one).
 # See tests/machine-transport/README.md.
 # Server-free unit tests of the integration suite's own helpers and baked-image
@@ -1297,7 +1297,7 @@ check-kernel-pin:
 # check-roost-pin: the roost-session version + protocol baked into both
 # rootfs Dockerfiles (ARG ROOST_SESSION_VERSION / ROOST_SESSION_PROTOCOL)
 # must match the Rust source of truth: RELEASE_PIN's version and
-# RELEASE_PIN_PROTOCOL in crates/shed-core/src/roost/bootstrap/source.rs
+# RELEASE_PIN_PROTOCOL in crates/shed-roost/src/bootstrap/source.rs
 # (not LATEST_KNOWN_RELEASE, which may name a newer roost this shed cannot speak).
 # It also holds both Dockerfiles' ROOST_SESSION_SHA256_{AMD64,ARM64} ARGs in
 # lockstep with each other — it cannot verify the digests offline (that is
@@ -1317,8 +1317,8 @@ check-roost-pin: check-gce-pins
 	 fc_amd64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_AMD64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 vz_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
-	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
-	 known_p=$$(sed -n 's/^pub const RELEASE_PIN_PROTOCOL: u32 = \([0-9][0-9]*\);.*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
+	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-roost/src/bootstrap/source.rs | head -1) ; \
+	 known_p=$$(sed -n 's/^pub const RELEASE_PIN_PROTOCOL: u32 = \([0-9][0-9]*\);.*/\1/p' crates/shed-roost/src/bootstrap/source.rs | head -1) ; \
 	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ] || \
 	    [ -z "$$vz_amd64" ] || [ -z "$$fc_amd64" ] || [ -z "$$vz_arm64" ] || [ -z "$$fc_arm64" ]; then \
 	   echo "ERROR: roost-session pin values missing:" ; \
@@ -1330,16 +1330,16 @@ check-roost-pin: check-gce-pins
 	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_SHA256_AMD64: $$fc_amd64" ; \
 	   echo "  vz/Dockerfile ARG ROOST_SESSION_SHA256_ARM64:      $$vz_arm64" ; \
 	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_SHA256_ARM64: $$fc_arm64" ; \
-	   echo "  RELEASE_PIN version:                               $$pin_v" ; \
-	   echo "  RELEASE_PIN_PROTOCOL:                              $$known_p" ; \
+	   echo "  crates/shed-roost RELEASE_PIN version:            $$pin_v" ; \
+	   echo "  crates/shed-roost RELEASE_PIN_PROTOCOL:           $$known_p" ; \
 	   exit 1 ; \
 	 fi ; \
 	 if [ "$$vz_v" != "$$fc_v" ] || [ "$$vz_v" != "$$pin_v" ] || [ "$$vz_p" != "$$fc_p" ] || [ "$$vz_p" != "$$known_p" ]; then \
 	   echo "ERROR: roost-session pin drifted:" ; \
 	   echo "  vz/Dockerfile:          version=$$vz_v protocol=$$vz_p" ; \
 	   echo "  firecracker/Dockerfile: version=$$fc_v protocol=$$fc_p" ; \
-	   echo "  crates/shed-core RELEASE_PIN version:            $$pin_v" ; \
-	   echo "  crates/shed-core RELEASE_PIN_PROTOCOL:           $$known_p" ; \
+	   echo "  crates/shed-roost RELEASE_PIN version:           $$pin_v" ; \
+	   echo "  crates/shed-roost RELEASE_PIN_PROTOCOL:          $$known_p" ; \
 	   echo "Bump in lockstep (see docs/reference/images.md)." ; \
 	   exit 1 ; \
 	 fi ; \
@@ -1359,7 +1359,7 @@ check-roost-pin: check-gce-pins
 # check-gce-pins: the GCE image bake (scripts/build-gce-image.sh, gce/) takes
 # its roost-session and craze pins from firecracker/Dockerfile through
 # scripts/read-guest-pins.sh, so check-roost-pin and check-craze-pin above
-# (which hold that Dockerfile in lockstep with vz/, crates/shed-core and
+# (which hold that Dockerfile in lockstep with vz/, crates/shed-roost and
 # craze-pin.env) guard the cloud image too. This target, a prerequisite of
 # both, fails if the reader cannot produce all seven values or if gce/ holds a
 # literal pin of its own (a version or any 64-hex digest).

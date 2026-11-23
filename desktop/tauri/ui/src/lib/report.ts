@@ -36,7 +36,7 @@ export type SeededReport<P> = {
   refreshToken: 0;
   modal: null;
   badges: ReportBadges;
-  sidebar: { servers: never[]; machines: never[] };
+  sidebar: { servers: never[] };
   hostErrors: never[];
 };
 
@@ -48,7 +48,7 @@ export function seededReport<P>(pane: P): SeededReport<P> {
     refreshToken: 0,
     modal: null,
     badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
-    sidebar: { servers: [], machines: [] },
+    sidebar: { servers: [] },
     hostErrors: [],
   };
 }

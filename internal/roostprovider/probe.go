@@ -37,7 +37,7 @@ var probeRecordCount = 1 + len(agentTable) + 1
 //  1. **No embedded single quote, anywhere.** This whole script becomes one
 //     single-quoted word in the remote command (`bash -lc '<script>'`), and a
 //     POSIX close-escape-reopen quote trick is not an escape in csh/tcsh/fish —
-//     which a `machines:` entry's login shell is entitled to be. Everything is
+//     which a far-side login shell is entitled to be. Everything is
 //     double-quoted instead, exactly as roost's own `exec_chain_command` is and
 //     for exactly the same reason. The landing dir is the one variable part,
 //     and it is passed as a positional argument rather than interpolated.
@@ -74,10 +74,10 @@ func ProbeScript() string {
 			a.Binary,
 		))
 	}
-	// `${1:-}` rather than `$1`: a machine's probe passes no positional
-	// arguments at all, and an unset `$1` under a login shell that happens to
-	// run with `set -u` would abort the script after it had already emitted
-	// most of its records.
+	// `${1:-}` rather than `$1`: a shed with no landing dir passes no positional
+	// argument, and an unset `$1` under a login shell that happens to run with
+	// `set -u` would abort the script after it had already emitted most of its
+	// records.
 	steps = append(steps, "if [ -n \"${1:-}\" ] && [ -d \"$1\" ]; then printf \"%s\\0\" 1; else printf \"%s\\0\" \"\"; fi")
 	steps = append(steps, "exit 0")
 	return strings.Join(steps, "; ")
@@ -93,13 +93,11 @@ func ProbeScript() string {
 // that double wrap is harmless (the outer bash parses one command line and
 // execs it — it does not re-expand the single-quoted script).
 //
-// landingDir is single-quoted with the POSIX close-escape-reopen trick, which is
-// the one place this package assumes a POSIX-family login shell on the far side.
-// That
-// assumption is safe because a landing dir is only ever passed for a SHED, and
-// a shed's login shell is bash by construction. A machine gets no positional
-// argument, so a machine's probe command carries no single quote beyond the
-// pair wrapping the script.
+// landingDir is single-quoted with the POSIX close-escape-reopen trick. That
+// is safe because a landing dir is only ever passed for a shed, and a shed's
+// login shell is bash by construction. An empty landing dir adds no positional
+// argument, so the command carries no single quote beyond the pair wrapping
+// the script.
 func ProbeCommand(landingDir string) string {
 	cmd := "bash -lc " + shellQuote(ProbeScript())
 	if landingDir != "" {
@@ -130,7 +128,7 @@ type Probe struct {
 	// that resolved. An agent absent from this map was not found.
 	Found map[string]string
 	// LandingDirExists is true when the landing dir handed to ProbeCommand is
-	// a directory on the far side. False for a machine, which passes none.
+	// a directory on the far side. False when none was passed, or it is not.
 	LandingDirExists bool
 }
 

@@ -1,0 +1,39 @@
+[package]
+name = "shed-roost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-roost — roost-session wire client, reach/watcher, bootstrap state machines, SSH endpoint helpers, and orderly-shutdown SpawnGate. Sole direct roost-ipc consumer in crates/."
+
+[lib]
+name = "shed_roost"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+shed-lane = { path = "../shed-lane" }
+roost-ipc = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "process", "sync", "time"] }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+libc = "0.2"
+
+[features]
+# Exports `testing` (in-process FakeRoost) for downstream crates' tests.
+# NON-default so a shipped binary never carries it.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "io-util", "process", "rt", "test-util"] }

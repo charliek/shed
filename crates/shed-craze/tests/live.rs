@@ -21,17 +21,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{drive_lane, DriveEnd, LaneChecker};
-use shed_core::lane::ring::MessageRing;
-use shed_core::lane::{
-    option_kind, AgentLane, AgentSource, LaneAnswer, LaneCreateRequest, LaneEvent, SendMode,
-    SourceEvent,
-};
-use shed_core::rc::RcActivity;
 use shed_craze::fold::CrazeFold;
 use shed_craze::testing::{bins, Recipe, TeeDial, TeeLine};
 use shed_craze::wire::{AttachResult, EventParams, ResetParams};
 use shed_craze::{lane_capabilities, new_request_id, CrazeDial};
+use shed_lane::lane::conformance::{drive_lane, DriveEnd, LaneChecker};
+use shed_lane::lane::ring::MessageRing;
+use shed_lane::lane::{
+    option_kind, AgentLane, AgentSource, LaneAnswer, LaneCreateRequest, LaneEvent, SendMode,
+    SourceEvent,
+};
+use shed_lane::rc::RcActivity;
 
 /// The recording this crate replays: craze v0.1.0 (the pin was its tag
 /// commit, `8d5676c`, when it was recorded), a gx session. A re-record runs

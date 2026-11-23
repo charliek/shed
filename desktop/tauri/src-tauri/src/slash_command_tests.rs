@@ -2,35 +2,45 @@
 //! `lane_slash_dispatch`, `lane_slash_accept`, `lane_set_title`; plan 029 D12),
 //! driven through Tauri's own argument extraction on its mock runtime.
 //!
-//! `launch_command_tests`'s reason: a `#[tauri::command]` receives only the
-//! arguments it declares and drops every other key of the invoke without a
-//! word, so a command that misnamed `caret` or `sessionId` would run as if the
-//! panel had sent nothing — a closed menu, a refusal — and nothing below the
-//! command could tell. These cells send exactly the camelCase keys `bridge.ts`
-//! sends and assert the command READ each one.
+//! A `#[tauri::command]` receives only the arguments it declares and drops
+//! every other key of the invoke without a word, so a command that misnamed
+//! `caret` or `session_id` would run as if the panel had sent nothing — a
+//! closed menu, a refusal — and nothing below the command could tell. These
+//! cells send exactly the camelCase keys `bridge.ts` sends and assert the
+//! command READ each one.
+//!
+//! The lane address is a shed `target` (`roost:<server>/<shed>`) plus
+//! `sessionId`. There is no `machine` and no `kind`: craze is the only lane.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use shed_core::roost::AgentLaneStamp;
-use tauri::test::{mock_builder, mock_context, noop_assets};
+use shed_core::config::ShedConfig;
+use shed_desktop_core::{ShedDesktopRuntime, ShedReachOptions};
+use tauri::ipc::{CallbackFn, InvokeBody};
+use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+use tauri::webview::InvokeRequest;
 
-use crate::lane::{LaneMachines, Lanes};
-use crate::launch_command_tests::invoke;
-use crate::machines::ReachKind;
-
-/// A machine layer with no lanes at all: every lane op answers `no_lane`.
-struct NoMachines;
-
-impl LaneMachines for NoMachines {
-    fn agent_lanes(&self, _machine: &str) -> BTreeMap<String, AgentLaneStamp> {
-        BTreeMap::new()
-    }
-
-    fn reach_kind(&self, machine: &str) -> Result<ReachKind, String> {
-        Err(format!("{machine} is not configured"))
-    }
+/// One invoke of `cmd` with `body` as its arguments, answered the way the
+/// frontend's `invoke` sees it: the command's value, or its error string.
+fn invoke(
+    webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+    cmd: &str,
+    body: Value,
+) -> Result<Value, Value> {
+    get_ipc_response(
+        webview,
+        InvokeRequest {
+            cmd: cmd.into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "tauri://localhost".parse().expect("a url"),
+            body: InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_string(),
+        },
+    )
+    .map(|response| response.deserialize::<Value>().expect("a JSON answer"))
 }
 
 /// A resolved menu as `lane_messages` answers it: a rename and a mode that
@@ -51,9 +61,9 @@ fn menu() -> Value {
 /// `lane_slash_filter` answers (0 is "not in the token", so closed), the
 /// activity dims and refuses (`working`), `row` and `key` pick what
 /// `lane_slash_accept` does, and `lane_set_title` reaches the lane layer with
-/// `sessionId` and `title` — a blank title is refused there, a real one finds
-/// no lane. A command missing a key it needs is refused by Tauri, never run on
-/// a guess.
+/// `target`, `sessionId` and `title` — a blank title is refused there, a real
+/// one finds no lane. A command missing a key it needs is refused by Tauri,
+/// never run on a guess.
 #[test]
 fn the_slash_commands_read_every_key_the_panel_sends() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -61,12 +71,19 @@ fn the_slash_commands_read_every_key_the_panel_sends() {
         .enable_all()
         .build()
         .expect("a test runtime");
-    let lanes = Arc::new(Lanes::for_test(
+    // No listed shed and no open lane: a real title reaches the lane layer and
+    // answers `no_lane`; the slash commands do not touch the runtime at all.
+    let desktop = Arc::new(ShedDesktopRuntime::start_headless(
         runtime.handle().clone(),
-        Arc::new(NoMachines),
+        &ShedConfig::default(),
+        ShedReachOptions {
+            test_mode: true,
+            ..ShedReachOptions::default()
+        },
+        false,
     ));
     let app = mock_builder()
-        .manage(lanes)
+        .manage(desktop)
         .invoke_handler(tauri::generate_handler![
             crate::lane_slash_filter,
             crate::lane_slash_dispatch,
@@ -136,7 +153,7 @@ fn the_slash_commands_read_every_key_the_panel_sends() {
         "`key` was read"
     );
 
-    let target = json!({ "machine": "m1", "kind": "craze", "sessionId": "0123456789ab" });
+    let target = json!({ "target": "roost:srv/dev", "sessionId": "0123456789ab" });
     let with = |extra: Value| {
         let mut body = target.clone();
         body.as_object_mut()

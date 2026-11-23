@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-app — the display-free app-logic layer (the shed-core-backed Backend + pull create store) shared by the Tauri client and shed-mobile. No UI or env-prefix coupling; depends only on the pure shed-core protocol crate."
+description = "shed-app — the display-free shed-server application layer (Backend, approval Coordinator, AuditStore, AuthModeRegistry, optional EmbeddedBroker). Desktop-only; zero roost-ipc, zero shed-lane."
 
 [lib]
 name = "shed_app"
@@ -17,26 +17,14 @@ workspace = true
 shed-core = { path = "../shed-core" }
 # The embeddable broker core — ONLY under the non-default `broker` feature (leg 3a.2).
 # It carries the heavy leaf deps (aws-sdk-*/notify/saphyr-parser); keeping it optional
-# means a default `shed-app` (and the mac FFI build) never links them.
+# means a default `shed-app` never links them.
 shed-broker = { path = "../shed-broker", optional = true }
-# `io-util` for the roost runner's child-pipe reads and writes, `process` for
-# `roost::SshExec` and the machine forward's `ssh -N -L` child — on top of the
-# workspace's rt/macros/sync/time.
-tokio = { workspace = true, features = ["io-util", "process"] }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
-# roost's SSH client-bridge transport + the `messages` params/results the roost
-# one-shots take and return (`roost.rs`). Rev-pinned in the workspace manifest —
-# see the long comment there.
-roost-ipc = { workspace = true }
-# The `tracing` FACADE only — no subscriber, no `tracing-subscriber`. The roost
-# watcher loop has two things worth saying that are neither an `Err` nor an
-# update (a resync, and a hooks re-send that did not land), and a `println!`
-# from a library the desktop and mobile both link is not an option.
-# Adds no crate to the lock: `roost-ipc` already brings the same facade into
-# this crate's graph, so a client that installs no subscriber pays nothing.
+# The `tracing` facade only — used for config-refusal warnings in `backend.rs`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Concurrent per-host list_sheds via futures::future::join_all.
 futures = "0.3"
@@ -44,15 +32,8 @@ futures = "0.3"
 # `clock` disabled — "now" comes from the injectable Clock seam,
 # not chrono, so no iana-time-zone/libc pull.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# Process liveness, signals and the port reservation socket for the machine
-# forward and the roost runner. Unix-only; the clients are Unix (Linux + macOS).
-libc = "0.2"
 
 [features]
-# The Remote-Control layer (`rc.rs` + the graduated `shed-rc-engine`) was this
-# crate's other non-default feature until plan 022 (S6, charliek/shed#328)
-# demolished the RC hub; `broker` is the only one left.
-#
 # The in-process broker bridge (`broker_bridge.rs`): the desktop app's credential broker,
 # backed by `shed-broker`. NON-default so a featureless `shed-app` stays
 # broker-free — `cargo test --features broker` runs its unit tests.
@@ -60,15 +41,7 @@ broker = ["dep:shed-broker"]
 
 [dev-dependencies]
 httpmock = { workspace = true }
-# Temp dirs for the `broker` bridge tests (config synthesis) and the roost reach
-# tests (the fake-`ssh` scratch dir). Dev-only — never in the default lib dep graph.
+# Temp dirs for the `broker` bridge tests (config synthesis).
 tempfile = "3"
-# `net` for the tests' loopback and Unix listeners (the bridge's held-stream bus
-# and a roost fake); the library itself opens no socket through tokio.
+# `net` for the tests' loopback and Unix listeners (the bridge's held-stream bus).
 tokio = { workspace = true, features = ["net"] }
-# shed-core's in-process fake roost-session (`roost::testing::FakeRoost`), exposed
-# by its test-only `test-support` feature. A dev-dependency (resolver v2) so the
-# feature is enabled for `cargo test -p shed-app` and NEVER for a shipped build —
-# the same resolver-v2 dev-dependency-only pattern this crate's own `test-support`
-# forwarding above uses for `rc_engine::fake`.
-shed-core = { path = "../shed-core", features = ["test-support"] }

@@ -8,15 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
-use shed_core::lane::{AgentLane, LaneEvent, LaneSession};
-use shed_core::rc::RcActivity;
 use shed_craze::testing::{
     attach_result, host_session_row, session_caps, session_info, snapshot_at, HubEnd, ScriptedDial,
     SCRIPT_WAIT,
 };
 use shed_craze::wire::ClientInfo;
 use shed_craze::{CrazeLane, LaneTimings};
+use shed_lane::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
+use shed_lane::lane::{AgentLane, LaneEvent, LaneSession};
+use shed_lane::rc::RcActivity;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 pub const HOST: &str = "0123456789ab";
@@ -181,6 +181,6 @@ pub fn text(t: &str) -> Value {
 }
 
 /// A lane subscribed, its stream and the conformance checker.
-pub async fn subscribed(lane: &CrazeLane) -> (Receiver<LaneEvent>, shed_core::lane::LaneStop) {
+pub async fn subscribed(lane: &CrazeLane) -> (Receiver<LaneEvent>, shed_lane::lane::LaneStop) {
     lane.subscribe(None).await.unwrap().into_parts()
 }

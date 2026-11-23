@@ -1,0 +1,34 @@
+[package]
+name = "shed-desktop-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+shed-lane = { path = "../shed-lane" }
+shed-roost = { path = "../shed-roost" }
+shed-craze = { path = "../shed-craze" }
+# Default features ONLY — never enable `broker` (keeps `shed-broker` and
+# `saphyr-parser` out of `shed-desktop-core` and default `shed-app`).
+shed-app = { path = "../shed-app" }
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util", "macros"] }
+# The `tracing` facade only (no subscriber).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+uuid.workspace = true
+
+[dev-dependencies]
+shed-roost = { path = "../shed-roost", features = ["test-support"] }
+shed-lane = { path = "../shed-lane", features = ["test-support"] }
+shed-craze = { path = "../shed-craze", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "process", "sync"] }

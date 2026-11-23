@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use tokio::runtime::Handle;
 
@@ -536,7 +536,7 @@ impl Backend {
             shed,
             &target.host,
             target.port,
-            &known_hosts_path(),
+            &shed_core::config::known_hosts_path(),
             &identity,
             session,
         ))
@@ -556,7 +556,7 @@ impl Backend {
             server_name: name.clone(),
             ssh_host: target.host.clone(),
             ssh_port: target.port,
-            known_hosts: known_hosts_path(),
+            known_hosts: shed_core::config::known_hosts_path(),
         })
     }
 
@@ -650,18 +650,6 @@ impl TokenMinter for RefusingMinter {
 fn no_configured_host(host: Option<&str>) -> ShedError {
     let which = host.map(|h| format!(": {h}")).unwrap_or_default();
     ShedError::Config(format!("no configured host{which}"))
-}
-
-/// The shed CLI's `known_hosts` file (`~/.shed/known_hosts`, the same file
-/// `shed server add` pins keys into) — `~/.shed` on both macOS and Linux.
-pub(crate) fn known_hosts_path() -> String {
-    // Cached: HOME is stable for the process, and `rc_targets` resolves this once
-    // per running shed — no need to re-read the env + reformat each time.
-    static PATH: LazyLock<String> = LazyLock::new(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.shed/known_hosts")
-    });
-    PATH.clone()
 }
 
 /// All hosts' sheds + a rollup of per-host reachability failures (what the

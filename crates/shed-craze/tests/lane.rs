@@ -15,14 +15,14 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{json, Value};
-use shed_core::lane::conformance::LaneChecker;
-use shed_core::lane::{AgentLane, LaneAnswer, LaneError, LaneEvent, LaneSettingChange, SendMode};
-use shed_core::rc::RcActivity;
 use shed_craze::testing::{
     ask_record, attach_result, host_session_row, session_info, slash_items, snapshot_at,
     SCRIPT_WAIT,
 };
 use shed_craze::{is_outcome_unknown, DialError};
+use shed_lane::lane::conformance::LaneChecker;
+use shed_lane::lane::{AgentLane, LaneAnswer, LaneError, LaneEvent, LaneSettingChange, SendMode};
+use shed_lane::rc::RcActivity;
 
 fn permission_event(id: &str) -> Value {
     json!({"type": "permission", "at": "2026-01-01T00:00:01Z",
@@ -1010,7 +1010,7 @@ async fn stop_resolves_on_the_receipt_and_the_lane_ends_on_the_reset() {
     let req = hub.expect("session.stop").await;
     hub.reply(&req, json!({})).await;
     stop.await.unwrap().unwrap();
-    let quiet = shed_core::lane::conformance::drive_lane(
+    let quiet = shed_lane::lane::conformance::drive_lane(
         &mut rx,
         &mut checker,
         Duration::from_millis(200),
@@ -1020,7 +1020,7 @@ async fn stop_resolves_on_the_receipt_and_the_lane_ends_on_the_reset() {
     .unwrap();
     assert_eq!(
         quiet.end,
-        shed_core::lane::conformance::DriveEnd::Deadline,
+        shed_lane::lane::conformance::DriveEnd::Deadline,
         "the receipt is not the end: {:#?}",
         quiet.frames
     );
@@ -2270,7 +2270,7 @@ async fn a_session_with_no_cards_still_advertises_and_answers_approvals() {
 // ---- the settings milestone (plan 025 §3.10, C11) ----
 
 /// The last `Settings` among `frames`.
-fn last_settings(frames: &[LaneEvent]) -> Option<shed_core::lane::LaneSettings> {
+fn last_settings(frames: &[LaneEvent]) -> Option<shed_lane::lane::LaneSettings> {
     frames.iter().rev().find_map(|e| match e {
         LaneEvent::Settings { settings } => Some(settings.clone()),
         _ => None,
@@ -2282,7 +2282,7 @@ fn is_settings(e: &LaneEvent) -> bool {
 }
 
 /// The effort option's current value in `s`.
-fn effort(s: &shed_core::lane::LaneSettings) -> Option<String> {
+fn effort(s: &shed_lane::lane::LaneSettings) -> Option<String> {
     s.options
         .iter()
         .find(|o| o.id == "effort")
@@ -2530,7 +2530,7 @@ async fn a_catalog_below_the_held_revision_is_never_applied() {
             json!({"type": "meta", "state": {"catalog": {"models": models, "revision": revision}}}),
         )
     };
-    let ids = |s: &shed_core::lane::LaneSettings| -> Vec<String> {
+    let ids = |s: &shed_lane::lane::LaneSettings| -> Vec<String> {
         s.models.iter().map(|m| m.id.clone()).collect()
     };
 

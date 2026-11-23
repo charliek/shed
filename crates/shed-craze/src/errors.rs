@@ -6,7 +6,7 @@
 //! reproduced here **verbatim and keyed on `data.code` ONLY** — never
 //! `data.reason`, never `message` — because craze's own rule is that a client
 //! decides everything from the code, and a caller of this crate then branches
-//! on the variant, never on the text. `shed_core::lane`'s module doc carries
+//! on the variant, never on the text. `shed_lane::lane`'s module doc carries
 //! the same table; `tests/wire.rs` asserts it row by row.
 //!
 //! **One deviation, P14:** a `session.create` refused `not_accepting` with
@@ -33,7 +33,7 @@
 //! in place of a create SUCCESS it could not send ([`SUCCESS_UNSENT`]): the
 //! session exists, so they are unknown at every attempt.
 //!
-//! [`AgentSource::create_held`]: shed_core::lane::AgentSource::create_held
+//! [`AgentSource::create_held`]: shed_lane::lane::AgentSource::create_held
 //!
 //! **And a rename's `index_write`** (plan 029 P19): `session.setTitle`
 //! answered `index_write` RAN — the session is renamed and its `meta` delta
@@ -51,7 +51,7 @@
 //! `not_resumable` (drop the row: `Gone`) and `start_failed` (show the cause,
 //! keep the row: `StartFailed`) opposite client actions, and the contract's
 //! `NotAccepting` is a unit variant that could carry neither. Only that code,
-//! and only on `session.reopen`; `shed_core::lane`'s module doc and
+//! and only on `session.reopen`; `shed_lane::lane`'s module doc and
 //! `crates/CLAUDE.md` carry the same exception. A hub that cannot reopen at
 //! all — its `hello` without `reopen`, or a refusal `unsupported` /
 //! `unknown_method` — is said in one set of words, [`reopen_unsupported`],
@@ -73,7 +73,7 @@
 //! three: only shed's own [`outcome_unknown`], [`set_title_error`] and
 //! [`reopen_lost`] carry them.
 
-use shed_core::lane::{LaneError, LaneReopenError};
+use shed_lane::lane::{LaneError, LaneReopenError};
 
 use crate::conn::{version_or_unknown, HubHello};
 use crate::wire::{code, reason, RpcError};
@@ -353,7 +353,7 @@ pub fn is_reopen_unsupported(e: &RpcError) -> bool {
 }
 
 /// `session.reopen`'s refusal as [`LaneReopenError`] (the module doc; the
-/// table is `shed_core::lane`'s too):
+/// table is `shed_lane::lane`'s too):
 ///
 /// | craze's answer | [`LaneReopenError`] |
 /// |---|---|

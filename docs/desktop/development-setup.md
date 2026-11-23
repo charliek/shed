@@ -60,12 +60,14 @@ release (which signs the DMG and publishes the Sparkle appcast) is
 
 ```
 crates/                   # shared Rust core workspace (sibling of desktop/)
-  shed-core/              # pure protocol client: HTTP/SSE, decoders, TLS, token FSM, config, approval + lane models
-  shed-app/               # UI-free app logic: Backend, approval Coordinator, the embedded broker bridge, roost
+  shed-lane/              # pure leaf: lane contract, RC DTOs, slash menu, craze argv
+  shed-core/              # pure protocol client: HTTP/SSE, decoders, TLS, token FSM, config
+  shed-roost/             # roost client; the only roost-ipc crate in this workspace
+  shed-app/               # UI-free shed client: Backend, approval Coordinator, broker bridge
+  shed-desktop-core/      # toolkit-free shed-only hosts, craze and lanes
   shed-broker/            # the credential broker the app embeds
   shed-broker-harness/    # test-only host of the app's broker (tests/broker-wire)
   shed-craze/             # craze agent-lane adapter
-  shed-opencode/          # opencode agent-lane adapter
   shedctl/                # headless IPC client (shipped in the Linux .deb)
 desktop/
   tauri/
@@ -85,6 +87,6 @@ desktop/
 - Default to no comments; add one only when the *why* is non-obvious (a hidden constraint,
   a workaround, a tricky invariant). Don't comment what well-named code already says.
 - Errors are returned, not logged-and-swallowed.
-- Keep `shed-core` and `shed-app` free of UI and Tauri dependencies; Tauri/WebKitGTK crates
+- Keep `shed-core`, `shed-app` and `shed-desktop-core` free of UI and Tauri dependencies; Tauri/WebKitGTK crates
   belong only in `desktop/tauri/src-tauri`.
 - Run `make -C desktop fmt` before committing Rust changes.

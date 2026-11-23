@@ -16,7 +16,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::rc::{strip_format_chars, RcActivity, RcKind, RcSession, RcState, TMUX_PREFIX};
+use shed_lane::rc::{strip_format_chars, RcActivity, RcKind, RcSession, RcState, TMUX_PREFIX};
+use shed_lane::text::{clean_display, non_empty_str, opt_trimmed};
 
 /// Deserialize `T`, mapping an explicit JSON `null` to `T::default()`. serde's
 /// `#[serde(default)]` only covers an ABSENT field; shed-server sends `null` for
@@ -275,7 +276,7 @@ pub struct Session {
 /// The RC display subset inside a [`Session`] row. Wire shape: Go
 /// `config.SessionRC` (`internal/config/types.go:199-215`) — every field but
 /// `managed` is `omitempty`. `kind`/`state`/`activity` stay raw wire strings
-/// here (this is the read-plane row, not the enriched [`crate::rc::RcSession`]
+/// here (this is the read-plane row, not the enriched [`shed_lane::rc::RcSession`]
 /// model — the overview adapter owns that mapping).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SessionRC {
@@ -296,7 +297,7 @@ pub struct SessionRC {
     pub activity_at: Option<String>,
     /// Hub-sanitized ≤200-rune preview. NOTE: sanitized for ANSI/C0C1 only —
     /// a renderer should still pass it through
-    /// [`crate::rc::strip_format_chars`] before display (the enriched paths
+    /// [`shed_lane::rc::strip_format_chars`] before display (the enriched paths
     /// do this at decode; this raw row does not).
     pub last_message: Option<String>,
 }
@@ -330,53 +331,6 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
             .map(str::to_string)
             .collect(),
         None => Vec::new(),
-    }
-}
-
-/// Trim on Dart's `String.trim()` set: Unicode White_Space PLUS U+FEFF (BOM).
-/// Rust's `str::trim` uses only the White_Space property, which U+FEFF lost in
-/// Unicode 6.3 — Dart keeps it in its trim set for legacy reasons (documented
-/// on `String.trim`). Every `_str`/`_nonEmpty`-parity helper below must trim
-/// on this set, or a BOM-padded guest value decodes differently here than on
-/// mobile (e.g. a `"\u{FEFF}"` shed name would survive as non-empty). FEFF is
-/// the only practical divergence — both languages otherwise share the Unicode
-/// whitespace set.
-pub(crate) fn dart_trim(s: &str) -> &str {
-    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
-}
-
-/// Trim a maybe-string to a non-empty value (Dart's `_nonEmpty`,
-/// `shed_dtos.dart:421-422`, and `_str`, `rc_models.dart:278-282` — identical
-/// semantics): non-string, absent, or blank → `None`. Trims on Dart's set via
-/// [`dart_trim`].
-fn non_empty_str(v: Option<&Value>) -> Option<&str> {
-    v.and_then(Value::as_str)
-        .map(dart_trim)
-        .filter(|s| !s.is_empty())
-}
-
-/// [`non_empty_str`], owned (the Dart `_str` used for the session's optional
-/// string fields; `rc_feed.dart:85-89` carries a byte-identical `_str`, so
-/// the feed decoders in [`crate::rc`] share this helper).
-pub(crate) fn opt_trimmed(v: Option<&Value>) -> Option<String> {
-    non_empty_str(v).map(str::to_string)
-}
-
-/// Dart `_cleanDisplay` (`rc_models.dart:284-290`): [`opt_trimmed`] plus a
-/// strip of Unicode format characters (category Cf) — for guest-controlled
-/// display text that could carry bidi-override spoofers. A value that is ONLY
-/// format characters degrades to `None`. `rc_feed.dart:93-98` carries a
-/// byte-identical `_text`, so the feed decoders in [`crate::rc`] share this
-/// helper too.
-pub(crate) fn clean_display(v: Option<&Value>) -> Option<String> {
-    let stripped = strip_format_chars(non_empty_str(v)?);
-    // Dart-set trim for parity ([`dart_trim`]) — though FEFF is Cf, so the
-    // strip above already removed it and this pass only sees whitespace.
-    let trimmed = dart_trim(&stripped);
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -642,7 +596,7 @@ impl OverviewShed {
 /// so a `None` `df` or an empty session list is a tolerated partial, not a
 /// failure — the decode has NO error path (a wrong-typed/missing block
 /// defaults). Ported from mobile's `Overview.fromJson`
-/// (`shed_dtos.dart:301-333`); hand-rolled (like [`crate::rc::RcKind`]'s manual
+/// (`shed_dtos.dart:301-333`); hand-rolled (like [`shed_lane::rc::RcKind`]'s manual
 /// impl) because the flatten-plus-filter session rule and the per-block
 /// tolerance aren't expressible with derive.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -848,7 +802,7 @@ pub fn valid_machine_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc::LANE_TUI;
+    use shed_lane::rc::LANE_TUI;
 
     #[test]
     fn opt_trimmed_trims_on_darts_set_including_bom() {

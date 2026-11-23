@@ -167,30 +167,31 @@ var ErrOptionShapedTarget = errors.New("ssh destination begins with a dash")
 // Target is one far side's ssh identity: everything the argv builder needs and
 // nothing else.
 //
-// Two constructors build it, because the two reaches genuinely differ. A shed
-// is always `<shed>@<server host> -p <ssh port>` pinned against
-// `~/.shed/known_hosts` — shed mints those host keys itself, so there is no
-// user config to defer to. A machine defers to the user's own `~/.ssh/config`
-// for everything the `machines:` entry does not state.
+// ShedTarget is the constructor. A shed is always `<shed>@<server host> -p
+// <ssh port>` pinned against `~/.shed/known_hosts` — shed mints those host
+// keys itself, so there is no user config to defer to. EmitPort and
+// KnownHosts stay on the struct because they decide the argv and which
+// ControlMaster a target may share; a shed always sets both.
 type Target struct {
-	// Dest is ssh's destination word: `<shed>@<host>` or `[user@]host`.
+	// Dest is ssh's destination word: `<shed>@<host>`.
 	Dest string
 	// Port is the ssh port; EmitPort decides whether `-p` is passed at all.
 	Port int
 	// EmitPort is true when the port must be forced on the command line.
-	// False for a machine on 22, so `~/.ssh/config`'s own `Port` still wins —
-	// the same rule `shed_core::machine::port_opts` follows.
+	// A shed always sets it: the server's sshd port is not something
+	// `~/.ssh/config` could be expected to know.
 	EmitPort bool
 	// KnownHosts, when non-empty, pins the host key: StrictHostKeyChecking=yes
-	// against this file. Empty means the user's own ssh config decides, which
-	// is what an unpinned `machines:` entry asks for.
+	// against this file. A shed always sets it (`config.GetKnownHostsPath()`).
+	// Empty leaves the pin off the argv, which the ControlMaster key still
+	// treats as its own connection.
 	KnownHosts string
 	// IdentityFile, when non-empty, is the key ssh offers first, and no
 	// agent-only key: the argv gains `-i <path> -o IdentitiesOnly=yes`, and,
 	// when the Remote keeps no shared connection of its own, `-o
 	// ControlMaster=no -o ControlPath=none`. It is a shed server entry's
-	// identity_file (a `machines:` entry never sets it). Argv checks it, the
-	// value, the file and its public key, before it builds anything.
+	// identity_file. Argv checks it, the value, the file and its public key,
+	// before it builds anything.
 	IdentityFile string
 	// Entry is the config name of the server entry IdentityFile came from,
 	// for the message when it cannot be used. It does not affect the argv.
@@ -214,22 +215,6 @@ func ShedTarget(s RunningShed, knownHosts string) Target {
 	}
 }
 
-// MachineTarget builds the Target for a `machines:` entry, with
-// `shed_core::machine`'s exact deferral semantics: no `user@` when the entry
-// names none, no `-p` on 22, host-key options only when `known_hosts` is set.
-func MachineTarget(m config.MachineEntry) Target {
-	dest := m.Host
-	if m.User != "" {
-		dest = m.User + "@" + dest
-	}
-	return Target{
-		Dest:       dest,
-		Port:       m.SSHPort,
-		EmitPort:   m.SSHPort != 22,
-		KnownHosts: m.KnownHosts,
-	}
-}
-
 // Validate refuses a Target that cannot be safely spelled on an ssh command
 // line.
 //
@@ -244,9 +229,8 @@ func MachineTarget(m config.MachineEntry) Target {
 //
 // roost refuses the same shape in its own target classifier
 // (roost-ipc/src/ssh.rs: "target starts with '-'; that looks like an option,
-// not a host"), and internal/config's `machines:` decoder skips such an entry.
-// This is the defence in depth behind both: the decoder is not the only way a
-// Target is built, and Argv is the one place a Target becomes argv.
+// not a host"). This is the defence in depth behind that: Argv is the one
+// place a Target becomes argv, so a Target built by hand gets no free pass.
 //
 // Both halves of `user@host` are checked rather than just the rendered
 // destination. `me@-oProxyCommand=x` does not itself begin with a dash and ssh
@@ -312,22 +296,6 @@ func (t Target) muxKey(identityKey string) string {
 			t.Dest, t.Port, t.EmitPort, t.KnownHosts, t.IdentityFile, identityKey)
 	}
 	return fmt.Sprintf("v1\x00%s\x00%d\x00%t\x00%s", t.Dest, t.Port, t.EmitPort, t.KnownHosts)
-}
-
-// Label renders this target the way ssh will actually dial it:
-// `[user@]host[:port]`, with each optional half present exactly when Argv
-// passes it.
-//
-// The list menu's subtitle is built from this rather than from the
-// `machines:` entry directly, so "the subtitle describes the connection that
-// will really be made" is structural instead of two files happening to agree.
-// A port that is NOT emitted is also not shown — `~/.ssh/config`'s own `Port`
-// is free to win, and a subtitle claiming 22 would be guessing.
-func (t Target) Label() string {
-	if !t.EmitPort {
-		return t.Dest
-	}
-	return t.Dest + ":" + strconv.Itoa(t.Port)
 }
 
 // Remote execs `ssh`. One per provider run; every call against it reuses the
@@ -723,8 +691,7 @@ func readTail(f *os.File, limit int64) (string, error) {
 
 // Probe runs the discovery round trip (plan 019 §3.2 step 2's first half).
 //
-// landingDir is a shed's landing dir, or "" for a machine and for a shed whose
-// server reported none.
+// landingDir is the shed's landing dir, or "" when the server reported none.
 func (r *Remote) Probe(ctx context.Context, t Target, landingDir string) (Probe, error) {
 	out, err := r.run(ctx, t, ProbeCommand(landingDir), nil, probeStdoutCap)
 	if err != nil {

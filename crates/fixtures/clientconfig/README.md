@@ -10,7 +10,7 @@ refused by name with a reason, never read with defaults. These files are that pr
 | File | What it is |
 |---|---|
 | `config.yaml` | Written by the CLI's own load and save (`config.LoadClientConfigFromPath`, then `config.ClientConfig.Save`) from real structs: the widest file it writes for ordinary values. One entry sets every `ServerEntry` field; others have a name with a colon (`prod:blue`), an address and a port (`127.0.0.1:8443`), names the saver quotes (`team: blue`, `true`, `1234`, `build #1`), values with a `#`, a quote and non-ASCII letters, and the fewest fields the saver writes. The other top-level sections are there too: `default_server`, `sheds`, `create_timeout` and a `machines:` section the CLI kept. |
-| `expected.json` | What the CLI holds for each server entry (`host`, `ssh_port`, `user`, `identity_file`), for each machine (as the CLI's own machines decoder reads it), and `default_server`. |
+| `expected.json` | What the CLI holds for each server entry (`host`, `ssh_port`, `user`, `identity_file`) and `default_server`. The `machines:` block in `config.yaml` is not decoded; it is there to prove the CLI's save preserves it. |
 
 **Do not edit by hand.** `internal/config/clientconfig_fixture_test.go` writes both files
 under `UPDATE_CLIENTCONFIG=1` and checks them otherwise, so a stale fixture fails
@@ -25,7 +25,7 @@ UPDATE_CLIENTCONFIG=1 go test ./internal/config -run TestClientConfigFixture
 
 - Go: `internal/config/clientconfig_fixture_test.go` (the writer and checker).
 - Rust: `the_cli_written_config_is_read_as_the_cli_reads_it` in
-  `crates/shed-core/src/config.rs` (servers, machines, default server; no entry refused,
+  `crates/shed-core/src/config.rs` (servers, default server; no entry refused,
   the file not refused) and in `crates/shed-broker/src/discovery.rs` (one target per entry).
 
 What the readers refuse instead of reading (a block scalar, a flow mapping, a tag, an

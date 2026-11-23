@@ -27,7 +27,7 @@ Two more knobs make that honest:
 * `ROOST_SESSION_INSTALL_BIN` is roost's own override rung, and the bytes it
   names are a shell script that answers `identify`, `start` and `client-bridge`
   the way the real daemon does. `_fake_session` is deliberately the same
-  stand-in `crates/shed-core/src/roost/bootstrap/tests.rs` uses, one language
+  stand-in `crates/shed-roost/src/bootstrap/tests.rs` uses, one language
   over — and `test_the_real_binary_is_installed_and_started_behind_the_fake_ssh`
   is where that claim is checked against the actual pinned-rev binary.
 
@@ -686,7 +686,7 @@ def _roost_rows(app: TauriClient, of: str | None = None, params: dict | None = N
 
 def _host_status(app: TauriClient, shed: str, **params) -> dict:
     """One shed's roost-host status row from `rc.list`, or `{}`."""
-    hosts = app.call("rc.list", params).get("machines", [])
+    hosts = app.call("rc.list", params).get("hosts", [])
     return next(
         (h for h in hosts if h.get("origin") == f"roost:{SERVER}/{shed}"), {}
     )
@@ -1150,7 +1150,7 @@ def test_a_running_shed_is_probed_and_then_watched(boot, rig, mock):
     _refresh(boot)
     live = [
         h
-        for h in boot.call("rc.list")["machines"]
+        for h in boot.call("rc.list")["hosts"]
         if h["origin"] == f"roost:{SERVER}/p19-live"
     ]
     assert len(live) == 1, live
@@ -1178,25 +1178,8 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     # see `Rig.agent_tab`.
     rig.agent_tab(fake)
 
-    launched = boot.call(
-        "roost.launch",
-        {"target": target, "kind": "opencode", "workdir": "/home/shed/work"},
-    )
-    assert launched["origin"] == target
-    assert launched["source"] == "roost"
-    assert launched["origin_kind"] == "shed"
-    assert launched["host"] == SERVER, "the SERVER, as a shed row spells it"
-    assert launched["shed"] == shed
-    assert launched["machine"] == target, "the address a lane op takes"
-    opened = fake.opens[-1]
-    assert opened["cwd"] == "/home/shed/work"
-    # `shed_core::roost::launch_argv`'s recipe for the kind: the agent's own
-    # binary, resolved by roost on the far side.
-    assert opened["argv"] == ["opencode"], opened
-
-    # Wait for the WATCHER's own snapshot rather than reading the optimistic row
-    # `roost.launch` inserted: the claim is about what a listing says, and the
-    # adapter-claimed tab is what makes a row survive a resync.
+    # Wait for the WATCHER's own snapshot. The adapter-claimed tab is what
+    # makes a row survive a resync.
     _wait_for(
         "the claimed tab to reach the listing",
         lambda: [r for r in _roost_rows(boot, shed) if r["slug"] == "7"] or None,
@@ -1206,6 +1189,7 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     assert rows, f"the shed's rows are missing: {everything}"
     assert {r["source"] for r in rows} == {"roost"}, "there is one row source now"
     assert {r["origin"] for r in rows} == {target}
+    assert {r["target"] for r in rows} == {target}
 
     # The contract is keyed by that same origin, which is what lets a card read
     # the contract for the row it is drawing.
@@ -1226,43 +1210,17 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     assert not _roost_rows(boot, "p19-new", {"host": SERVER, "shed": shed})
 
 
-def test_a_first_prompt_or_permission_mode_is_refused_on_a_shed(boot, rig, mock):
-    """**Refused, exactly `bad_request`, and nothing opens on the shed** (plan
-    026 §3.5) — the `roost:<server>/<shed>` twin of `test_tauri_machines.py`'s
-    machine-form cell, over the real bridge.
-
-    Every door a shed is addressed through: `roost.launch`/`machine.launch` by
-    the grammar token (the pre-S6 `rc.launch {shed}` was removed in 0.10.0).
-    The last launch is the control: the same shed, asked for what a roost
-    launch does, opens a tab — so the zero `tab.open` above is the refusal's,
-    not a shed that could not have opened anything. It carries a name,
-    which is the shed path's half of the title rule.
-    """
+def test_launch_doors_are_unknown_ops_and_open_nothing(boot, rig, mock):
+    """`roost.launch` and `machine.launch` are gone. A shed target answers
+    `unknown_op` and the roost session opens nothing."""
     shed = "p26-refused"
     fake = rig.roost()
     target = rig.host(shed, identity=IDENTITY_CURRENT, running=True, roost=fake)
-    doors = [
-        ("roost.launch", {"target": target}),
-        ("machine.launch", {"target": target}),
-    ]
-    for field, value in (("initial_prompt", "fix the build"), ("permission_mode", "plan")):
-        for op, address in doors:
-            with pytest.raises(ShedError) as excinfo:
-                boot.call(op, {**address, "kind": "opencode", field: value})
-            assert excinfo.value.code == "bad_request", (op, field, excinfo.value)
-            assert excinfo.value.message.startswith(
-                f"{field} is not supported by a roost launch"), excinfo.value
-    assert fake.opens == [], f"a refused launch opened a tab on the shed: {fake.opens}"
-    assert fake.title_calls == []
-
-    launched = boot.call(
-        "roost.launch",
-        {"target": target, "kind": "opencode", "display_name": "  Shed run  "},
-    )
-    assert len(fake.opens) == 1, fake.opens
-    assert launched["origin"] == target, launched
-    assert launched["title"] == "applied", launched
-    assert fake.title_calls == [{"tab_id": launched["slug"], "title": "Shed run"}]
+    for op in ("roost.launch", "machine.launch", "roost.run"):
+        with pytest.raises(ShedError) as excinfo:
+            boot.call(op, {"target": target, "kind": "opencode", "command": "true"})
+        assert excinfo.value.code == "unknown_op", (op, excinfo.value)
+    assert fake.opens == [], f"a removed launch opened a tab on the shed: {fake.opens}"
 
 
 def test_a_down_kind_reaches_rc_list_and_a_flap_keeps_the_roost_rows(boot, rig, mock):
@@ -1283,11 +1241,8 @@ def test_a_down_kind_reaches_rc_list_and_a_flap_keeps_the_roost_rows(boot, rig, 
     installed = _bootstrap(boot, target)
     assert installed["plan"]["kind"] == "update", installed
     rig.agent_tab(fake)
-    boot.call("roost.launch", {"target": target, "kind": "opencode", "workdir": "/home/shed"})
-    # The WATCHER's rows, not the optimistic one `roost.launch` inserted: an
-    # unclaimed tab leaves the agent-owned inventory on the next snapshot (it is
-    # somebody's terminal), so the row that must survive the flap is the claimed
-    # one.
+    # The row that must survive the flap is the adapter-claimed tab. An
+    # unclaimed tab leaves the agent-owned inventory on the next snapshot.
     rows_before = _wait_for(
         "the shed's roost rows",
         lambda: [r for r in _roost_rows(boot, shed) if r["slug"] == "7"] or None,
@@ -1526,7 +1481,7 @@ def test_the_real_binary_is_installed_and_started_behind_the_fake_ssh(rig, mock,
 
 # ---------------------------------------------------------------------------
 # the UI (C8): the status line + plan-matrix button, the consent dialog's
-# copy, and the toast — all UI TRUTH, read the `machines.dump` way rather than
+# copy, and the toast — all UI TRUTH, read from the pane dump rather than
 # by re-deriving what the backend already proved above.
 # ---------------------------------------------------------------------------
 
@@ -1537,7 +1492,7 @@ def _shed_roost_dump(app: TauriClient) -> dict:
 
     Deliberately a different question from `roost.preview`: that is the
     backend's answer regardless of what's on screen; this is what a person
-    looking at the pane reads — the whole point of a `*.dump` op (`machines.dump`'s
+    looking at the pane reads — the whole point of a `*.dump` op (the pane's
     rule, extended to roost)."""
     return app.call("shed_roost.dump")["sheds"] or {}
 

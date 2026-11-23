@@ -313,7 +313,7 @@ impl Recipe {
     /// The find-only probe (`providers --hub --json`) through the jailed ladder.
     pub async fn probe(&self) -> Probe {
         probe_process(
-            shed_core::craze::providers_hub_argv_jailed(),
+            shed_lane::craze::providers_hub_argv_jailed(),
             EnvPolicy::Exactly(self.env()),
         )
         .await

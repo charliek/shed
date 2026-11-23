@@ -13,17 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_app::slash_menu::{self, SlashAction};
-use shed_core::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
-use shed_core::lane::{
+use shed_craze::testing::{bins, HookDial, Recipe, TeeDial, RECIPE_WAIT};
+use shed_craze::{new_request_id, CrazeDial, CrazeSource};
+use shed_lane::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
+use shed_lane::lane::{
     AgentLane, AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneCreated,
     LaneError, LaneEvent, LaneSlashArg, LaneSlashCatalog, LaneSlashKind, LaneSlashMethod,
     LaneSlashPicker, LaneSlashRequires, LaneSlashSource, SendMode, SourceEvent,
     LANE_CHANNEL_CAPACITY,
 };
-use shed_core::rc::RcActivity;
-use shed_craze::testing::{bins, HookDial, Recipe, TeeDial, RECIPE_WAIT};
-use shed_craze::{new_request_id, CrazeDial, CrazeSource};
+use shed_lane::rc::RcActivity;
+use shed_lane::slash_menu::{self, SlashAction};
 use tokio::sync::mpsc::Receiver;
 
 const FAKE: &str = "0c0c0c0c0c0c";
@@ -74,7 +74,7 @@ fn resets(frames: &[LaneEvent]) -> usize {
 async fn lane_on(
     source: &CrazeSource,
     host_id: &str,
-) -> (Arc<dyn AgentLane>, shed_core::lane::SourceSubscription) {
+) -> (Arc<dyn AgentLane>, shed_lane::lane::SourceSubscription) {
     let mut sub = source.subscribe().await.unwrap();
     let deadline = tokio::time::Instant::now() + RECIPE_WAIT;
     loop {
@@ -93,7 +93,7 @@ async fn lane_on(
 /// A lane seeded on the recipe's fake host.
 async fn seeded(
     lane: &Arc<dyn AgentLane>,
-) -> (Receiver<LaneEvent>, shed_core::lane::LaneStop, LaneChecker) {
+) -> (Receiver<LaneEvent>, shed_lane::lane::LaneStop, LaneChecker) {
     let (mut rx, stop) = lane.subscribe(None).await.unwrap().into_parts();
     let mut checker = LaneChecker::new();
     drive(&mut rx, &mut checker, "the seed", is_ready).await;
@@ -310,7 +310,7 @@ async fn permission_question_and_plan_are_answered() {
         lane.answer(
             "perm-1",
             LaneAnswer::Permission {
-                decision: shed_core::lane::LaneDecision::Reject,
+                decision: shed_lane::lane::LaneDecision::Reject,
             },
         )
         .await

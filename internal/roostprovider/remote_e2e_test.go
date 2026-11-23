@@ -77,9 +77,9 @@ func TestProbeWithNoAgentsAndNoLandingDir(t *testing.T) {
 	}
 
 	// And the menu that falls out of it.
-	host := Token{Machine: "mini2"}
+	host := Token{Shed: "dev", Server: "srv"}
 	m := AgentMenu(host, got)
-	assertNoneRow(t, m.Items[0], "no agents found on mini2",
+	assertNoneRow(t, m.Items[0], "no agents found on srv/dev",
 		"looked for claude, opencode under bash -lc")
 }
 
@@ -146,7 +146,7 @@ func TestBridgeOpsThroughFakeSSH(t *testing.T) {
 	}
 
 	params, err := TabOpenFor(Token{
-		Machine: "mini2", Agent: "opencode", Home: "/home/shed", Cwd: "/home/shed/roost", Project: "1",
+		Shed: "dev", Server: "srv", Agent: "opencode", Home: "/home/shed", Cwd: "/home/shed/roost", Project: "1",
 	})
 	if err != nil {
 		t.Fatalf("TabOpenFor: %v", err)
@@ -538,7 +538,7 @@ func TestActivateStepThreeEndToEnd(t *testing.T) {
 			t.Fatalf("projects = %+v", projects)
 		}
 
-		tok := Token{Machine: "mini2", Agent: "opencode", Home: probe.Home}
+		tok := Token{Shed: "dev", Server: "srv", Agent: "opencode", Home: probe.Home}
 		candidates := WorkdirCandidates(projects, probe.Home, "", probe.LandingDirExists)
 		opened, collapsed := CollapseWorkdirs(tok, candidates)
 		if !collapsed {
@@ -587,7 +587,7 @@ func TestActivateStepThreeEndToEnd(t *testing.T) {
 			t.Fatalf("TabList: %v", err)
 		}
 
-		tok := Token{Machine: "mini2", Agent: "opencode", Home: probe.Home}
+		tok := Token{Shed: "dev", Server: "srv", Agent: "opencode", Home: probe.Home}
 		candidates := WorkdirCandidates(projects, probe.Home, filepath.Join(r.home, "proj"), probe.LandingDirExists)
 		if _, collapsed := CollapseWorkdirs(tok, candidates); collapsed {
 			t.Fatalf("four candidates collapsed")
@@ -727,7 +727,7 @@ func TestEmptyResultIsAProviderFailure(t *testing.T) {
 		r.replaceReply("tabopen", `{"id":"1","ok":true,"result":{}}`)
 
 		params, err := TabOpenFor(Token{
-			Machine: "mini2", Agent: "claude-rc", Home: "/home/shed", Cwd: "/home/shed",
+			Shed: "dev", Server: "srv", Agent: "claude-rc", Home: "/home/shed", Cwd: "/home/shed",
 		})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
@@ -748,7 +748,7 @@ func TestEmptyResultIsAProviderFailure(t *testing.T) {
 		if _, err := r.remote.Identify(ctx, r.target()); err != nil {
 			t.Errorf("Identify against roost's own vector: %v", err)
 		}
-		params, err := TabOpenFor(Token{Machine: "mini2", Agent: "claude-rc", Cwd: "/home/shed"})
+		params, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "claude-rc", Cwd: "/home/shed"})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
 		}

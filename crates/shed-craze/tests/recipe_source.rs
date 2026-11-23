@@ -12,19 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{
-    drive_lane, drive_source, Drive, DriveEnd, LaneChecker, SourceChecker,
-};
-use shed_core::lane::{
-    AgentSource, LaneCreateRequest, LaneError, LaneEvent, LanePromptOutcome, LaneProviderState,
-    LaneReopenError, LaneSavedSession, LaneSavedSessions, LaneSession, SourceEvent, SourceOffline,
-};
-use shed_core::rc::RcActivity;
 use shed_craze::testing::{bins, saved_index_row, HookDial, PathKind, Recipe, RECIPE_WAIT};
 use shed_craze::{
     connect_hub, is_outcome_unknown, new_request_id, CrazeDial, DialError, EnvPolicy, Probe,
     ProcessDial,
 };
+use shed_lane::lane::conformance::{
+    drive_lane, drive_source, Drive, DriveEnd, LaneChecker, SourceChecker,
+};
+use shed_lane::lane::{
+    AgentSource, LaneCreateRequest, LaneError, LaneEvent, LanePromptOutcome, LaneProviderState,
+    LaneReopenError, LaneSavedSession, LaneSavedSessions, LaneSession, SourceEvent, SourceOffline,
+};
+use shed_lane::rc::RcActivity;
 use tokio::sync::mpsc::Receiver;
 
 const FAKE: &str = "0a0a0a0a0a0a";
@@ -722,7 +722,7 @@ async fn too_old_is_offline_too_old_in_both_forms() {
 /// the recipe's variables (plan 032 §3.5).
 fn no_start_dial(recipe: &Recipe) -> ProcessDial {
     ProcessDial::new(
-        shed_core::craze::bridge_hub_no_start_argv_jailed(),
+        shed_lane::craze::bridge_hub_no_start_argv_jailed(),
         EnvPolicy::Exactly(recipe.env()),
     )
     .with_cwd(recipe.root().to_path_buf())
@@ -898,7 +898,7 @@ async fn a_saved_session_is_listed_reopened_joined_and_replayed() {
             source.create_options().await.unwrap().reopen,
             "a 0.2.0 hub's hello says reopen"
         );
-        let ms = |t: &str| shed_core::time::rfc3339_unix_ms(t).unwrap();
+        let ms = |t: &str| shed_lane::time::rfc3339_unix_ms(t).unwrap();
         assert_eq!(
             source.saved().await.unwrap(),
             LaneSavedSessions {

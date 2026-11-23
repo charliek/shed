@@ -46,9 +46,9 @@ fakes", and the trap this paragraph exists for:
 
 | reader | how it names the file |
 |---|---|
-| `crates/shed-core/src/roost/testing.rs` | `include_str!` (the Rust fake's template) |
-| `crates/shed-core/src/roost/fence.rs` | its own separate `include_str!` — not a fake, easy to miss |
-| `crates/shed-core/tests/roost_provider_vectors.rs` | reads it by name at runtime |
+| `crates/shed-roost/src/testing.rs` | `include_str!` (the Rust fake's template) |
+| `crates/shed-roost/src/fence.rs` | its own separate `include_str!` — not a fake, easy to miss |
+| `crates/shed-roost/tests/roost_provider_vectors.rs` | reads it by name at runtime |
 | `internal/roostprovider/goldens_test.go` | by name (`SpokenProtocol`'s pin) |
 | `internal/roostprovider/wire_test.go` | by name, twice (decode + string-id) |
 | `internal/roostprovider/fakessh_test.go` | by name (the fake ssh session's reply) |
@@ -115,7 +115,7 @@ hand-edited generation number would have left both quietly wrong.
 
 **It lags the pin by one commit, on purpose, and a tripwire bounds that.** A re-pin
 is a source edit, but re-recording needs a live daemon of the new generation — a
-live leg, which lands later. `crates/shed-core/src/roost/model.rs`'s test module
+live leg, which lands later. `crates/shed-roost/src/model.rs`'s test module
 carries `RECORDED_GENERATION` for what this file holds, asserted against it at
 runtime, plus a compile-time assertion that the recording may trail
 `SESSION_PROTOCOL_VERSION` by at most one generation. Refresh the recording and the
@@ -152,7 +152,7 @@ no-semantic-edits rule above governs the vendored vectors, not these.
 
 | file | what it pins | asserted by |
 |---|---|---|
-| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` value (built by `execChain`)) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
+| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-roost/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` value (built by `execChain`)) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
 | `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`), Go (`internal/roostprovider`'s `agentTable`) and Dart (the kind SET a machine's create form offers) |
 | `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`), Go (`ClassifySSHFailure` + `ProviderRow`) and Dart (`classes` **and** `reach_kinds`, against shed-mobile's own port in `lib/ssh/roost_reach.dart`) |
 | `wired-agents.json` | the agent names every shed client raises a host's `agent-hooks` key to (`session.set_agent_hooks`'s `agents`), in the order they are sent | Rust (`shed_core::roost::bootstrap::ROOST_WIRED_AGENTS` — the desktop's and the phone's raise) and Go (`internal/roostprovider`'s `WiredAgents()` — `shed attach`'s start-rung raise) |
@@ -176,7 +176,7 @@ golden is what keeps that third port honest.
 
 Everything else under `bootstrap/` is a **tripwire on roost's own script
 builders**, written by plan 019 C4 and read only by Rust
-(`shed-core/tests/roost_bootstrap_goldens.rs`):
+(`shed-roost/tests/roost_bootstrap_goldens.rs`):
 
 | file | the builder it pins |
 |---|---|

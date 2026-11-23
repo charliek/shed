@@ -49,15 +49,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use shed_app::slash_menu::{self, SlashAction, SlashDispatch};
-use shed_core::lane::conformance::{drive_source, SourceChecker};
-use shed_core::lane::{
-    AgentSource, LaneCapabilities, LaneCreateRequest, LaneError, LaneModelEffort,
-    LanePromptOutcome, LaneProviderState, LaneSettingChange, LaneSettings, LaneSlashArg,
-    LaneSlashKind, LaneSlashMethod, LaneSlashPicker, LaneSlashRequires, LaneSlashRow,
-    LaneSlashSource, SourceEvent,
-};
-use shed_core::rc::RcActivity;
 use shed_craze::conn::{check_protocol_and_codecs, judge_hub_hello};
 use shed_craze::testing::{HubEnd, ScriptedDial, SCRIPT_WAIT};
 use shed_craze::wire::{
@@ -65,6 +56,15 @@ use shed_craze::wire::{
     HelloResult, HostRow, Incoming, ResetParams, RosterParams, RosterRow, SubscribeResult,
 };
 use shed_craze::{source_capabilities, CrazeSource};
+use shed_lane::lane::conformance::{drive_source, SourceChecker};
+use shed_lane::lane::{
+    AgentSource, LaneCapabilities, LaneCreateRequest, LaneError, LaneModelEffort,
+    LanePromptOutcome, LaneProviderState, LaneSettingChange, LaneSettings, LaneSlashArg,
+    LaneSlashKind, LaneSlashMethod, LaneSlashPicker, LaneSlashRequires, LaneSlashRow,
+    LaneSlashSource, SourceEvent,
+};
+use shed_lane::rc::RcActivity;
+use shed_lane::slash_menu::{self, SlashAction, SlashDispatch};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")

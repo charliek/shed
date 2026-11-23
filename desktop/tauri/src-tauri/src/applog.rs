@@ -1093,17 +1093,14 @@ mod tests {
         let sink = leak(Sink::new(MAX_BYTES, KEEP, 8));
         sink.open(Some(&path)).unwrap();
         tracing::subscriber::with_default(subscriber(sink, false), || {
-            tracing::warn!(target: "shed_app::roost", "a resync after a gap");
-            tracing::debug!(target: "shed_app::roost", "quiet by default");
+            tracing::warn!(target: "shed_roost", "a resync after a gap");
+            tracing::debug!(target: "shed_roost", "quiet by default");
         });
         let got = lines(&path);
         assert_eq!(got.len(), 1, "{got:?}");
         let line = &got[0];
         assert!(line.contains(" WARN "), "{line}");
-        assert!(
-            line.ends_with("shed_app::roost: a resync after a gap"),
-            "{line}"
-        );
+        assert!(line.ends_with("shed_roost: a resync after a gap"), "{line}");
         assert!(line.split(' ').next().unwrap().ends_with('Z'), "{line}");
     }
 
@@ -1147,12 +1144,18 @@ mod tests {
                 tracing::warn!(target: "roost_ipc::ssh", "warn-roost-ipc");
                 tracing::error!(target: "roost_ipc::bootstrap", "error-roost-ipc");
                 tracing::debug!(target: "roost_ipc::client", "debug-roost-ipc");
-                tracing::info!(target: "shed_app::roost", "info-shed-app");
+                tracing::info!(target: "shed_roost", "info-shed-roost");
+                tracing::info!(target: "shed_desktop_core", "info-shed-desktop-core");
                 tracing::warn!(target: "shed_broker", "warn-shed-broker");
                 tracing::info!(target: "tauri::app", "info-tauri");
             });
             let text = std::fs::read_to_string(&path).unwrap();
-            for kept in ["info-shed-app", "warn-shed-broker", "info-tauri"] {
+            for kept in [
+                "info-shed-roost",
+                "info-shed-desktop-core",
+                "warn-shed-broker",
+                "info-tauri",
+            ] {
                 assert!(text.contains(kept), "debug={debug}: {kept} missing: {text}");
             }
             for roost in ["warn-roost-ipc", "error-roost-ipc", "debug-roost-ipc"] {
@@ -1173,7 +1176,8 @@ mod tests {
         let sink = leak(Sink::new(MAX_BYTES, KEEP, 8));
         sink.open(Some(&path)).unwrap();
         tracing::subscriber::with_default(subscriber(sink, true), || {
-            tracing::debug!(target: "shed_app::roost", "debug-shed-app");
+            tracing::debug!(target: "shed_roost", "debug-shed-roost");
+            tracing::debug!(target: "shed_desktop_core", "debug-shed-desktop-core");
             tracing::debug!(target: "shed_craze::watcher", "debug-shed-craze");
             tracing::debug!(target: "roost_ipc::client", "debug-roost-ipc");
             tracing::debug!(target: "hyper_util::client", "debug-hyper");
@@ -1182,7 +1186,8 @@ mod tests {
         });
         let text = std::fs::read_to_string(&path).unwrap();
         for admitted in [
-            "debug-shed-app",
+            "debug-shed-roost",
+            "debug-shed-desktop-core",
             "debug-shed-craze",
             "debug-roost-ipc",
             "info-tauri",

@@ -213,15 +213,13 @@ class _ApprovalOps:
 
 
 class _RcOps:
-    """The Agents op surface — list / launch / kill / inject_test.
+    """The Agents op surface — list and inject_test.
 
-    **All four are roost ops since S6** (charliek/shed#328): a shed's agent
-    sessions are the tabs its own `roost-session` reports, so `rc.list` returns
-    that and only that, a shed is launched with `roost.launch` on
-    `roost:<server>/<shed>` (the 0.9.x alias `rc.launch` was removed in 0.10.0),
-    `rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
-    snapshot. `self.call` comes from the `IPCClient`
-    base each mixes in with.
+    A shed's agent sessions are the tabs its own `roost-session` reports, so
+    `rc.list` returns that and only that, and `rc.inject_test` puts a row into
+    the roost snapshot. Launch, kill and the machines pane are gone: those ops
+    answer `unknown_op`. `self.call` comes from the `IPCClient` base each mixes
+    in with.
 
     The pure pane-classifier op and its `rc_classify` helper went with S2
     (charliek/shed#324): a row's `state` comes off the wire, not from a pane."""
@@ -234,24 +232,18 @@ class _RcOps:
             params["shed"] = shed
         return self.call("rc.list", params)["sessions"]
 
-    def rc_kill(self, shed: str, slug: str, host: str | None = None) -> None:
-        params: dict = {"shed": shed, "slug": slug}
-        if host:
-            params["host"] = host
-        self.call("rc.kill", params)
-
-    def rc_inject_test(self, shed: str, slug: str, *, host: str | None = None,
+    def rc_inject_test(self, target: str, slug: str, *,
                        kind: str = "claude-rc", display_name: str | None = None,
                        workdir: str | None = None, lifecycle: str | None = None,
                        attention: bool | None = None) -> None:
         """Put a row into the shed's ROOST snapshot — test mode only.
 
-        `slug` is the roost tab id, so it must parse as one: the injected row is
-        closeable by the same `rc.kill`/`tab.close` a real one is, and a row with
-        an invented slug would not be. `lifecycle` is roost's own
-        `agent_lifecycle` word (`working`, `waiting`, `finished`, …)."""
-        params: dict = {"shed": shed, "slug": slug, "kind": kind}
-        for k, v in (("host", host), ("display_name", display_name),
+        `target` is the shed target (`roost:<server>/<shed>`). `slug` is the
+        roost tab id, so it must parse as one: a row with an invented slug is
+        refused. `lifecycle` is roost's own `agent_lifecycle` word (`working`,
+        `waiting`, `finished`, …)."""
+        params: dict = {"target": target, "slug": slug, "kind": kind}
+        for k, v in (("display_name", display_name),
                      ("workdir", workdir), ("lifecycle", lifecycle),
                      ("attention", attention)):
             if v is not None:
@@ -304,54 +296,6 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         """Open the New-Shed dialog (raises the window + emits the event)."""
         self.call("ui.show_create")
 
-    def show_launch(self) -> None:
-        """Open the New-session (launch agent) dialog (raises the window + emits the event)."""
-        self.call("ui.show_launch")
-
-    def launch_dump(self) -> dict | None:
-        """The New-session dialog's own rendered truth — `{rendered, values,
-        create_enabled}` — or None while none is mounted.
-
-        `rendered` is its DOM text rather than a list of fields, so it cannot
-        claim a field the dialog does not show — which is what makes the ABSENCE
-        of one assertable (there is no initial-prompt box: a launch carrying a
-        prompt is refused, plan 026 §3.5).
-        `values` is each labelled control's current value keyed by its label
-        (what was typed is not text content), and `create_enabled` is the Create
-        button's own `disabled`, inverted — both read off the same DOM."""
-        return self.call("launch.dump").get("launch")
-
-    def fill_launch(self, **fields: str) -> None:
-        """Type into the open New-session dialog — `mode` (`agent` | `command`),
-        `target` (a `Where` value: `machine:<name>` or `shed:<host>/<name>`),
-        `command`, `workdir`, `name` (the agent mode's Session name); an absent
-        key is left as it is. TEST MODE ONLY.
-
-        An event to a dialog that registers its listener after it mounts, so a
-        fill sent the instant `ui.show_launch` returns can land before anyone is
-        listening: poll `launch_dump()` for the values and re-send (it is
-        idempotent) rather than assuming one send arrived."""
-        self.call("ui.fill_launch", fields)
-
-    def submit_launch(self) -> None:
-        """Press the open New-session dialog's Create button, through the
-        button's own gate (a disabled Create is not pressed). TEST MODE ONLY."""
-        self.call("ui.submit_launch")
-
-    def roost_run(self, target: str, command: str | None,
-                  workdir: str | None = None) -> dict:
-        """Run a command in a tab (plan 025 P5): a roost `tab.open` of
-        `command` split on ASCII whitespace — no shell, no quoting, no kind — on
-        `target` (a machine's bare name, or `roost:<server>/<shed>`). Answers
-        `{origin, machine, slug, cwd, argv}`; `command=None` omits the key (a
-        `bad_request`, as blank is)."""
-        params: dict = {"target": target}
-        if command is not None:
-            params["command"] = command
-        if workdir is not None:
-            params["workdir"] = workdir
-        return self.call("roost.run", params)
-
     def agents_dump(self) -> list[dict]:
         """The sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""
@@ -380,59 +324,10 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         sidebar tooltips and the empty state's copy."""
         return self.call("dashboard.dump")
 
-    def machines_dump(self) -> list[dict] | None:
-        """What the MACHINES PANE rendered: a row per machine (`{name, origin,
-        reachable, status, detail, sessions}`), or None off-pane.
-
-        Distinct from `machines.list` on purpose — that is the backend's view and
-        answers from anywhere; this proves the state reached the window."""
-        return self.call("machines.dump")["machines"]
-
-    # -- machines (plan 013: each machine's roost-session) -----------------
-    def machines_list(self) -> list[dict]:
-        """The BACKEND's view of every watched machine: `{name, origin,
-        reachable, connected_once, sessions, detail}`, in config-then-arrival
-        order. Answers from any pane (unlike `machines_dump`)."""
-        return self.call("machines.list")["machines"]
-
-    def machine_kill(self, machine: str, slug: str) -> None:
-        """Close a session on a machine — a roost `tab.close`; the slug IS the
-        tab id. Addressed by (machine, slug), never by (host, shed, slug)."""
-        self.call("machine.kill", {"machine": machine, "slug": slug})
-
-    def machine_launch(self, machine: str, kind: str = "opencode",
-                       workdir: str | None = None, display_name: str | None = None,
-                       initial_prompt: str | None = None) -> dict:
-        """Open a session ON a machine — a roost `tab.open` of the kind's argv in
-        `workdir`. A non-blank `display_name` becomes the tab's title (the answer's
-        `title` says whether it took); a non-blank `initial_prompt` is refused
-        `bad_request` before any tab opens (plan 026 §3.5)."""
-        params: dict = {"machine": machine, "kind": kind}
-        for k, v in (("workdir", workdir), ("display_name", display_name),
-                     ("initial_prompt", initial_prompt)):
-            if v is not None:
-                params[k] = v
-        return self.call("machine.launch", params)
-
-    def machine_capabilities(self, machine: str) -> dict:
-        """A machine's RC capabilities — the SYNTHESIZED roost contract (no SSH
-        probe), the same set `rc.list` stamps under `machine:<name>`."""
-        return self.call("machine.capabilities", {"machine": machine})["capabilities"]
-
-    def machine_add(self, name: str, host: str | None = None, user: str | None = None,
-                    ssh_port: object | None = None) -> None:
-        """Append a machine to the shed config and start watching it now — the
-        same path the Add dialog drives."""
-        params: dict = {"name": name}
-        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port)):
-            if v is not None:
-                params[k] = v
-        self.call("machine.add", params)
-
     def sidebar_dump(self) -> dict:
-        """The sidebar's status foot as rendered: `{servers, machines}`. Answers
-        from any pane (the sidebar is always mounted), which is why it is where
-        an unreachable server or machine is guaranteed to be visible."""
+        """The sidebar's status foot as rendered: `{servers}`. Answers from any
+        pane (the sidebar is always mounted), which is why an unreachable server
+        is guaranteed to be visible."""
         return self.call("sidebar.dump")
 
     def provider_modes_get(self) -> dict:
@@ -490,7 +385,7 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         return self.call("ui.current_pane").get("pane")
 
     def modal(self) -> str | None:
-        """Which modal (if any) the frontend has open: 'create' | 'launch' | None.
+        """Which modal (if any) the frontend has open: 'create' | 'craze' | None.
         (Preferences is a dedicated window, not a modal — see prefs_dump.)"""
         return self.call("ui.modal").get("modal")
 

@@ -176,11 +176,12 @@ def test_updater_status_and_check_disabled(tauri):
 
 def test_navigate_rejects_unknown_pane(tauri):
     # An unknown pane is a bad_request, not blindly emitted — a bogus pane would
-    # otherwise blank the UI (PANES[pane] undefined).
+    # otherwise blank the UI (PANES[pane] undefined). `machines` is not a pane.
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    with pytest.raises(ShedError) as e:
-        tauri.navigate("bogus")
-    assert e.value.code == "bad_request"
+    for pane in ("bogus", "machines"):
+        with pytest.raises(ShedError) as e:
+            tauri.navigate(pane)
+        assert e.value.code == "bad_request"
 
 
 def test_navigate_reports_rendered_pane(tauri):
@@ -244,8 +245,8 @@ def test_set_appearance_drives_dark_and_light(tauri):
 def test_sidebar_badges_match_fixture(tauri):
     # The sidebar nav badge counts are UI truth, reported over IPC (ui.badges), so
     # they're asserted as logical content, not pixels. The default fixture has 2
-    # sheds on 1 configured host, no RC sessions, no pending approvals. `hosts`
-    # counts CONFIGURED hosts (from system_df, an async fetch), so wait on the full
+    # sheds on 1 configured server, no RC sessions, no pending approvals. `hosts`
+    # counts CONFIGURED servers (from system_df, an async fetch), so wait on the full
     # snapshot rather than `sheds` alone — the host count lands independently.
     want = {"sheds": 2, "agents": 0, "hosts": 1, "pending": 0}
     tauri.wait_until(lambda: (tauri.badges() or {}) == want,
@@ -737,50 +738,6 @@ def test_egress_pane_renders(tauri):
                      timeout=15, what="profiles sub-tab shown")
     png, w, h = tauri.screenshot(scale=1)
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
-
-
-def test_launch_dialog_opens(tauri):
-    # The New-session (launch agent) dialog opens (ui.show_launch → the frontend
-    # reports modal=="launch") and paints on the real WebView. The launch LOGIC is
-    # covered by the shared test_agents suite — the same roost launch path the
-    # dialog's rcLaunch command drives. Mirrors test_new_shed_dialog_opens.
-    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    tauri.show_launch()
-    tauri.wait_until(lambda: tauri.modal() == "launch", timeout=15, what="launch dialog open")
-    if platform.system() == "Darwin":
-        return
-    tauri.show_window()
-    png, w, h = tauri.screenshot(scale=1)
-    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
-
-
-def test_the_launch_dialog_does_not_ask_for_a_prompt_it_cannot_deliver(tauri):
-    """**The dialog offers no initial-prompt field** (`charliek/shed#366`).
-
-    It used to, for a SHED target, back when a shed launch went to the in-guest
-    hub — which typed the kickoff into the tmux pane it had just created. S6
-    retired the hub and re-pointed that door at `roost.launch`, whose `tab.open`
-    is an argv and a working directory and nothing else: the box stayed on
-    screen with nothing at the far end, and what a user typed into it went
-    nowhere, silently. A launch that carries a first prompt is now refused
-    (`bad_request`, plan 026 §3.5) rather than dropped, so the honest UI does
-    not ask.
-
-    Asserted against the dialog's own rendered text, so it is about what was
-    painted rather than about what the source says. The three fields it DOES
-    offer are the control — a dump of a dialog that never mounted would pass a
-    bare `not in` check.
-    """
-    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    tauri.show_launch()
-    tauri.wait_until(lambda: tauri.modal() == "launch", timeout=15, what="launch dialog open")
-    tauri.wait_until(lambda: tauri.launch_dump(), timeout=15,
-                     what="the launch dialog to report its rendered copy")
-    rendered = tauri.launch_dump()["rendered"]
-    for offered in ("Where", "Session name", "Working directory", "Kind"):
-        assert offered in rendered, (offered, rendered)
-    for withheld in ("Initial prompt", "Initial command", "Typed into the agent"):
-        assert withheld not in rendered, (withheld, rendered)
 
 
 def test_hosts_auth_reports_the_config_mode_unlearned(tauri):

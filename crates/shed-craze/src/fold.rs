@@ -115,18 +115,18 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use shed_core::lane::feed::{
+use shed_lane::lane::feed::{
     sanitize_feed_text, truncate_bytes, APPROVAL_DECISION_ALLOW, APPROVAL_DECISION_ALLOW_ALWAYS,
     APPROVAL_DECISION_DENY, APPROVAL_STATUS_PENDING, APPROVAL_STATUS_RESOLVED, FEED_ROLE_ASSISTANT,
     FEED_ROLE_SYSTEM, FEED_ROLE_TOOL, FEED_ROLE_USER, FEED_TYPE_APPROVAL_REQUEST,
     FEED_TYPE_REASONING, FEED_TYPE_STATUS, FEED_TYPE_TEXT, FEED_TYPE_TOOL_RESULT,
     FEED_TYPE_TOOL_USE,
 };
-use shed_core::lane::{
+use shed_lane::lane::{
     option_kind, LaneApproval, LaneApprovalKind, LaneApprovalOption, LaneApprovalStatus,
     LaneQuestion, LaneSlashCatalog,
 };
-use shed_core::rc::{RcActivity, RcFeedApproval, RcFeedMessage, RcFeedTool};
+use shed_lane::rc::{RcActivity, RcFeedApproval, RcFeedMessage, RcFeedTool};
 
 use crate::segment::{split_rows, Segmenter};
 use crate::settings::{SettingsSections, SettingsState};
@@ -1614,7 +1614,7 @@ fn approval_of(
         options,
         questions,
         request_json: serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string()),
-        created_at_unix_ms: at.and_then(shed_core::time::rfc3339_unix_ms),
+        created_at_unix_ms: at.and_then(shed_lane::time::rfc3339_unix_ms),
     }
 }
 

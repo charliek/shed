@@ -3,7 +3,7 @@
 shed-desktop is a desktop app that ties the **shed** toolchain into one resident control
 surface: it lists and controls sheds (VMs) across hosts, shows the agent sessions running in
 them as [roost](../extensions/roost-session-hosts.md) rows with live
-[craze and opencode lanes](agent-lanes.md), and brokers the credential-approval gate. By
+[craze lanes](agent-lanes.md), and brokers the credential-approval gate. By
 its **credential broker** runs the credential brokering (SSH, AWS, Docker) in the app's own
 process — see [The credential broker](#the-credential-broker). The app is the only credential
 broker; there is no separate daemon.
@@ -13,8 +13,9 @@ roost or craze.
 The app is a **Tauri** client on both macOS and Linux, built from `desktop/tauri/src-tauri`
 (bin `shed-desktop-tauri`). All protocol and app logic lives in the shared **Rust core**:
 `shed-core` (the shed-server protocol layer — HTTP/SSE, decoding, control-token auth, TLS
-pinning) and **`shed-app`**, the UI-free app-logic layer, with `shed-craze` and
-`shed-opencode` as the agent-lane adapters — see [Rust core](rust-core.md). On Linux it ships
+pinning), **`shed-app`** (the UI-free shed client), **`shed-desktop-core`** (the shed-only
+hosts, craze and lane runtime), `shed-lane`, `shed-roost` and `shed-craze` — see
+[Rust core](rust-core.md). On Linux it ships
 as the `shed-desktop` nfpm `.deb` (`/usr/bin/shed-desktop`, with a headless `shedctl` and the
 polkit action alongside) via `charliek/apt-charliek` (`apt install shed-desktop`); on macOS as
 the notarized DMG with Sparkle updates. A first-class design goal is that the app is
@@ -24,7 +25,7 @@ the notarized DMG with Sparkle updates. A first-class design goal is that the ap
 
 shed-desktop sits between two other systems: the **shed servers** (one per host, over
 HTTP, and over the plugin bus for credential requests) and the **shed CLI's config file**
-(read; the app only ever appends a `machines:` entry). Its credential broker runs inside the
+(read-only: `servers:` and `default_server`). Its credential broker runs inside the
 app. It also serves its own control socket that
 `shedctl` and the test harness drive, and checks GitHub Pages for Sparkle updates.
 
@@ -59,14 +60,15 @@ flow](#the-credential-broker)).
 
 | Part | Where | Role |
 |---|---|---|
-| Rust shell | `desktop/tauri/src-tauri/src/` | The Tauri app: `lib.rs` (setup, the Tauri commands the UI invokes), `ipc.rs` (the control socket and its op dispatch), `approval.rs` (the native Touch ID / polkit gate and notifier), `broker.rs` (the embedded credential broker's host), `tray.rs` (tray menu + macOS popover), `updater.rs` (Sparkle, macOS), `roost_hosts.rs` / `machines.rs` / `lane.rs` / `craze.rs` (agent sessions and lanes), `termctl.rs` (terminal launch), `prefs.rs` (persisted preferences), `screenshot.rs`, `single_instance.rs`, `shutdown.rs`, `applog.rs` |
+| Rust shell | `desktop/tauri/src-tauri/src/` | The Tauri app: `lib.rs` (setup, the Tauri commands the UI invokes), `ipc.rs` (the control socket and its op dispatch), `approval.rs` (the native Touch ID / polkit gate and notifier), `broker.rs` (the embedded credential broker's host), `tray.rs` (tray menu + macOS popover), `updater.rs` (Sparkle, macOS), thin adapters over `shed-desktop-core` (`ShedHosts`, `ShedCraze`, `ShedLanes`), `termctl.rs` (terminal launch), `prefs.rs` (persisted preferences), `screenshot.rs`, `single_instance.rs`, `shutdown.rs`, `applog.rs` |
 | Web UI | `desktop/tauri/ui/` | React + Vite + TypeScript: the dashboard (`App.tsx`), the Preferences window, the macOS tray popover, and the agent-lane panels. It reports what it rendered back to the shell, which is what the IPC `*.dump` ops answer from |
-| Shared core | `crates/` | `shed-core` (protocol, config, approval policy model), `shed-app` (`Backend`, the approval `Coordinator`, `AuditStore`, roost hosts), `shed-broker` (the credential broker), `shed-craze` / `shed-opencode` (lane adapters) — see [Rust core](rust-core.md) |
+| Shared core | `crates/` | `shed-lane` (lane contract, RC DTOs, slash menu), `shed-core` (protocol, config, approval policy model), `shed-roost` (roost client; the only `roost-ipc` crate), `shed-app` (`Backend`, the approval `Coordinator`, `AuditStore`), `shed-desktop-core` (shed-only hosts, craze and lanes), `shed-broker` (the credential broker), `shed-craze` (the lane adapter) — see [Rust core](rust-core.md) |
 | `shedctl` | `crates/shedctl/` | A headless CLI for the control socket — see [shedctl](cli.md) |
 | Bundled openers | `desktop/Resources/bin/` | `shed-open-ghostty` and `shed-open-roost.py`, the terminal presets' launch scripts, shipped as app resources |
 
 The Tauri crate is its own cargo workspace (so its WebKitGTK/Tauri dependencies stay out of
-`crates/`) and takes `shed-core` + `shed-app` as path dependencies.
+`crates/`) and takes `shed-core`, `shed-app`, `shed-desktop-core`, `shed-lane`, `shed-roost`
+and `shed-craze` as path dependencies. It does not depend on `roost-ipc` directly.
 
 ## How the pieces connect
 
@@ -203,11 +205,11 @@ broker's waiting subscriptions so it connects at once. The same calls are the IP
 shed-desktop reads the **same config the `shed` CLI manages** — `~/.shed/config.yaml`
 — to discover hosts. It parses it with `shed-core`'s tiny indentation reader (`ShedConfig`,
 no YAML dependency), reading `servers:` (name → `host`, `http_port`, `ssh_port`, and the
-secure-server fields) and `default_server`, plus the `machines:` section. The app never
-writes `servers:`; its one write is the Machines pane's **Add machine**, which appends a
-`machines:` entry after backing the file up. To add or remove hosts, use the `shed` CLI; the app reflects the
-change on its next poll (the Preferences → Hosts section is a read-only mirror). A missing
-config degrades to an empty host list, never a crash.
+secure-server fields) and `default_server`. It does not read or write a `machines:` block.
+The CLI keeps any `machines:` block it finds and preserves it as an opaque YAML subtree on save (formatting and indentation may be normalized on re-encode). To add or remove
+hosts, use the `shed` CLI; the app reflects the change on its next poll (the Preferences →
+Hosts section is a read-only mirror). A missing config degrades to an empty host list, never
+a crash.
 
 ### The control socket (shedctl + the harness)
 
@@ -244,8 +246,7 @@ run had not reached by then are left to their own protocols (an ssh master's
 `ControlPersist`, a bridge's stdin closing).
 
 - **Nothing new starts once it begins.** The app holds one spawn gate, closed first. Every
-  place the app starts a child — a craze bridge (local or over ssh), an ssh exec, an opencode
-  `ssh -N -L` forward, a roost tunnel — takes a section of that gate across the spawn and the
+  place the app starts a child — a craze bridge over ssh, an ssh exec, a roost tunnel — takes a section of that gate across the spawn and the
   child's registration, so a spawn either finished before the close (and the shutdown ends
   it) or is refused with `shutting_down`; a spawn already under way when the close began
   that lands after it kills its own child at registration. The UI's own calls (a refresh,
@@ -253,9 +254,8 @@ run had not reached by then are left to their own protocols (an ssh master's
 - **Then it ends what it owns, in a fixed order, each step bounded:** the app's own roost
   watchers, probes and in-flight one-shots (a launch, a bootstrap, a tab close) are joined,
   and cancelled past a short bound (they are the only clients of a roost tunnel, so no
-  connection can arrive while the tunnels close); the agent lanes and their forwards are
-  closed (on a thread of their own, the forward children killed and reaped); the craze
-  sources stop and every registered bridge child is killed and its exit seen, even one a
+  connection can arrive while the tunnels close); the craze lanes are
+  closed; the craze sources stop and every registered bridge child is killed and its exit seen, even one a
   transcript request is still holding; each roost tunnel runs its own teardown; and each ssh
   connection master is asked to exit — and, if it does not, is ended by its pid after
   checking that pid is the master on this app's control socket.

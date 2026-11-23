@@ -1,8 +1,8 @@
 //! `shed-craze-lane` — a tiny CLI over the agent-lane contract for driving
 //! THIS machine's craze hub by hand (or a phone-style loopback port), and the
 //! smallest proof the contract is usable from outside this crate: past
-//! building the source it calls nothing but [`shed_core::lane::AgentSource`]
-//! and the [`shed_core::lane::AgentLane`] it opens.
+//! building the source it calls nothing but [`shed_lane::lane::AgentSource`]
+//! and the [`shed_lane::lane::AgentLane`] it opens.
 //!
 //! ```text
 //! shed-craze-lane [--port N] <verb> [args]
@@ -38,12 +38,12 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use shed_core::lane::{
-    AgentLane, AgentSource, LaneAnswer, LaneCreateRequest, LaneDecision, LaneEvent, SendMode,
-    SourceEvent,
-};
 use shed_craze::{
     new_request_id, probe_process, CrazeDial, CrazeSource, EnvPolicy, Probe, ProcessDial, TcpDial,
+};
+use shed_lane::lane::{
+    AgentLane, AgentSource, LaneAnswer, LaneCreateRequest, LaneDecision, LaneEvent, SendMode,
+    SourceEvent,
 };
 
 const USAGE: &str = "\
@@ -218,7 +218,7 @@ async fn run() -> Result<(), String> {
             if port.is_some() {
                 return Err("probe runs locally; it has no --port form".to_string());
             }
-            match probe_process(shed_core::craze::providers_hub_argv(), EnvPolicy::Inherit).await {
+            match probe_process(shed_lane::craze::providers_hub_argv(), EnvPolicy::Inherit).await {
                 Probe::Hub => println!("a hub is running"),
                 Probe::NoHub => println!("craze is installed; no hub is running"),
                 Probe::Offline { cause, reason } => {
@@ -256,7 +256,7 @@ async fn run() -> Result<(), String> {
 
 /// One session verb, on the lane — nothing here but the contract.
 async fn lane_verb(lane: &dyn AgentLane, verb: &str, rest: &[String]) -> Result<(), String> {
-    let e = |e: shed_core::lane::LaneError| e.to_string();
+    let e = |e: shed_lane::lane::LaneError| e.to_string();
     match verb {
         "history" => {
             let page = lane.history(None, 200).await.map_err(e)?;
@@ -380,7 +380,7 @@ async fn lane_verb(lane: &dyn AgentLane, verb: &str, rest: &[String]) -> Result<
     Ok(())
 }
 
-fn print_row(m: &shed_core::rc::RcFeedMessage) {
+fn print_row(m: &shed_lane::rc::RcFeedMessage) {
     let what = match &m.tool {
         Some(t) => format!(
             "{} {}",

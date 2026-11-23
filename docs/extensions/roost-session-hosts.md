@@ -1,18 +1,20 @@
 # Putting `roost-session` on a shed or machine
 
-S5 of the Roost Pivot (`epics/roost-pivot.md`) lets the shed desktop and mobile apps install
-and start a [roost](https://github.com/charliek/roost) `roost-session` daemon on a shed or a
-`machines:` entry that doesn't already have one — over the target's own SSH, with the same
-choreography roost's own UI uses. This turns a shed's `codex` and `cursor` rows from
-**liveness only** into roost-sourced activity, matching what a `machines:` entry already gets —
-demonstrated live, not only in the hermetic tests that cover the mechanism this page describes:
-a real shed's `codex` row carries roost-sourced `activity` with `source: "roost"`
-(`epics/roost-pivot.md`'s S5 row).
+S5 of the Roost Pivot (`epics/roost-pivot.md`) lets a shed client install
+and start a [roost](https://github.com/charliek/roost) `roost-session` daemon on a host
+that doesn't already have one — over the target's own SSH, with the same
+choreography roost's own UI uses. The **desktop app installs on a shed only**.
+The mobile app still installs on a shed or a `machines:` entry. This turns a
+shed's `codex` and `cursor` rows from **liveness only** into roost-sourced
+activity — demonstrated live, not only in the hermetic tests that cover the
+mechanism this page describes: a real shed's `codex` row carries roost-sourced
+`activity` with `source: "roost"` (`epics/roost-pivot.md`'s S5 row). An
+interactive session on a host that is not a shed belongs in the `roost` app.
 
 This page describes the mechanism the clients drive: where the bytes come from, what consent
 promises, what the rollback guarantee actually covers, and the edges (`shed reset`, two
 clients, buildbox-style read-only hosts). The button, the dialog, and the toast are the desktop
-UI's concern (Tauri `roost.probe`/`roost.preview`/`roost.bootstrap`/`roost.launch` — see
+UI's concern (Tauri `roost.probe`/`roost.preview`/`roost.bootstrap` — see
 [Desktop IPC](../desktop/ipc.md)); this page is about what happens once you click it.
 
 ## The source ladder
@@ -255,8 +257,8 @@ you to upgrade whichever side is older.
 
 ## See also
 
-- [Desktop IPC](../desktop/ipc.md) — the `roost.probe`/`roost.preview`/`roost.bootstrap`/
-  `roost.launch` ops the desktop app calls to drive this.
+- [Desktop IPC](../desktop/ipc.md) — the `roost.probe`/`roost.preview`/`roost.bootstrap`
+  ops the desktop app calls to drive this. `roost.launch` is not an op.
 - [The `shed` roost provider](roost-provider.md) — S4, the palette entry that opens a tab once
   a session exists.
 - `epics/roost-pivot.md` — the Roost Pivot's tracking table (not a published doc page).

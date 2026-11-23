@@ -128,6 +128,8 @@ jobs:
               - 'crates/shed-app/**'
               - 'crates/shed-broker-harness/**'
               - 'crates/shed-core/**'
+              # shed-broker depends on shed-core, which depends on shed-lane.
+              - 'crates/shed-lane/**'
               - 'crates/rust-toolchain.toml'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
@@ -143,8 +145,10 @@ jobs:
               # composers whose output the corpus pins (`display_line`, and the
               # craze remote command that ships through it).
               - 'tests/machine-transport/**'
-              - 'crates/shed-core/src/machine.rs'
-              - 'crates/shed-core/src/craze.rs'
+              - 'crates/shed-lane/src/shell_quote.rs'
+              - 'crates/shed-lane/src/craze.rs'
+              - 'crates/shed-lane/tests/machine_transport_contract.rs'
+              - 'crates/shed-lane/tests/craze_ladder.rs'
             integrationunits:
               # The integration suite's server-free unit tests (shed#398),
               # which also pin the parallel dev configs, their renderer, the
@@ -254,7 +258,7 @@ jobs:
 
   # The two offline, fail-fast-on-drift pins (`make check-roost-pin
   # check-craze-pin`) ran in NO CI job before plan 025 — the paths they read
-  # (crates/shed-core/src/roost/bootstrap/source.rs, craze-pin.env, both
+  # (crates/shed-roost/src/bootstrap/source.rs, craze-pin.env, both
   # Dockerfiles) live partly under crates/, which the `go` filter excludes,
   # so this job runs on `go || rust || ci` rather than riding along with
   # `test`/`lint`. No Rust/Go toolchain needed — just the checkout and the
@@ -532,24 +536,23 @@ jobs:
             exit 1
           fi
           sudo timeout 300 apt-get install -y build-essential
-      - name: shed-core + shed-opencode — test + clippy (Linux)
+      - name: shared crates — test + clippy (Linux)
         # Scoped to -p. --all-targets runs the pinned-TLS verifier + redirect/non-https
         # fail-closed tests here; the e2e's plain-HTTP mock never exercises the
         # pin/token paths, so they stay cargo-only on Linux.
         #
-        # shed-opencode (plan 015) rides along rather than getting a job of its
-        # own: it is a pure client of shed-core's lane contract with the same
-        # dependency surface, its suite is hermetic (the loopback `FakeOpencode`
-        # behind the `test-support` feature — the env-gated live smoke skips
-        # without `SHED_OPENCODE_LIVE`), and it is a crate the Tauri app links,
-        # so a break here must not first surface as a desktop build failure.
-        # (shed-gx, plan 017's second adapter, rode along the same way until
-        # plan 025 C1 — shed#390 — retired the gx lane.) Named EXPLICITLY, like
-        # the engine leg below: a filter that matched nothing would run zero
-        # tests silently.
+        # Plan 038 split the old shed-core into shed-lane (pure lane/RC leaf),
+        # shed-roost (sole roost-ipc crate), shed-desktop-core (toolkit-free
+        # shed-only runtime) and a slim shed-core / shed-app. Named EXPLICITLY,
+        # like the shed-craze leg below: a filter that matched nothing would run
+        # zero tests silently. `test-support` is only on the crates that export
+        # it (lane conformance, FakeRoost). shed-opencode was retired in plan 038.
+        # shed-craze's recipe (real hub, SHED_CRAZE_REQUIRE) is the next step.
         run: |
-          cargo test -p shed-core -p shed-opencode --all-targets --locked
-          cargo clippy -p shed-core -p shed-opencode --all-targets --locked -- -D warnings
+          cargo test -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked
+          cargo test -p shed-lane -p shed-roost --all-targets --features test-support --locked
+          cargo clippy -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked -- -D warnings
+          cargo clippy -p shed-lane -p shed-roost --all-targets --features test-support --locked -- -D warnings
       # shed-craze (plan 025 C7) runs its recipe cells against the REAL craze
       # hub, craze-fake-host and craze-fake-agent, built here at the pinned
       # CRAZE_TEST_SHA (craze-pin.env) by the shared composite action — which
@@ -631,7 +634,7 @@ jobs:
   # proven on a real sshd. `MT_REQUIRE_SSHD=1` turns the suite's no-sshd SKIP
   # into a FAILURE, so a runner that lost openssh-server fails this job rather
   # than passing it vacuously. The Rust leg (and the craze ladder's behaviour
-  # tests) ride along because core-linux's `rust` filter does not see
+  # tests) ride along because the `rust` filter does not see
   # `tests/machine-transport/**`: without them a scenarios-only edit would
   # never meet the composer equality it is pinned by.
   machine-transport:
@@ -666,7 +669,7 @@ jobs:
           rustc --version && cargo --version
       - name: Rust leg + the craze ladder's behaviour tests
         working-directory: crates
-        run: cargo test -p shed-core --test machine_transport_contract --test craze_ladder --locked
+        run: cargo test -p shed-lane --test machine_transport_contract --test craze_ladder --locked
       - uses: astral-sh/setup-uv@v6
       - name: Live leg + forwarded-hub family (a missing sshd FAILS, never skips)
         run: MT_REQUIRE_SSHD=1 make test-machine-transport

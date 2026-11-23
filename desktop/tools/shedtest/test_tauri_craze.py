@@ -9,45 +9,33 @@ and `craze-0.0.1` (the real v0.0.1, for the too-old cell). They come from
 `SHED_CRAZE_REQUIRE=1` (CI) it FAILS instead, so a run can never go green on
 skipped craze cells.
 
-Five independent app instances (`test_tauri_lane.py`'s fixture shape — each
-its own throwaway HOME/XDG_RUNTIME_DIR, so its own socket and single-instance
-lock, the session app untouched):
+Four independent app instances (each its own throwaway HOME/XDG_RUNTIME_DIR,
+so its own socket and single-instance lock, the session app untouched). None
+of them dials a local craze: every hub is a listed shed reached over a fake
+`ssh` that runs the remote command in that shed's jail and records it.
 
-* `app` — THIS machine's craze, through the test-mode `SHED_TAURI_CRAZE_PATH`
-  seam: a directory holding a RECORDING `craze` wrapper (it notes the `PATH`
-  and argv it was run with, then execs a private copy of the real binary), so
-  the jailed ladder is observable. `localhost`'s roost is a `FakeRoost` (for
-  the row merge, and Open in terminal's `tab.open`). The hub this app's eager
-  source births is under the app's own HOME / `CRAZE_HOME` / a short `/tmp`
-  `CRAZE_RUNTIME_DIR`. Two switches in the rig's root steer the wrapper for
-  the create sheet's cells (C10): `outage` makes every craze run fail at once
-  (exit 1, before any hub — an unreachable machine), and `proxy` runs each NEW
-  `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s
-  requestId to `creates.log` and — while `drop-creates` exists — cuts the
-  connection once the hub has the create, so its answer is lost. It records
-  the replies that come back too — every create's (`create-replies.log`) and
-  every `session.attach`'s (`attaches.log`) — which is where a first-frame
-  claim is asserted (P26): on what the app was told, not on a poll. The settings
-  cells (C11) use the same proxy for `session.set`: every one is logged to
-  `sets.log` (its params, so `forModel` and the commandId are on record), and
-  while `drop-sets` exists the connection that carried it is cut the same way.
-* `app_absent` — an EMPTY seam directory (craze not installed) and a
-  host-installed-craze SENTINEL at `$HOME/.nix-profile/bin/craze` (an absolute
-  rung the production ladder would reach and the jailed one never may).
-* `app_remote` — no local craze; three remote machines reached through a fake
-  `ssh` that runs each remote command in a per-machine jail and RECORDS every
-  command — and refuses (and records) any command naming an absolute ladder
-  rung, so the jailed composition is asserted without ever running one.
-* `app_shed` (plan 026 §3.2) — no local craze and no machines: one server,
-  served by a PRIVATE mock that lists four sheds running, each reached
-  through the same fake `ssh` in a jail of its own (a shed's ssh user is its
-  name) and none running a roost-session — the running sheds a dormant craze
-  is offered on without listing them.
-* `app_no_start` (plan 032 §3.5, W5) — no local craze; two remote machines
-  through the same fake `ssh`, each with a hub running before launch and a
-  switch set before the app's first dial: one whose roster dial is held so
-  its hub can end between the probe and the `--no-start` bridge, and one
-  emulating a craze older than 0.2.0 (`--no-start` refused).
+* `app` — two sheds, `czdesk` and `czother`, each with a RECORDING `craze`
+  wrapper (it notes the `PATH` and argv it was run with, then execs a private
+  copy of the real binary) and a hub the harness started BEFORE the app, so
+  the app attaches with `bridge --hub --no-start`. `czdesk`'s roost is a
+  `FakeRoost` pumped over that shed's `client-bridge`. Switches in the jail
+  steer the wrapper: `outage` fails every craze run, and `proxy` runs each NEW
+  `bridge --hub` — with or without `--no-start` — through `bridge_proxy.py`,
+  which logs every `session.create` to `creates.log` and, while `drop-creates`
+  exists, cuts the connection once the hub has the create. It records the
+  replies too (`create-replies.log`, `attaches.log`): a first-frame claim is
+  asserted on what the app was told. The settings cells use the same proxy for
+  `session.set` (`sets.log`, and `drop-sets` cuts that connection).
+* `app_shed` — one server and six sheds (dormant, too-old, probe-only,
+  stopped-then-started, absent, and the desk's sibling is not here). The
+  absent shed's jail holds a sentinel at an absolute ladder rung the jailed
+  dial must never run.
+* `app_no_start` — two sheds, each with a hub up before launch and a switch
+  set before the first dial: one whose roster dial is held so its hub can end
+  between the probe and the `--no-start` bridge, and one emulating a craze
+  older than 0.2.0 (`--no-start` refused, so the dial falls back to a plain
+  `bridge --hub`).
+* the shutdown cells launch their own shed-only app per signal.
 
 **Every craze process is torn down** at module end by its program path (each
 rig's private copies, never this host's own craze), checked just before each
@@ -59,6 +47,7 @@ touched — no rig's `PATH`, `HOME` or `CRAZE_HOME` reaches them.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -74,8 +63,7 @@ import pytest
 
 import ui
 from client import ShedError, TauriClient, scaled_timeout
-from fake_opencode import FakeOpencode
-from fake_roost import FakeRoost
+from fake_roost import SESSION_PROTOCOL, FakeRoost
 from mockserver import MockShedServer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -84,7 +72,14 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 #: every cell asserts the PNG it captured either way.
 SHOTS = os.environ.get("SHED_CRAZE_SHOTS")
 
-LOCAL = "localhost"
+SERVER = "mock"
+DESK = "czdesk"
+OTHER = "czother"
+TARGET = f"roost:{SERVER}/{DESK}"
+OTHER_TARGET = f"roost:{SERVER}/{OTHER}"
+#: A second session id registered on BOTH sheds, so an unsolicited lane-event
+#: can be shown to route by `(target, session_id)` and not by id alone.
+TWIN = "0a0a0a0a0a0a"
 KIND = "craze"
 #: The fake host's registry identity (twelve hex digits, as craze mints them).
 FAKE_HOST = "0c0c0c0c0c0c"
@@ -431,9 +426,15 @@ class CrazeEnv:
                 f"if [ -e '{self.root / 'outage'}' ]; then\n"
                 "  printf '%s\\n' 'craze: a simulated outage (shedtest)' >&2; exit 1\n"
                 "fi\n"
-                f"if [ \"$*\" = 'bridge --hub' ] && [ -e '{self.root / 'proxy'}' ]; then\n"
-                f"  exec '{sys.executable}' '{self.root / 'bridge_proxy.py'}' '{self.real / 'craze'}' \"$@\"\n"
-                "fi\n"
+                # The roster and a lane dial `bridge --hub --no-start`; an explicit
+                # create dials plain `bridge --hub`. Both must be recordable.
+                f"case \"$*\" in\n"
+                f"  'bridge --hub'|'bridge --hub --no-start')\n"
+                f"    if [ -e '{self.root / 'proxy'}' ]; then\n"
+                f"      exec '{sys.executable}' '{self.root / 'bridge_proxy.py'}' '{self.real / 'craze'}' \"$@\"\n"
+                f"    fi\n"
+                f"    ;;\n"
+                f"esac\n"
                 f"exec '{self.real / 'craze'}' \"$@\"\n"))
         elif kind == "old":
             os.symlink(self.real / "craze-0.0.1", self.path_dir / "craze")
@@ -642,11 +643,12 @@ class Bridge:
             self.proc.wait()
 
 
-def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost | None,
-            ssh_bin: Path | None = None, config: Path = FIXTURES / "config-craze.yaml"):
-    """An independent app instance (`test_tauri_lane.py`'s shape): its own
-    HOME/XDG_RUNTIME_DIR, its own broker (which serves no server), the session
-    app untouched."""
+def _launch(mock, *, runtime_dir: Path, ssh_bin: Path | None = None,
+            config: Path = FIXTURES / "config-craze-shed.yaml"):
+    """An independent app instance: its own HOME/XDG_RUNTIME_DIR, its own
+    broker (which serves no server), the session app untouched. Sheds are
+    reached over `ssh_bin`; there is no local craze seam and no roost-socket
+    map (a non-empty map would stop every shed from spawning ssh)."""
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
@@ -656,12 +658,7 @@ def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost
         log = runtime_dir / "craze-ui.log"
         env = ui.subproc_env(
             cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-            config_path=config,
-            roost_sockets={LOCAL: roost.socket_path} if roost else None,
-            ssh_bin=ssh_bin,
-            craze_path=craze.path_dir if craze else None,
-            craze_home=craze.craze_home if craze else None,
-            craze_runtime_dir=craze.runtime if craze else None)
+            config_path=config, ssh_bin=ssh_bin)
         log_fh = open(log, "wb")
         proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
         ui.await_hermetic("tauri", sock=sock, mock_base_url=mock.base_url, proc=proc, log=log)
@@ -701,43 +698,160 @@ def _stop(client, proc, log_fh) -> None:
         f"the app needed the harness's SIGKILL after {took:.2f}s: its orderly shutdown hung"
 
 
-@pytest.fixture(scope="module")
-def rig(bins):
-    """THIS machine's craze namespace — the recording seam over the real binary."""
-    root = Path(tempfile.mkdtemp(prefix="shcz-", dir="/tmp")).resolve()
-    env = CrazeEnv(bins, root, root / "h")
+def _running_shed(name: str) -> dict:
+    return {"name": name, "status": "running", "backend": "vz",
+            "created_at": "2026-10-09T12:00:00Z", "started_at": "2026-10-09T12:00:01Z"}
+
+
+_ROOST_IDENTITY = json.dumps({
+    "app_version": "0.0.21",
+    "session_protocol": SESSION_PROTOCOL,
+    "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
+})
+
+
+def _roost_stub() -> str:
+    """The shed's `roost-session`: identify prints a current session, and
+    `client-bridge` pumps to `SHED_FAKE_ROOST_SOCKET` once a session is up."""
+    return f"""#!/bin/sh
+printf '%s\\n' "$1" >> "${{HOME}}/.calls"
+case "$1" in
+  identify)
+    printf '%s\\n' '{_ROOST_IDENTITY}'
+    ;;
+  start)
+    : > "${{HOME}}/.session-running"
+    printf 'ready pid=%s\\n' "$$"
+    ;;
+  client-bridge)
+    if [ ! -f "${{HOME}}/.session-running" ]; then
+      printf '%s\\n' 'client-bridge: no session is listening' >&2
+      exit 1
+    fi
+    exec python3 -c '
+import os, socket, sys, threading
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+def up():
     try:
-        yield env
-    finally:
-        left = env.teardown()
-        shutil.rmtree(root, ignore_errors=True)
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            s.sendall(chunk)
+    except Exception:
+        pass
+    try:
+        s.shutdown(socket.SHUT_WR)
+    except Exception:
+        pass
+threading.Thread(target=up, daemon=True).start()
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        os.write(1, chunk)
+except Exception:
+    pass
+' "${{SHED_FAKE_ROOST_SOCKET}}"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"""
+
+
+def _arm_roost(env: CrazeEnv, fake: FakeRoost) -> None:
+    """Point `env`'s shed at `fake`: the socket path the fake ssh reads, the
+    session marker, and the stub `client-bridge` pumps through."""
+    (env.root / "socket").write_text(str(fake.socket_path))
+    (env.home / ".session-running").touch()
+    _write_exec(env.home / ".local" / "bin" / "roost-session", _roost_stub())
+
+
+class Desk:
+    """The main world: two listed sheds, each with a hub the harness started
+    before the app, and `czdesk`'s roost a `FakeRoost` over its fake ssh.
+
+    Setup is one `ExitStack`: a failure after the roost or a hub is up still
+    closes that socket and those processes."""
+
+    def __init__(self, bins: Path):
+        self._stack = contextlib.ExitStack()
+        try:
+            self.remote = Remote(bins, jails=((DESK, "recipe"), (OTHER, "recipe")), prefix="shcd-")
+            self._stack.callback(self._stop_remote)
+            self.env = self.remote.jails[DESK]
+            self.other = self.remote.jails[OTHER]
+            self.roost = FakeRoost().start()
+            self._stack.callback(self.roost.shutdown)
+            _arm_roost(self.env, self.roost)
+            # An absolute ladder rung under the desk shed's HOME. The jailed dial
+            # must never run it.
+            self.sentinel_log = self.remote.root / "sentinel.log"
+            _write_exec(self.env.home / ".nix-profile" / "bin" / "craze",
+                        f"#!/bin/sh\necho ran >> '{self.sentinel_log}'\nexit 2\n")
+            self.host = self.env.fake_host(FAKE_HOST, FAKE_SESSION)
+            self.holder = self.env.bridge()
+            assert self.holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+            self.other_host = self.other.fake_host(TWIN, "craze-twin")
+            self.other_holder = self.other.bridge()
+            assert self.other_holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+            self.mock = MockShedServer()
+            self.mock.set_sheds([_running_shed(DESK), _running_shed(OTHER)])
+            self.mock.start()
+            self._stack.callback(self.mock.stop)
+        except BaseException:
+            self._stack.close()
+            raise
+
+    def _stop_remote(self) -> None:
+        left = self.remote.teardown()
         assert not left, f"craze processes left behind: {left}"
 
+    def teardown(self) -> None:
+        self._stack.close()
+
 
 @pytest.fixture(scope="module")
-def roost():
-    fake = FakeRoost().start()
+def desk(bins):
+    world = None
     try:
-        yield fake
+        world = Desk(bins)
+        yield world
     finally:
-        fake.shutdown()
+        if world is not None:
+            world.teardown()
 
 
 @pytest.fixture(scope="module")
-def app(rig, roost, mock):
-    """The main instance: this machine's craze through the seam, its roost a
-    `FakeRoost`. A fake host is registered BEFORE launch, so the first roster
-    seeds with it."""
-    host = rig.fake_host(FAKE_HOST, FAKE_SESSION)
-    started = _launch(mock, runtime_dir=rig.home, craze=rig, roost=roost)
+def rig(desk):
+    """`czdesk`'s recording craze — the cells' `rig.bridge` / `rig.op`."""
+    return desk.env
+
+
+@pytest.fixture(scope="module")
+def roost(desk):
+    return desk.roost
+
+
+@pytest.fixture(scope="module")
+def app(desk):
+    """The main instance. Both hubs are already up, so the app attaches with
+    `--no-start`, and the first roster seeds with the desk's fake host."""
+    runtime = Path(tempfile.mkdtemp(prefix="shcd-app-", dir="/tmp")).resolve()
+    started = _launch(desk.mock, runtime_dir=runtime, ssh_bin=desk.remote.ssh)
     client = started[0]
     try:
         client.wait_until(lambda: _row(client, FAKE_HOST) is not None, timeout=WAIT,
                           what="the fake host's craze row")
-        client.fake_host = host  # type: ignore[attr-defined]
+        client.fake_host = desk.host  # type: ignore[attr-defined]
         yield client
     finally:
         _stop(*started)
+        shutil.rmtree(runtime, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
@@ -764,45 +878,75 @@ def created(app, rig) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _rows(app: TauriClient, machine: str = LOCAL) -> list[dict]:
-    return [r for r in app.call("rc.list").get("sessions", []) if r.get("machine") == machine]
+def _as_target(name: str) -> str:
+    """A shed name or an already-formed `roost:<server>/<shed>` token."""
+    return name if name.startswith("roost:") else f"roost:{SERVER}/{name}"
 
 
-def _row(app: TauriClient, host_id: str, machine: str = LOCAL) -> dict | None:
-    return next((r for r in _rows(app, machine)
+def _rows(app: TauriClient, shed: str = DESK) -> list[dict]:
+    target = _as_target(shed)
+    return [r for r in app.call("rc.list").get("sessions", []) if r.get("target") == target]
+
+
+def _row(app: TauriClient, host_id: str, shed: str = DESK) -> dict | None:
+    return next((r for r in _rows(app, shed)
                  if r.get("source") == "craze" and r.get("slug") == host_id), None)
 
 
-def _status(app: TauriClient, name: str) -> dict | None:
-    return next((m for m in app.call("machines.list")["machines"] if m["name"] == name), None)
+def _status(app: TauriClient, name: str = DESK) -> dict | None:
+    """The shed's craze status: its host row once one exists, else the
+    `shed_craze` entry a dormant or too-old shed is offered through."""
+    target = _as_target(name)
+    listed = app.call("rc.list")
+    row = next((h for h in listed.get("hosts") or []
+                if h.get("origin") == target or h.get("target") == target), None)
+    if row is not None:
+        return row
+    return next((e for e in listed.get("shed_craze") or [] if e.get("origin") == target), None)
 
 
-def _lane(app: TauriClient, op: str, host_id: str, **extra) -> dict:
-    return app.call(op, {"machine": LOCAL, "kind": KIND, "session_id": host_id, **extra})
+def _lane(app: TauriClient, op: str, host_id: str, shed: str = DESK, **extra) -> dict:
+    return app.call(op, {"target": _as_target(shed), "session_id": host_id, **extra})
 
 
-def _messages(app: TauriClient, host_id: str) -> dict:
-    return _lane(app, "lane.messages", host_id)
+def _messages(app: TauriClient, host_id: str, shed: str = DESK) -> dict:
+    return _lane(app, "lane.messages", host_id, shed)
 
 
-def _texts(app: TauriClient, host_id: str) -> list[str]:
-    return [m.get("text") or "" for m in _messages(app, host_id)["messages"]]
+def _texts(app: TauriClient, host_id: str, shed: str = DESK) -> list[str]:
+    return [m.get("text") or "" for m in _messages(app, host_id, shed)["messages"]]
 
 
-def _ready(app: TauriClient, host_id: str) -> dict:
-    _lane(app, "lane.open", host_id)
-    app.wait_until(lambda: _messages(app, host_id)["generation"] >= 1, timeout=WAIT,
+def _wait_unscaled(pred, timeout: float, what: str) -> None:
+    """`wait_until` scales with `SHED_TAURI_TEST_TIMEOUT_SCALE`. A ceiling that
+    has to sit under the 30 s dormant probe must stay a wall-clock deadline."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if pred():
+                return
+        except ShedError:
+            pass
+        time.sleep(0.1)
+    raise AssertionError(f"timed out after {timeout}s (unscaled) waiting for {what}")
+
+
+def _ready(app: TauriClient, host_id: str, shed: str = DESK) -> dict:
+    _lane(app, "lane.open", host_id, shed)
+    app.wait_until(lambda: _messages(app, host_id, shed)["generation"] >= 1, timeout=WAIT,
                    what=f"the seeded craze lane on {host_id}")
-    return _messages(app, host_id)
+    return _messages(app, host_id, shed)
 
 
 def _dump(app: TauriClient) -> dict | None:
     return app.call("lane.dump")["lane"]
 
 
-def _panel(app: TauriClient, host_id: str) -> dict:
-    app.call("ui.show_lane", {"machine": LOCAL, "kind": KIND, "session_id": host_id})
+def _panel(app: TauriClient, host_id: str, shed: str = DESK) -> dict:
+    target = _as_target(shed)
+    app.call("ui.show_lane", {"target": target, "session_id": host_id})
     app.wait_until(lambda: bool((d := _dump(app)) and d["session_id"] == host_id
+                                and d.get("target") == target
                                 and (d["generation"] >= 1 or d["error"])),
                    timeout=WAIT, what="the transcript panel to mount and report")
     return _dump(app)
@@ -842,13 +986,13 @@ def test_rows_from_a_fake_host_and_a_created_session(app, created):
     and the hostId. The machine's craze is `live`."""
     fake = _row(app, FAKE_HOST)
     assert fake["kind"] == KIND and fake["source"] == "craze", fake
-    assert fake["origin"] == "machine:localhost" and fake["origin_kind"] == "machine"
+    assert fake["origin"] == TARGET and fake["origin_kind"] == "shed"
     assert fake["agent_lane"] == {"kind": KIND, "session_id": FAKE_HOST}
     assert fake["stale"] is False
     assert created["slug"] == created["agent_lane"]["session_id"]
     assert created["provider"] == "grok", created
     assert created["workdir"].endswith("/w"), created
-    status = _status(app, LOCAL)
+    status = _status(app)
     assert status["craze"]["state"] == "live", status
     assert status["craze"]["create"] is True
 
@@ -861,17 +1005,45 @@ def test_rows_from_a_fake_host_and_a_created_session(app, created):
     _shot(app, "craze-rows.png")
 
 
-def test_the_local_dial_is_jailed(app, rig):
-    """**The test-mode local dial is the JAILED ladder** (plan 025 §3.6.1):
-    every craze the app's dials ran was the seam's, found by rung 2 and run with
-    `PATH` exactly the seam directory — the production ladder prepends its
-    exec PATH (`/opt/homebrew/bin`, `/usr/local/bin`, …), which is how a craze
-    installed on the host could reach a hermetic run."""
+def test_the_shed_dial_is_jailed(app, rig, desk):
+    """**The shed dial is the jailed ladder** (plan 025 §3.6.1): every craze
+    the app ran was the shed's wrapper, found with `PATH` exactly that jail's
+    bin, and the roster attached with `bridge --hub --no-start`. The absolute
+    rung under the shed's HOME was never run."""
     calls = rig.recorded()
-    assert calls, "the app's craze dials ran the seam's craze"
+    assert calls, "the app's craze dials ran the shed's craze"
     paths = {path for path, _ in calls}
     assert paths == {str(rig.path_dir)}, f"a dial ran with another PATH: {paths}"
-    assert any(argv == "bridge --hub" for _, argv in calls), calls
+    assert any("bridge --hub --no-start" in argv for _, argv in calls), calls
+    assert not (desk.remote.root / "refused").exists()
+    assert not desk.sentinel_log.exists()
+
+
+def test_a_live_shed_roster_dials_no_start_and_probes_once(app, desk):
+    """**A live shed's roster attaches with `--no-start`** (plan 032 §3.5):
+    the shed was probed once, then the roster dialled `bridge --hub
+    --no-start` — never a plain `bridge --hub`. A lane opened on its row
+    dials the same way and asks no probe of its own."""
+    recs = _craze_records(desk.remote, DESK)
+    first = next((i for i, r in enumerate(recs) if _is_no_start(r.text)), None)
+    assert first is not None, f"the roster dialled --no-start: {recs}"
+    assert [_is_probe(r.text) for r in recs[:first]] == [True], \
+        f"exactly one probe, then the roster's --no-start: {recs}"
+    assert not any(_is_plain_bridge(r.text) for r in recs), f"a plain bridge --hub ran: {recs}"
+    probes = sum(_is_probe(r.text) for r in recs)
+    no_starts = sum(_is_no_start(r.text) for r in recs)
+    args = {"target": TARGET, "session_id": FAKE_HOST}
+    app.call("lane.open", args)
+    try:
+        app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1,
+                       timeout=WAIT, what="the seeded shed craze lane")
+        recs = _craze_records(desk.remote, DESK)
+        assert sum(_is_no_start(r.text) for r in recs) > no_starts, \
+            f"the lane dialled --no-start: {recs}"
+        assert sum(_is_probe(r.text) for r in recs) == probes, f"the lane asked no probe: {recs}"
+        assert not any(_is_plain_bridge(r.text) for r in recs), recs
+    finally:
+        app.call("lane.close", args)
 
 
 # ---------------------------------------------------------------------------
@@ -896,21 +1068,24 @@ def test_the_lane_seeds_sends_and_echoes(app, created):
     app.wait_until(lambda: any(r["text"] == "echo: again please" for r in _dump(app)["rows"]),
                    timeout=WAIT, what="the panel to render the echo")
     panel = _dump(app)
-    assert panel["kind"] == KIND and panel["lane_kind"] == KIND
+    assert panel["kind"] == KIND and panel["target"] == TARGET
     assert panel["stop"] == {"confirming": False}, "a hub-created session offers Stop"
     _shot(app, "craze-lane.png")
     _unmount(app)
 
 
-def test_the_lane_key_carries_the_kind(app, created):
-    """**The kind is half the lane's address** (plan 025 §3.6.4): the same
-    hostId under another kind is no lane at all — never the craze one."""
+def test_the_lane_address_is_the_shed_and_the_session(app, created):
+    """**A lane is the shed plus the session** (plan 025 §3.6.4, shed-only):
+    a missing target is refused, and a stray kind is ignored — the craze lane
+    still opens."""
     host = created["slug"]
-    refused = _error(lambda: app.call("lane.open", {"machine": LOCAL, "kind": "opencode",
-                                                    "session_id": host}))
-    assert refused.code == "no_lane", refused
-    missing = _error(lambda: app.call("lane.open", {"machine": LOCAL, "session_id": host}))
-    assert missing.code == "bad_request" and "kind" in missing.message, missing
+    missing = _error(lambda: app.call("lane.open", {"session_id": host}))
+    assert missing.code == "bad_request", missing
+    app.call("lane.open", {"target": TARGET, "kind": "opencode", "session_id": host})
+    app.wait_until(lambda: _messages(app, host)["generation"] >= 1
+                   and _messages(app, host)["capabilities"]["kind"] == KIND,
+                   timeout=WAIT, what="the craze lane, opened despite a stray kind")
+    app.call("lane.close", {"target": TARGET, "session_id": host})
 
 
 def test_asks_are_answered_through_the_lane(app, rig):
@@ -1058,20 +1233,21 @@ def _sheet(app: TauriClient) -> dict | None:
     return app.call("craze_create.dump")["craze_create"]
 
 
-def _open_sheet(app: TauriClient, machine: str = LOCAL) -> dict:
+def _open_sheet(app: TauriClient, shed: str = DESK) -> dict:
     """`ui.show_craze_create`, then the sheet's options read (or failed) — and,
     on an idle sheet, its provider settled: the preselection is an effect of
     the render that shows the options, so one dump can land between the two."""
-    app.call("ui.show_craze_create", {"machine": machine})
+    target = _as_target(shed)
+    app.call("ui.show_craze_create", {"target": target})
 
     def settled() -> bool:
         d = _sheet(app)
-        if not (d and d["machine"] == machine and d["state"] != "loading"):
+        if not (d and d.get("target") == target and d["state"] != "loading"):
             return False
         return (d["state"] != "idle" or d["preselected"] is None
                 or any(p["selected"] for p in d["providers"]))
 
-    app.wait_until(settled, timeout=WAIT, what=f"the create sheet on {machine} to read its options")
+    app.wait_until(settled, timeout=WAIT, what=f"the create sheet on {target} to read its options")
     return _sheet(app)
 
 
@@ -1153,24 +1329,6 @@ def test_the_sheet_renders_crazes_options_in_order(app, created, rig):
     _close_sheet(app)
 
 
-def test_the_launch_dialogs_target_list_leads_to_the_sheet(app):
-    """The New-session dialog's "Where" lists a craze target for this machine
-    (its craze is live and can create); picking it and pressing Continue opens
-    craze's own sheet there."""
-    app.call("ui.show_launch")
-    app.wait_until(lambda: bool(app.call("launch.dump")["launch"]), timeout=20,
-                   what="the launch dialog")
-    assert "localhost — new craze session" in app.call("launch.dump")["launch"]["rendered"]
-    app.call("ui.fill_launch", {"target": f"craze:{LOCAL}"})
-    app.wait_until(lambda: "Continue" in (app.call("launch.dump")["launch"] or {}).get("rendered", ""),
-                   timeout=20, what="the craze target selected")
-    app.call("ui.submit_launch")
-    app.wait_until(lambda: bool((d := _sheet(app)) and d["machine"] == LOCAL), timeout=WAIT,
-                   what="the craze sheet, from the launch dialog")
-    assert app.call("launch.dump")["launch"] is None, "the launch dialog gave way to the sheet"
-    _close_sheet(app)
-
-
 def test_a_create_from_the_sheet_opens_its_transcript_at_once(app, rig):
     """**Create, then the transcript at once** (plan 025 §3.8, §3.6.4): a
     provider, a fresh directory and a first prompt; Create closes the sheet and
@@ -1186,7 +1344,7 @@ def test_a_create_from_the_sheet_opens_its_transcript_at_once(app, rig):
     _shot(app, "craze-create-filled.png")
     _submit_when_ready(app)
     app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
-    app.wait_until(lambda: bool((lane := _dump(app)) and lane["lane_kind"] == KIND
+    app.wait_until(lambda: bool((lane := _dump(app)) and lane.get("target") == TARGET
                                 and any(r["text"] == "echo: hello sheet" for r in lane["rows"])),
                    timeout=WAIT, what="the new session's transcript, with its first prompt's echo")
     lane = _dump(app)
@@ -1420,9 +1578,10 @@ def test_a_start_failure_shows_crazes_cause_and_try_again_mints_a_new_id(app, ri
 
 def test_the_typed_form_survives_the_machine_going_offline(app, rig):
     """**No state clears the typed form** (plan 025 §3.8): with the sheet open
-    and filled, this machine's craze goes OFFLINE under it (its hub stopped, and
+    and filled, the shed's craze goes OFFLINE under it (its hub stopped, and
     craze unreachable for a while) — the sheet says so and disables Create, and
-    keeps every typed character; when craze is back, the note goes and Create
+    keeps every typed character. A shed dial is attach-only, so the harness
+    starts the hub again; once the app reattaches, the note goes and Create
     works again, the form as it was."""
     _open_sheet(app)
     typed = {"cwd": "/typed/before/the/outage", "prompt": "kept\nacross the outage"}
@@ -1440,9 +1599,13 @@ def test_the_typed_form_survives_the_machine_going_offline(app, rig):
         assert [p["id"] for p in d["providers"] if p["selected"]] == ["grok"]
         _shot(app, "craze-create-offline.png")
     finally:
+        # The harness's own bridge, not the wrapper: it starts the hub while
+        # the app's dials are still refused, then the app is allowed to attach.
+        holder = rig.bridge()
+        assert holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
         rig.switch("outage", False)
-    app.wait_until(lambda: (_status(app, LOCAL) or {}).get("craze", {}).get("state") == "live",
-                   timeout=WAIT * 2, what="this machine's craze back")
+    app.wait_until(lambda: (_status(app) or {}).get("craze", {}).get("state") == "live",
+                   timeout=WAIT * 2, what="the shed's craze back")
     app.wait_until(lambda: (_sheet(app) or {}).get("note") is None, timeout=WAIT,
                    what="the offline note gone")
     d = _sheet(app)
@@ -1466,7 +1629,7 @@ def test_open_in_terminal_attaches_a_tab_across_roost_snapshots(app, roost):
     row = _row(app, host)
     assert row and "tab_id" not in row, row
     opens = len(roost.opens)
-    out = app.call("craze.open_terminal", {"machine": LOCAL, "session_id": host})
+    out = app.call("craze.open_terminal", {"target": TARGET, "session_id": host})
     assert len(roost.opens) == opens + 1, "one tab.open reached roost"
     call = roost.opens[-1]
     assert call["argv"] == out["argv"], (call, out)
@@ -1497,12 +1660,14 @@ def test_open_in_terminal_attaches_a_tab_across_roost_snapshots(app, roost):
         time.sleep(0.1)
     app.navigate("agents")
     _shot(app, "craze-open-terminal.png")
-
-    app.call("machine.kill", {"machine": LOCAL, "slug": tab})
-    app.wait_until(lambda: "tab_id" not in (_row(app, host) or {"tab_id": tab}), timeout=WAIT,
-                   what="the row headless again")
-    assert _row(app, host) is not None, "closing the attach tab only detached: the session runs on"
-    assert int(tab) not in roost.tab_ids()
+    assert _row(app, host) is not None, "the session runs on, on the shed"
+    # Closing the roost tab only detaches: the attached id clears and the
+    # craze session stays live.
+    roost.close_tab(int(tab))
+    app.wait_until(lambda: (row := _row(app, host)) is not None and "tab_id" not in row,
+                   timeout=WAIT, what="closing the roost tab to clear the attached id")
+    assert _row(app, host)["source"] == "craze"
+    assert _status(app)["craze"]["state"] == "live"
 
 
 # ---------------------------------------------------------------------------
@@ -1596,7 +1761,7 @@ def _settle_reopens(app: TauriClient, rig: CrazeEnv, sent: int, replied: int) ->
         app.wait_until(lambda: len(rig.reopen_replies()) - replied >= len(rig.reopens()) - sent,
                        timeout=WAIT * 3, what="craze's answer to every reopen the cell sent")
         if _sheet(app) is None:
-            app.call("ui.show_craze_create", {"machine": LOCAL})
+            app.call("ui.show_craze_create", {"target": TARGET})
             app.wait_until(lambda: _sheet(app) is not None, timeout=WAIT,
                            what="the sheet, to see its reopen land")
         app.wait_until(lambda: not _resuming(_sheet(app)), timeout=WAIT * 3,
@@ -1642,7 +1807,8 @@ def test_a_saved_session_resumes_into_its_transcript(app, rig):
         row = _saved_of(d, SAVED_ID)
         assert row, d["saved"]["rows"]
         assert row["title"] == "a saved desk session" and row["provider"] == "grok", row
-        assert row["workspace"] == "~/resume-me", "the app's own home, shortened"
+        # A shed reports `/home/shed` as its home, so a jail path is not shortened.
+        assert row["workspace"] == str(work), row
         assert row["updated"], row
         assert (row["state"], row["button"], row["enabled"]) == ("idle", "Resume", True), row
         assert _saved_of(d, GONE_ID), "a session whose directory went is still listed"
@@ -1677,7 +1843,7 @@ def test_a_saved_session_resumes_into_its_transcript(app, rig):
         rig.set_grok(rig.grok_echo)
     assert rig.reopens()[before:] == [{"id": SAVED_ID}], "one reopen; the refused press sent nothing"
 
-    app.wait_until(lambda: bool((lane := _dump(app)) and lane["lane_kind"] == KIND
+    app.wait_until(lambda: bool((lane := _dump(app)) and lane.get("target") == TARGET
                                 and any(REPLAYED in (r.get("text") or "") for r in lane["rows"])),
                    timeout=WAIT, what="the resumed session's transcript, with its replayed answer")
     host = _dump(app)["session_id"]
@@ -1827,7 +1993,7 @@ def permodel(app, rig) -> dict:
 
 def _sheet_open(app: TauriClient, host: str) -> dict:
     """`ui.show_lane_settings` on `host`, then the sheet's first report."""
-    app.call("ui.show_lane_settings", {"machine": LOCAL, "kind": KIND, "session_id": host})
+    app.call("ui.show_lane_settings", {"target": TARGET, "session_id": host})
     app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host and d["rows"]),
                    timeout=WAIT, what="the settings sheet to open and report its rows")
     return _settings(app)
@@ -1982,7 +2148,7 @@ def test_an_option_is_bound_to_the_model_the_sheet_displayed(app, rig, permodel)
     composer-2.5; the session is moved back to grok-4.6 for the next cell."""
     host = permodel["host"]
     calls = permodel["calls"]
-    target = {"machine": LOCAL, "kind": KIND, "session_id": host}
+    lane_args = {"target": TARGET, "session_id": host}
     _sheet_open(app, host)
     assert _row_of(app, "model").get("current") == "grok-4.6"
     assert _row_of(app, "fast").get("current") == "true"
@@ -1992,7 +2158,7 @@ def test_an_option_is_bound_to_the_model_the_sheet_displayed(app, rig, permodel)
         try:
             other.call("session.set", {"sessionId": sid, "commandId": "1",
                                        "setting": {"kind": "model", "value": "composer-2.5"}})
-            app.wait_until(lambda: (app.call("lane.messages", target).get("settings") or {})
+            app.wait_until(lambda: (app.call("lane.messages", lane_args).get("settings") or {})
                            .get("model") == "composer-2.5",
                            timeout=WAIT, what="the move folded by the lane")
             assert _row_of(app, "model")["current"] == "grok-4.6", "the sheet still shows grok-4.6"
@@ -2062,44 +2228,53 @@ def test_a_change_lost_to_a_drop_is_not_confirmed_until_the_next_settings(app, r
     _unmount(app)
 
 
-def test_no_settings_where_the_capabilities_say_none(app, roost):
-    """**Hidden, never disabled** (plan 025 §3.10): an opencode lane on this
-    machine — its capabilities say `settings: false` — gets no chip, and
-    `ui.show_lane_settings` opens its transcript and NO sheet."""
-    session = "ses_settingless"
-    tab = 90
-    oc = FakeOpencode()
-    oc.add_session(session, title="no settings here", directory="/home/shed/oc")
-    oc.set_simple_transcript(session, "a question", "an answer")
-    oc.set_status(session, "idle")
-    try:
-        roost.add_tab(tab, cwd="/home/shed/oc", title="oc", source="opencode", session_id=session,
-                      lifecycle="working", detail="session_status", shell_state="unknown",
-                      metadata={"server_url": oc.base_url})
-        app.wait_until(lambda: any((r.get("agent_lane") or {}).get("session_id") == session
-                                   for r in _rows(app)),
-                       timeout=WAIT, what="the opencode row's lane stamp")
-        target = {"machine": LOCAL, "kind": "opencode", "session_id": session}
-        app.call("lane.open", target)
-        app.call("ui.show_lane_settings", target)
-        app.wait_until(lambda: bool((d := _dump(app)) and d["session_id"] == session
-                                    and d["kind"] == "opencode" and d["generation"] >= 1),
-                       timeout=WAIT, what="the opencode transcript, seeded")
-        caps = app.call("lane.messages", target)["capabilities"]
-        assert caps["settings"] is False, caps
-        assert _dump(app)["settings_chip"] is None, "no chip"
-        # Nor a `/` menu (plan 029 X4): opencode publishes no catalog.
-        assert caps.get("slash") is False and caps.get("set_title") is False, caps
-        assert app.call("lane.messages", target)["slash_menu"] is None
-        assert _dump(app)["slash_menu"] is None
-        time.sleep(scaled_timeout(0.5))
-        assert _settings(app) is None, "no sheet, even when asked for"
-        _shot(app, "craze-settings-none.png")
-        _unmount(app)
-    finally:
-        app.call("machine.kill", {"machine": LOCAL, "slug": str(tab)})
-        app.wait_until(lambda: tab not in roost.tab_ids(), timeout=WAIT, what="the opencode tab gone")
-        oc.stop()
+def _activity_chip(s: dict) -> str | None:
+    """The card's activity chip label, the same rule as `rcActivityLabel`."""
+    if s.get("state") not in ("ready", "reconnecting"):
+        return None
+    return {"needs_input": "needs input", "needs_approval": "needs approval",
+            "working": "working", "idle": "idle"}.get(s.get("activity") or "")
+
+
+def test_a_passive_opencode_tab_has_no_transcript(app, roost):
+    """**A passive opencode tab** (plan 038): a roost tab of kind `opencode`
+    carrying `server_url` shows its label and activity, the shed advertises
+    `feed: "activity"` and `watch: false` for that kind, and the Agents pane
+    renders no Transcript button — there is no opencode lane."""
+    roost.add_tab(90, cwd="/home/shed/oc", title="oc working", source="opencode",
+                  session_id="ses_passive", lifecycle="working", detail="session_status",
+                  metadata={"server_url": "http://127.0.0.1:4096"})
+    app.wait_until(
+        lambda: any(r.get("kind") == "opencode" and r.get("target") == TARGET
+                    for r in app.call("rc.list")["sessions"]),
+        timeout=WAIT, what="the opencode row")
+    row = next(r for r in app.call("rc.list")["sessions"]
+               if r.get("kind") == "opencode" and r.get("target") == TARGET)
+    assert row["display_name"] == "oc working", row
+    assert row.get("activity"), row
+    assert not row.get("agent_lane"), row
+    caps = app.call("rc.list")["capabilities"][TARGET]["kind_features"]["opencode"]
+    # `watch: false` is omitted on the wire (omitempty); absence is false.
+    assert caps["feed"] == "activity" and caps.get("watch", False) is False, caps
+    app.navigate("agents")
+    app.wait_until(
+        lambda: any(s.get("kind") == "opencode" and s.get("transcript") is False
+                    for s in app.call("agents.dump")["sessions"])
+        and any(s.get("source") == "craze" and s.get("slug") == FAKE_HOST
+                and s.get("transcript") is True
+                for s in app.call("agents.dump")["sessions"]),
+        timeout=20, what="the Agents pane: a craze Transcript button, and none on opencode")
+    shown = next(s for s in app.call("agents.dump")["sessions"] if s.get("kind") == "opencode")
+    craze = next(s for s in app.call("agents.dump")["sessions"]
+                 if s.get("source") == "craze" and s.get("slug") == FAKE_HOST)
+    assert shown["transcript"] is False
+    assert craze["transcript"] is True, "the Transcript reporter sees a live craze row's button"
+    assert shown["display_name"] == "oc working"
+    assert shown.get("activity")
+    # The chip is the rendered label (`working`), not only the row's activity word.
+    assert shown.get("activity_chip") == _activity_chip(shown), shown
+    assert craze.get("activity_chip") == _activity_chip(craze), craze
+    _shot(app, "craze-opencode-passive.png")
 
 
 # ---------------------------------------------------------------------------
@@ -2969,7 +3144,7 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
     app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
     header = _poll(lambda: r if (r := _dump(app)) and r["session_id"] == host and r["generation"] >= 1 else None,
                    "the transcript's seeded report")
-    assert header["lane_kind"] == KIND and header["title"] == name, \
+    assert header["target"] == TARGET and header["kind"] == KIND and header["title"] == name, \
         f"the transcript header: {header['title']!r}"
     row = _exactly_one_session_in(app, cwd)
     assert row["slug"] == host and row["display_name"] == name, row
@@ -3239,7 +3414,129 @@ def test_glm_reasoning_is_its_effort(app, rig, permodel):
 
 
 # ---------------------------------------------------------------------------
-# (3) the row merge — D4, on this machine
+# the same session id on two sheds, and a reopen outliving its shed
+# ---------------------------------------------------------------------------
+
+SUPER_ID = "0192f0aa-6666-7000-8000-00000000supr"
+
+
+def test_an_unsolicited_lane_event_stays_on_its_shed(app, rig, desk):
+    """**A lane-event routes by shed and session** (plan 038): the same
+    session id is live on two sheds. The desk panel is mounted on it. The
+    other shed's host then quits, and that lane's `down` is the terminal
+    event. The mounted panel keeps the desk's live transcript — it does not
+    go `ended` or take the other shed's banner.
+
+    The view is held first, so a `down` applied off the event cannot be wiped
+    by the reread of the mounted lane. Dropping `ev.target === target` in the
+    panel's listener paints `ended` from the other shed's `down` and this
+    fails. (`lane.stop` is not the event: a fake host refuses `session.stop`.)"""
+    twin = rig.fake_host(TWIN, "craze-desk-twin")
+    app.wait_until(lambda: _row(app, TWIN) is not None, timeout=WAIT,
+                   what="the twin session on the desk shed")
+    app.wait_until(lambda: _row(app, TWIN, OTHER) is not None, timeout=WAIT,
+                   what="the twin session on the other shed")
+    _panel(app, TWIN)
+    _lane(app, "lane.open", TWIN, OTHER)
+    try:
+        app.wait_until(lambda: _messages(app, TWIN, OTHER)["generation"] >= 1, timeout=WAIT,
+                       what="the other shed's lane seeded")
+        rig.op(twin, {"name": "text", "text": "only on this shed"})
+        app.wait_until(
+            lambda: any((r.get("text") or "") == "only on this shed"
+                        for r in (_dump(app) or {}).get("rows", [])),
+            timeout=WAIT, what="the desk panel's own text")
+        app.call("ui.hold_lane_view", {"hold": True})
+        # The hold event has to land before the other shed's `down`, or the
+        # reread of this lane would clear a banner the missing target check painted.
+        time.sleep(scaled_timeout(0.5))
+        desk.other.op(desk.other_host, {"name": "quit"})
+        desk.other_host.wait(timeout=10)
+        app.wait_until(lambda: _messages(app, TWIN, OTHER).get("ended") is True, timeout=WAIT,
+                       what="the other shed's lane to end")
+        deadline = time.monotonic() + scaled_timeout(1.5)
+        while time.monotonic() < deadline:
+            panel = _dump(app)
+            assert panel is not None, "the desk panel stays mounted"
+            assert panel["target"] == TARGET and panel["session_id"] == TWIN, panel
+            assert panel.get("ended") is not True, panel
+            assert not panel.get("stale"), panel
+            assert any((r.get("text") or "") == "only on this shed" for r in panel["rows"]), panel["rows"]
+            time.sleep(0.05)
+        assert _messages(app, TWIN).get("ended") is not True, "the desk lane is still live"
+        assert _row(app, TWIN) is not None, "the desk session stays listed"
+        assert _row(app, TWIN, OTHER) is None, "the stopped session left the other shed"
+    finally:
+        try:
+            app.call("ui.hold_lane_view", {"hold": False})
+        except ShedError:
+            pass
+        _unmount(app)
+        for shed in (DESK, OTHER):
+            try:
+                app.call("lane.close", {"target": _as_target(shed), "session_id": TWIN})
+            except ShedError:
+                pass
+
+
+def test_a_reopen_is_superseded_when_the_shed_is_removed(app, rig, desk):
+    """**A reopen that outlives its shed is superseded** (plan 038): Resume is
+    held, the shed is removed, and craze's answer says the session resumed but
+    was not opened — the note names the removal, and no transcript opens."""
+    work = _mkdir_0700(rig.home / "supersede-me")
+    _seed_saved(rig, _saved_row(SUPER_ID, "desk-super", work, "a superseded resume",
+                                "2026-10-13T10:00:00Z"))
+    loader = _write_exec(rig.root / "grok-load-super",
+                         f"#!/bin/sh\nexec '{rig.real / 'craze-fake-agent'}' -script grok-load \"$@\"\n")
+    rig.set_grok(loader)
+    rig.switch("proxy", True)
+    before = len(rig.reopens())
+    try:
+        _open_sheet(app)
+        _choose_resume(app)
+        app.wait_until(lambda: _saved_of(_sheet(app), SUPER_ID) is not None, timeout=WAIT,
+                       what="the saved row")
+        with SetGate(rig.root / "hold-reopens", what="reopen") as gate:
+            app.call("ui.resume_saved", {"id": SUPER_ID})
+            app.wait_until(lambda: len(rig.reopens()) > before, timeout=WAIT,
+                           what="the reopen on the wire, held")
+            desk.mock.set_sheds([_running_shed(OTHER)])
+            app.call("sheds.list")
+            app.wait_until(lambda: _status(app, DESK) is None, timeout=WAIT,
+                           what="the desk shed to leave the listing")
+            gate.release()
+            app.wait_until(
+                lambda: "removed and added again" in (
+                    ((_saved_of(_sheet(app), SUPER_ID) or {}).get("error") or "")),
+                timeout=WAIT * 3, what="the superseded note on the saved row")
+        replies = [r for r in rig.reopen_replies() if r.get("id") == SUPER_ID]
+        assert replies, "craze answered the reopen"
+        opened = replies[-1].get("hostId")
+        assert opened, replies[-1]
+        panel = _dump(app)
+        # A resumed transcript is addressed by the new host id, not by the
+        # saved id — either one on screen means the superseded reopen opened.
+        assert panel is None or panel.get("session_id") not in {SUPER_ID, opened}, \
+            (panel, opened)
+        assert _sheet(app) is not None, "the sheet stays, to say why it was not opened"
+    finally:
+        desk.mock.set_sheds([_running_shed(DESK), _running_shed(OTHER)])
+        try:
+            app.call("sheds.list")
+        except ShedError:
+            pass
+        rig.switch("proxy", False)
+        rig.set_grok(rig.grok_echo)
+        if _sheet(app) is not None:
+            _close_sheet(app)
+        if _dump(app) is not None:
+            _unmount(app)
+        app.wait_until(lambda: _row(app, FAKE_HOST) is not None, timeout=WAIT,
+                       what="the desk shed's craze back after it was re-listed")
+
+
+# ---------------------------------------------------------------------------
+# (3) the row merge — a roost tab and a craze row on the same shed
 # ---------------------------------------------------------------------------
 
 
@@ -3249,8 +3546,8 @@ def test_a_craze_tab_folds_into_its_hub_row_and_returns_when_the_feed_drops(app,
     hub's, carrying the tab's id — and with the hub feed down roost's row
     stands alone again, beside the hub row's last-known, STALE copy.
 
-    LAST in the module: it takes this machine's craze away (the seam's craze
-    renamed, so the eager source cannot birth a new hub) and stops the hub."""
+    LAST of the desk app's cells: it renames the shed's craze so nothing can
+    redial, and stops the hub."""
     fake = _row(app, FAKE_HOST)
     provider_session = fake.get("provider_session_id")
     assert provider_session, f"the fake host's row names its provider session: {fake}"
@@ -3258,8 +3555,8 @@ def test_a_craze_tab_folds_into_its_hub_row_and_returns_when_the_feed_drops(app,
                   session_id=provider_session, lifecycle="working")
     app.wait_until(lambda: (_row(app, FAKE_HOST) or {}).get("tab_id") == str(CRAZE_TAB),
                    timeout=WAIT, what="the tab folded into the hub row")
-    assert not [r for r in _rows(app) if r.get("source") == "roost"], \
-        "an absorbed craze tab is not a roost row"
+    assert not [r for r in _rows(app) if r.get("source") == "roost" and r.get("slug") == str(CRAZE_TAB)], \
+        "an absorbed craze tab is not also a roost row"
 
     # The feed goes down for good: no craze to redial, and the hub stopped.
     (rig.path_dir / "craze").rename(rig.path_dir / "craze.off")
@@ -3270,51 +3567,12 @@ def test_a_craze_tab_folds_into_its_hub_row_and_returns_when_the_feed_drops(app,
     retained = _row(app, FAKE_HOST)
     assert retained["stale"] is True and retained["approximate"] is True, retained
     assert "tab_id" not in retained, "nothing is absorbed while the feed is down"
-    assert _status(app, LOCAL)["craze"]["state"] in ("offline", "absent")
+    assert _status(app)["craze"]["state"] in ("offline", "absent")
 
 
 # ---------------------------------------------------------------------------
 # (4) not installed — and the host's own craze never answers
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def app_absent(bins, roost, mock):
-    """An EMPTY seam (craze not installed) and a sentinel craze at an absolute
-    rung under this app's HOME (`$HOME/.nix-profile/bin`), which the jailed
-    ladder never reaches."""
-    root = Path(tempfile.mkdtemp(prefix="shcz-", dir="/tmp")).resolve()
-    env = CrazeEnv(bins, root, root / "h", kind="empty")
-    sentinel_log = root / "sentinel.log"
-    _write_exec(env.home / ".nix-profile" / "bin" / "craze",
-                f"#!/bin/sh\necho ran >> '{sentinel_log}'\nexit 2\n")
-    started = _launch(mock, runtime_dir=env.home, craze=env, roost=roost)
-    client = started[0]
-    client.sentinel_log = sentinel_log  # type: ignore[attr-defined]
-    try:
-        client.wait_until(lambda: (_status(client, LOCAL) or {}).get("craze", {}).get("cause")
-                          == "not_installed", timeout=WAIT, what="craze read as not installed")
-        yield client
-    finally:
-        _stop(*started)
-        left = env.teardown()
-        shutil.rmtree(root, ignore_errors=True)
-        assert not left, f"craze processes left behind: {left}"
-
-
-def test_not_installed_shows_no_craze_rows_and_no_note(app_absent):
-    """No craze → no craze rows, `absent`, and NOTHING in the machines pane —
-    a machine without craze is not a problem to report. And the sentinel at an
-    absolute rung never ran."""
-    status = _status(app_absent, LOCAL)
-    assert status["craze"]["state"] == "absent", status
-    assert not [r for r in _rows(app_absent) if r.get("source") == "craze"]
-    app_absent.navigate("machines")
-    app_absent.wait_until(lambda: app_absent.machines_dump(), timeout=20,
-                          what="the machines pane to report")
-    local = next(m for m in app_absent.machines_dump() if m["name"] == LOCAL)
-    assert local.get("craze_note") is None, local
-    assert not app_absent.sentinel_log.exists(), "a host-installed craze answered a hermetic run"
 
 
 # ---------------------------------------------------------------------------
@@ -3330,8 +3588,9 @@ def _fake_ssh(root: Path) -> str:
       `exits.log`), held while the root's `wedge-exit` switch exists — a
       wedged master (plan 026 §3.3); `-O check` finds no master (there is no
       master process here); a remote `true` (roost's warm-up) succeeds;
-      roost's `client-bridge` chain is answered `command not found` (these
-      machines run no roost-session — they are craze hosts).
+      roost's `client-bridge` chain pumps to the jail's FakeRoost when the
+      shed has one (`$jail/socket` plus `$HOME/.local/bin/roost-session`),
+      and is `command not found` otherwise.
     * **A craze command naming an absolute ladder rung is REFUSED and
       recorded, never run** — the production ladder would reach this host's
       own craze there, and the remote dials must be the jailed composition.
@@ -3413,6 +3672,12 @@ fi
 if [ "$cmd" = "true" ]; then exit 0; fi
 case "$cmd" in
   *client-bridge*)
+    p="$jail/h/.local/bin/roost-session"
+    socket=
+    if [ -f "$jail/socket" ]; then socket=$(cat "$jail/socket"); fi
+    if [ -x "$p" ] && [ -n "$socket" ]; then
+        exec env -i HOME="$jail/h" PATH="/usr/bin:/bin" SHED_FAKE_ROOST_SOCKET="$socket" "$p" client-bridge
+    fi
     printf '%s\\n' 'roost-session: command not found' >&2
     exit 127
     ;;
@@ -3522,49 +3787,8 @@ class Remote:
         return left
 
 
-@pytest.fixture(scope="module")
-def remote(bins):
-    r = Remote(bins)
-    try:
-        yield r
-    finally:
-        left = r.teardown()
-        assert not left, f"craze processes left behind: {left}"
-
-
-@pytest.fixture(scope="module")
-def app_remote(remote, mock):
-    """No local craze; the three remote machines through the fake ssh. The live
-    machine's hub runs BEFORE launch (the harness's own bridge holds it), with a
-    fake host in its roster, so the app's first probe finds it."""
-    live = remote.jails["craze-live"]
-    live.fake_host("0d0d0d0d0d0d", "craze-remote-fake")
-    holder = live.bridge()
-    assert holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
-    runtime_dir = Path(tempfile.mkdtemp(prefix="shrm-", dir="/tmp")).resolve()
-    started = _launch(mock, runtime_dir=runtime_dir, craze=None, roost=None, ssh_bin=remote.ssh)
-    client = started[0]
-    try:
-        yield client
-    finally:
-        _stop(*started)
-        holder.close()
-        shutil.rmtree(runtime_dir, ignore_errors=True)
-
-
 def _craze_state(app: TauriClient, name: str) -> dict:
     return ((_status(app, name) or {}).get("craze") or {})
-
-
-def test_a_remote_hub_is_attached_over_ssh(app_remote):
-    """A remote machine whose hub is running is attached — the probe found it,
-    and ONE roster connection over the ssh duplex lists its sessions."""
-    app_remote.wait_until(lambda: _craze_state(app_remote, "craze-live").get("state") == "live",
-                          timeout=WAIT, what="the live remote's craze attached")
-    app_remote.wait_until(lambda: _row(app_remote, "0d0d0d0d0d0d", machine="craze-live"),
-                          timeout=WAIT, what="the remote fake host's row")
-    row = _row(app_remote, "0d0d0d0d0d0d", machine="craze-live")
-    assert row["origin"] == "machine:craze-live" and row["source"] == "craze", row
 
 
 def _craze_records(rig: "Remote", user: str) -> list["Record"]:
@@ -3591,164 +3815,19 @@ def _live_hubs(env: "CrazeEnv") -> list[int]:
     return [pid for pid in env.hub_pids() if _program_args(pid).startswith(str(env.real))]
 
 
-def test_a_live_remote_roster_dials_no_start_and_probes_once(app_remote, remote):
-    """**A remote roster attaches with `--no-start`** (plan 032 §3.5): the
-    live machine was probed ONCE, then its roster dialled craze 0.2.0's
-    find-only `bridge --hub --no-start` — no second probe in front of it, and
-    never a plain `bridge --hub`. A lane opened on its row dials the same way
-    with no probe of its own: nothing a background dial runs can start a hub."""
-    machine = "craze-live"
-    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
-                          timeout=WAIT, what="the live remote's craze attached")
-    recs = _craze_records(remote, machine)
-    first = next((i for i, r in enumerate(recs) if _is_no_start(r.text)), None)
-    assert first is not None, f"the roster dialled --no-start: {recs}"
-    assert [_is_probe(r.text) for r in recs[:first]] == [True], \
-        f"exactly one probe, then the roster's --no-start: {recs}"
-    assert not any(_is_plain_bridge(r.text) for r in recs), f"a plain bridge --hub ran: {recs}"
-
-    probes = sum(_is_probe(r.text) for r in recs)
-    no_starts = sum(_is_no_start(r.text) for r in recs)
-    args = {"machine": machine, "kind": KIND, "session_id": "0d0d0d0d0d0d"}
-    app_remote.call("lane.open", args)
-    try:
-        app_remote.wait_until(lambda: app_remote.call("lane.messages", args)["generation"] >= 1,
-                              timeout=WAIT, what="the seeded remote craze lane")
-        recs = _craze_records(remote, machine)
-        assert sum(_is_no_start(r.text) for r in recs) > no_starts, \
-            f"the lane dialled --no-start: {recs}"
-        assert sum(_is_probe(r.text) for r in recs) == probes, f"the lane asked no probe: {recs}"
-        assert not any(_is_plain_bridge(r.text) for r in recs), recs
-    finally:
-        app_remote.call("lane.close", args)
-
-
-def test_no_remote_hub_is_born_while_dormant(app_remote, remote):
-    """**Attach-only** (plan 025 §3.6.1): a remote machine with craze and NO hub
-    stays dormant — the fake ssh recorded the find-only probe and never a
-    `bridge --hub`, and no hub record exists there."""
-    # Dormant — or a `bridge --hub`, which must never come.
-    app_remote.wait_until(
-        lambda: _craze_state(app_remote, "craze-dormant").get("state") == "dormant"
-        or any("bridge --hub" in c for c in remote.commands("craze-dormant")),
-        timeout=WAIT, what="the dormant remote's probe")
-    cmds = remote.commands("craze-dormant")
-    assert not any("bridge --hub" in c for c in cmds), "a remote hub was dialled while dormant"
-    craze_cmds = [c for c in cmds if "craze" in c]
-    assert craze_cmds, cmds
-    assert all("providers --hub --json" in c for c in craze_cmds), \
-        f"a dormant remote got something but the find-only probe: {craze_cmds}"
-    assert not remote.jails["craze-dormant"].hub_pids(), "a remote hub was born"
-
-
-def test_remote_dials_are_jailed_and_never_reach_a_host_craze(app_remote, remote):
-    """Every remote craze command is the JAILED composition — the fake ssh
-    refuses (and records) one that names an absolute rung — and the dormant
-    jail's sentinel at an absolute rung never ran."""
-    app_remote.wait_until(lambda: any("craze" in c for c in remote.commands("craze-dormant")),
-                          timeout=WAIT, what="the dormant remote's first craze command")
-    assert not (remote.root / "refused").exists(), "a remote craze command named an absolute rung"
-    app_remote.wait_until(lambda: _craze_state(app_remote, "craze-dormant").get("state") == "dormant",
-                          timeout=WAIT, what="the dormant remote's probe")
-    assert not (remote.root / "refused").exists(), "a remote craze command named an absolute rung"
-    assert not remote.sentinel_log.exists(), "a host-installed craze answered a remote probe"
-
-
-def test_too_old_shows_the_machines_pane_note(app_remote):
-    """craze v0.0.1 on a machine (the real binary) reads too old, and the
-    machines pane SAYS so — with what to do."""
-    app_remote.wait_until(lambda: _craze_state(app_remote, "craze-old").get("cause") == "too_old",
-                          timeout=WAIT, what="craze-old read as too old")
-    app_remote.navigate("machines")
-    app_remote.wait_until(
-        lambda: any(m["name"] == "craze-old" and m.get("craze_note")
-                    for m in (app_remote.machines_dump() or [])),
-        timeout=20, what="the machines pane's craze note")
-    row = next(m for m in app_remote.machines_dump() if m["name"] == "craze-old")
-    assert row["craze_note"] == "craze on this machine is too old for shed; update it", row
-    assert row["craze_create"] is False, "too old: no create entry (plan 025 §3.8)"
-    dormant = next(m for m in app_remote.machines_dump() if m["name"] == "craze-dormant")
-    assert dormant.get("craze_note") is None, "dormant is not a problem to report"
-    assert dormant["craze_create"] is True, "dormant: create is offered (plan 025 §3.6.5)"
-    _shot(app_remote, "craze-machines.png")
-
-
-def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, remote):
-    """**Create on a DORMANT machine** (plan 025 §3.6.5, §3.6.1): opening the
-    sheet is the explicit action that starts a remote hub — its
-    `create_options` dials `bridge --hub` (jailed, like every remote command in
-    test mode) where no hub ran — and the machine's source, WOKEN by it, probes
-    and attaches at once rather than at its next 30 s dormant probe. And the
-    sheet's "Name (optional)" (plan 029 P10): absent from the dormant status
-    (`create_title: false`, as `create_options`), the field appears on the
-    open sheet once the woken hub is live and says it takes a title.
-
-    LAST of the remote machines' cells: craze-dormant is no longer dormant
-    after it."""
-    machine = "craze-dormant"
-    jail = remote.jails[machine]
-    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "dormant",
-                          timeout=WAIT, what="craze-dormant dormant")
-    assert not jail.hub_pids()
-    # Plan 029 P10: a dormant machine's status says it cannot name a session
-    # at create — no hub has said so yet — exactly as it says no
-    # `create_options`; its sheet offers "Name (optional)" once the hub is live.
-    dormant = _craze_state(app_remote, machine)
-    assert dormant.get("create_title") is False and dormant.get("create_options") is False, dormant
-    # Anchor on a fresh dormant probe: without the wake, the next one — the
-    # earliest the source could attach — is a full DORMANT_PROBE (30 s) later.
-    probes = lambda: [c for c in remote.commands(machine) if "providers --hub --json" in c]  # noqa: E731
-    seen = len(probes())
-    app_remote.wait_until(lambda: len(probes()) > seen, timeout=45, what="a fresh dormant probe")
-    probed_at = time.monotonic()
-    d = _open_sheet(app_remote, machine)
-    assert d["state"] == "idle", d
-    assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "claude", "native"], d["providers"]
-    assert d["preselected"] == "grok"
-    assert any("bridge --hub" in c for c in remote.commands(machine)), \
-        "the sheet's create_options dialled bridge --hub (an explicit action)"
-    assert jail.hub_pids(), "a hub runs there now"
-    assert not (remote.root / "refused").exists(), "a remote craze command named an absolute rung"
-    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
-                          timeout=WAIT, what="craze-dormant attached")
-    assert time.monotonic() - probed_at < 25, "woken by the sheet, not left to its next dormant probe"
-    assert _craze_state(app_remote, machine).get("create_title") is True, "craze 0.1.1's hub takes a title"
-    # The open sheet grows its Name field once the hub is live (P10).
-    app_remote.wait_until(lambda: (_sheet(app_remote) or {}).get("title_field") is True, timeout=WAIT,
-                          what="the Name field on the now-live machine's sheet")
-    assert "Name" in _sheet(app_remote)["values"], _sheet(app_remote)["values"]
-    _shot(app_remote, "craze-create-dormant.png")
-    _close_sheet(app_remote)
-
-
 # ---------------------------------------------------------------------------
 # (5b) `--no-start` (plan 032 §3.5, W5): the race closed, and the fallback
 # ---------------------------------------------------------------------------
 
-#: Two remote machines, each with a hub running BEFORE launch (the harness's
-#: own bridge holds it) and its switch set before the app's first dial:
-#: `craze-race`'s roster dial is HELD (`hold-roster` 0) so the cell can end
-#: its hub between the probe and the bridge; `craze-legacy` emulates a craze
-#: older than 0.2.0 (`craze-0.1`: `--no-start` refused).
+#: Two sheds, each with a hub running BEFORE launch (the harness's own bridge
+#: holds it) and its switch set before the app's first dial: `craze-race`'s
+#: roster dial is HELD (`hold-roster` 0) so the cell can end its hub between
+#: the probe and the bridge; `craze-legacy` emulates a craze older than 0.2.0
+#: (`craze-0.1`: `--no-start` refused).
 RACE_MACHINE = "craze-race"
 LEGACY_MACHINE = "craze-legacy"
 LEGACY_FAKE_HOST = "0b0b0b0b0b0b"
 NO_START_JAILS = ((RACE_MACHINE, "recipe"), (LEGACY_MACHINE, "recipe"))
-NO_START_CONFIG = f"""servers:
-    mock:
-        host: 127.0.0.1
-        http_port: 8080
-        ssh_port: 2222
-default_server: mock
-sheds: {{}}
-machines:
-    {RACE_MACHINE}:
-        host: craze-host
-        user: {RACE_MACHINE}
-    {LEGACY_MACHINE}:
-        host: craze-host
-        user: {LEGACY_MACHINE}
-"""
 #: The app's log line when a host's dial falls back (`SshCrazeDial::fall_back`).
 FELL_BACK = "does not know `bridge --hub --no-start`"
 
@@ -3778,20 +3857,23 @@ def no_start_rig(bins):
 
 
 @pytest.fixture(scope="module")
-def app_no_start(no_start_rig, mock):
-    """No local craze; the two W5 machines through the fake ssh."""
-    runtime_dir = Path(tempfile.mkdtemp(prefix="shns-", dir="/tmp")).resolve()
-    config = no_start_rig.root / "config.yaml"
-    config.write_text(NO_START_CONFIG)
-    started = _launch(mock, runtime_dir=runtime_dir, craze=None, roost=None,
-                      ssh_bin=no_start_rig.ssh, config=config)
-    client = started[0]
-    client.log_path = runtime_dir / "craze-ui.log"  # type: ignore[attr-defined]
-    try:
+def app_no_start(no_start_rig):
+    """The two W5 sheds, listed by a private mock and reached through the fake ssh.
+
+    The mock, the runtime dir and the app are one `ExitStack`, so a launch
+    that fails after the mock is up still stops it and removes the dir."""
+    with contextlib.ExitStack() as stack:
+        m = MockShedServer()
+        m.set_sheds([_running_shed(name) for name, _ in NO_START_JAILS])
+        m.start()
+        stack.callback(m.stop)
+        runtime_dir = Path(tempfile.mkdtemp(prefix="shns-", dir="/tmp")).resolve()
+        stack.callback(lambda: shutil.rmtree(runtime_dir, ignore_errors=True))
+        started = _launch(m, runtime_dir=runtime_dir, ssh_bin=no_start_rig.ssh)
+        stack.callback(lambda: _stop(*started))
+        client = started[0]
+        client.log_path = runtime_dir / "craze-ui.log"  # type: ignore[attr-defined]
         yield client
-    finally:
-        _stop(*started)
-        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 def test_a_hub_gone_between_the_probe_and_the_bridge_leaves_the_source_dormant(
@@ -3850,14 +3932,14 @@ def test_a_craze_older_than_0_2_falls_back_once_and_goes_live(app_no_start, no_s
     machine = LEGACY_MACHINE
     app.wait_until(lambda: _craze_state(app, machine).get("state") == "live",
                    timeout=WAIT, what="the 0.1.x machine live through the fallback")
-    app.wait_until(lambda: _row(app, LEGACY_FAKE_HOST, machine=machine), timeout=WAIT,
+    app.wait_until(lambda: _row(app, LEGACY_FAKE_HOST, machine) is not None, timeout=WAIT,
                    what="its fake host's row")
     recs = _craze_records(no_start_rig, machine)
     kinds = ["probe" if _is_probe(r.text) else "no-start" if _is_no_start(r.text)
              else "bridge" if _is_plain_bridge(r.text) else r.text for r in recs]
     assert kinds[:4] == ["probe", "no-start", "probe", "bridge"], kinds
 
-    args = {"machine": machine, "kind": KIND, "session_id": LEGACY_FAKE_HOST}
+    args = {"target": _as_target(machine), "session_id": LEGACY_FAKE_HOST}
     app.call("lane.open", args)
     try:
         app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1,
@@ -3878,28 +3960,27 @@ def test_a_craze_older_than_0_2_falls_back_once_and_goes_live(app_no_start, no_s
 # (6) a running shed's craze: offer, don't list (plan 026 §3.2, shed#399)
 # ---------------------------------------------------------------------------
 
-SERVER = "mock"
 #: The sheds the shed instance's private mock lists running, each with its own
 #: jail (a shed's ssh user is its name) — so each cell's craze is its own:
 #: `czoffer` is created on, `czold` runs the real v0.0.1, `czprobe` has its
-#: probe switched, `czstop` is stopped.
-SHED_JAILS = (("czoffer", "recipe"), ("czold", "old"), ("czprobe", "recipe"), ("czstop", "recipe"))
-TOO_OLD_NOTE = "craze on this machine is too old for shed; update it"
+#: probe switched, `czstop` is stopped, `czabsent` has no craze at all.
+SHED_JAILS = (("czoffer", "recipe"), ("czold", "old"), ("czprobe", "recipe"),
+              ("czstop", "recipe"), ("czabsent", "empty"))
+TOO_OLD_NOTE = "craze on this shed is too old; update it"
 
 
 def _shed_target(name: str) -> str:
     return f"roost:{SERVER}/{name}"
 
 
-def _running_shed(name: str) -> dict:
-    return {"name": name, "status": "running", "backend": "vz",
-            "created_at": "2026-10-09T12:00:00Z", "started_at": "2026-10-09T12:00:01Z"}
-
-
 @pytest.fixture(scope="module")
 def shed_rig(bins):
     """The fake ssh and one jail per running shed."""
     r = Remote(bins, jails=SHED_JAILS, prefix="shcs-")
+    absent = r.jails["czabsent"]
+    r.absent_sentinel = r.root / "absent-sentinel.log"
+    _write_exec(absent.home / ".nix-profile" / "bin" / "craze",
+                f"#!/bin/sh\necho ran >> '{r.absent_sentinel}'\nexit 2\n")
     try:
         yield r
     finally:
@@ -3929,8 +4010,7 @@ def app_shed(shed_rig, shed_mock):
     running sheds reach their jails through the fake ssh — so each shed has an
     attach-only craze source, and no roost-session to list it."""
     runtime_dir = Path(tempfile.mkdtemp(prefix="shsh-", dir="/tmp")).resolve()
-    started = _launch(shed_mock, runtime_dir=runtime_dir, craze=None, roost=None,
-                      ssh_bin=shed_rig.ssh, config=FIXTURES / "config-craze-shed.yaml")
+    started = _launch(shed_mock, runtime_dir=runtime_dir, ssh_bin=shed_rig.ssh)
     try:
         yield started[0]
     finally:
@@ -3950,34 +4030,12 @@ def _offered_as(app: TauriClient, name: str) -> dict:
 
 def _listed(app: TauriClient, name: str) -> bool:
     """Whether the shed is a LISTED host: a status row of `rc.list`."""
-    return any(m["origin"] == _shed_target(name) for m in app.call("rc.list")["machines"])
+    return any(m.get("origin") == _shed_target(name) for m in app.call("rc.list").get("hosts") or [])
 
 
 def _shed_row(app: TauriClient, name: str) -> dict | None:
     """The running shed's Sheds-pane row as rendered (`shed_roost.dump`)."""
     return (app.call("shed_roost.dump")["sheds"] or {}).get(_shed_target(name))
-
-
-def _where(app: TauriClient) -> str:
-    """The New-session dialog's rendered text — its "Where" choices among it —
-    or "" while none is open."""
-    return (app.call("launch.dump")["launch"] or {}).get("rendered") or ""
-
-
-def _where_offers(app: TauriClient, name: str) -> bool:
-    return f"{_shed_target(name)} — new craze session" in _where(app)
-
-
-def _open_launch(app: TauriClient) -> None:
-    app.call("ui.show_launch")
-    app.wait_until(lambda: bool(app.call("launch.dump")["launch"]), timeout=20,
-                   what="the launch dialog")
-
-
-def _close_launch(app: TauriClient) -> None:
-    app.call("ui.close_launch")
-    app.wait_until(lambda: app.call("launch.dump")["launch"] is None, timeout=20,
-                   what="the launch dialog to close")
 
 
 def _shed_craze_commands(rig: Remote, name: str) -> list[str]:
@@ -3997,17 +4055,14 @@ def _offered_on_its_row(app: TauriClient, name: str) -> None:
 def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
     """**A dormant shed is offered craze, not listed** (plan 026 §3.2, shed#399).
     A running shed whose find-only probe says no hub runs there offers New
-    craze session on its Sheds-pane row and in the New-session dialog's
-    "Where", and is NOT a listed host (`rc.list.machines` lacks it); until the
+    craze session on its Sheds-pane row, and is NOT a listed host; until the
     click, the fake ssh carried only the probe.
 
-    The click opens the sheet with its options loaded — and with no note,
-    where reading the status rows alone would say "… has no craze" — while
-    the roster's `Ready` is HELD BACK (the fake ssh holds the roster's
+    The click opens the sheet with its options loaded — and with no note —
+    while the roster's `Ready` is HELD BACK (the fake ssh holds the roster's
     `bridge --hub`, the second, behind the sheet's), so the shed is still
     unlisted and only its `shed_craze` entry says what its craze is: Create
-    is enabled. A create then lists the shed, and its card — no roost there —
-    reads `craze only`, in the sidebar too."""
+    is enabled. A create then lists the shed."""
     app = app_shed
     name = "czoffer"
     target = _shed_target(name)
@@ -4015,12 +4070,6 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
     _offered_on_its_row(app, name)
     assert not _listed(app, name), "a dormant shed is not a listed host"
     assert _shed_row(app, name)["craze_note"] is None
-    _open_launch(app)
-    try:
-        app.wait_until(lambda: _where_offers(app, name), timeout=20,
-                       what="Where to offer the dormant shed")
-    finally:
-        _close_launch(app)
     _shot(app, "craze-shed-offer.png")
     cmds = _shed_craze_commands(shed_rig, name)
     assert cmds and all("providers --hub --json" in c for c in cmds), \
@@ -4029,12 +4078,12 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
 
     (jail.root / "hold-roster").write_text("1")
     try:
-        app.call("ui.show_craze_create", {"machine": target})
+        app.call("ui.show_craze_create", {"target": target})
         seen: list[dict] = []
 
         def loaded() -> bool:
             d = _sheet(app)
-            if not (d and d["machine"] == target):
+            if not (d and d.get("target") == target):
                 return False
             seen.append(d)
             return d["state"] != "loading"
@@ -4066,15 +4115,9 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
         app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
         app.wait_until(lambda: _listed(app, name), timeout=WAIT, what="the shed listed by its create")
         assert _offered(app, name) is None, "listed now: no longer a shed_craze entry"
-        app.navigate("machines")
-        app.wait_until(lambda: any(m["origin"] == target for m in app.machines_dump() or []),
-                       timeout=20, what="the shed's card in the Machines pane")
-        card = next(m for m in app.machines_dump() if m["origin"] == target)
-        assert card["status"] == "craze only", card
-        assert card["detail"] == "no roost session here yet — craze sessions only", card
-        bar = next(m for m in app.sidebar_dump()["machines"] if m["origin"] == target)
-        assert (bar["status"], bar["note"], bar["tone"]) == ("craze only", "craze only", "neutral"), bar
-        _shot(app, "craze-shed-craze-only.png")
+        app.wait_until(lambda: bool(_rows(app, name)), timeout=WAIT,
+                       what="the created session listed on the shed")
+        _shot(app, "craze-shed-listed.png")
     finally:
         (jail.root / "hold-roster").unlink(missing_ok=True)
         app.call("ui.close_craze_create")
@@ -4085,8 +4128,8 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
 def test_a_too_old_shed_says_so_on_its_row(app_shed, shed_rig):
     """**A too-old shed says so on its row** (plan 026 §3.2): the real craze
     v0.0.1 in a running shed reads too old — its `shed_craze` entry — and its
-    Sheds-pane row shows the note and no New craze session; "Where" offers it
-    nothing; it is not listed, and nothing but the probe reached it."""
+    Sheds-pane row shows the note and no New craze session; it is not listed,
+    and nothing but the probe reached it."""
     app = app_shed
     name = "czold"
     app.wait_until(lambda: _offered_as(app, name).get("cause") == "too_old", timeout=WAIT,
@@ -4098,15 +4141,6 @@ def test_a_too_old_shed_says_so_on_its_row(app_shed, shed_rig):
     row = _shed_row(app, name)
     assert row["craze_note"] == TOO_OLD_NOTE, row
     assert row["craze_create"] is False, "too old: no create entry"
-    _open_launch(app)
-    try:
-        # The dialog has rendered the running sheds — this one among them —
-        # before the absence of its craze choice means anything.
-        app.wait_until(lambda: f"{SERVER}/{name}" in _where(app), timeout=20,
-                       what="the dialog's shed targets")
-        assert not _where_offers(app, name), _where(app)
-    finally:
-        _close_launch(app)
     cmds = _shed_craze_commands(shed_rig, name)
     assert cmds and all("providers --hub --json" in c for c in cmds), cmds
     _shot(app, "craze-shed-too-old.png")
@@ -4115,9 +4149,9 @@ def test_a_too_old_shed_says_so_on_its_row(app_shed, shed_rig):
 def test_a_dormant_shed_offer_follows_its_probe(app_shed, shed_rig):
     """**The offer follows the probe** (plan 026 §3.2), with the sheet closed —
     so the source stays dormant and keeps probing: a probe that exits 127 (not
-    installed) takes the row's New craze session away and "Where" drops it,
-    and a probe that says no hub again brings both back, each on the UI's own
-    re-read. No `bridge --hub` ran.
+    installed) takes the row's New craze session away, and a probe that says
+    no hub again brings it back, each on the UI's own re-read. No
+    `bridge --hub` ran.
 
     An OPEN sheet births the hub and the roster attaches, so the loop stops
     probing; the sheet's half is therefore its own: with the probe switched
@@ -4131,35 +4165,48 @@ def test_a_dormant_shed_offer_follows_its_probe(app_shed, shed_rig):
     probe_127 = jail.root / "probe-127"
     app.wait_until(lambda: _offered_as(app, name).get("state") == "dormant", timeout=WAIT,
                    what=f"{name} offered as dormant")
+    early = _offered_as(app, name)
+    assert early.get("create_title") is False, early
+    assert early.get("create_options") is False, early
     app.navigate("sheds")
-    # The dialog re-reads `rc.list` as it opens, so the offer below is on screen
-    # whatever repainted before; what follows is the probe's own repaints.
-    _open_launch(app)
+    app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True, timeout=20,
+                   what="its row to offer it")
+    probe_127.touch()
     try:
-        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True
-                       and _where_offers(app, name), timeout=20,
-                       what="its row and Where to offer it")
-        probe_127.touch()
         # The next dormant probe (every 30 s) is the one that exits 127.
-        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is False
-                       and not _where_offers(app, name),
+        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is False,
                        timeout=45, what="the offer to go once the probe exits 127")
         assert _offered(app, name) is None, "not installed: no entry"
         probe_127.unlink()
         # Not installed re-probes every 30 s too.
-        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True
-                       and _where_offers(app, name),
+        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True,
                        timeout=45, what="the offer back once the probe says no hub")
     finally:
         probe_127.unlink(missing_ok=True)
-        _close_launch(app)
     assert not any("bridge --hub" in c for c in shed_rig.commands(name)), \
         "the sheet was closed: nothing dialled bridge --hub"
 
+    # Anchor the wake to a probe that just landed, so the next background
+    # probe is a full 30 s away. The attach has to happen inside that gap.
+    seen = sum(_is_probe(r.text) for r in _craze_records(shed_rig, name))
+    app.wait_until(lambda: sum(_is_probe(r.text) for r in _craze_records(shed_rig, name)) > seen,
+                   timeout=45, what="a fresh dormant probe")
+    dormant = _offered_as(app, name)
+    assert dormant.get("state") == "dormant", dormant
+    assert dormant.get("create_title") is False, dormant
+    assert dormant.get("create_options") is False, dormant
+    probes = sum(_is_probe(r.text) for r in _craze_records(shed_rig, name))
     d = _open_sheet(app, target)
     assert d["state"] == "idle" and d["note"] is None, d
-    app.wait_until(lambda: _listed(app, name) and (_status(app, target) or {}).get("craze", {})
-                   .get("state") == "live", timeout=WAIT, what="the roster to attach")
+    _wait_unscaled(
+        lambda: _listed(app, name) and (_status(app, target) or {}).get("craze", {}).get("state") == "live",
+        22, "the roster to attach from the sheet, inside the probe interval")
+    extra = sum(_is_probe(r.text) for r in _craze_records(shed_rig, name)) - probes
+    assert extra <= 1, \
+        "the roster attached on the sheet's dial, not on another probe cycle"
+    assert (_status(app, target) or {}).get("craze", {}).get("create_title") is True
+    app.wait_until(lambda: (_sheet(app) or {}).get("title_field") is True, timeout=WAIT,
+                   what="the Name field once the woken hub says it takes a title")
     d = _fill(app, cwd=str(jail.work))
     assert d["create_enabled"] is True, d
     probe_127.touch()
@@ -4184,50 +4231,54 @@ def test_a_dormant_shed_offer_follows_its_probe(app_shed, shed_rig):
         _close_sheet(app)
 
 
-def test_a_stopped_dormant_shed_leaves_where(app_shed, shed_rig, shed_mock):
-    """**A stopped dormant shed leaves "Where"** (plan 026 §3.2): stopping it in
-    the mock server takes away its row's offer and its "Where" choice on the
-    app's own shed refresh — no refresh by hand: the removal of a shed that
-    was only OFFERED (never listed) still tells the UI to re-read."""
+def test_a_stopped_dormant_shed_leaves_its_row(app_shed, shed_rig, shed_mock):
+    """**A stopped dormant shed leaves its row** (plan 026 §3.2): stopping it
+    in the mock server takes away its offer on the app's own shed refresh —
+    no refresh by hand: the removal of a shed that was only OFFERED (never
+    listed) still tells the UI to re-read."""
     app = app_shed
     name = "czstop"
     _offered_on_its_row(app, name)
-    _open_launch(app)
-    try:
-        app.wait_until(lambda: _where_offers(app, name), timeout=20, what="Where to offer it")
-        _, sheds = shed_mock.snapshot()
-        shed_mock.set_sheds([dict(s, status="stopped") if s["name"] == name else s
-                             for s in sheds or []])
-        app.wait_until(lambda: not _where_offers(app, name), timeout=WAIT,
-                       what="Where to drop the stopped shed on the app's own refresh")
-        app.wait_until(lambda: _shed_row(app, name) is None, timeout=20,
-                       what="the stopped shed's row to offer nothing")
-    finally:
-        _close_launch(app)
+    _, sheds = shed_mock.snapshot()
+    shed_mock.set_sheds([dict(s, status="stopped") if s["name"] == name else s
+                         for s in sheds or []])
+    app.wait_until(lambda: _shed_row(app, name) is None, timeout=WAIT,
+                   what="the stopped shed's row to leave on the app's own refresh")
     assert _offered(app, name) is None, "a stopped shed is no entry"
     assert not any("bridge --hub" in c for c in shed_rig.commands(name))
+
+
+def test_an_absent_shed_offers_nothing_and_never_runs_a_host_craze(app_shed, shed_rig):
+    """**Craze not installed** is not a note and not an offer. The sentinel at
+    an absolute ladder rung under the shed's HOME never runs."""
+    app = app_shed
+    name = "czabsent"
+    app.wait_until(
+        lambda: any(_is_probe(text) for text in _shed_craze_commands(shed_rig, name)),
+        timeout=WAIT, what="the absent shed's craze probe")
+    assert not (shed_rig.root / "refused").exists(), \
+        "a production-ladder refusal is not this shed's probe"
+    app.navigate("sheds")
+    app.wait_until(lambda: _shed_row(app, name) is not None, timeout=20,
+                   what="the absent shed's row")
+    row = _shed_row(app, name)
+    assert row.get("craze_note") is None, row
+    assert row.get("craze_create") is False, row
+    assert _offered(app, name) is None
+    assert not _rows(app, name)
+    assert not shed_rig.absent_sentinel.exists(), "a host-installed craze answered the probe"
 
 
 # ---------------------------------------------------------------------------
 # (7) the orderly shutdown, from every exit path (plan 026 §3.3, shed#389)
 # ---------------------------------------------------------------------------
 
-#: The signal cells' remote machine: a live hub there (the harness's own
-#: bridge holds it, started BEFORE launch), reached through the fake ssh.
-SIG_MACHINE = "craze-sig"
+#: The signal cells' shed: a live hub there (the harness's own bridge holds
+#: it, started BEFORE launch), reached through the fake ssh. The app owns the
+#: ssh bridges and the SshExec master; the hub and the session it created are
+#: the remote's, and must survive the app.
+SIG_SHED = "czsig"
 SIG_FAKE_HOST = "0e0e0e0e0e0e"
-SIG_CONFIG = f"""servers:
-    mock:
-        host: 127.0.0.1
-        http_port: 8080
-        ssh_port: 2222
-default_server: mock
-sheds: {{}}
-machines:
-    {SIG_MACHINE}:
-        host: craze-host
-        user: {SIG_MACHINE}
-"""
 
 
 def _ps_table() -> dict[int, tuple[int, str]]:
@@ -4270,45 +4321,41 @@ def _pid_alive(pid: int) -> bool:
 
 
 class SigRig:
-    """One signal cell's world (plan 026 §3.3) — everything its OWN app
-    instance needs, never the module's shared `app`: this machine's craze
-    (the recording seam over the real binary, its own HOME and hub), and one
-    remote machine through the fake ssh with a live hub of its own."""
+    """One signal cell's world: one listed shed, its hub started by the
+    harness before the app, reached through the fake ssh."""
 
     def __init__(self, bins: Path, *, wedge: bool = False):
-        self.root = Path(tempfile.mkdtemp(prefix="shsg-", dir="/tmp")).resolve()
         self.started = None
         self.holder = None
-        self.local = None
         self.remote = None
+        self.mock = None
+        self.env = None
+        self.log: Path | None = None
+        self.runtimes: list[Path] = []
         try:
-            # 0700 all the way down: craze refuses a runtime dir beneath a
-            # group-writable ancestor.
-            local = _mkdir_0700(self.root / "local")
-            self.local = CrazeEnv(bins, local, local / "h")
-            self.remote = Remote(bins, jails=((SIG_MACHINE, "recipe"),), prefix="shsr-")
-            live = self.remote.jails[SIG_MACHINE]
-            live.fake_host(SIG_FAKE_HOST, "craze-sig-fake")
-            self.holder = live.bridge()
+            self.remote = Remote(bins, jails=((SIG_SHED, "recipe"),), prefix="shsr-")
+            self.env = self.remote.jails[SIG_SHED]
+            self.env.fake_host(SIG_FAKE_HOST, "craze-sig-fake")
+            self.holder = self.env.bridge()
             assert self.holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
-            self.local.fake_host(FAKE_HOST, FAKE_SESSION)
-            self.config = self.root / "config.yaml"
-            self.config.write_text(SIG_CONFIG)
+            self.mock = MockShedServer()
+            self.mock.set_sheds([_running_shed(SIG_SHED)])
+            self.mock.start()
             if wedge:
                 (self.remote.root / "wedge-exit").touch()
         except BaseException:
-            # A rig that failed halfway still owns what it started. The
-            # original failure is the one reported.
             try:
                 self.teardown()
             except BaseException:
                 pass
             raise
 
-    def launch(self, mock):
-        """An app instance of this rig's own: its HOME is the local namespace's."""
-        self.started = _launch(mock, runtime_dir=self.local.home, craze=self.local, roost=None,
-                               ssh_bin=self.remote.ssh, config=self.config)
+    def launch(self):
+        """An app instance of this rig's own, pointed at the private mock."""
+        runtime = Path(tempfile.mkdtemp(prefix="shsg-app-", dir="/tmp")).resolve()
+        self.runtimes.append(runtime)
+        self.log = runtime / "craze-ui.log"
+        self.started = _launch(self.mock, runtime_dir=runtime, ssh_bin=self.remote.ssh)
         return self.started
 
     def exits(self) -> list[str]:
@@ -4316,17 +4363,14 @@ class SigRig:
         return log.read_text().splitlines() if log.exists() else []
 
     def teardown(self) -> list[int]:
-        """Every step runs, whatever an earlier one raised (plan 026 §3.3, F9):
-        an app that needed the harness's SIGKILL is reported only once the
-        holder is closed and both namespaces are swept — the first failure is
-        re-raised at the end, with any craze process left behind printed."""
+        """Every step runs, whatever an earlier one raised."""
         failures: list[BaseException] = []
         left: list[int] = []
 
         def step(do):
             try:
                 do()
-            except BaseException as failure:  # re-raised below, once all ran
+            except BaseException as failure:
                 failures.append(failure)
 
         if self.remote is not None:
@@ -4336,11 +4380,12 @@ class SigRig:
             step(lambda: _stop(*started))
         if self.holder is not None:
             step(self.holder.close)
-        if self.local is not None:
-            step(lambda: left.extend(self.local.teardown()))
         if self.remote is not None:
             step(lambda: left.extend(self.remote.teardown()))
-        shutil.rmtree(self.root, ignore_errors=True)
+        if self.mock is not None:
+            step(self.mock.stop)
+        for runtime in self.runtimes:
+            shutil.rmtree(runtime, ignore_errors=True)
         if failures:
             if left:
                 print(f"\n[craze] signal rig: craze processes left behind: {left}")
@@ -4374,48 +4419,41 @@ def wedged_rig(bins):
 
 
 def _remote_lane(app: TauriClient, host_id: str) -> None:
-    """Open the remote machine's craze lane on `host_id` and wait for its seed."""
-    args = {"machine": SIG_MACHINE, "kind": KIND, "session_id": host_id}
+    """Open the shed's craze lane on `host_id` and wait for its seed."""
+    args = {"target": _as_target(SIG_SHED), "session_id": host_id}
     app.call("lane.open", args)
     app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1, timeout=WAIT,
-                   what=f"the seeded remote craze lane on {host_id}")
+                   what=f"the seeded craze lane on {host_id}")
 
 
 def _set_up_children(app: TauriClient, rig: SigRig) -> str:
-    """Every child class the harness can reach (plan 026 §3.3's table): this
-    machine's roster and an open local lane (class C, local craze bridges), a
-    session CREATED through the app (its `craze serve` is the hub's, so it must
-    outlive the app), and the remote machine's roster and an open lane over the
-    fake ssh, with that host's `SshExec` master (class B). Answers the created
-    session's hostId."""
-    app.wait_until(lambda: _row(app, FAKE_HOST) is not None, timeout=WAIT,
-                   what="this machine's craze row")
-    cwd = _mkdir_0700(rig.local.root / "w-sig")
-    created = app.call("craze.create", {"machine": LOCAL, "cwd": str(cwd),
+    """The shed's roster, a session created through the app (its `craze serve`
+    is the hub's, so it must outlive the app), and an open lane over the fake
+    ssh, with that shed's `SshExec` master. Answers the created session's hostId."""
+    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, SIG_SHED) is not None, timeout=WAIT,
+                   what="the shed's craze row")
+    cwd = _mkdir_0700(rig.env.root / "w-sig")
+    created = app.call("craze.create", {"target": _as_target(SIG_SHED), "cwd": str(cwd),
                                         "prompt": "hello quit"})
     host = created["host_id"]
-    app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT,
+    app.wait_until(lambda: _row(app, host, SIG_SHED) is not None, timeout=WAIT,
                    what="the created session's row")
-    _ready(app, FAKE_HOST)
-    _ready(app, host)
-    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, machine=SIG_MACHINE) is not None,
-                   timeout=WAIT, what="the remote machine's craze row")
-    _remote_lane(app, SIG_FAKE_HOST)
-    assert rig.remote.live_bridges(SIG_MACHINE), "the remote lane's ssh bridge runs"
+    _ready(app, SIG_FAKE_HOST, SIG_SHED)
+    _ready(app, host, SIG_SHED)
+    assert rig.remote.live_bridges(SIG_SHED), "the shed's ssh bridge runs"
     return host
 
 
 def _app_owned(app_pid: int, rig: SigRig) -> tuple[dict[int, str], set[int]]:
-    """The app's DESCENDANT tree, recorded by walking ppids from its pid — and,
-    listed apart, the persistent processes it does not own: this machine's
-    craze hub (by its own record) and everything under it (its session hosts
-    and their agents). A hub is the bridge's child until that bridge exits, so
-    it sits inside the app's tree while the app runs, and must be told apart."""
+    """The app's descendant tree, and, listed apart, the remote hub and
+    everything under it. The harness started that hub, so it is not the
+    app's; a session the app created is the hub's child and must be told
+    apart the same way."""
     table = _ps_table()
     tree = _descendants(app_pid, table)
     persistent: set[int] = set()
-    for hub in rig.local.hub_pids():
-        if hub in table and table[hub][1].startswith(str(rig.local.real)):
+    for hub in rig.env.hub_pids():
+        if hub in table and table[hub][1].startswith(str(rig.env.real)):
             persistent.add(hub)
             persistent.update(_descendants(hub, table))
     owned = {pid: args for pid, args in tree.items() if pid not in persistent}
@@ -4429,12 +4467,11 @@ def _quit(app: TauriClient, proc: subprocess.Popen, how: str) -> None:
         os.kill(proc.pid, getattr(signal, how))
 
 
-def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
+def _quit_leaves_no_app_children(rig: SigRig, how: str) -> str:
     """One exit path, end to end (plan 026 §3.3 and AM7). An app instance of
-    the rig's own is set up with a local craze lane (jailed), a session created
-    through it, and a remote fake-ssh machine with an open lane and its
-    `SshExec` master; its descendant tree is recorded; then it is quit by `how`
-    ([`_quit`]). Then:
+    the rig's own is set up with a session created on its shed and an open
+    lane over the fake ssh, with that shed's `SshExec` master; its descendant
+    tree is recorded; then it is quit by `how` ([`_quit`]). Then:
 
     * it exits by itself within 5 s (the harness's kill is never used), with
       status 0;
@@ -4445,11 +4482,11 @@ def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
       the session.
 
     Answers the created session's hostId."""
-    app, proc, _log_fh = rig.launch(mock)
+    app, proc, _log_fh = rig.launch()
     host = _set_up_children(app, rig)
     owned, persistent = _app_owned(proc.pid, rig)
-    hubs = [p for p in rig.local.hub_pids() if p in persistent]
-    assert hubs, "this machine's hub was recorded among the persistent processes"
+    hubs = [p for p in rig.env.hub_pids() if p in persistent]
+    assert hubs, "the shed's hub was recorded among the persistent processes"
     bridges = [pid for pid, args in owned.items() if "bridge" in args or "ssh" in args]
     assert bridges, f"the app's craze bridges were recorded among its children: {owned}"
 
@@ -4480,7 +4517,7 @@ def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
         f"{how}: the remote host's SshExec master was never asked to -O exit: {exits}"
 
     assert code == 0, f"{how}: an orderly exit is a clean one (exit {code})"
-    said = [line for line in (rig.local.home / "craze-ui.log").read_text(errors="replace").splitlines()
+    said = [line for line in rig.log.read_text(errors="replace").splitlines()
             if "shutdown" in line]
     assert any("shutdown: done" in line for line in said), \
         f"{how}: the orderly shutdown did not run: {said}"
@@ -4488,16 +4525,16 @@ def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
 
     # The persistent processes the app does not own: still there.
     for hub in hubs:
-        assert _pid_alive(hub) and _program_args(hub).startswith(str(rig.local.real)), \
+        assert _pid_alive(hub) and _program_args(hub).startswith(str(rig.env.real)), \
             f"{how}: the craze hub {hub} did not survive the app"
-    ps = subprocess.run([str(rig.local.real / "craze"), "ps", "--json"], env=rig.local.env(),
-                        capture_output=True, text=True, timeout=30, cwd=str(rig.local.root))
+    ps = subprocess.run([str(rig.env.real / "craze"), "ps", "--json"], env=rig.env.env(),
+                        capture_output=True, text=True, timeout=30, cwd=str(rig.env.root))
     assert host in ps.stdout, f"{how}: craze ps no longer lists the session: {ps.stdout} {ps.stderr}"
     return host
 
 
 @pytest.mark.parametrize("how", ["SIGTERM", "SIGINT", "SIGHUP", "app.quit"])
-def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
+def test_sigterm_leaves_no_app_children(sig_rig, how):
     """**Every exit path ends every child the app owns, and nothing it does
     not** (plan 026 §3.3, shed#389). The app is sent SIGTERM, SIGINT or SIGHUP
     by its RECORDED pid — or the test-mode `app.quit` door, the tray's own
@@ -4506,22 +4543,22 @@ def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
     master asked to `-O exit`, the craze hub and the created session still
     running. Then a relaunched app re-opens its lane."""
     rig = sig_rig
-    host = _quit_leaves_no_app_children(rig, mock, how)
+    host = _quit_leaves_no_app_children(rig, how)
 
     # A relaunched app re-opens its lane (the first instance's own handles
     # released first: it has exited).
     first, rig.started = rig.started, None
     first[0].close()
     first[2].close()
-    app2, _proc2, _fh2 = rig.launch(mock)
-    app2.wait_until(lambda: _row(app2, host) is not None, timeout=WAIT,
+    app2, _proc2, _fh2 = rig.launch()
+    app2.wait_until(lambda: _row(app2, host, SIG_SHED) is not None, timeout=WAIT,
                     what="the session's row after the relaunch")
-    _ready(app2, host)
+    _ready(app2, host, SIG_SHED)
 
 
 @pytest.mark.skipif(sys.platform != "darwin",
                     reason="app.terminate is the macOS system-quit path ([NSApplication terminate:])")
-def test_a_macos_system_quit_leaves_no_app_children(sig_rig, mock):
+def test_a_macos_system_quit_leaves_no_app_children(sig_rig):
     """**A macOS system quit ends every child the app owns, and nothing it
     does not** (plan 026 AM7). A Dock Quit, a logout and an AppleScript `quit`
     all take AppKit's `[NSApplication terminate:]`, which reaches the app ONLY
@@ -4532,25 +4569,25 @@ def test_a_macos_system_quit_leaves_no_app_children(sig_rig, mock):
     `app.quit` case ([`_quit_leaves_no_app_children`]): the app exits by
     itself within 5 s with status 0, every recorded descendant is dead, the
     remote master got `-O exit`, and the hub and the session survive."""
-    _quit_leaves_no_app_children(sig_rig, mock, "app.terminate")
+    _quit_leaves_no_app_children(sig_rig, "app.terminate")
 
 
-def test_a_second_signal_exits_at_once(wedged_rig, mock):
+def test_a_second_signal_exits_at_once(wedged_rig):
     """**A second signal is the escape hatch** (plan 026 §3.3): with the remote
     masters' `-O exit` WEDGED (the fake ssh holds it), the first SIGTERM's
     orderly shutdown is held in its tunnels/masters phase; a second SIGTERM
     ends the app at once, with status 143 (128 + SIGTERM)."""
     rig = wedged_rig
-    app, proc, _log_fh = rig.launch(mock)
-    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, machine=SIG_MACHINE) is not None,
-                   timeout=WAIT, what="the remote machine's craze row")
+    app, proc, _log_fh = rig.launch()
+    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, SIG_SHED) is not None,
+                   timeout=WAIT, what="the shed's craze row")
     # The wedge is on from launch, so roost's own replace path may have logged
     # (and been held by) `-O exit`s already: wait for one the SHUTDOWN sends,
     # past its craze phase — and only then signal again. A second SIGTERM sent
     # before the signal thread took the first is coalesced with it by the OS
     # and tokio, which is no test of the escape.
     before = len(rig.exits())
-    ui_log = rig.local.home / "craze-ui.log"
+    ui_log = rig.log
     os.kill(proc.pid, signal.SIGTERM)
     deadline = time.monotonic() + scaled_timeout(15)
     while not (len(rig.exits()) > before

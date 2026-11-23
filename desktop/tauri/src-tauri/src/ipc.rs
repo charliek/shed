@@ -29,7 +29,10 @@ use shed_core::approval::{
     ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule, SshApprovalPolicy,
 };
 use shed_core::models::CreateShedRequest;
-use shed_core::rc::RcKind;
+use shed_desktop_core::{
+    failure_json, installed_json, InjectedRow, LaneFailure, ShedDesktopRuntime, ShedHosts, ShedId,
+};
+use shed_lane::rc::RcKind;
 
 use crate::env::Env;
 use crate::prefs::SharedPrefs;
@@ -53,7 +56,7 @@ const REFRESH_POLL: Duration = Duration::from_millis(15);
 /// minutes is comfortably more than the sum of the steps on a slow link and far
 /// less than "until the app quits".
 // `pub(crate)`: the `roost_bootstrap` Tauri command in `lib.rs` (the frontend's
-// own door onto `RoostHosts::bootstrap`, beside this socket op) shares the same
+// own door onto `ShedHosts::bootstrap`, beside this socket op) shares the same
 // outer guarantee rather than picking its own number.
 pub(crate) const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(600);
 
@@ -62,35 +65,23 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
 }
 
-/// `(machine, kind, session_id)` — the address every `lane.*` op takes. The
-/// kind is the row's `agent_lane.kind` and is REQUIRED (plan 025 §3.6.4): a
-/// craze hostId and an opencode session id are separate namespaces, and a
-/// lane op that guessed which one it meant could address the wrong lane.
-fn lane_target(params: &Value) -> Result<(String, String, String), (String, String)> {
-    Ok((
-        req_str(params, "machine")?.to_string(),
-        req_str(params, "kind")?.to_string(),
-        req_str(params, "session_id")?.to_string(),
-    ))
+/// `(target, session_id)` — the address every `lane.*` op takes. `target` is a
+/// server-listed shed (`roost:<server>/<shed>`).
+fn lane_target(params: &Value) -> Result<(ShedId, String), (String, String)> {
+    let target = parse_shed(req_str(params, "target")?)?;
+    let session_id = req_str(params, "session_id")?.to_string();
+    Ok((target, session_id))
+}
+
+/// A shed target, or `bad_request` when the string is not `roost:<server>/<shed>`.
+fn parse_shed(target: &str) -> Result<ShedId, (String, String)> {
+    ShedId::parse(target).map_err(|message| err("bad_request", message))
 }
 
 /// A lane failure as the IPC error envelope. The codes are the lane contract's
 /// own, so a client branches on the same vocabulary the DTOs speak.
-fn lane_err(failure: crate::lane::LaneFailure) -> (String, String) {
+fn lane_err(failure: LaneFailure) -> (String, String) {
     err(failure.code(), failure.message())
-}
-
-/// A machine row has NO terminal (plan 013 S3).
-///
-/// Its sessions come from a `roost-session`, whose synthesized capabilities
-/// advertise `attach: "native-remote"` — the terminal belongs to roost, and shed
-/// attaches to nothing (roost R3 is where attach lands; mobile gets a read-only
-/// `tab.dump` peek in the meantime, the desktop gets no terminal action). The
-/// card hides `>_ open` off the same capability; this is the server-side half, so
-/// a caller that asks anyway is told why instead of being handed a `tmux attach`
-/// for a session that has no tmux.
-fn machine_terminal_refusal() -> (String, String) {
-    err("not_enabled", crate::roost_hosts::NO_TERMINAL)
 }
 
 /// The sheds listing payload — `{sheds, host_errors}` — the one shape every
@@ -104,128 +95,20 @@ fn machine_terminal_refusal() -> (String, String) {
 /// failures that [`Backend::list_sheds`] drops on the floor are carried beside it
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
-/// **The single shaper for `rc.list`** — the roost sessions on every listed
-/// host, each host's contract, each host's health, and the unlisted hosts
-/// craze is offered on (`shed_craze`, plan 026 §3.2).
-///
-/// Shared by the socket IPC op and the frontend's `rc_list` Tauri command, the
-/// same way [`sheds_payload`] is shared. Those two used to build this payload
-/// independently, with a comment claiming they matched; adding machine sessions
-/// to one and not the other made the pane render nothing while the IPC op was
-/// correct — exactly the divergence a single shaper prevents.
-///
-/// **One source since S6** (`charliek/shed#328`). This used to return a UNION:
-/// the hub's rows (`source: "hub"`, listed by ssh'ing `shed-ext-rc` into the
-/// shed) beside roost's. The guest binary, the server's routes and the Go
-/// engine are gone, so the hub half is gone with them — a shed's agent sessions
-/// are the tabs its `roost-session` reports, and a shed with no session lists
-/// none. `source` is still stamped (always `"roost"`), because a consumer that
-/// branches on it must keep reading a value rather than `undefined`.
-pub(crate) async fn rc_list_payload(
-    backend: &Backend,
-    machines: &crate::roost_hosts::RoostHosts,
-    host: Option<&str>,
-    shed: Option<&str>,
-) -> Value {
-    let targets = backend.rc_targets(host, shed).await;
-    // **Every running shed is a roost host** (plan 019 §3.6). This is the
-    // ADD-ONLY half of the reconcile: `targets` is narrowed by the caller's
-    // filter, so it can say "this shed is running" and never "that one stopped".
-    // The authoritative half — which removes a stopped shed's watcher — rides on
-    // the unfiltered `sheds.list`/`sheds.refresh`, which is the only caller that
-    // knows which SERVERS answered (see [`observe_reachability`]).
-    machines
-        .observe_sheds(
-            &targets
-                .iter()
-                .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
-                .collect::<Vec<_>>(),
-            &[],
-        )
-        .await;
-    // ONE lock acquisition for the rows and the health — see
-    // `RoostHosts::snapshot`: reading them separately can produce a frame where
-    // a row is `stale: false` while its host is `reachable: false`.
-    //
-    // The filter is a SHED filter: it narrows sheds by server and name, and
-    // omits machines outright, because a machine belongs to no server.
-    //
-    // `shed_craze` is read under that same lock (plan 026 §3.2): the hosts this
-    // payload OFFERS craze on without listing them — a running shed whose craze
-    // probe says dormant (New craze session on its Sheds-pane row and in
-    // "Where"), or too old (its note) — so a host is never both a status row and
-    // an entry. The filter narrows it exactly as it narrows the status rows.
-    let (sessions, machine_status, shed_craze) =
-        machines.snapshot(crate::roost_hosts::HostFilter { server: host, shed });
-    // **Capabilities keyed by ORIGIN** (plan 013 §3.4) — `machine:<name>` or
-    // `roost:<server>/<shed>`, the same string each row carries, so the UI has a
-    // data path from a row to the contract behind it. That is what gates the
-    // attach affordance: roost rows advertise `attach: "native-remote"` and the
-    // card must NOT offer a terminal.
-    //
-    // Synthesized, never probed: roost has no capabilities op to ask, so the
-    // answer is the constant contract this client implements against it.
-    // Stamped from the STATUS rows rather than a second read of the registry, so
-    // the keys can never disagree with the hosts the same payload lists.
-    let capabilities: serde_json::Map<String, Value> = machine_status
-        .iter()
-        .filter_map(|m| m.get("origin").and_then(Value::as_str))
-        .map(|origin| {
-            (
-                origin.to_string(),
-                json!(shed_app::roost::roost_capabilities()),
-            )
-        })
-        .collect();
-    json!({
-        "sessions": sessions,
-        "capabilities": Value::Object(capabilities),
-        "machines": machine_status,
-        "shed_craze": shed_craze,
-    })
-}
-
 pub(crate) fn sheds_payload(r: &Reachability) -> Value {
     json!({ "sheds": r.sheds, "host_errors": r.host_errors })
 }
 
-/// Reconcile the roost-host layer's SHEDS against a full reachability refresh
-/// (plan 019 §3.6).
+/// Refresh reachability and reconcile shed hosts against it.
 ///
-/// The authoritative half, and the only caller that can be: a
-/// [`Reachability`] carries every healthy host's sheds AND the per-host
-/// failures, so "this shed of an answering server is gone" is distinguishable
-/// from "that server never answered". Without that distinction a laptop
-/// changing networks would look exactly like every shed on it stopping, and
-/// every watcher would be torn down and rebuilt on the next refresh.
-///
-/// Called from each `backend.refresh()` site rather than inside `refresh`
-/// itself: `Backend` is `shed-app`'s and knows nothing about this app's host
-/// registry, and giving it a callback would be a layering inversion for three
-/// call sites.
-pub(crate) async fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
-    use shed_core::models::ShedStatus;
-
-    let failed: std::collections::HashSet<&str> =
-        r.host_errors.iter().map(|e| e.server.as_str()).collect();
-    let running: Vec<(String, String)> = r
-        .sheds
-        .iter()
-        .filter(|s| s.status == ShedStatus::Running)
-        .map(|s| (s.host.clone(), s.name.clone()))
-        .collect();
-    // Every server that did NOT report a failure answered — including one that
-    // answered with no sheds at all, which is precisely the case a "servers seen
-    // in the shed list" rule would get wrong (it is indistinguishable from a
-    // failure, and a shed that stopped would keep its watcher forever).
-    let answered: Vec<String> = r
-        .sheds
-        .iter()
-        .map(|s| s.host.clone())
-        .chain(hosts.servers())
-        .filter(|server| !failed.contains(server.as_str()))
-        .collect();
-    hosts.observe_sheds(&running, &answered).await;
+/// The sequence is taken BEFORE the fetch, so a slow answer cannot
+/// reauthorize a shed a newer refresh already removed
+/// ([`shed_desktop_core::observe_reachability_at`]).
+pub(crate) async fn refresh_hosts(backend: &Backend, hosts: &ShedHosts) -> Reachability {
+    let seq = hosts.next_observe_seq();
+    let reachability = backend.refresh().await;
+    shed_desktop_core::observe_reachability_at(hosts, seq, &reachability).await;
+    reachability
 }
 
 /// A required string param, or a `bad_request` error naming the missing key — the
@@ -277,11 +160,9 @@ fn roost_consent_door(
     }
 }
 
-/// Reject an unknown (preserved-raw) `RcKind` on a launch path. The
-/// unknown-kind policy preserves such a value on READ (list/decode), but you cannot
-/// LAUNCH a kind this build does not understand. Shared by the socket IPC handler
-/// and the `#[tauri::command]` invoke path (`lib.rs::rc_launch`) so the two entry
-/// points cannot drift.
+/// Reject an unknown (preserved-raw) `RcKind`. The unknown-kind policy
+/// preserves such a value on READ, but `rc.inject_test` will not plant a kind
+/// this build does not understand.
 pub(crate) fn ensure_known_kind(kind: &RcKind) -> Result<(), String> {
     if kind.is_known() {
         Ok(())
@@ -301,80 +182,11 @@ fn rc_kind(params: &Value) -> Result<RcKind, (String, String)> {
     Ok(kind)
 }
 
-/// Parse `roost.run`'s `command` param — the shared [`RunCommand::parse`],
-/// with its refusal answered as `bad_request` (a missing, non-string, empty or
-/// whitespace-only command is the caller's mistake, not the host's).
-///
-/// [`RunCommand::parse`]: crate::roost_hosts::RunCommand::parse
-fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String, String)> {
-    crate::roost_hosts::RunCommand::parse(params.get("command").and_then(Value::as_str))
-        .map_err(|m| err("bad_request", m))
-}
-
-/// A [`LaunchError`](crate::roost_hosts::LaunchError) as the socket's error
-/// pair: `bad_request` for a request a roost launch refuses, `action_failed`
-/// for one it tried — the same codes the `rc_launch`/`machine_launch` commands
-/// put in front of their error string.
-fn launch_failure(e: crate::roost_hosts::LaunchError) -> (String, String) {
-    err(e.code(), e.message())
-}
-
-/// The one gate + router behind the New-session dialog's two driver doors
-/// (`ui.fill_launch` / `ui.submit_launch`, plan 025 C3): the event name and
-/// payload to emit, or the refusal.
-///
-/// **TEST-MODE ONLY**, the [`roost_consent_door`] rule. They exist because the
-/// dialog's "Run a command" mode is only reachable by typing into it and
-/// clicking Create, and the harness has no keyboard and no click — while
-/// `launch.dump` (the dialog's own rendered truth) is what proves the mode
-/// works. Filling a person's dialog and pressing its button for them is not
-/// something a shipped app needs anyone to do; the production door onto the
-/// same backend is `roost.run`.
-///
-/// `ui.fill_launch {mode?, target?, command?, workdir?, name?}` sets those
-/// controls the way a person would (an absent key is left as it is); `mode` is
-/// `agent` (the kind picker) or `command` (the Command field), and `name` is the
-/// agent mode's Session name. `ui.submit_launch`
-/// presses Create, through the same gate the button has — a dialog that would
-/// not let a person submit does not let this door either.
-fn launch_door(
-    env: &Env,
-    op: &str,
-    params: &Value,
-) -> Result<(&'static str, Value), (String, String)> {
-    if !env.test_mode {
-        return Err(err("not_enabled", format!("{op} requires test mode")));
-    }
-    match op {
-        "ui.fill_launch" => {
-            let mut fill = serde_json::Map::new();
-            for key in ["mode", "target", "command", "workdir", "name"] {
-                match params.get(key) {
-                    None | Some(Value::Null) => {}
-                    Some(Value::String(s)) => {
-                        if key == "mode" && s != "agent" && s != "command" {
-                            return Err(err(
-                                "bad_request",
-                                format!("unknown launch mode: {s:?} (agent | command)"),
-                            ));
-                        }
-                        fill.insert(key.to_string(), json!(s));
-                    }
-                    Some(_) => return Err(err("bad_request", format!("'{key}' must be a string"))),
-                }
-            }
-            Ok(("fill-launch", Value::Object(fill)))
-        }
-        "ui.submit_launch" => Ok(("submit-launch", json!({}))),
-        other => Err(err("unknown_op", format!("{other} is not a launch door"))),
-    }
-}
-
 /// The one gate + router behind the craze create sheet's two driver doors
 /// (`ui.fill_craze_create` / `ui.submit_craze_create`, plan 025 C10): the event
 /// name and payload to emit, or the refusal.
 ///
-/// **TEST-MODE ONLY**, [`launch_door`]'s rule and for its reason: the sheet's
+/// **TEST-MODE ONLY**, [`roost_consent_door`]'s rule and for its reason: the sheet's
 /// request-id lifecycle (§3.8) is only reachable by filling it in and pressing
 /// its button — the very thing a harness has no keyboard or pointer for — while
 /// `craze_create.dump` (the sheet's own rendered truth) is what proves it.
@@ -732,13 +544,13 @@ fn req_bool(params: &Value, key: &str) -> Result<bool, (String, String)> {
 
 /// `craze.create`'s request from the socket's params: every field TYPED
 /// ([`opt_str`]) — a `request_id: 7` is `bad_request`, not an absent id that
-/// [`crate::craze::create_request`] would replace with a fresh one, which would
-/// turn a retry of an unknown outcome into a second session — then read the
-/// one way both doors read it.
+/// [`shed_desktop_core::create_request`] would replace with a fresh one, which
+/// would turn a retry of an unknown outcome into a second session — then read
+/// the one way both doors read it.
 fn craze_create_request(
     params: &Value,
-) -> Result<shed_core::lane::LaneCreateRequest, (String, String)> {
-    crate::craze::create_request(
+) -> Result<shed_lane::lane::LaneCreateRequest, (String, String)> {
+    shed_desktop_core::create_request(
         opt_str(params, "cwd")?,
         opt_str(params, "provider")?,
         opt_str(params, "prompt")?,
@@ -751,14 +563,14 @@ fn craze_create_request(
 /// `craze.create`'s `held` from the socket's params (plan 026 §3.1): TYPED
 /// like every other field — absent or `null` is a fresh create, a non-bool is
 /// `bad_request` — and, set, it needs the `request_id` it replays
-/// ([`crate::craze::held_create`]).
+/// ([`shed_desktop_core::held_create`]).
 fn craze_create_held(params: &Value) -> Result<bool, (String, String)> {
-    crate::craze::held_create(opt_bool(params, "held")?, opt_str(params, "request_id")?)
+    shed_desktop_core::held_create(opt_bool(params, "held")?, opt_str(params, "request_id")?)
         .map_err(craze_err)
 }
 
-/// A craze op's refusal as the IPC error envelope ([`crate::craze::CrazeFailure`]).
-fn craze_err(failure: crate::craze::CrazeFailure) -> (String, String) {
+/// A craze op's refusal as the IPC error envelope ([`shed_desktop_core::CrazeFailure`]).
+fn craze_err(failure: shed_desktop_core::CrazeFailure) -> (String, String) {
     err(failure.code, failure.message)
 }
 
@@ -892,14 +704,8 @@ pub struct Handler {
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
     prefs: SharedPrefs,
-    /// Roost hosts (plan 013 S3, generalized to sheds by plan 019 §3.6): one
-    /// watcher per `machines:` entry (plus the implicit `localhost`) and per
-    /// running shed, and the sessions each reports. Since S6 this is the ONLY
-    /// source the Agents pane has.
-    machines: Arc<crate::roost_hosts::RoostHosts>,
-    /// The agent lanes open on machine rows (plan 015 §3.4) — one live opencode
-    /// transcript per `(machine, session)`.
-    lanes: Arc<crate::lane::Lanes>,
+    /// Shed hosts, agent lanes, and the orderly shutdown (plan 038).
+    runtime: Arc<ShedDesktopRuntime>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
     /// frontend to echo it back (a synchronous refresh — see [`Self::sheds_refresh`]).
     refresh_seq: AtomicU64,
@@ -916,8 +722,7 @@ impl Handler {
         terminal: SharedTerminal,
         coordinator: Coordinator,
         prefs: SharedPrefs,
-        machines: Arc<crate::roost_hosts::RoostHosts>,
-        lanes: Arc<crate::lane::Lanes>,
+        runtime: Arc<ShedDesktopRuntime>,
     ) -> Self {
         Self {
             env,
@@ -927,8 +732,7 @@ impl Handler {
             terminal,
             coordinator,
             prefs,
-            machines,
-            lanes,
+            runtime,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
         }
@@ -997,26 +801,6 @@ impl Handler {
                 let _ = self.app.emit("show-create", json!({}));
                 Ok(json!({}))
             }
-            "ui.show_launch" => {
-                present_main_window(&self.app);
-                let _ = self.app.emit("show-launch", json!({}));
-                Ok(json!({}))
-            }
-            // Its close (plan 026 §3.2): the dialog closes on Escape or Cancel
-            // — a key or a click — and a caller that opened it to read its
-            // "Where" choices must be able to put it away again.
-            "ui.close_launch" => {
-                let _ = self.app.emit("close-launch", json!({}));
-                Ok(json!({}))
-            }
-            // The New-session dialog's typing-and-clicking doors (plan 025 C3)
-            // — TEST-MODE ONLY, see [`launch_door`]. They act on a dialog that
-            // `ui.show_launch` already opened, so neither raises the window.
-            "ui.fill_launch" | "ui.submit_launch" => {
-                let (event, payload) = launch_door(&self.env, op, params)?;
-                let _ = self.app.emit(event, payload);
-                Ok(json!({}))
-            }
             // The roost bootstrap consent dialog's drivable doors (plan 019
             // §3.6/C8) — TEST-MODE ONLY, see [`roost_consent_door`].
             "ui.show_roost_consent" | "ui.confirm_roost_consent" | "ui.close_roost_consent" => {
@@ -1040,11 +824,11 @@ impl Handler {
             // closes the lane. Two doors into one `Lanes` (`lib.rs`'s commands
             // and this module's `lane.*`), not three.
             "ui.show_lane" => {
-                let (machine, kind, session_id) = lane_target(params)?;
+                let (target, session_id) = lane_target(params)?;
                 present_main_window(&self.app);
                 let _ = self.app.emit(
                     "show-lane",
-                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
+                    json!({ "target": target, "session_id": session_id }),
                 );
                 Ok(json!({}))
             }
@@ -1053,17 +837,16 @@ impl Handler {
                 Ok(json!({}))
             }
             // The craze create sheet (plan 025 §3.8, C10), on the show-lane
-            // pattern: it opens from a machine group's "New craze session" (or
-            // the launch dialog's craze target) — a CLICK — and
-            // `craze_create.dump` only means anything once one is mounted.
-            // Opening it runs `create_options`, an explicit action that may
-            // start a hub on a dormant machine, exactly as the click does.
+            // pattern: it opens from a shed row's "New craze session" — a
+            // CLICK — and `craze_create.dump` only means anything once one is
+            // mounted. Opening it runs `create_options`, an explicit action
+            // that may start a hub on a dormant shed, exactly as the click does.
             "ui.show_craze_create" => {
-                let machine = req_str(params, "machine")?.to_string();
+                let target = parse_shed(req_str(params, "target")?)?;
                 present_main_window(&self.app);
                 let _ = self
                     .app
-                    .emit("show-craze-create", json!({ "machine": machine }));
+                    .emit("show-craze-create", json!({ "target": target }));
                 Ok(json!({}))
             }
             "ui.close_craze_create" => {
@@ -1088,11 +871,11 @@ impl Handler {
             // too (the sheet is the panel's); a session whose capabilities say
             // `settings: false` has no chip, and no sheet opens.
             "ui.show_lane_settings" => {
-                let (machine, kind, session_id) = lane_target(params)?;
+                let (target, session_id) = lane_target(params)?;
                 present_main_window(&self.app);
                 let _ = self.app.emit(
                     "show-lane-settings",
-                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
+                    json!({ "target": target, "session_id": session_id }),
                 );
                 Ok(json!({}))
             }
@@ -1145,8 +928,7 @@ impl Handler {
                 Ok(json!({}))
             }
             "sheds.list" => {
-                let reachability = self.backend.refresh().await;
-                observe_reachability(&self.machines, &reachability).await;
+                let reachability = refresh_hosts(&self.backend, self.runtime.hosts()).await;
                 Ok(sheds_payload(&reachability))
             }
             "sheds.refresh" => self.sheds_refresh().await,
@@ -1173,26 +955,11 @@ impl Handler {
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
             "rc.list" => self.rc_list(params).await,
-            "rc.kill" => self.rc_kill(params).await,
             "rc.inject_test" => self.rc_inject_test(params),
-            "machines.list" => Ok(self.machines_list()),
-            "machines.dump" => Ok(self.machines_dump()),
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "shed_roost.dump" => Ok(self.shed_roost_dump()),
             "roost_consent.dump" => Ok(self.roost_consent_dump()),
-            "launch.dump" => Ok(self.launch_dump()),
             "toast.dump" => Ok(self.toast_dump()),
-            "machine.kill" => self.machine_kill(params).await,
-            // `machine.launch` is `roost.launch` addressed by a bare machine
-            // name — kept as an alias (plan 019 §3.6) because the dialog, the
-            // frontend bridge and every existing cell send it, and a rename with
-            // no new behaviour behind it would be churn.
-            "machine.launch" | "roost.launch" => self.roost_launch(params).await,
-            // "Run a command in a tab" (plan 025 P5) — `roost.launch`'s sibling
-            // that goes through no kind.
-            "roost.run" => self.roost_run(params).await,
-            "machine.capabilities" => self.machine_capabilities(params),
-            "machine.add" => self.machine_add(params),
             // -- roost hosts: probe, preview, bootstrap (plan 019 §3.6) --
             "roost.probe" => self.roost_probe(params).await,
             "roost.preview" => self.roost_preview(params).await,
@@ -1396,7 +1163,7 @@ impl Handler {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             pane,
-            "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system"
+            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
         ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
@@ -1461,8 +1228,7 @@ impl Handler {
         let has_frontend = self.ui.lock().ok().is_some_and(|s| s.has("main"));
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
-            let reachability = self.backend.refresh().await;
-            observe_reachability(&self.machines, &reachability).await;
+            let reachability = refresh_hosts(&self.backend, self.runtime.hosts()).await;
             return Ok(sheds_payload(&reachability));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
@@ -1536,11 +1302,6 @@ impl Handler {
     /// command + resolved preset/invocation, WITHOUT spawning. `shed` (not `name`)
     /// matches the mac contract; gtk has no terminal.
     fn terminal_preview(&self, params: &Value) -> Result<Value, (String, String)> {
-        // Any `machine` at all refuses — a non-string value is still a machine
-        // row asking for a terminal it cannot have (CodeRabbit review finding).
-        if params.get("machine").is_some_and(|m| !m.is_null()) {
-            return Err(machine_terminal_refusal());
-        }
         let shed = req_str(params, "shed")?;
         self.terminal.preview(
             params.get("host").and_then(Value::as_str),
@@ -1558,14 +1319,6 @@ impl Handler {
     /// resolved opener. DISABLED under test mode (spawning a terminal isn't
     /// hermetic — the harness drives terminal.preview instead).
     fn terminal_open(&self, params: &Value) -> Result<Value, (String, String)> {
-        // The machine refusal comes FIRST: it is true in every mode, and a
-        // "disabled in test mode" answer would tell a harness to retry the
-        // preview, which is refused for the same reason.
-        // Any `machine` at all refuses — a non-string value is still a machine
-        // row asking for a terminal it cannot have (CodeRabbit review finding).
-        if params.get("machine").is_some_and(|m| !m.is_null()) {
-            return Err(machine_terminal_refusal());
-        }
         if self.env.test_mode {
             return Err(err(
                 "not_enabled",
@@ -1615,58 +1368,16 @@ impl Handler {
     // the wire from the guest (where it is liveness now) and a machine row's from
     // roost; no client re-derives one from a pane.
 
-    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines,
-    /// shed_craze}`. The
-    /// roost tabs on every listed host. Which sheds are running comes from
-    /// `Backend` (resolution stays in shed-app); the rows come from each host's
-    /// own `roost-session`.
+    /// `rc.list {host?, shed?}` → `{sessions, capabilities, hosts, shed_craze}`.
+    /// Which sheds are running comes from `Backend`; the rows come from each
+    /// shed's own `roost-session`.
     async fn rc_list(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = params.get("host").and_then(Value::as_str);
         let shed = params.get("shed").and_then(Value::as_str);
-        Ok(rc_list_payload(&self.backend, &self.machines, host, shed).await)
-    }
-
-    /// `machines.list` → `{machines}`: per-machine reachability for the sessions
-    /// view's group headers, without the sessions themselves.
-    ///
-    /// Separate from `rc.list` because a machine is worth showing even when it
-    /// has no sessions AND cannot be reached — that row IS the information
-    /// ("mini3 is asleep"), and a sessions-only payload has nowhere to put it.
-    fn machines_list(&self) -> Value {
-        json!({ "machines": self.machines.status() })
-    }
-
-    /// `machine.add {name, host?, user?, ssh_port?}` → append the
-    /// machine to the shed config and start watching it.
-    ///
-    /// The same implementation the Add dialog invokes — the harness drives the
-    /// op, the dialog drives the command, and both land in
-    /// `machines::add_from_json`, so what is tested is what ships.
-    fn machine_add(&self, params: &Value) -> Result<Value, (String, String)> {
-        crate::machines::add_from_json(&self.machines, &self.env.config_path, params)
-            .map(|()| json!({}))
-            .map_err(|e| err("bad_request", e))
-    }
-
-    /// `machines.dump` → what the MACHINES PANE actually rendered (UI truth, like
-    /// `agents.dump`/`egress.profiles`), as opposed to `machines.list`, which is
-    /// the backend's view and answers off-pane.
-    ///
-    /// The distinction is the whole point: `machines.list` can be perfect while
-    /// nothing reaches the pane — exactly the bug that shipped machine state to
-    /// the IPC op but never to the window. Off-pane this is `null`, not a stale
-    /// snapshot from the last mount.
-    fn machines_dump(&self) -> Value {
-        let on_pane = self
-            .ui_get("pane")
-            .and_then(|p| p.as_str().map(|s| s == "machines"))
-            .unwrap_or(false);
-        let machines = if on_pane {
-            self.ui_get("machines_pane").unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
-        json!({ "machines": machines })
+        Ok(
+            shed_desktop_core::rc_list_payload(&self.backend, self.runtime.hosts(), host, shed)
+                .await,
+        )
     }
 
     /// `sidebar.dump` → the sidebar's status foot as rendered: `{servers,
@@ -1708,20 +1419,6 @@ impl Handler {
         json!({ "consent": self.ui_get("roost_consent").unwrap_or(Value::Null) })
     }
 
-    /// `launch.dump` → the New-session dialog's own rendered text
-    /// (`{launch: {rendered}}`), or `null` while none is mounted. UI truth, the
-    /// `roost_consent.dump` rule: the dialog reports itself and this relays the
-    /// last report.
-    ///
-    /// It exists for the fields that are NOT there. Since S6 the dialog offers
-    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and a
-    /// launch that carries a prompt is refused (plan 026 §3.5) — and "the UI does
-    /// not ask for something it cannot deliver" is only assertable against what
-    /// was actually painted.
-    fn launch_dump(&self) -> Value {
-        json!({ "launch": self.ui_get("launch_dialog").unwrap_or(Value::Null) })
-    }
-
     /// `toast.dump` → the last (or currently shown) toast the shell reported —
     /// the PATH warning / hook-wiring summary a bootstrap ends with, or an error.
     /// `null` before any has been shown.
@@ -1729,98 +1426,12 @@ impl Handler {
         json!({ "toast": self.ui_get("toast").unwrap_or(Value::Null) })
     }
 
-    /// `machine.kill {machine, slug}` → close a session on a machine (a roost
-    /// `tab.close`; the slug IS the tab id).
-    ///
-    /// Distinct from [`Self::rc_kill`] only in how the host is ADDRESSED: a shed
-    /// is `(host, shed)`, a machine is its bare name. Both end in the same
-    /// `tab.close` since S6. Folding them into one op would mean passing an
-    /// empty `shed` and having the backend guess which path was meant.
-    async fn machine_kill(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
-        let slug = req_str(params, "slug")?.to_string();
-        self.machines
-            .kill(&machine, &slug)
-            .await
-            .map_err(|e| err("action_failed", e))?;
-        Ok(json!({}))
-    }
-
-    /// `roost.launch {target, kind, workdir?, …}` → the opened row: a roost
-    /// `tab.open` running the kind's agent on that host (plan 019 §3.6).
-    ///
-    /// Addressed by the target grammar — `machine:<name>` or
-    /// `roost:<server>/<shed>` — which is what generalizes it from machines to
-    /// sheds. `machine.launch {machine, …}` is the same op under its old name
-    /// and its old parameter, kept as an alias.
-    ///
-    /// Since S6 (`charliek/shed#328`) a shed is launched here too, as
-    /// `roost:<server>/<shed>`. Its pre-S6 alias `rc.launch {shed}`, held open
-    /// for 0.9.x clients, was removed in 0.10.0 and answers `unknown_op`.
-    ///
-    /// `kind` and `workdir` are the `tab.open`, and a `display_name` is set as
-    /// the tab's title after it (the row's `title` says whether it took); an
-    /// `initial_prompt` or `permission_mode` is refused `bad_request` before any
-    /// tab opens, and a launch that was tried and failed is `action_failed`
-    /// ([`crate::roost_hosts::RoostHosts::launch`] has the rule, plan 026 §3.5).
-    async fn roost_launch(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = match params.get("target").and_then(Value::as_str) {
-            Some(target) => target.to_string(),
-            None => req_str(params, "machine")?.to_string(),
-        };
-        let kind = rc_kind(params)?;
-        let opt = |k: &str| params.get(k).and_then(Value::as_str);
-        self.machines
-            .launch(
-                &target,
-                &kind,
-                opt("display_name"),
-                opt("workdir"),
-                // TYPED, unlike the fields above: a first prompt or a mode in
-                // some other JSON shape is still one, and reading it as absent
-                // would drop it silently (plan 026 §3.5).
-                opt_str(params, "permission_mode")?,
-                opt_str(params, "initial_prompt")?,
-            )
-            .await
-            .map_err(launch_failure)
-    }
-
-    /// `roost.run {target | machine, command, workdir?}` → the tab it opened: a
-    /// roost `tab.open` running `command` on that host (plan 025 P5, "Run a
-    /// command in a tab").
-    ///
-    /// Addressed like [`Self::roost_launch`] — `target` in the grammar, or a bare
-    /// `machine` — but **gated by no kind**: there is no `kind` param, nothing is
-    /// checked against [`shed_app::roost::roost_capabilities`], and no launch
-    /// recipe is looked up. `command` is split on ASCII whitespace into the argv
-    /// verbatim, with no shell and no quoting ([`crate::roost_hosts::RunCommand`]
-    /// has the whole rule): `codex --model x` works, a quoted argument does not.
-    ///
-    /// `command` is REQUIRED — absent, empty or whitespace-only is `bad_request`,
-    /// answered before the host is touched. A host that cannot be reached is
-    /// `action_failed`, as a launch's is.
-    async fn roost_run(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = match params.get("target").and_then(Value::as_str) {
-            Some(target) => target.to_string(),
-            None => req_str(params, "machine")?.to_string(),
-        };
-        let command = run_command(params)?;
-        self.machines
-            .run(
-                &target,
-                &command,
-                params.get("workdir").and_then(Value::as_str),
-            )
-            .await
-            .map_err(|e| err("action_failed", e))
-    }
-
-    /// `roost.probe {target}` → what is on that host, and whether anything is
+    /// `roost.probe {target}` → what is on that shed, and whether anything is
     /// serving. Read-only: it writes nothing and is safe to run before consent.
     async fn roost_probe(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = req_str(params, "target")?.to_string();
-        self.machines
+        let target = parse_shed(req_str(params, "target")?)?;
+        self.runtime
+            .hosts()
             .probe(&target)
             .await
             .map_err(|failure| err(failure.stage.as_str(), failure.message))
@@ -1832,8 +1443,9 @@ impl Handler {
     ///
     /// Nothing is resolved or fetched (plan 019 §3.5).
     async fn roost_preview(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = req_str(params, "target")?.to_string();
-        self.machines
+        let target = parse_shed(req_str(params, "target")?)?;
+        self.runtime
+            .hosts()
             .preview(&target)
             .await
             .map_err(|failure| err(failure.stage.as_str(), failure.message))
@@ -1878,13 +1490,16 @@ impl Handler {
     /// remote step themselves (roost's own numbers), and this is the outer
     /// guarantee that a wedged transport cannot hold the socket open forever.
     async fn roost_bootstrap(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = req_str(params, "target")?.to_string();
+        let target = parse_shed(req_str(params, "target")?)?;
         let fingerprint = req_str(params, "fingerprint")?.to_string();
         let consent = params
             .get("consent")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let run = self.machines.bootstrap(&target, &fingerprint, consent);
+        let run = self
+            .runtime
+            .hosts()
+            .bootstrap(&target, &fingerprint, consent);
         let outcome = match tokio::time::timeout(BOOTSTRAP_BUDGET, run).await {
             Ok(outcome) => outcome,
             Err(_) => {
@@ -1898,8 +1513,8 @@ impl Handler {
             }
         };
         match outcome {
-            Ok(Ok(installed)) => Ok(crate::roost_hosts::installed_json(&installed)),
-            Ok(Err(failure)) => Ok(crate::roost_hosts::failure_json(&failure)),
+            Ok(Ok(installed)) => Ok(installed_json(&installed)),
+            Ok(Err(failure)) => Ok(failure_json(&failure)),
             // A [`Refusal`] is about the CALL, not the host: no consent, an
             // unaddressable target, or a bootstrap for this target already
             // running. Its own code, so a driver can tell them apart.
@@ -1908,21 +1523,6 @@ impl Handler {
                 Err(err(code, refusal.message()))
             }
         }
-    }
-
-    /// `machine.capabilities {machine}` → `{capabilities}` — what a create form
-    /// may offer for that machine.
-    ///
-    /// The SAME synthesized roost contract `rc.list` stamps under
-    /// `capabilities["machine:<name>"]`, not a second, probed answer that could
-    /// disagree with it. No SSH round-trip: roost has none to make.
-    fn machine_capabilities(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
-        let caps = self
-            .machines
-            .capabilities(&machine)
-            .map_err(|e| err("action_failed", e))?;
-        Ok(json!({ "capabilities": caps }))
     }
 
     // -- agent lanes (plan 015 §3.4) ------------------------------------------
@@ -1935,7 +1535,7 @@ impl Handler {
     // Failures answer the same `{code, message}` envelope everything else does,
     // with the lane contract's own snake_case codes (`unknown_session`,
     // `already_resolved`, `unauthorized`, …) plus `no_lane` for a row that has
-    // no transcript to show. See [`crate::lane::LaneFailure`].
+    // no transcript to show. See [`LaneFailure`].
 
     /// `lane.open {machine, kind, session_id}` → `{session}`.
     ///
@@ -1946,9 +1546,10 @@ impl Handler {
     /// entry rather than opening a second subscription, and two concurrent calls
     /// build ONE.
     async fn lane_open(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .open(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .open(&target, &session_id)
             .await
             .map_err(lane_err)
     }
@@ -1959,38 +1560,42 @@ impl Handler {
     /// and the one place a client reads what the session can do (its `/` menu
     /// included, resolved); `finished` is the lane over for good (plan 032).
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .messages(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .messages(&target, &session_id)
             .map_err(lane_err)
     }
 
     /// `lane.approvals {machine, kind, session_id}` → `{approvals}` — what is
     /// blocking on the human, this session's and its descendants'.
     fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .approvals(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .approvals(&target, &session_id)
             .map_err(lane_err)
     }
 
     /// `lane.send {machine, kind, session_id, text, mode?}` → `{}`.
     async fn lane_send(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
+        let (target, session_id) = lane_target(params)?;
         let text = req_str(params, "text")?.to_string();
-        let mode = crate::lane::parse_mode(params.get("mode").and_then(Value::as_str))
+        let mode = shed_desktop_core::parse_mode(params.get("mode").and_then(Value::as_str))
             .map_err(lane_err)?;
-        self.lanes
-            .send(&machine, &kind, &session_id, &text, mode)
+        self.runtime
+            .lanes()
+            .send(&target, &session_id, &text, mode)
             .await
             .map_err(lane_err)
     }
 
     /// `lane.cancel {machine, kind, session_id}` → `{}`.
     async fn lane_cancel(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .cancel(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .cancel(&target, &session_id)
             .await
             .map_err(lane_err)
     }
@@ -2000,9 +1605,10 @@ impl Handler {
     /// leaves, when the session's close arrives. Refused by a session whose
     /// capabilities say `stop: false`.
     async fn lane_stop(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .stop(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .stop(&target, &session_id)
             .await
             .map_err(lane_err)
     }
@@ -2013,27 +1619,29 @@ impl Handler {
     /// the order a client shows them) and the usage. `lane.messages`'
     /// `settings` is the same thing as the stream last said it.
     async fn lane_settings(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        self.lanes
-            .settings(&machine, &kind, &session_id)
+        let (target, session_id) = lane_target(params)?;
+        self.runtime
+            .lanes()
+            .settings(&target, &session_id)
             .await
             .map_err(lane_err)
     }
 
     /// `lane.set {machine, kind, session_id, change}` → `{}` — change one
     /// setting (plan 025 §3.10). `change` is `{kind: "model"|"mode", id}` or
-    /// `{kind: "config", id, value}` ([`crate::lane::parse_setting`]); the new
+    /// `{kind: "config", id, value}` ([`shed_desktop_core::parse_setting`]); the new
     /// value arrives on the stream. `not_accepting` is craze's `stale_model`
     /// among others (the session left the model an option was chosen for),
     /// and `outcome_unknown` an answer lost to a drop — never resent.
     async fn lane_set(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
+        let (target, session_id) = lane_target(params)?;
         let change = params
             .get("change")
             .ok_or_else(|| err("bad_request", "missing 'change'"))?;
-        let change = crate::lane::parse_setting(change).map_err(lane_err)?;
-        self.lanes
-            .set(&machine, &kind, &session_id, change)
+        let change = shed_desktop_core::parse_setting(change).map_err(lane_err)?;
+        self.runtime
+            .lanes()
+            .set(&target, &session_id, change)
             .await
             .map_err(lane_err)
     }
@@ -2046,10 +1654,11 @@ impl Handler {
     /// that TOOK and craze could not record (`index_write`): a success, never
     /// a failure; an answer lost to a drop is `outcome_unknown`, never resent.
     async fn lane_set_title(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
+        let (target, session_id) = lane_target(params)?;
         let title = req_str(params, "title")?.to_string();
-        self.lanes
-            .set_title(&machine, &kind, &session_id, &title)
+        self.runtime
+            .lanes()
+            .set_title(&target, &session_id, &title)
             .await
             .map_err(lane_err)
     }
@@ -2061,24 +1670,25 @@ impl Handler {
     /// "allow-once"|"allow-always"|"reject"}` (by semantic kind),
     /// `{question: [[…]]}` — optionally with `custom_text: [string|null]`, the
     /// free text per question — or `{reject: true}`. See
-    /// [`crate::lane::parse_answer`].
+    /// [`shed_desktop_core::parse_answer`].
     async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
+        let (target, session_id) = lane_target(params)?;
         let approval_id = req_str(params, "approval_id")?.to_string();
         let answer = params
             .get("answer")
             .ok_or_else(|| err("bad_request", "missing 'answer'"))?;
-        let answer = crate::lane::parse_answer(answer).map_err(lane_err)?;
-        self.lanes
-            .answer(&machine, &kind, &session_id, &approval_id, answer)
+        let answer = shed_desktop_core::parse_answer(answer).map_err(lane_err)?;
+        self.runtime
+            .lanes()
+            .answer(&target, &session_id, &approval_id, answer)
             .await
             .map_err(lane_err)
     }
 
     /// `lane.close {machine, kind, session_id}` → `{}`. Idempotent.
     fn lane_close(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, kind, session_id) = lane_target(params)?;
-        Ok(self.lanes.close(&machine, &kind, &session_id))
+        let (target, session_id) = lane_target(params)?;
+        Ok(self.runtime.lanes().close(&target, &session_id))
     }
 
     /// `lane.dump` → what the transcript PANEL rendered (UI truth, like
@@ -2103,9 +1713,8 @@ impl Handler {
 
     // -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
     //
-    // Addressed by `machine` — a machine's bare name or a shed's
-    // `roost:<server>/<shed>` token, the row's own `machine`. Refusals carry
-    // [`crate::craze::CrazeFailure`]'s codes: the lane contract's, plus
+    // Addressed by `target` (`roost:<server>/<shed>`). Refusals carry
+    // [`shed_desktop_core::CrazeFailure`]'s codes: the lane contract's, plus
     // `outcome_unknown` (the one a caller keeps its request id on), `too_old`,
     // `not_installed` and `no_craze` — and a reopen's own `gone` and
     // `start_failed` (plan 032 §3.4).
@@ -2116,9 +1725,10 @@ impl Handler {
     /// craze source it came through (plan 032 §3.4). May start a hub on a
     /// dormant machine: an explicit action.
     async fn craze_create_options(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
-        self.machines
-            .craze_create_options(&machine)
+        let target = parse_shed(req_str(params, "target")?)?;
+        self.runtime
+            .hosts()
+            .craze_create_options(&target)
             .await
             .map_err(craze_err)
     }
@@ -2128,17 +1738,18 @@ impl Handler {
     /// `{session, host_id, prompt, prompt_error?, request_id}`: a new craze
     /// session, its row folded into the machine's listing at once. `cwd` must
     /// be absolute; a blank provider or prompt is absent
-    /// ([`crate::craze::create_request`]); `request_id` is the caller's (reused
+    /// ([`shed_desktop_core::create_request`]); `request_id` is the caller's (reused
     /// only to retry an unknown outcome) or minted here — and answered back
     /// either way. `held: true` says the call REPLAYS a request id kept from
     /// an unknown outcome (plan 026 §3.1): only craze's own answer about that
     /// request ends it, so anything else is `outcome_unknown` again.
     async fn craze_create(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
+        let target = parse_shed(req_str(params, "target")?)?;
         let held = craze_create_held(params)?;
         let request = craze_create_request(params)?;
-        self.machines
-            .craze_create(&machine, request, held)
+        self.runtime
+            .hosts()
+            .craze_create(&target, request, held)
             .await
             .map_err(craze_err)
     }
@@ -2152,8 +1763,12 @@ impl Handler {
     /// craze source incarnation it came through. May start a hub on a dormant
     /// machine.
     async fn craze_saved(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
-        self.machines.craze_saved(&machine).await.map_err(craze_err)
+        let target = parse_shed(req_str(params, "target")?)?;
+        self.runtime
+            .hosts()
+            .craze_saved(&target)
+            .await
+            .map_err(craze_err)
     }
 
     /// `craze.reopen {machine, id}` → `{session, host_id, ended, superseded,
@@ -2163,13 +1778,14 @@ impl Handler {
     /// removed (or removed and registered again) while it ran, nothing was
     /// folded, and there is nothing to open on it here.
     /// `id` is TYPED like every craze field and must be non-blank
-    /// ([`crate::craze::reopen_id`]). Refusal codes keep the reopen error's
-    /// variant ([`crate::craze::CrazeFailure::reopen`]).
+    /// ([`shed_desktop_core::reopen_id`]). Refusal codes keep the reopen error's
+    /// variant ([`shed_desktop_core::CrazeFailure::reopen`]).
     async fn craze_reopen(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
-        let id = crate::craze::reopen_id(opt_str(params, "id")?).map_err(craze_err)?;
-        self.machines
-            .craze_reopen(&machine, &id)
+        let target = parse_shed(req_str(params, "target")?)?;
+        let id = shed_desktop_core::reopen_id(opt_str(params, "id")?).map_err(craze_err)?;
+        self.runtime
+            .hosts()
+            .craze_reopen(&target, &id)
             .await
             .map_err(craze_err)
     }
@@ -2179,10 +1795,11 @@ impl Handler {
     /// that session (the row's `slug`, its hostId), in its workspace; the row
     /// shows that tab from now on.
     async fn craze_open_terminal(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
+        let target = parse_shed(req_str(params, "target")?)?;
         let session_id = req_str(params, "session_id")?.to_string();
-        self.machines
-            .craze_open_terminal(&machine, &session_id)
+        self.runtime
+            .hosts()
+            .craze_open_terminal(&target, &session_id)
             .await
             .map_err(craze_err)
     }
@@ -2200,36 +1817,7 @@ impl Handler {
 
     /// The roost host a shed-addressed op is about: `roost:<server>/<shed>`.
     ///
-    /// `host` resolves through `Backend` exactly as it did when these ops went
-    /// to the hub — an alias, a bare server name and an omitted host all land
-    /// where they always did — and only the last step, turning a resolved server
-    /// plus a shed name into a host token, is new.
-    fn shed_target(&self, params: &Value) -> Result<String, (String, String)> {
-        let shed = req_str(params, "shed")?;
-        let server = self
-            .backend
-            .resolve_rc_target(params.get("host").and_then(Value::as_str))
-            .map_err(|e| err("bad_request", e.to_string()))?
-            .server_name;
-        Ok(format!("roost:{server}/{shed}"))
-    }
-
-    /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
-    ///
-    /// A `tab.close` since S6, like [`Self::machine_kill`] — the slug IS the tab
-    /// id. The two ops survive separately only because the ADDRESSING differs:
-    /// a shed is `(host, shed)`, a machine is its bare name.
-    async fn rc_kill(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = self.shed_target(params)?;
-        let slug = req_str(params, "slug")?.to_string();
-        self.machines
-            .kill(&target, &slug)
-            .await
-            .map_err(|e| err("action_failed", e))?;
-        Ok(json!({}))
-    }
-
-    /// `rc.inject_test {shed, slug, host?, kind?, display_name?, workdir?,
+    /// `rc.inject_test {target, slug, kind?, display_name?, workdir?,
     /// lifecycle?, attention?}` → put a row into the shed's roost snapshot
     /// (test-only, guarded like `policy.set`).
     ///
@@ -2241,9 +1829,10 @@ impl Handler {
         if !self.env.test_mode {
             return Err(err("not_enabled", "rc.inject_test requires test mode"));
         }
-        let target = self.shed_target(params)?;
+        let target = parse_shed(req_str(params, "target")?)?;
         let row = self.build_inject_row(params)?;
-        self.machines
+        self.runtime
+            .hosts()
             .inject_test(&target, row)
             .map_err(|e| err("bad_request", e))?;
         Ok(json!({}))
@@ -2251,10 +1840,7 @@ impl Handler {
 
     /// Build the roost row an inject-test param bag describes, filling the title
     /// and workdir defaults the harness omits.
-    fn build_inject_row(
-        &self,
-        params: &Value,
-    ) -> Result<crate::roost_hosts::InjectedRow, (String, String)> {
+    fn build_inject_row(&self, params: &Value) -> Result<InjectedRow, (String, String)> {
         let slug = req_str(params, "slug")?;
         let tab_id = slug.parse::<i64>().map_err(|_| {
             err(
@@ -2263,7 +1849,7 @@ impl Handler {
             )
         })?;
         let opt = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
-        Ok(crate::roost_hosts::InjectedRow {
+        Ok(InjectedRow {
             tab_id,
             // Defaults like the rest of this op: the harness sends what the cell
             // is about and nothing else.
@@ -2806,10 +2392,11 @@ mod tests {
             json!({"question": [["yes"]], "custom_text": [3]}),
         ];
         for bad in bad_answers {
-            let socket =
-                lane_err(crate::lane::parse_answer(&bad).expect_err("this answer is malformed"));
+            let socket = lane_err(
+                shed_desktop_core::parse_answer(&bad).expect_err("this answer is malformed"),
+            );
             let command = recover(&crate::lane_error(
-                crate::lane::parse_answer(&bad).expect_err("this answer is malformed"),
+                shed_desktop_core::parse_answer(&bad).expect_err("this answer is malformed"),
             ));
             assert_eq!(
                 socket.0, "bad_request",
@@ -2822,9 +2409,10 @@ mod tests {
         }
 
         for bad in ["later", "  interject please", "QUEUE"] {
-            let socket = lane_err(crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"));
+            let socket =
+                lane_err(shed_desktop_core::parse_mode(Some(bad)).expect_err("a bad mode"));
             let command = recover(&crate::lane_error(
-                crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"),
+                shed_desktop_core::parse_mode(Some(bad)).expect_err("a bad mode"),
             ));
             assert_eq!(socket.0, "bad_request");
             assert_eq!(command, socket, "the two doors disagree on mode {bad:?}");
@@ -2842,7 +2430,7 @@ mod tests {
             "`question` must be a list of lists of option ids: invalid type:              string \"yes\", expected a sequence",
             "no colon here at all",
         ] {
-            let raw = crate::lane_error(crate::lane::LaneFailure::bad_request(message.to_string()));
+            let raw = crate::lane_error(LaneFailure::bad_request(message.to_string()));
             assert_eq!(
                 recover(&raw),
                 ("bad_request".to_string(), message.to_string()),
@@ -2942,9 +2530,8 @@ mod tests {
 
     #[test]
     fn ensure_known_kind_gates_unknown() {
-        // The shared gate both entry points (socket IPC rc_kind + the tauri
-        // rc_launch command) apply: serde preserves an unknown kind as Other, so
-        // launching must reject it here.
+        // The gate `rc.inject_test` applies: serde preserves an unknown kind as
+        // Other, and an inject must reject it here.
         assert!(ensure_known_kind(&RcKind::Opencode).is_ok());
         assert!(ensure_known_kind(&RcKind::Other("borg".into())).is_err());
     }
@@ -2957,8 +2544,6 @@ mod tests {
             roost_sockets: std::collections::HashMap::new(),
             ssh_bin: None,
             roost_jail_fs_root: false,
-            craze_path: None,
-            craze_env: Vec::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
@@ -3093,114 +2678,6 @@ mod tests {
             .is_none());
     }
 
-    /// **`roost.run`'s `command` is required** (plan 025 P5): absent, empty and
-    /// whitespace-only are each `bad_request` — the caller's mistake, answered
-    /// before any host is touched — and so is a `command` that is not a string
-    /// at all. A real one comes back split, with no kind in sight.
-    #[test]
-    fn roost_run_refuses_an_absent_empty_or_blank_command_as_bad_request() {
-        for (what, params) in [
-            ("absent", json!({ "target": "mini3" })),
-            ("null", json!({ "target": "mini3", "command": null })),
-            ("empty", json!({ "target": "mini3", "command": "" })),
-            (
-                "whitespace",
-                json!({ "target": "mini3", "command": "  \t \n" }),
-            ),
-            (
-                "not a string",
-                json!({ "target": "mini3", "command": ["codex"] }),
-            ),
-        ] {
-            let (code, message) =
-                run_command(&params).expect_err(&format!("{what} must be refused, not run"));
-            assert_eq!(code, "bad_request", "{what}: {message}");
-            assert!(message.contains("'command'"), "{what}: {message}");
-        }
-
-        let command = run_command(&json!({ "target": "mini3", "command": "codex --model x" }))
-            .expect("a command line");
-        assert_eq!(command.argv(), ["codex", "--model", "x"]);
-        // Not gated by kinds: a first word no kind table has ever named is a
-        // command like any other.
-        let command = run_command(&json!({ "command": "borg -v" })).expect("any program");
-        assert_eq!(command.argv(), ["borg", "-v"]);
-    }
-
-    /// **The New-session dialog's driver doors are test-mode only**, the
-    /// consent doors' rule: filling a person's dialog and pressing its button for
-    /// them is the harness's need, never a shipped app's. In test mode they
-    /// route to their events, carrying only the controls that were named, and a
-    /// mode the dialog does not have — or a control that is not text — is a bad
-    /// request rather than an event the dialog would have to second-guess.
-    #[test]
-    fn the_launch_dialog_doors_are_test_mode_only() {
-        let fill = json!({
-            "mode": "command",
-            "target": "machine:mini3",
-            "command": "codex --model x",
-        });
-
-        let mut prod = env(None);
-        prod.test_mode = false;
-        for op in ["ui.fill_launch", "ui.submit_launch"] {
-            let (code, message) = launch_door(&prod, op, &fill)
-                .expect_err("a driver door must not be reachable in a shipped app");
-            assert_eq!(code, "not_enabled", "{op}");
-            assert!(message.contains(op), "the refusal names the op: {message}");
-        }
-
-        let test = env(None);
-        assert_eq!(
-            launch_door(&test, "ui.fill_launch", &fill).unwrap(),
-            ("fill-launch", fill.clone()),
-            "the named controls, and nothing invented for the others"
-        );
-        assert_eq!(
-            launch_door(&test, "ui.submit_launch", &json!({})).unwrap(),
-            ("submit-launch", json!({}))
-        );
-        assert_eq!(
-            launch_door(&test, "ui.fill_launch", &json!({ "mode": "shell" }))
-                .expect_err("no such mode")
-                .0,
-            "bad_request"
-        );
-        assert_eq!(
-            launch_door(&test, "ui.fill_launch", &json!({ "command": 7 }))
-                .expect_err("not text")
-                .0,
-            "bad_request"
-        );
-        // The agent mode's Session name travels too (plan 026 §3.5's cell types
-        // one): it is the box a display name comes from.
-        let named = json!({ "mode": "agent", "target": "machine:mini3", "name": "My run" });
-        assert_eq!(
-            launch_door(&test, "ui.fill_launch", &named).unwrap(),
-            ("fill-launch", named.clone())
-        );
-    }
-
-    /// **Both launch codes, at the socket** (plan 026 §3.5): a request a roost
-    /// launch refuses is `bad_request`, and only a launch that was tried and
-    /// failed is `action_failed` — the distinction a caller acts on (fix the
-    /// request, or retry the host). The message is the refusal's, untouched.
-    #[test]
-    fn a_launch_error_keeps_its_code_at_the_socket() {
-        use crate::roost_hosts::LaunchError;
-        assert_eq!(
-            launch_failure(LaunchError::BadRequest("no prompts here".into())),
-            ("bad_request".to_string(), "no prompts here".to_string())
-        );
-        assert_eq!(
-            launch_failure(LaunchError::Failed("machine:mini3: unreachable".into())),
-            (
-                "action_failed".to_string(),
-                "machine:mini3: unreachable".to_string()
-            )
-        );
-    }
-
     /// **`craze.create`'s `request_id` is read strictly** (C10 review): only an
     /// ABSENT (or null) id is minted; a present one is used as given or refused
     /// — a non-string, an empty or a malformed one is `bad_request`, because
@@ -3208,7 +2685,7 @@ mod tests {
     /// second session. Every other field is typed the same way.
     #[test]
     fn craze_create_reads_its_request_id_strictly() {
-        let base = json!({ "machine": "localhost", "cwd": "/w" });
+        let base = json!({ "target": "roost:localhost/dev", "cwd": "/w" });
         let with = |key: &str, v: Value| {
             let mut p = base.clone();
             p[key] = v;
@@ -3269,7 +2746,8 @@ mod tests {
     /// create needs the request id it replays.
     #[test]
     fn craze_create_reads_held_strictly() {
-        let base = json!({ "machine": "localhost", "cwd": "/w", "request_id": "shed-held-1" });
+        let base =
+            json!({ "target": "roost:localhost/dev", "cwd": "/w", "request_id": "shed-held-1" });
         let with = |key: &str, v: Value| {
             let mut p = base.clone();
             p[key] = v;
@@ -3292,7 +2770,7 @@ mod tests {
     }
 
     /// **The craze create sheet's driver doors are test-mode only** (plan 025
-    /// C10), the launch doors' rule; in test mode they route to their events
+    /// C10), the consent doors' rule; in test mode they route to their events
     /// with only the controls that were named, and a control of the wrong type
     /// is a bad request.
     #[test]

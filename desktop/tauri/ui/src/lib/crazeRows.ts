@@ -10,7 +10,7 @@
  *  `bridge.ts`, narrowed. */
 export type CrazeRowLike = {
   source?: string | null;
-  machine?: string | null;
+  target?: string | null;
   host: string;
   shed: string;
   slug: string;
@@ -20,35 +20,12 @@ export type CrazeRowLike = {
   last_reply?: string | null;
 };
 
-/** Where a card's End/kill action goes: a roost `tab.close` on a host
- *  addressed by `machine` (`machine.kill`), or — for a payload too old to
- *  stamp an address — by `(host, shed)` (`rc.kill`). `null`: the row has no
- *  tab to end. */
-export type KillTarget =
-  | { via: "machine"; machine: string; slug: string }
-  | { via: "shed"; host: string; shed: string; slug: string };
-
-/** **A craze row's End tab routes by its TYPED `tab_id`, never by its slug.**
- *  `machine.kill` parses `slug` as a roost tab id, and a craze row's slug is
- *  its hostId — twelve hex digits that would either fail to parse or, worse,
- *  name somebody else's tab. So the craze row sends `String(tab_id)` and a
- *  craze row with no tab (a headless session) has nothing to end. A roost
- *  row's slug IS its tab id, as it always was. */
-export function killTarget(s: CrazeRowLike): KillTarget | null {
-  if (s.source === "craze") {
-    if (!s.machine || s.tab_id == null || s.tab_id === "") return null;
-    return { via: "machine", machine: s.machine, slug: String(s.tab_id) };
-  }
-  if (s.machine) return { via: "machine", machine: s.machine, slug: s.slug };
-  return { via: "shed", host: s.host, shed: s.shed, slug: s.slug };
-}
-
 /** **Open in terminal is offered on a HEADLESS craze row** (plan 025
- *  §3.6.5/§3.6.6): a craze session with no roost tab attached, on a host the
- *  row addresses. A row that has a tab offers End tab instead; a roost row
- *  never offers it. */
+ *  §3.6.5/§3.6.6): a craze session with no roost tab attached, addressed by
+ *  its shed target. A roost row never offers it — the desktop does not drive
+ *  that tab. */
 export function canOpenTerminal(s: CrazeRowLike): boolean {
-  return s.source === "craze" && !!s.machine && (s.tab_id == null || s.tab_id === "");
+  return s.source === "craze" && !!s.target && (s.tab_id == null || s.tab_id === "");
 }
 
 /** The card's one-line "what is it doing": craze's `doing`; else, when the
@@ -69,7 +46,7 @@ export function crazeDoingLine(s: CrazeRowLike): { text: string; dimmed: boolean
 export function crazeMachineNote(
   craze: { state?: string | null; cause?: string | null } | null | undefined,
 ): string | null {
-  if (craze?.cause === "too_old") return "craze on this machine is too old for shed; update it";
+  if (craze?.cause === "too_old") return "craze on this shed is too old; update it";
   return null;
 }
 

@@ -21,6 +21,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Desktop: sheds only.** The desktop app no longer reads `machines:` as a host
+  list, no longer implies a `localhost` host, and no longer offers LaunchModal,
+  `rc.kill`, or an opencode transcript. `shed roost-provider` lists running sheds
+  only. A `machines:` block already in `~/.shed/config.yaml` is preserved as an
+  opaque YAML subtree on save — YAML formatting and indentation may be normalized
+  on re-encode — and is not interpreted. An interactive roost session,
+  or a host you used to name under `machines:`, belongs in the `roost` app. The
+  shared Rust client is now `shed-lane`, `shed-core`, `shed-roost`, `shed-craze`,
+  `shed-app` and `shed-desktop-core` (plus `shed-broker`, `shed-broker-harness` and
+  `shedctl`). The opencode adapter crate is gone.
 - **Images: the `extensions` and `full` images bake craze 0.4.1** (0.10.1 baked 0.2.0). In a
   shed built from them, the desktop's create sheet lists craze's `claude` provider, which
   craze 0.4.0 added, and no longer lists `gx`, which it removed. A shed keeps the craze its

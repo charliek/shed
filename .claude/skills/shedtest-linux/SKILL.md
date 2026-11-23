@@ -18,7 +18,7 @@ running.
 ```bash
 make -C desktop tauri-test-linux    # Tauri crate's Linux-only approval-seam tests (polkit gate; Docker, no display)
 make -C desktop tauri-build-linux   # the render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 under Xvfb (Docker)
-make -C desktop core-linux          # shed-core cargo test + clippy on Linux (Docker)
+make -C desktop core-linux          # shared crates: test + clippy on Linux (Docker)
 ```
 
 - **`tauri-build-linux` is the render gate and the one to trust for any shared/Linux change.**
@@ -178,68 +178,44 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   down host OUT of the shared `fixtures/config.yaml` (it would break the m0 golden gate + put an
   error banner in every "healthy" screenshot).
 
-## Driving against a roost-session (machine rows)
+## Driving a shed's roost-session
 
-Since plan 013 the Tauri app's **machine** rows come from a `roost-session`, not from the RC
-hub — one `RoostWatcher` per `machines:` entry, plus an implicit `localhost` host for the
-machine the app is running on. Since plan 014 that watcher **does not poll**: it subscribes to
-roost's observer event stream and emits a snapshot only when a
-row actually changed, so there is **no poll knob any more** — the env var that used to turn the
-cadence down was deleted from the app, from `shed_app::roost` and from `ui.py`, and a recipe
-that still exports it is exporting nothing. Two env vars steer it:
+The desktop lists sheds only. There is no `machines:` host list, no implicit
+`localhost` host, and no Machines pane. A shed's roost rows come from that
+shed's `roost-session`. The watcher subscribes to roost's observer event stream
+and emits a snapshot only when a row actually changed.
 
 | Variable | Where it is read | Effect |
 |---|---|---|
-| `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `<machine>=<socket path>`. A named machine (including `localhost`) is dialled on that Unix socket instead of through roost's SSH client-bridge. Non-empty ⇒ **no** machine ever spawns ssh; an unmapped entry is a permanently-unreachable row. This is the app-level var — `ui.py`'s `subproc_env` sets or CLEARS it on every hermetic launch (never inherited from the parent shell), so nothing downstream of the harness can leak a stray value in. |
-| `SHEDTEST_ROOST_SOCKETS` | `conftest.py`'s `_env_roost_sockets`, harness-level | Same `<machine>=<socket path>` shape, read once and passed explicitly as `roost_sockets` to the SESSION app fixture (`_app_session`) — the harness-level opt-in for pointing the pytest session app at a real daemon instead of `fake_roost.py`. A custom driver script (not going through `conftest.py`) must do the equivalent itself: read this var, parse it into a `{name: path}` map, and pass it as `ui.launch(..., roost_sockets=...)` — since the launch no longer inherits, nothing shows up unless the caller supplies the map explicitly. |
+| `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `roost:<server>/<shed>=<socket path>`, one entry per shed (not `localhost`). A mapped shed's `roost-session` is dialled on that Unix socket. A shed that is not in the map still uses `SHED_TAURI_SSH_BIN` when that fake `ssh` is configured, and is unreachable when it is not. `ui.py`'s `subproc_env` sets or CLEARS the var on every hermetic launch. |
+| `SHEDTEST_ROOST_SOCKETS` | `conftest.py`'s `_env_roost_sockets`, harness-level | Same `roost:<server>/<shed>=<socket path>` shape, passed as `roost_sockets` to the session app. A custom driver must pass the map to `ui.launch(..., roost_sockets=...)`. |
 
-`localhost` is listed only once its socket has answered at least once (connect-if-present in
-both directions), so an app with no session running shows no `localhost` row at all — that is
-correct, not a bug. A configured machine named `localhost` wins over the implicit one, and
-`machine.add {"name":"localhost"}` is refused.
+`rc.inject_test` plants a roost row on a shed (`target` is `roost:<server>/<shed>`).
+`machines.list`, `machines.dump`, `machine.*`, `roost.launch`, `roost.run`, `rc.kill`,
+`ui.show_launch`, `ui.*_launch` and `launch.dump` answer `unknown_op`. `ui.navigate`
+with `"machines"` is `bad_request`.
 
-### Agent lanes ride the same seam (plan 015)
+### Agent lanes
 
-`test_tauri_lane.py` drives the `lane.*` ops — an opencode transcript on a machine row — and
-needs **no extra setup**: `fake_roost` serves a tab whose `ownership.metadata` carries
-`server_url`, and `fake_opencode.py` (a port of the rc-parity fake, pin guard and all) answers
-on a loopback port in the pytest process. The mapping in `SHED_TAURI_ROOST_SOCKETS` is what
-makes the machine count as LOCAL, so the lane dials that URL directly and the suite spawns no
-ssh. Against a real remote machine the same code takes the other branch — an
-`ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
-exercise.
+Craze is the only lane, and it runs on a shed over the fake-ssh seam
+(`SHED_TAURI_SSH_BIN`). There is no local craze path and no opencode lane.
+`test_tauri_craze.py` is the module. `lane.*`, `ui.show_lane` and
+`ui.show_lane_settings` take `target` (`roost:<server>/<shed>`) and `session_id`.
+There is no `kind` parameter.
 
-**Driving the New-session dialog's "Run a command" mode** (plan 025 C3, `roost.run`). The mode
-is reachable only by typing and clicking, so it has TEST-MODE-ONLY doors beside
-`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?, name?}` types into the
-open dialog (`name` is the agent mode's Session name, which a launch sets as the tab's title
-with `tab.set_title` — both fakes record those as `title_calls` / `set_title_calls()`, and
-`refuse_next_set_title` fails one) and `ui.submit_launch` presses Create through the button's
-own gate. The fill is an
-event to a listener the dialog registers AFTER it mounts, so one sent the instant
-`ui.show_launch` returns can land on nobody — re-send it (it is idempotent) until
-`launch.dump`'s `values` / `create_enabled` show it, as `test_tauri_machines.py`'s dialog cell
-does. And a run's tab is not a row (nobody owns it), so there is no `machine.kill` for it: a cell
-that opens one must close it on the fake's own wire (`roost_call(…, "tab.close", …)`), because
-the module's later cells pin literal tab ids and the fake hands each `tab.open` the next free one.
-
-**Driving the transcript PANEL.** The panel opens from a card's Transcript affordance — a
-click, which the harness does not have — so it has drivable ops on the `ui.show_create` /
-`ui.show_launch` pattern: `ui.show_lane {machine, session_id}` mounts it (and raises the
-window), `ui.close_lane` unmounts it, and `lane.dump` answers what it RENDERED (`null` once
-no panel is mounted, which is deliberately not pane-gated — the panel can be open over any
-pane). The panel itself calls `lane.open` on mount and `lane.close` on unmount, so mounting
-one opens a lane and unmounting one closes it: a cell that leaves a panel up leaves a
-subscription up. `lane.messages` (what the backend staged) and `lane.dump` (what is on
-screen) are different questions — assert the one you mean. `SHED_LANE_SHOTS=<dir>` makes the
-panel cells keep their `app.screenshot` PNGs there; unset, they still capture and assert one.
+**Driving the transcript panel.** `ui.show_lane {target, session_id}` mounts it,
+`ui.close_lane` unmounts it, and `lane.dump` answers what it rendered (`null`
+once no panel is mounted). The panel calls `lane.open` on mount and `lane.close`
+on unmount. `lane.messages` (what the backend staged) and `lane.dump` (what is
+on screen) are different questions. `SHED_LANE_SHOTS=<dir>` keeps the panel
+cells' screenshots.
 
 ### The gx lane (plan 017) — retired
 
 gx and its lane left shed in plan 025 C1 (shed#390); `test_tauri_gx_lane.py` and `fake_gx.py`
 are gone with it. Its slot is craze's — next section.
 
-### Craze sessions (plan 025 C9) — the real hub, two seams
+### Craze sessions — the real hub, on a shed
 
 `test_tauri_craze.py` drives the **real** craze hub: the pinned `craze`, `craze-fake-host`,
 `craze-fake-agent` and the real `craze-0.0.1`, from `SHED_CRAZE_BIN_DIR`. Without it the module
@@ -255,12 +231,10 @@ make craze-binaries OUT=desktop/tools/shedtest/.craze-bin
 SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin make -C desktop tauri-build-linux
 ```
 
-- **The local seam is `SHED_TAURI_CRAZE_PATH`** (test mode AND a debug build, an `exec_seam` like
-  `SHED_TAURI_SSH_BIN`): a directory the local craze dial's **jailed** ladder (rungs 1–2 only, no
-  exec-PATH enhancement) finds `craze` in, run under `env_clear()` + `HOME`/`CRAZE_HOME`/
-  `CRAZE_RUNTIME_DIR` from the app's env + `PATH=<that dir>`. `ui.subproc_env(craze_path=…,
-  craze_home=…, craze_runtime_dir=…)` sets or CLEARS all three, so a developer's own `CRAZE_HOME`
-  never reaches a hermetic launch. Unset → the app has no local craze source at all.
+- **Craze is reached only on a shed, through the fake ssh** (`SHED_TAURI_SSH_BIN`, test mode
+  and a debug build). There is no local craze path. `ui.subproc_env` still clears
+  `CRAZE_HOME` and `CRAZE_RUNTIME_DIR` so a developer's own values never reach a hermetic
+  launch.
 - **`CRAZE_RUNTIME_DIR` must be short, 0700 and under `/tmp`** — craze refuses one beneath a
   group-writable ancestor (`~/.cache` is 0775 on some hosts) and a socket path over ~104 bytes.
   The rigs use `tempfile.mkdtemp(prefix="shcz-", dir="/tmp")`.
@@ -281,25 +255,22 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   `PATH` and argv it ran with, then execs a private copy) — every dial must have run with `PATH`
   exactly the seam dir. The empty-seam instance and the dormant remote jail each carry a craze
   stub at `$HOME/.nix-profile/bin` (an absolute rung relative to HOME) that must never run.
-- **Do NOT run a "swap the jailed ladder for the production one" control over the whole file on
-  a workstation**: the EMPTY-seam instance would then walk the production ladder to this host's
-  own `/usr/local/bin/craze`. Run that control with `-k` on the recording-wrapper cell
-  (`test_the_local_dial_is_jailed`), whose rung 2 answers first, or in the Docker leg.
+- **Do not point a hermetic launch at this host's `/usr/local/bin/craze`.** Craze is reached
+  only through the fake-ssh jail. A control that swaps the jail's `craze` for the production
+  binary belongs on one cell, or in the Docker leg, never on the whole file.
 - **Teardown is by program path**: every craze process of a rig — each bridge, the hub, each
   `craze serve` it creates, the fake hosts and agents — runs a private COPY under the rig's
   `real/`, and the module end signals exactly those (re-checking each pid's command line first).
   Never `pkill -f craze`: the owner's own craze and hub may be running.
 - The row merge needs a `FakeRoost` tab with `source="craze"` and `session_id` = the hub row's
   `provider_session_id` (the craze rows carry it). To show the roost row coming BACK, the feed
-  must stay down: rename the seam's `craze` first (the eager source then reads not-installed)
-  and only then SIGTERM the hub — otherwise the eager redial births a new hub within a second.
+  must stay down: rename the seam's `craze` before SIGTERM, so a redial cannot birth a new hub.
   That cell is LAST in the module for that reason.
-- `lane.*` ops all take `kind` now (`"craze"` / `"opencode"`, the row's `agent_lane.kind`);
-  `ui.show_lane` too.
+- `lane.*` ops take `target` and `session_id`. There is no `kind`. `ui.show_lane` too.
 
 ### The craze create sheet and Open in terminal (plan 025 C10)
 
-- **Drive the sheet through its doors**: `ui.show_craze_create {machine}` (opening it reads
+- **Drive the sheet through its doors**: `ui.show_craze_create {target}` (opening it reads
   `craze.create_options` — on a DORMANT remote that is the explicit action that starts its hub),
   `ui.fill_craze_create {provider?, cwd?, title?, prompt?, recent?}` and `ui.submit_craze_create` (test
   mode only), `ui.close_craze_create`; read it with `craze_create.dump` (providers with
@@ -355,7 +326,7 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   user is its NAME, so each shed is its own jail of the same fake `ssh` (`Remote(bins,
   jails=SHED_JAILS)`). None runs roost (the fake answers `client-bridge` `command not found`),
   so only craze can list one; until then it is `rc.list`'s `shed_craze`, read on screen through
-  `shed_roost.dump`'s `craze_create`/`craze_note` and `launch.dump`'s rendered "Where".
+  `shed_roost.dump`'s `craze_create`/`craze_note`.
 - **Three switches in a JAIL's root**: `probe-127` makes the find-only probe exit 127 (not
   installed); `hold-roster` (content N) holds the (N+1)-th `bridge --hub` of that jail —
   `--no-start` ones counted — until the switch goes, recording the held record's name in
@@ -377,8 +348,8 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   for ORDER ("the first `bridge --hub` is the sheet's").
 - A dormant probe re-runs every 30 s, and so does a not-installed one: a cell that flips
   `probe-127` waits ~45 s each way. Without a fresh `rc.list` re-read (a `refresh` event) the UI
-  keeps its last listing — `ui.show_launch` re-reads on mount, so open the dialog FIRST when a
-  control must reach a later assertion. `ui.close_launch` closes it.
+  keeps its last listing — drive a `refresh` before a control that must see the
+  later listing.
 
 ### The orderly shutdown cells (plan 026 C3)
 
@@ -426,7 +397,7 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
 
 ### The settings sheet (plan 025 C11)
 
-- **Drive it through its doors**: `ui.show_lane_settings {machine, kind, session_id}` mounts
+- **Drive it through its doors**: `ui.show_lane_settings {target, session_id}` mounts
   the transcript panel AND asks for its sheet; `ui.pick_lane_setting {row, value}` (test mode
   only) presses a value — `row` is `model`, `mode` or an option's id; `ui.close_lane_settings`.
   Read it with `lane_settings.dump` (rows with `control`, `current`, `values[].selected`,
@@ -438,9 +409,8 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
   `cursor`, not grok (as grok it fails `no supported auth method`). `rig.set_agents(grok=…,
   cursor=<wrapper>)` and create with `provider: "cursor"`; then `rig.set_grok(rig.grok_echo)` AT
   ONCE — the C10 sheet cell asserts cursor is NOT ready. Every fake-agent script advertises
-  models and modes, so no craze session in the rig has `settings: false`: the hidden-sheet cell
-  uses an opencode tab (FakeOpencode + a FakeRoost tab with `server_url`), closed again with
-  `machine.kill` so the last cell (the D4 fold) still sees no roost rows.
+  models and modes, so no craze session in the rig has `settings: false`. A roost tab is
+  status only: there is no opencode transcript and no `machine.kill`.
 - **The agent's own knobs go in its wrapper** (the hub's env is fixed at its birth):
   `CRAZE_FAKE_DUMP_CALLS=<file>` records every `set_config_option <id>=<value>` the agent was
   ASKED for (what reached it, not what was sent); `CRAZE_FAKE_SET_GATE=<path>` holds each set
@@ -538,7 +508,7 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   -v shed-tauri-linux-target:/target -e CARGO_TARGET_DIR=/target \
   -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
   -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
-  -e SHEDTEST_ROOST_SOCKETS=localhost=/roost/roost.sock \
+  -e SHEDTEST_ROOST_SOCKETS=roost:my-server/dev=/roost/roost.sock \
   --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
   shed-tauri-linux:latest bash -c '…build + driver, as in the screenshot recipe below…'
 ```
@@ -549,14 +519,14 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   explicitly instead. Driving through pytest, `conftest.py`'s `_app_session` fixture reads
   `SHEDTEST_ROOST_SOCKETS` and passes it to `ui.launch(roost_sockets=...)`. A bespoke driver
   script (the screenshot recipe below) must do the same itself.
-- Then `rc.list` carries the roost rows (`origin: "machine:localhost"`, `tab_id`, `attention`)
-  and `capabilities["machine:localhost"]` — synthesized, `attach: "native-remote"`, so the card
-  offers **no** terminal action and `terminal.preview {machine: …}` answers
-  `not_enabled: terminal unavailable: attach is native-remote`.
+- Then `rc.list` carries that shed's roost rows (`target` `roost:<server>/<shed>`,
+  `tab_id`, `attention`) and `capabilities["roost:<server>/<shed>"]` — synthesized,
+  `attach: "native-remote"`, so the card offers no terminal attach.
 - The container's uid is root (0) while the socket is owned by uid 1000; roost's socket is
   mode 0600, so either run with `--user 1000` or loosen the socket's mode for the run. If
-  `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
-  socket is indistinguishable from "no session" by design.
+  `rc.list` shows that shed absent, that is the first thing to check — an unconnectable
+  socket is indistinguishable from "no session" by design. A shed not named in the map
+  still uses `SHED_TAURI_SSH_BIN` when that fake `ssh` is configured.
 
 ### `tauri-test-linux` lints the Linux cfg; `tauri-mac` lints the mac one
 
@@ -652,31 +622,21 @@ the daemon is the old one — rebuild rather than un-pinning shed.
 
 ### The `real_roost` pytest smoke (no host socket to mount)
 
-`test_tauri_machines.py::test_a_real_roost_session_answers_the_client` is a simpler
-alternative to the mount-the-host-socket recipe above: it spawns its OWN jailed
-`roost-session` daemon inside the container and discovers its socket by globbing the
-daemon's runtime dir, so nothing needs mounting except the binary itself. Mount a built
-`roost-session`'s directory read-only and point `SHED_TAURI_ROOST_SESSION_BIN` at it, then
-run pytest with `-m real_roost` (the test is skipped, not failed, when the var is unset —
-that's how CI stays roost-binary-free):
+`test_tauri_bootstrap.py::test_the_real_binary_is_installed_and_started_behind_the_fake_ssh`
+is a simpler alternative to the mount-the-host-socket recipe above: it drives a real
+`roost-session` behind the fake ssh. Mount a built `roost-session`'s directory read-only
+and point `SHED_TAURI_ROOST_SESSION_BIN` at it, then run pytest with `-m real_roost`
+(the test is skipped, not failed, when the binary is absent — that's how CI stays
+roost-binary-free):
 
 ```bash
 -v /path/to/roost/target/debug:/roost-bin:ro \
 -e SHED_TAURI_ROOST_SESSION_BIN=/roost-bin/roost-session \
-… uv run --group test pytest tools/shedtest/test_tauri_machines.py -m real_roost
+… uv run --group test pytest tools/shedtest/test_tauri_bootstrap.py -m real_roost
 ```
 
-**Running this natively (no Docker) on a host with a group-writable `umask`:** the fixture
-(`_jailed_session_env` in `test_tauri_machines.py`) creates its XDG runtime dir with plain
-`Path.mkdir()`, which inherits the process umask rather than forcing `0700`. A dev host whose
-default umask is `0002` (group-writable, common on shared-group Debian/Ubuntu setups) produces
-`0775` directories, and roost-session's own runtime-dir validator refuses to start under a
-group-/world-writable ancestor with no sticky bit (`error: validate runtime dir …: runtime-dir
-ancestor … is group- or world-writable without the sticky bit`) — the daemon exits 1 almost
-immediately and the test fails with `roost-session exited 1; see …/session.stderr` (the stderr
-file itself is already gone by the time you look, since the `finally` block `rmtree`s `root`
-unconditionally). This is a host-umask mismatch, not a shed or roost defect: run the pytest
-invocation under `(umask 022 && …)` and it passes.
+The rig forces `0700` on the jail directories it creates (`test_tauri_bootstrap.py`),
+so a group-writable developer umask does not fail the daemon's runtime-dir check.
 
 ## How the Docker legs are wired (so failures make sense)
 
@@ -775,18 +735,16 @@ ImageMagick's `import -window root` if `scrot` is absent or fails (the tool orde
 `src-tauri/src/screenshot.rs::capture` is `grim` → `scrot` → `import`; `grim` is
 skipped without a `WAYLAND_DISPLAY`, so X11/Xvfb tries `scrot` then `import`). Either
 way the PNG is the full display; the reported truth ops (`dashboard.dump` / `agents.dump` /
-`launch.dump` / `egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
-assertions, the pixels are the eyeball. `agents.dump`'s `empty` and `launch.dump`'s
-`rendered` are how the ABSENCE of something is asserted — which of the four blank
-Agents panes is on screen, and that the launch dialog offers no field it cannot
-deliver — neither of which a screenshot can be made to fail on.
+`sidebar.dump` / `shed_roost.dump` / `egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
+assertions, the pixels are the eyeball. `agents.dump`'s `empty` is how the ABSENCE of
+sessions is asserted. `launch.dump` and `machines.dump` answer `unknown_op`.
 
 ## Gremlins
 
 - **On a Linux workstation, `e2e-tauri` must run under Xvfb — never on the inherited desktop.**
   An agent's shell inherits `DISPLAY`/`WAYLAND_DISPLAY` from the owner's Wayland session; a run
   there pops windows onto the owner's screen, fails every screenshot cell (`scrot: no image
-  grabbed`) and fails `test_tauri_lane.py` cells that pass under Xvfb (this cost plan 025's C1
+  grabbed`) and fails craze lane cells that pass under Xvfb (this cost plan 025's C1
   hours). The exact command:
   `env -u WAYLAND_DISPLAY -u DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a --server-args="-screen 0 1400x900x24" make -C desktop e2e-tauri`
   — and kill any `shed-desktop-tauri` the run leaves behind BY PID (`ps -o pid,ppid,lstart,args
@@ -796,13 +754,11 @@ deliver — neither of which a screenshot can be made to fail on.
   parameter gets the command run as if the key were absent — no error anywhere. A command's
   argument shape is testable only above its body: drive it through Tauri's mock runtime
   (`tauri::test::mock_builder` + `get_ipc_response`; the crate's dev-dependency turns on
-  tauri's `test` feature, which adds no package), as `src/launch_command_tests.rs` does.
-- **Run a subset of tauri modules in collection (alphabetical) order** →
-  `test_tauri_machines.py`'s self-managed apps `ui.quit("tauri")` the session app and do not
-  bring it back, so a module named AFTER it on the command line errors at setup with
-  `FileNotFoundError` from `client.py`'s `connect` (the session socket is gone). A full run is
-  fine — it sorts last — but `pytest test_tauri_machines.py test_tauri.py -k …` is not; list it
-  last.
+  tauri's `test` feature, which adds no package). The launch-command tests were removed
+  with the launch dialog.
+- **Run a subset of tauri modules in collection (alphabetical) order.** A module that
+  `ui.quit`s the session app and does not bring it back makes a later module error at
+  setup with `FileNotFoundError` from `client.py`'s `connect`. A full run is fine.
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
   `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (already in the target) so WebKitGTK's
   bubblewrap sandbox can create user namespaces Docker's default seccomp blocks.

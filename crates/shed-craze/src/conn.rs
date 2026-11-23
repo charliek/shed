@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use shed_core::lane::feed::truncate_bytes;
+use shed_lane::lane::feed::truncate_bytes;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
@@ -103,7 +103,7 @@ pub const PREAMBLE_MAX_BYTES: usize = 4 << 10;
 /// connection as [`ConnEnd::Backlog`] — the reader never waits for room. As
 /// deep as the contract's own frame channel (`LANE_CHANNEL_CAPACITY`), so a
 /// burst the consumer can publish onward is a burst this queue can hold.
-pub const NOTIFICATION_QUEUE: usize = shed_core::lane::LANE_CHANNEL_CAPACITY;
+pub const NOTIFICATION_QUEUE: usize = shed_lane::lane::LANE_CHANNEL_CAPACITY;
 
 /// A notification, as a peer sent it.
 #[derive(Debug, Clone, PartialEq)]

@@ -2952,8 +2952,6 @@ dependencies = [
  "chrono",
  "futures",
  "httpmock",
- "libc",
- "roost-ipc",
  "serde",
  "serde_json",
  "shed-broker",
@@ -3028,11 +3026,11 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
- "roost-ipc",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shed-lane",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -3047,29 +3045,63 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
- "shed-app",
- "shed-core",
  "shed-craze",
+ "shed-lane",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
 ]
 
 [[package]]
-name = "shed-opencode"
+name = "shed-desktop-core"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "shed-app",
+ "shed-core",
+ "shed-craze",
+ "shed-lane",
+ "shed-roost",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "shed-lane"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "shed-roost"
 version = "0.10.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "futures-util",
+ "libc",
  "reqwest",
+ "roost-ipc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shed-core",
- "shed-opencode",
+ "shed-lane",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

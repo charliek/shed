@@ -18,7 +18,7 @@ a shape here cannot drift away from the shape roost publishes without the copy
 step noticing.
 
 It is the Python twin of `shed_core::roost::testing::FakeRoost`
-(`crates/shed-core/src/roost/testing.rs`) — the same controls, the same
+(`crates/shed-roost/src/testing.rs`) — the same controls, the same
 semantics, deliberately built from the same vectors so the Rust unit tests and
 this suite cannot disagree about what a roost-session says. **When you change one
 fake, change the other**, and pin the change in both `testing.rs`'s tests and
@@ -628,6 +628,12 @@ class FakeRoost:
             opened["data"]["tab"] = copy.deepcopy(tab)
             self._commit([opened])
             return copy.deepcopy(tab)
+
+    def close_tab(self, tab_id: int) -> None:
+        """Close a tab the way roost does when it goes: drop it and commit
+        `tab.closed`. The app's watcher is what clears an attached id."""
+        with self._lock:
+            self._close(tab_id)
 
     def set_axes(self, tab_id: int, *, lifecycle=_UNSET, has_notification=_UNSET,
                  detail=_UNSET, ownership=_UNSET) -> None:

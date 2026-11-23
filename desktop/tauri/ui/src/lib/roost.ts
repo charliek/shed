@@ -426,9 +426,8 @@ export function renderedValues(selector: string): Record<string, string> {
   return out;
 }
 
-/** Report the Sheds pane's per-shed roost rows (mounted-only, the
- *  `machines.dump`/`reportMachinesPane` rule — pass `null` on unmount). Read
- *  by `shed_roost.dump`. */
+/** Report the Sheds pane's per-shed roost rows (mounted-only — pass `null`
+ *  on unmount). Read by `shed_roost.dump`. */
 export function reportShedRoost(rows: Record<string, RoostDumpRow> | null): void {
   void invokeFireAndForget("ui_report", { snapshot: { shed_roost: rows } });
 }

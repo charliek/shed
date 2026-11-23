@@ -6,25 +6,25 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
-  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key, Server,
+  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
   Fingerprint, Moon, Sun, Settings, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import owlOrange from "@/assets/owl-orange.svg";
 import owlAmber from "@/assets/owl-amber.svg";
 import {
-  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, FactChip, ActBtn, GhostBtn,
-  PageHead, HeadAction, RefreshHeadButton, Empty, agentColor, type Tone,
+  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, FactChip, ActBtn,
+  PageHead, HeadAction, RefreshHeadButton, Empty, type Tone,
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { LanePanel } from "@/components/LanePanel";
 import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
-import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
+import { canOpenTerminal, crazeDoingLine, crazeMachineNote } from "@/lib/crazeRows";
 import { newestReload } from "@/lib/newest";
 import { isBusy, statusText } from "@/lib/shedStatus";
 import {
-  EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateTargets, createTitle,
-  crazeCreateUpdateNote, crazeStatusFor, edit as editCrazeDraft, groupMachine, liveSetter,
+  EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, createTitle,
+  crazeStatusFor, edit as editCrazeDraft, groupMachine, liveSetter,
   replaysHeldRequest, settle, sheetOnScreen,
   type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
@@ -36,8 +36,8 @@ import {
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
-  reportShedRoost, renderedText, renderedValues, useRoostBoard,
-  type RoostPreview, type RoostToast, type RoostCardState, type RoostDumpRow,
+  reportShedRoost, renderedText, useRoostBoard,
+  type RoostPreview, type RoostToast, type RoostDumpRow,
 } from "@/lib/roost";
 import {
   useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
@@ -45,15 +45,15 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, machineLaunch, roostRun, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
+  sessionKey, reportAgents, useRcSessions,
   crazeCreate, crazeOpenTerminal, crazeReopen, crazeSaved, laneFailure,
-  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
+  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
-  type RcSession, type RcKind, type RcState,
-  type RcCapabilities, type MachineStatus, type MachinePaneRow, type AgentsLoad, type ShedCrazeEntry,
-  offeredKinds, agentsEmptyState, crazeOnly,
+  type RcSession, type RcState,
+  type MachineStatus, type AgentsLoad, type ShedCrazeEntry,
+  agentsEmptyState,
 } from "@/lib/bridge";
 
 /** "server/shed" when multi-server, else the shed name. */
@@ -79,11 +79,6 @@ function approveHint(scope: Approval["default_scope"]): string {
 }
 const NAV: [Pane, string, typeof Box][] = [
   ["sheds", "Sheds", Boxes],
-  // Machines sit beside Sheds because they are the same kind of thing to a
-  // person — somewhere your sessions run. Only the way they are REACHED
-  // differs (a shed through its server's API, a machine over SSH to its own
-  // activity hub), and that belongs in the plumbing, not the navigation.
-  ["machines", "Machines", Server],
   ["approvals", "Approvals", Shield],
   ["agents", "Agents", Sparkles],
   ["activity", "Activity", ScrollText],
@@ -109,17 +104,8 @@ function groupBy<T>(rows: T[], key: (row: T) => string): [string, T[]][] {
 
 const groupByHost = (sheds: Shed[]) => groupBy(sheds, (s) => s.host);
 
-/** Where a session runs, as its group heading: `machine:<name>` for a machine,
- *  `<host>/<shed>` for a shed. The SAME string the card used to carry as a
- *  chip — hoisted to the heading, so it is said once per group instead of once
- *  per row. */
-const sessionOrigin = (s: RcSession): string =>
-  // `origin` is optional on the wire; for a machine it is the only thing that
-  // names the box, so fall back to the machine name rather than grouping every
-  // machine session under one blank heading.
-  s.origin_kind === "machine"
-    ? (s.origin ?? `machine:${s.machine ?? "?"}`)
-    : `${s.host}/${s.shed}`;
+/** Where a session runs, as its group heading: `<server>/<shed>`. */
+const sessionOrigin = (s: RcSession): string => `${s.host}/${s.shed}`;
 
 /** A one-line spec summary ending in the status and its reason (`statusText`:
  *  `2 vCPU · 4 GB · stopped (capacity)`; just the status when specs are absent).
@@ -157,7 +143,7 @@ function HostLabel({ host }: { host: string }) {
   );
 }
 
-/** A sidebar section heading (SHED SERVERS / MACHINES). */
+/** A sidebar section heading (SHED SERVERS). */
 function SidebarSection({ label }: { label: string }) {
   return (
     <div className="flex items-center px-2.5 pb-2 pt-2.5 first-of-type:pt-0.5">
@@ -257,43 +243,12 @@ export function needsYou(s: RcSession): boolean {
   return s.activity === "needs_input" || s.activity === "needs_approval";
 }
 
-/* ---- sidebar status vocabulary -------------------------------------------- */
-/** A machine's sidebar note: one clean word, never the raw transport error.
- *
- *  "no route to host" is the right thing to show someone who came looking for a
- *  reason; it is the wrong thing to put in a status list they scan. The raw
- *  `detail` stays one hover away. */
-function machineSidebarNote(m: MachineStatus): string {
-  if (m.reachable) return m.sessions === 1 ? "1 session" : `${m.sessions} sessions`;
-  if (crazeOnly(m)) return "craze only";
-  return m.connected_once ? "offline" : "connecting";
-}
-
-/** A machine's sidebar dot: green up, amber still connecting, grey down — and
- *  neutral for a host listed by craze alone (plan 026 §3.2), which is not
- *  waiting on anything. */
-function machineSidebarTone(m: MachineStatus): SidebarTone {
-  if (m.reachable) return "ok";
-  if (crazeOnly(m)) return "neutral";
-  return m.connected_once ? "off" : "pending";
-}
-
-/** Healthy first, then still-connecting, then offline — and alphabetical inside
- *  each band so the list doesn't reshuffle as machines come and go. A list whose
- *  order changes under you is one you stop trusting at a glance. A host listed
- *  by craze alone ranks with the reachable ones: its craze sessions are there. */
-function sortedMachines(machines: MachineStatus[]): MachineStatus[] {
-  const rank = (m: MachineStatus) => (m.reachable || crazeOnly(m) ? 0 : m.connected_once ? 2 : 1);
-  return [...machines].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
-}
-
-/* ---- Sheds pane ----------------------------------------------------------- */
-function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, machines, shedCraze, onCrazeCreate }: {
+function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, hosts, shedCraze, onCrazeCreate }: {
   sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void;
   roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
   /** `rc.list`'s status rows and `shed_craze` — what each running shed's craze
    *  is read from ([`crazeStatusFor`], plan 026 §3.2). */
-  machines: MachineStatus[]; shedCraze: ShedCrazeEntry[];
+  hosts: MachineStatus[]; shedCraze: ShedCrazeEntry[];
   onCrazeCreate: (machine: string) => void;
 }) {
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
@@ -309,9 +264,9 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   // status row's once it is listed, else its `shed_craze` entry's — so a shed
   // whose probe says dormant offers New craze session here without being a
   // listed host, and one whose craze is too old says so.
-  const crazeOf = (target: string) => crazeStatusFor(target, machines, shedCraze);
-  // Publish what this pane rendered — the `machines.dump`/`reportMachinesPane`
-  // rule, mounted-only, keyed on the VALUE so an unrelated re-render doesn't
+  const crazeOf = (target: string) => crazeStatusFor(target, hosts, shedCraze);
+  // Publish what this pane rendered, mounted-only, keyed on the VALUE so an
+  // unrelated re-render doesn't
   // re-report. Each row's `rendered` — and its craze offer and note — are read
   // back off its own nodes IN THE EFFECT (after the commit), so the fields
   // beside them cannot pass as a parallel data structure with nothing on screen.
@@ -433,100 +388,6 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   );
 }
 
-/** Add a machine — a native host reached over SSH for its `roost-session`.
- *
- *  Mirrors the New Shed dialog because it is the same kind of act: naming a
- *  place your sessions can run.
- *
- *  It does NOT collect `rc_bin` — that field named a path to `sx`'s RC
- *  binary, and `sx` was sunset, unreleased, in plan 016. C8 (plan 022 S6)
- *  finished the retirement: `machine.add` no longer accepts `rc_bin` and
- *  `shed_core::config::MachineEntry` no longer models it. A hand-written
- *  `~/.shed/config.yaml` that still carries a leftover `rc_bin:` key keeps
- *  loading regardless — the config reader silently ignores any key it
- *  doesn't model.
- */
-function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
-  const fid = useId();
-  const [name, setName] = useState("");
-  const [host, setHost] = useState("");
-  const [user, setUser] = useState("");
-  const [sshPort, setSshPort] = useState("22");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const canAdd = name.trim().length > 0 && !busy;
-
-  const submit = async () => {
-    if (!canAdd) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await addMachine({
-        name: name.trim(),
-        // Empty host means "same as the name", the rule the config reader
-        // already applies — so an entry for `mini3` needs one field, not two.
-        host: host.trim() || undefined,
-        user: user.trim() || undefined,
-        ssh_port: sshPort.trim() ? Number(sshPort) : undefined,
-      });
-      onAdded();
-      onClose();
-    } catch (e) {
-      setError(String(e));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <DialogShell
-      icon={Server}
-      title="New machine"
-      sub="A computer you reach over SSH that runs the shed activity hub."
-      onClose={onClose}
-      width={540}
-      footer={
-        <>
-          <button onClick={onClose} className={dialogBtnSecondary}>Cancel</button>
-          <button
-            onClick={() => void submit()}
-            disabled={!canAdd}
-            className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
-            style={{
-              background: canAdd ? "var(--shed-accent)" : "var(--shed-inset)",
-              color: canAdd ? "var(--shed-accent-fg)" : "var(--shed-text-muted)",
-              border: "none",
-              cursor: canAdd ? "pointer" : "default",
-            }}
-          >
-            <Plus size={16} /> {busy ? "Adding…" : "Add machine"}
-          </button>
-        </>
-      }
-    >
-      <Field label="Name" help="How it is labelled, and the handle you pass to sx as machine:<name>.">
-        <input id={`${fid}-name`} className={dialogInput} value={name} placeholder="mini3"
-          onChange={(e) => setName(e.target.value)} autoFocus />
-      </Field>
-      <Field label="Address" hint="optional" help="Hostname or IP. Defaults to the name.">
-        <input id={`${fid}-host`} className={dialogInput} value={host} placeholder="mini3"
-          onChange={(e) => setHost(e.target.value)} />
-      </Field>
-      <Field label="SSH user" hint="optional" help="Leave empty to let ssh decide (your ssh_config, then the local user).">
-        <input id={`${fid}-user`} className={dialogInput} value={user} placeholder="charliek"
-          onChange={(e) => setUser(e.target.value)} />
-      </Field>
-      <Field label="SSH port">
-        <input id={`${fid}-port`} className={dialogInput} value={sshPort} inputMode="numeric"
-          onChange={(e) => setSshPort(e.target.value)} />
-      </Field>
-      {error && (
-        <div className="text-[13px] leading-snug" style={{ color: "var(--shed-danger)" }}>{error}</div>
-      )}
-    </DialogShell>
-  );
-}
-
 /* ---- Approvals pane ------------------------------------------------------- */
 function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
   const now = useNowTick();
@@ -582,17 +443,6 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
 }
 
 /* ---- Agents / remote-control ---------------------------------------------- */
-/** Human labels for the creatable kinds (the gated set is capability-derived).
- *  `codex`/`cursor`/`gx`/`grok` left this table in plan 025 (shed#390) — a
- *  row of one of those kinds renders through the `?? k` fallback below, its
- *  raw kind string, which is the plain-row contract (D1). `craze` is the one
- *  addition: craze's own lane, named rather than left as a raw string. */
-const RC_KIND_LABELS: Record<string, string> = {
-  "claude-rc": "Claude", opencode: "opencode", shell: "Shell",
-  craze: "Craze",
-};
-const rcKindLabel = (k: RcKind): string => RC_KIND_LABELS[k] ?? k;
-
 /** State → status-chip tone: green ready, red dead, amber for in-progress /
     needs-action (the mapping the pane has always used, now on the shared vocab). */
 function rcStateTone(state: RcState): Tone {
@@ -601,8 +451,8 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunch, refresh, onTranscript, onSetUpRoost, onCrazeCreate }:
-  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; load: AgentsLoad; loadError: string | null; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void; onSetUpRoost: () => void; onCrazeCreate: (machine: string) => void }) {
+function AgentsPane({ sessions, hosts, hasUnwatchedRunningShed, load, loadError, refresh, onTranscript, onSetUpRoost, onCrazeCreate }:
+  { sessions: RcSession[]; hosts: MachineStatus[]; hasUnwatchedRunningShed: boolean; load: AgentsLoad; loadError: string | null; refresh: () => void; onTranscript: (s: RcSession) => void; onSetUpRoost: () => void; onCrazeCreate: (target: string) => void }) {
   const [error, setError] = useState<string | null>(null);
   // The empty state is a VALUE, not inline JSX: it is reported as UI truth so
   // `agents.dump` can assert the words — the `dashboard.dump.empty` rule, and
@@ -612,7 +462,7 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
   // `agentsEmpty.ts`): still reading, could not read, and read-and-empty are one
   // screen but three different pieces of news, and only the last one may offer
   // the bootstrap.
-  const empty = sessions.length === 0 ? agentsEmptyState(machines, load, loadError) : null;
+  const empty = sessions.length === 0 ? agentsEmptyState(hosts, load, loadError, hasUnwatchedRunningShed) : null;
 
   // Refresh the shared RC state on mount so navigating to the pane re-lists (the
   // shared state, so the sidebar badge stays consistent — one source of truth).
@@ -620,7 +470,32 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
   // Publish the rendered sessions + empty state so the `agents.dump` op can
   // observe them. This effect stays IN the pane so reportAgents fires ONLY while
   // the pane is mounted (the backend blanks the agents snapshot off-pane).
-  useEffect(() => { reportAgents(sessions, empty); }, [sessions, empty?.state, empty?.title, empty?.body, empty?.action]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // Read AFTER the commit: the Transcript button is the DOM, and a roost
+    // opencode tab must be able to prove it rendered none.
+    const buttons = new Set(
+      Array.from(document.querySelectorAll<HTMLElement>("[data-agent-transcript]")).map(
+        (el) => el.dataset.agentTranscript ?? "",
+      ),
+    );
+    const chips = new Map(
+      Array.from(document.querySelectorAll<HTMLElement>("[data-agent-activity]")).map((el) => [
+        el.dataset.agentActivity ?? "",
+        el.dataset.agentActivityLabel ?? "",
+      ]),
+    );
+    reportAgents(
+      sessions.map((s) => {
+        const key = `${s.target ?? ""}/${s.slug}`;
+        return {
+          ...s,
+          transcript: buttons.has(key),
+          activity_chip: chips.has(key) ? chips.get(key) : null,
+        };
+      }),
+      empty,
+    );
+  }, [sessions, empty?.state, empty?.title, empty?.body, empty?.action]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div>
@@ -630,7 +505,6 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
         right={
           <div className="flex items-center gap-[18px]">
             <RefreshHeadButton onClick={refresh} />
-            <HeadAction icon={Plus} label="New session" color="var(--shed-accent)" onClick={onLaunch} />
           </div>
         }
       />
@@ -662,95 +536,17 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
                 its "New craze session". */}
             <div className="flex items-start justify-between gap-3">
               <HostLabel host={origin} />
-              <CrazeCreateAction machine={groupMachine(origin, rows, machines)} onCrazeCreate={onCrazeCreate} compact />
+              <CrazeCreateAction machine={groupMachine(origin, rows, hosts)} onCrazeCreate={onCrazeCreate} compact />
             </div>
             <div className="flex flex-col gap-3">
               {rows.map((s) => (
-                // Keyed by ORIGIN, not host/shed: a machine session's shed is
-                // empty by construction, so two machines sharing a slug would
-                // otherwise collide into one React key.
-                <SessionCard key={sessionKey(s)} session={s} capabilities={capabilities} onKilled={refresh} onError={setError} onTranscript={onTranscript} />
+                // Keyed by the shed target plus the slug, so two sheds that reuse a
+                // roost tab id do not collide into one React key.
+                <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} onTranscript={onTranscript} />
               ))}
             </div>
           </div>
         ))
-      )}
-    </div>
-  );
-}
-
-/* ---- Machines pane -------------------------------------------------------- */
-/** The status chip's text — the SINGLE source for both the render and the
- *  reported UI truth, so `machines.dump` can never claim a word the pane
- *  doesn't show. "connecting" (never yet reached) and "unreachable" (reached
- *  once, gone now) are deliberately different claims. */
-function machineStatusLabel(m: MachineStatus): string {
-  if (m.reachable) return "reachable";
-  // Listed by craze alone (plan 026 §3.2): no roost has answered there, and
-  // none is being waited on — "connecting" would be a promise nothing keeps.
-  if (crazeOnly(m)) return "craze only";
-  return m.connected_once ? "unreachable" : "connecting";
-}
-
-/** The sub-line under a machine's name: its session count when it's up, the
- *  REASON it isn't when it's down — and, for a host listed by craze alone,
- *  what it does have. */
-function machineDetailLine(m: MachineStatus, sessions: number): string {
-  if (m.reachable) return `${sessions} ${sessions === 1 ? "session" : "sessions"}`;
-  if (crazeOnly(m)) return "no roost session here yet — craze sessions only";
-  return m.detail ?? "waiting for the machine's activity hub";
-}
-/** A configured machine: its reachability, and why not when it isn't.
- *
- *  Unreachable is rendered as INFORMATION, not an error — a machine that is
- *  asleep, off-network, or simply not running a hub is the everyday case. The
- *  `detail` is shown verbatim because "no route to host" and "nothing is
- *  listening on 1029" are different problems with different fixes, and
- *  flattening them to "offline" would throw away the only actionable part. */
-function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onOpenConsent, onCrazeCreate }:
-  {
-    machine: MachineStatus; sessions: number; waiting: number;
-    roostState: RoostCardState | undefined; roostBusy: string | undefined;
-    onOpenConsent: (target: string, preview: RoostPreview) => void;
-    onCrazeCreate: (machine: string) => void;
-  }) {
-  const crazeNote = crazeMachineNote(m.craze) ?? crazeCreateUpdateNote(m.craze);
-  // A host listed by craze alone is not a dimmed, waiting card: its craze
-  // sessions are live information (plan 026 §3.2).
-  const shown = m.reachable || crazeOnly(m);
-  return (
-    <div
-      className={cn(cardCls, "flex flex-col gap-1 px-[18px] py-4")}
-      style={{ opacity: shown ? 1 : 0.7 }}
-      data-machine={m.name}
-    >
-      <div className="flex items-center gap-4">
-        <StatusChip tone={m.reachable ? "ok" : crazeOnly(m) ? "muted" : "attention"} label={machineStatusLabel(m)} />
-        {/* The one thing a machine can tell you that a count cannot: something on
-            it stopped and wants a person. */}
-        {waiting > 0 && <StatusChip tone="attention" label={`${waiting} waiting`} />}
-        <div className="min-w-0 flex-1">
-          <div className="mb-1 flex flex-wrap items-center gap-2.5">
-            <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
-            <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">
-              {m.origin}
-            </span>
-          </div>
-          <div className="truncate font-mono text-[12px] text-shed-text-muted">
-            {machineDetailLine(m, sessions)}
-          </div>
-        </div>
-        <CrazeCreateAction machine={m} onCrazeCreate={onCrazeCreate} />
-      </div>
-      <RoostLine target={m.origin} state={roostState} busyDetail={roostBusy} onOpenConsent={onOpenConsent} />
-      {/* This machine's craze, when there is something to say about it — a
-          craze too old for shed says so, and what to do; a live hub that
-          cannot create says to update it (listing still works); a machine
-          with no craze at all says nothing (plan 025 §3.6.5, §3.8). */}
-      {crazeNote && (
-        <div className="font-mono text-[12px]" style={{ color: "var(--shed-warn-fg)" }} data-craze-note>
-          {crazeNote}
-        </div>
       )}
     </div>
   );
@@ -780,151 +576,30 @@ function CrazeCreateAction({ machine: m, onCrazeCreate, compact }:
   );
 }
 
-/** The Machines pane — machines sit beside sheds because they are the same kind
- *  of thing to a person: somewhere your sessions run. Each machine's card leads
- *  its own sessions, so "what is mini3 doing" is one place rather than a filter
- *  over the Agents list.
- *
- *  Machines are configured in `~/.shed/config.yaml` (the `machines:` section that
- *  `sx` reads) and are read ONCE at startup, so there is deliberately no add/edit
- *  affordance here — an in-app editor that silently needed a relaunch would be
- *  worse than the file. */
-function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenConsent, roostBusy, onCrazeCreate }: {
-  machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void; onNew: () => void;
-  roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
-  onCrazeCreate: (machine: string) => void;
-}) {
-  useEffect(() => { refresh(); }, [refresh]);
-  const reachable = machines.filter((m) => m.reachable).length;
-  const roostBoard = useRoostBoard(machines.map((m) => m.origin), roostTick);
-
-  // Grouped by ORIGIN, never by shed: a hub reports an EMPTY shed on every
-  // machine session, so two machines sharing a slug would collide into one row.
-  //
-  // This pane is about the MACHINES, not what runs on them — sessions live in
-  // Agents, grouped by origin. What a machine owes you here is a count, and
-  // whether any of its sessions is waiting on you.
-  const grouped = machines.map((m) => {
-    const rows = sessions.filter((s) => s.origin === m.origin);
-    return { machine: m, rows, waiting: rows.filter(needsYou).length };
-  });
-
-  const reported = grouped.map(({ machine: m, rows, waiting }) => ({
-    name: m.name,
-    origin: m.origin,
-    reachable: m.reachable,
-    status: machineStatusLabel(m),
-    detail: machineDetailLine(m, rows.length),
-    sessions: rows.map((s) => s.slug),
-    waiting,
-    craze_note: crazeMachineNote(m.craze) ?? crazeCreateUpdateNote(m.craze),
-    // Whether the card offers "New craze session" — the same rule its button
-    // is rendered by (plan 025 §3.6.5).
-    craze_create: crazeCreateOffered(m.craze),
-    // The plan-matrix status line + button, as rendered — the SAME data
-    // `MachineCard`'s `RoostLine` reads, so `machines.dump` can never claim a
-    // word the card doesn't show (the pane's own rule, extended to roost).
-    roost: roostDumpRow(m.origin, roostBoard[m.origin], roostBusy[m.origin]),
-  }));
-  // Publish what this pane rendered — keyed on the VALUE, so an unrelated parent
-  // re-render (the 5s shed poll, an approval, an appearance flip) does not
-  // re-report.
-  const reportedKey = JSON.stringify(reported);
-  useEffect(() => {
-    reportMachinesPane(JSON.parse(reportedKey) as MachinePaneRow[]);
-  }, [reportedKey]);
-  // CLEAR on UNMOUNT only — a separate `[]` effect on purpose. Folding the clear
-  // into the cleanup above would run it before every re-report, opening a window
-  // where `machines.dump` reads null while the pane is plainly on screen.
-  useEffect(() => () => reportMachinesPane(null), []);
-
-  return (
-    <div>
-      <PageHead
-        title="Machines"
-        accessory={
-          <span className="font-mono text-[13px] text-shed-text-muted">
-            {reachable} of {machines.length} reachable
-          </span>
-        }
-        right={
-          <div className="flex items-center gap-[18px]">
-            <RefreshHeadButton onClick={refresh} />
-            <HeadAction icon={Plus} label="New machine" color="var(--shed-accent)" onClick={onNew} />
-          </div>
-        }
-      />
-      {machines.length === 0 ? (
-        <Empty
-          icon={Server}
-          title="No machines configured"
-          body="A machine is a computer you reach over SSH that runs the shed activity hub. Add one under machines: in ~/.shed/config.yaml."
-        />
-      ) : (
-        <div className="flex flex-col gap-3">
-          {grouped.map(({ machine: m, rows, waiting }) => (
-            <MachineCard
-              key={m.origin}
-              machine={m}
-              sessions={rows.length}
-              waiting={waiting}
-              roostState={roostBoard[m.origin]}
-              roostBusy={roostBusy[m.origin]}
-              onOpenConsent={onOpenConsent}
-              onCrazeCreate={onCrazeCreate}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript }:
-  { session: RcSession; capabilities: Record<string, RcCapabilities>; onKilled: () => void; onError: (e: string) => void; onTranscript: (s: RcSession) => void }) {
+function SessionCard({ session: s, onKilled, onError, onTranscript }:
+  { session: RcSession; onKilled: () => void; onError: (e: string) => void; onTranscript: (s: RcSession) => void }) {
   const [busy, setBusy] = useState(false);
-  const claude = s.kind === "claude-rc";
   // WORKDIR FIRST: on a narrow pane this truncates, and the working directory
   // is what tells two sessions on the same box apart. The origin is not here at
   // all — the pane is grouped by it.
   const sub = s.workdir ?? "";
   const act = rcActivityLabel(s);
   const rail = sessionRail(s);
-  // `>_ open` only makes sense for a tmux-attach row, and it FAILS CLOSED: a
-  // row whose contract does not say `tmux` gets no terminal button.
-  //
-  // Both halves of the old rule went with the hub (S6). Absent capabilities
-  // used to mean "a shed too old to advertise", which had always had a tmux
-  // pane; and `attachKind` used to fall back to `"tmux"` for the same reason.
-  // There is no such shed any more — every row is a roost tab, whose
-  // synthesized contract says `native-remote` — so "nothing said so" now means
-  // there is nothing to attach to, not that the answer is tmux.
-  const caps = capabilitiesFor({ capabilities }, s);
-  const canAttach = attachKind(caps, s.kind) === "tmux";
-  // A craze session's row is its HUB's (plan 025 §3.6.3): the provider and
-  // model, what it is doing, what it is blocked on, who is attached — and its
-  // End tab exists only when the merge attached a roost tab to it.
+  // A craze session's row is its hub's: the provider and model, what it is
+  // doing, what it is blocked on, who is attached. A roost-detected row is
+  // status only — its label and activity stay, and the desktop does not
+  // launch, kill, or open a transcript for it.
   const craze = s.source === "craze";
   const doing = craze ? crazeDoingLine(s) : null;
   const asks = craze && typeof s.pending_approvals === "number" ? s.pending_approvals : 0;
-  const canEnd = killTarget(s) !== null;
-  // Open in terminal (plan 025 §3.6.6): a headless craze session — no tab
-  // attached — gets `craze attach` in a new roost tab; the row then carries
-  // that tab (and its End tab).
+  // Open in terminal: a headless craze session gets `craze attach` in a new
+  // roost tab.
   const canAttachCraze = canOpenTerminal(s);
   const attachCraze = async () => {
     setBusy(true);
-    try { await crazeOpenTerminal(s.machine ?? "", s.slug); onKilled(); }
+    try { await crazeOpenTerminal(s.target ?? "", s.slug); onKilled(); }
     catch (e) { onError(String(e)); }
     finally { setBusy(false); }
-  };
-  const kill = async () => {
-    setBusy(true);
-    // Routes by origin — a machine session is addressed by (machine, slug), a
-    // shed session by (host, shed, slug). One entry point so the distinction
-    // lives in the bridge rather than at every call site.
-    try { await killSession(s); onKilled(); }
-    catch (e) { onError(String(e)); setBusy(false); }
   };
   return (
     <div
@@ -963,7 +638,11 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
           {/* A craze row has no roost lifecycle to show — its activity,
               its start error and its staleness say what there is to say. */}
           {!craze && <StatusChip tone={rcStateTone(s.state)} label={s.state} />}
-          {act && <StatusChip tone={act.tone} label={act.label} />}
+          {act && (
+            <span data-agent-activity={`${s.target ?? ""}/${s.slug}`} data-agent-activity-label={act.label}>
+              <StatusChip tone={act.tone} label={act.label} />
+            </span>
+          )}
         </span>
       </div>
       <div className="mt-2 flex items-center gap-4">
@@ -982,8 +661,9 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               exactly that and on nothing about the kind. It LEADS on the rows
               that have it: a machine row has no tmux pane to attach to, so this
               is how you read the session at all. */}
-          {s.agent_lane && s.machine && (
+          {craze && s.agent_lane && s.target && (
             <button
+              data-agent-transcript={`${s.target}/${s.slug}`}
               onClick={() => onTranscript(s)}
               title="Open the live transcript"
               className="hbtn inline-flex items-center gap-[7px] rounded-[9px] px-[14px] py-2.5 text-[13px] font-medium"
@@ -1007,29 +687,6 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               <Terminal size={15} /> Open in terminal
             </button>
           )}
-          {/* Every session opens in a terminal, whichever kind of place it runs
-              in. A shed resolves through its server's ssh endpoint; a machine
-              through its own config entry — the difference is the address, and
-              a person opening a session should not have to care which they
-              have. It LEADS, because on the desktop the terminal is how you
-              read a session, not a fallback for when something else is
-              missing.
-              A roost row (attach !== "tmux") has no tmux pane behind it — R3
-              lands attach for those; until then the button is simply absent
-              rather than opening onto nothing.
-              Addressed by `machine` for every row now, machine or shed: that is
-              the host address the backend takes, and since S6 there is no
-              second, `(host, shed, tmux_session)`-shaped terminal path. */}
-          {canAttach && s.machine && (
-            <button
-              onClick={() => void openMachineTerminal(s.machine ?? "", s.slug)}
-              title={claude ? "Open the session in a terminal" : "Open in Terminal"}
-              className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
-              style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
-            >
-              {">_ open"}
-            </button>
-          )}
           {/* claude.ai is a second way in, not a better one — a quiet square
               beside the terminal rather than a labelled pill competing with
               it. */}
@@ -1044,21 +701,6 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
             >
               <ExternalLink size={15} />
             </a>
-          )}
-          {/* Delete is a bare glyph, last and quietest. A tinted red box makes
-              it the loudest thing on a card you are only reading. On a craze
-              row it is End TAB — it closes the roost tab the session runs in
-              (by the row's typed `tab_id`, never its hostId slug), and a
-              headless craze session has none to close; Stop is the
-              transcript's. */}
-          {canEnd && (
-            <GhostBtn
-              icon={Trash2}
-              title={craze ? "End tab" : "End session"}
-              onClick={() => void kill()}
-              disabled={busy}
-              spin={busy}
-            />
           )}
         </div>
       </div>
@@ -1483,334 +1125,6 @@ function SystemPane({ sheds }: { sheds: Shed[] }) {
   );
 }
 
-/* ---- New-session (launch agent) dialog ------------------------------------ */
-/** Per-kind one-line help under the Kind picker. */
-function kindHelp(kind: RcKind): string {
-  if (kind === "shell") return "plain bash in the shed workspace";
-  if (kind === "claude-rc") return "live claude REPL with /rc";
-  return "a remote coding-agent session";
-}
-
-/** A place a session can be started: a running shed, or a machine.
- *
- *  Encoded as one string so the picker stays a plain <select>: `shed:<host>/<name>`
- *  or `machine:<name>`. A machine is offered on the same footing as a shed —
- *  an agent on a machine is a session like any other, and a separate dialog for
- *  it would be the first place that stopped being true. */
-type LaunchTarget =
-  | { kind: "shed"; value: string; label: string; host: string; shed: string }
-  | { kind: "machine"; value: string; label: string; machine: string }
-  /** A craze session on a machine whose craze can create one (plan 025
-   *  §3.8): picking it leads on to the craze create sheet, which owns the
-   *  provider, the directory and the first prompt. */
-  | { kind: "craze"; value: string; label: string; machine: string };
-
-/** What the dialog starts: an agent of a kind (`roost.launch`, offered only for
- *  the kinds the target's contract names), or a command line run as typed in a
- *  new roost tab (`roost.run`, plan 025 P5 — gated by no kind at all). The
- *  second is how an agent's own TUI is started now that the per-agent kinds are
- *  gone: `codex --model x` is a command like any other. */
-type LaunchMode = "agent" | "command";
-const LAUNCH_MODES: [LaunchMode, string][] = [["agent", "An agent"], ["command", "Run a command"]];
-/** The Command field's help: the split rule, in the words a person needs. */
-const RUN_COMMAND_HELP =
-  "Runs as typed in a new roost tab, split on ASCII whitespace (spaces, tabs, newlines; a non-ASCII space such as NBSP is part of the word) — " +
-  "no shell, so quotes, pipes and $VARIABLES are passed through literally. " +
-  "An agent roost recognises appears as a session; anything else is a plain roost tab.";
-
-function LaunchAgentDialog({ sheds, machines, shedCraze, capabilities, refresh, onClose, onLaunched, onCrazeCreate }:
-  { sheds: Shed[]; machines: MachineStatus[]; shedCraze: ShedCrazeEntry[]; capabilities: Record<string, RcCapabilities>; refresh: () => void; onClose: () => void; onLaunched: () => void; onCrazeCreate: (machine: string) => void }) {
-  const fid = useId(); // base for per-field control ids (label↔control association)
-  const running = sheds.filter((s) => s.status === "running");
-  const targets: LaunchTarget[] = [
-    ...running.map((s) => ({
-      kind: "shed" as const,
-      value: `shed:${s.host}/${s.name}`,
-      label: qualifiedShed(s.host, s.name),
-      host: s.host,
-      shed: s.name,
-    })),
-    ...machines.map((m) => ({
-      kind: "machine" as const,
-      value: `machine:${m.name}`,
-      label: `machine:${m.name}`,
-      machine: m.name,
-    })),
-    // A craze session wherever one can be created: a listed host whose craze
-    // offers it, and an unlisted shed whose probe says dormant (`shed_craze`,
-    // plan 026 §3.2) — read through the one lookup, `crazeStatusFor`.
-    ...crazeCreateTargets(machines, shedCraze).map((m) => ({
-      kind: "craze" as const,
-      value: `craze:${m.name}`,
-      label: `${m.name} — new craze session`,
-      machine: m.name,
-    })),
-  ];
-  const [target, setTarget] = useState(targets[0]?.value ?? "");
-  const [kind, setKind] = useState<RcKind>("claude-rc");
-  const [displayName, setDisplayName] = useState("");
-  const [workdir, setWorkdir] = useState("");
-  const [mode, setMode] = useState<LaunchMode>("agent");
-  const [command, setCommand] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // A machine's capabilities are not in the shared `rc.list` map — that covers
-  // sheds. Probed per selection, and NOT assumed while it is in flight: an
-  // unprobed machine offers nothing rather than a guess that can only fail.
-  const [machineCaps, setMachineCaps] = useState<Record<string, RcCapabilities | null>>({});
-  const [capsError, setCapsError] = useState<string | null>(null);
-  const [capsBusy, setCapsBusy] = useState(false);
-  const selected = targets.find((t) => t.value === target);
-
-  // The Kind picker gates on the SHARED capabilities (the same rc.list object that
-  // feeds the badge + pane). The dialog is App-level (drivable via ui.show_launch
-  // from any pane), so refresh on open to gate on current capabilities.
-  useEffect(() => { refresh(); }, [refresh]);
-
-  // Close on Escape (like the other dialogs), but not while a launch is in flight
-  // — mirrors NewShedDialog's `!creating` guard (here the in-flight flag is `busy`).
-  useEscClose(onClose, !busy);
-
-  // Probe a machine when it is selected. Re-probed on every selection rather
-  // than cached forever: a machine asleep a minute ago may be up now.
-  useEffect(() => {
-    if (selected?.kind !== "machine") { setCapsError(null); setCapsBusy(false); return; }
-    const name = selected.machine;
-    let live = true;
-    setCapsBusy(true);
-    setCapsError(null);
-    machineCapabilities(name)
-      .then((caps) => { if (live) setMachineCaps((prev) => ({ ...prev, [name]: caps })); })
-      .catch((e) => { if (live) setCapsError(String(e)); })
-      .finally(() => { if (live) setCapsBusy(false); });
-    return () => { live = false; };
-  }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // UNPROBED and PROBED-BUT-EMPTY are different answers and must not collapse:
-  // `offeredKinds(undefined)` falls back to claude+shell, which is right for an
-  // engine too old to advertise (it has always had both) and WRONG for a
-  // machine nobody has asked yet — that would offer a kind on the strength of
-  // never having looked. A machine is only ever read from its own probe.
-  const probed = selected?.kind !== "machine" || selected.machine in machineCaps;
-  // A shed's contract is keyed by its ROOST origin since S6 — `roost:<server>/
-  // <shed>`, the same string its rows carry. The `host/shed` composite this used
-  // to read was the HUB's key, and the payload has none of them any more: a shed
-  // with no roost-session simply has no entry, and `offeredKinds(undefined)`
-  // then offers nothing, which is the truth about it.
-  const caps = selected?.kind === "machine"
-    ? machineCaps[selected.machine] ?? undefined
-    : capabilities[selected?.kind === "shed" ? `roost:${selected.host}/${selected.shed}` : ""];
-  const kinds = probed && !capsError ? offeredKinds(caps) : [];
-  // Keep the selection valid when the target changes OR its offered kinds change.
-  useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target, kinds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const targetOpts = targets.map((t) => ({ value: t.value, label: t.label }));
-  // `capsBusy` is part of the gate, not just a spinner: a click landing during
-  // a re-probe would launch against whatever the PREVIOUS probe said.
-  //
-  // A command consults none of it — no kind is offered, so there is nothing for
-  // a probe to gate — and needs only somewhere to run and a word to run there.
-  // Blank is not offered as "a plain shell": roost's own UI opens shells, and
-  // the backend refuses a blank command anyway.
-  const crazeTarget = selected?.kind === "craze";
-  const canCreate = crazeTarget
-    ? true
-    : mode === "command"
-    ? !!selected && command.trim() !== ""
-    : !!selected && kinds.length > 0 && !capsBusy && !capsError;
-
-  // Report what this dialog RENDERED (`launch.dump`), the `reportRoostConsent`
-  // rule: from inside the dialog, so a report made beside the JSX cannot go on
-  // answering after the JSX is gone, and read from the DOM after the commit so
-  // it can never claim a field the dialog does not show. That is what makes
-  // "there is no prompt field" assertable without a screenshot.
-  //
-  // `values` (what is typed into each labelled control) and `create_enabled`
-  // (the Create button's own `disabled`) are read back off the same DOM, for the
-  // "Run a command" mode: what a person typed is not text content.
-  // The "Where" choices are part of it: a shed offered craze (or no longer)
-  // while the dialog is open changes what it shows (plan 026 §3.2).
-  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}|${mode}|${command}|${workdir}|${displayName}|${busy}|${targets.map((t) => t.value).join(",")}`;
-  useEffect(() => {
-    reportLaunchDialog({
-      rendered: renderedText("[data-launch]"),
-      values: renderedValues("[data-launch]"),
-      create_enabled: document.querySelector<HTMLButtonElement>("[data-launch] [data-launch-create]")?.disabled === false,
-    });
-  }, [shape]);
-  useEffect(() => () => reportLaunchDialog(null), []);
-
-  // The dialog's typing-and-clicking doors (`ui.fill_launch` /
-  // `ui.submit_launch`, test mode only — `ipc.rs`'s `launch_door`): the
-  // "Run a command" mode is only reachable by typing into the dialog and
-  // pressing Create, and the harness has neither a keyboard nor a pointer.
-  // Fill sets the named controls exactly as typing would; submit presses Create
-  // through the button's own gate, which a ref keeps current — the listeners are
-  // registered once, so a handler that closed over the first render would judge
-  // the press by that render's (empty) fields.
-  const pressCreate = useRef<() => void>(() => {});
-  useEffect(() => { pressCreate.current = () => { if (canCreate && !busy) void submit(); }; });
-  useEffect(() => {
-    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
-    const uns: Array<() => void> = [];
-    let cancelled = false;
-    void import("@tauri-apps/api/event").then(async ({ listen }) => {
-      uns.push(
-        await listen<{ mode?: unknown; target?: unknown; command?: unknown; workdir?: unknown; name?: unknown }>("fill-launch", (e) => {
-          const fill = e.payload ?? {};
-          if (fill.mode === "agent" || fill.mode === "command") setMode(fill.mode);
-          if (typeof fill.target === "string") setTarget(fill.target);
-          if (typeof fill.command === "string") setCommand(fill.command);
-          if (typeof fill.workdir === "string") setWorkdir(fill.workdir);
-          if (typeof fill.name === "string") setDisplayName(fill.name);
-        }),
-      );
-      uns.push(await listen("submit-launch", () => pressCreate.current()));
-      if (cancelled) uns.forEach((u) => u());
-    });
-    return () => {
-      cancelled = true;
-      uns.forEach((u) => u());
-    };
-  }, []);
-
-  const submit = async () => {
-    if (!selected) { setError("Pick somewhere to run it."); return; }
-    // A craze target goes on to craze's own sheet: what to start there is
-    // craze's question (its providers, its recent directories).
-    if (selected.kind === "craze") { onCrazeCreate(selected.machine); return; }
-    setBusy(true);
-    setError(null);
-    try {
-      if (mode === "command") {
-        // The line goes as typed: the split is the backend's one rule
-        // (`RunCommand::parse`, shared with the `roost.run` socket op), so it
-        // is not split a second way here. A shed is addressed by its roost
-        // origin — the key its capabilities are already read under above.
-        await roostRun({
-          target: selected.kind === "machine" ? selected.machine : `roost:${selected.host}/${selected.shed}`,
-          command,
-          workdir: workdir.trim() || undefined,
-        });
-      } else if (selected.kind === "machine") {
-        await machineLaunch({
-          machine: selected.machine,
-          kind,
-          displayName: displayName.trim() || undefined,
-          workdir: workdir.trim() || undefined,
-        });
-      } else {
-        await rcLaunch({
-          shed: selected.shed,
-          host: selected.host,
-          kind,
-          displayName: displayName.trim() || undefined,
-          workdir: workdir.trim() || undefined,
-        });
-      }
-      onLaunched();
-    } catch (e) {
-      // A launch throws a coded `LaneFailure`; its message is the sentence.
-      setError(e instanceof Error ? e.message : String(e));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Scrim onClose={onClose} mark="launch">
-      <DialogShell
-        icon={Sparkles}
-        title="New session"
-        sub="Start a remote-control session — in a shed, or on a machine."
-        onClose={onClose}
-        footer={
-          <>
-            <button onClick={onClose} className={dialogBtnSecondary}>Cancel</button>
-            <button
-              data-launch-create
-              onClick={() => void submit()}
-              disabled={!canCreate || busy}
-              className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
-              style={{
-                background: canCreate ? "var(--shed-accent)" : "var(--shed-inset)",
-                color: canCreate ? "var(--shed-accent-fg)" : "var(--shed-text-muted)",
-                border: "none",
-                opacity: busy ? 0.7 : 1,
-                cursor: canCreate && !busy ? "pointer" : "default",
-              }}
-            >
-              <Sparkles size={16} /> {crazeTarget ? "Continue" : busy ? "Launching…" : "Create"}
-            </button>
-          </>
-        }
-      >
-        <Field label="Where" htmlFor={targetOpts.length ? `${fid}-shed` : undefined}>
-          {targetOpts.length ? (
-            <Select id={`${fid}-shed`} value={target} onChange={setTarget} options={targetOpts} />
-          ) : (
-            <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-muted">Nothing to run on yet — start a shed, or add a machine.</div>
-          )}
-        </Field>
-        {crazeTarget ? (
-          <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-secondary" data-launch-craze>
-            A craze session on {selected?.machine}: Continue opens craze&apos;s create sheet — its providers, its recent directories, and an optional first prompt.
-          </div>
-        ) : (
-        <>
-        <Field label="Start">
-          <Segmented options={LAUNCH_MODES} value={mode} set={(v) => setMode(v as LaunchMode)} />
-        </Field>
-        {/* A command takes no session name: `roost.run` is an argv and a working
-            directory, and roost owns the tab's title — so the box is not offered
-            for something that would be dropped (the prompt field's rule, below). */}
-        {mode === "agent" && (
-          <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
-            <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={selected?.kind === "machine" ? `defaults to ${selected.machine}/slug` : "defaults to shed/slug"} className={dialogInput} />
-          </Field>
-        )}
-        <Field label="Working directory" hint="optional" htmlFor={`${fid}-workdir`}>
-          <input id={`${fid}-workdir`} value={workdir} onChange={(e) => setWorkdir(e.target.value)} placeholder={selected?.kind === "machine" ? "defaults to $HOME on that machine" : "defaults to $SHED_WORKSPACE"} className={cn(dialogInput, "font-mono text-[13px]")} />
-        </Field>
-        {mode === "command" ? (
-          <Field label="Command" htmlFor={`${fid}-command`} help={RUN_COMMAND_HELP}>
-            <input id={`${fid}-command`} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="codex --model gpt-5" spellCheck={false} className={cn(dialogInput, "font-mono text-[13px]")} />
-          </Field>
-        ) : (
-          <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
-            {capsBusy && kinds.length === 0 ? (
-              <div className="px-1 py-2 text-[13px] text-shed-text-muted">reading what {selected?.kind === "machine" ? selected.machine : "this shed"} can run…</div>
-            ) : capsError ? (
-              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{capsError}</div>
-            ) : kinds.length === 0 ? (
-              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{selected?.kind === "machine" ? `no agents installed on ${selected.machine} that sx can run` : "no agent kinds available in this shed"}</div>
-            ) : (
-              <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
-            )}
-          </Field>
-        )}
-        </>
-        )}
-        {/* **There is no initial-prompt field, on either roost target** (a
-            craze target's first prompt is craze's create sheet's, plan 025
-            §3.8, where something delivers it) — roost's
-            `tab.open` is an argv and a working directory, and there is no typed-
-            input channel behind it. The field used to be offered for a SHED
-            target, back when a shed launch went to the hub, which typed the
-            kickoff into a tmux pane; S6 retired the hub and the shed door became
-            `roost.launch`, so the box was still on screen with nothing at the far
-            end — what was typed went nowhere, silently. Now the backend REFUSES
-            a launch that carries a first prompt or a permission mode
-            (`bad_request`, before any tab opens; plan 026 §3.5) rather than
-            dropping it, so the honest UI does not ask for either. The session
-            name is different: it is delivered, as the tab's title. */}
-        {error && (
-          <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
-        )}
-      </DialogShell>
-    </Scrim>
-  );
-}
-
 /* ---- New-shed (create dialog with live SSE progress) ---------------------- */
 const BACKEND_OPTS = [
   { value: "", label: "Default" },
@@ -2100,7 +1414,7 @@ export default function App() {
   // they can't diverge. `refreshRc` reloads on the pane Refresh button, a
   // launch/kill, and pane/dialog open; the hook itself reloads on mount + `refresh`.
   const {
-    sessions: rcSessions, capabilities: rcCapabilities, machines: rcMachines, shedCraze: rcShedCraze,
+    sessions: rcSessions, hosts: rcHosts, shedCraze: rcShedCraze,
     load: rcLoad, error: rcLoadError, refresh: refreshRc,
   } = useRcSessions();
 
@@ -2156,19 +1470,19 @@ export default function App() {
   // incarnation left, a running reopen's lock included, as soon as the new
   // one is SEEN: never waiting on a create-options read, which may fail. The
   // ref holds the latest status for the sheet's opening, below.
-  const rcCrazeNow = useRef({ machines: rcMachines, shedCraze: rcShedCraze });
+  const rcCrazeNow = useRef({ hosts: rcHosts, shedCraze: rcShedCraze });
   const crazeGenOf = useCallback(
     (machine: string) =>
-      crazeStatusFor(machine, rcCrazeNow.current.machines, rcCrazeNow.current.shedCraze)?.source_gen,
+      crazeStatusFor(machine, rcCrazeNow.current.hosts, rcCrazeNow.current.shedCraze)?.source_gen,
     [],
   );
   useEffect(() => {
-    rcCrazeNow.current = { machines: rcMachines, shedCraze: rcShedCraze };
+    rcCrazeNow.current = { hosts: rcHosts, shedCraze: rcShedCraze };
     const next = observeSources(crazeResumes.current, crazeGenOf);
     if (next === crazeResumes.current) return;
     crazeResumes.current = next;
     setResumes(next);
-  }, [rcMachines, rcShedCraze, crazeGenOf]);
+  }, [rcHosts, rcShedCraze, crazeGenOf]);
   const openCrazeSheet = useCallback((machine: string) => {
     // A sheet opening reads afresh (nothing cached) — unless a reopen still
     // runs there, which it then shows as it was left: once the machine's
@@ -2233,7 +1547,7 @@ export default function App() {
         // The session's transcript — opened AGAIN in place when it is the
         // panel already on screen (a finished lane whose host the resume
         // rejoined): its address, and so its key, would not change.
-        setLane((l) => laneOnResume(l, { machine, kind: "craze", sessionId: reopened.host_id }));
+        setLane((l) => laneOnResume(l, { target: machine, sessionId: reopened.host_id }));
       }
     } catch (e) {
       const f = laneFailure(e);
@@ -2256,7 +1570,7 @@ export default function App() {
     updateDraft(machine, () => started);
     try {
       const created = await crazeCreate({
-        machine,
+        target: machine,
         cwd: started.cwd.trim(),
         provider: started.provider,
         prompt: started.prompt,
@@ -2291,7 +1605,7 @@ export default function App() {
       if (closesOntoTranscript(sheetOnScreen(modalNow.current, crazeMachineNow.current), machine)) {
         setModal(null);
         setPane("agents");
-        setLane({ machine, kind: "craze", sessionId: created.host_id });
+        setLane({ target: machine, sessionId: created.host_id });
       }
     } catch (e) {
       const f = laneFailure(e);
@@ -2338,21 +1652,14 @@ export default function App() {
     };
   }, []);
   const hostCount = hostRows.length;
-  // Machines in the sidebar's status foot, healthy-first (see `sortedMachines`).
-  const sidebarMachines = sortedMachines(rcMachines);
+  // `badges.hosts` is the configured server count (`system_df`), not the
+  // session-host list.
   // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds
   // derived there, hosts/agents/pending from here), the sidebar's rendered rows,
   // and the mode so the report is one complete snapshot, never a partial that
   // races the `main` slot / tray count.
   const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending, {
     servers: hostRows.map((h) => ({ name: h.host, reachable: h.usage != null })),
-    machines: sidebarMachines.map((m) => ({
-      name: m.name,
-      origin: m.origin,
-      status: machineStatusLabel(m),
-      note: machineSidebarNote(m),
-      tone: machineSidebarTone(m),
-    })),
   });
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
@@ -2376,30 +1683,25 @@ export default function App() {
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-create", () => setModal("create")));
-      uns.push(await listen("show-launch", () => setModal("launch")));
-      // `ui.close_launch` (plan 026 §3.2): the New-session dialog closes on
-      // Escape or Cancel — keys and clicks the harness has none of.
-      uns.push(await listen("close-launch", () => setModal((m) => (m === "launch" ? null : m))));
       // The craze create sheet's door (`ui.show_craze_create {machine}`),
       // the same pattern: it opens from a machine's "New craze session" — a
       // click the harness has none of.
       uns.push(
-        await listen<{ machine?: unknown }>("show-craze-create", (e) => {
-          if (typeof e.payload?.machine === "string") openCrazeSheet(e.payload.machine);
+        await listen<{ target?: unknown }>("show-craze-create", (e) => {
+          if (typeof e.payload?.target === "string") openCrazeSheet(e.payload.target);
         }),
       );
       uns.push(await listen("close-craze-create", () => setModal((m) => (m === "craze" ? null : m))));
       // The transcript panel's drivable door (`ui.show_lane` / `ui.close_lane`),
-      // the show-create/show-launch pattern: the panel opens from a card CLICK,
+      // the show-create pattern: the panel opens from a card CLICK,
       // and the harness has no click — while `lane.dump` (the panel's own truth,
       // and the whole point of C6) is only observable once one is mounted.
       uns.push(
-        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane", (e) => {
-          const machine = e.payload?.machine;
-          const kind = e.payload?.kind;
+        await listen<{ target?: unknown; session_id?: unknown }>("show-lane", (e) => {
+          const target = e.payload?.target;
           const sessionId = e.payload?.session_id;
-          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
-            setLane({ machine, kind, sessionId });
+          if (typeof target === "string" && typeof sessionId === "string") {
+            setLane({ target, sessionId });
           }
         }),
       );
@@ -2409,12 +1711,11 @@ export default function App() {
       // a click — so the door mounts the panel for that session (if it is
       // not the one open) and asks for its sheet.
       uns.push(
-        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane-settings", (e) => {
-          const machine = e.payload?.machine;
-          const kind = e.payload?.kind;
+        await listen<{ target?: unknown; session_id?: unknown }>("show-lane-settings", (e) => {
+          const target = e.payload?.target;
           const sessionId = e.payload?.session_id;
-          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
-            setLane({ machine, kind, sessionId, settings: true });
+          if (typeof target === "string" && typeof sessionId === "string") {
+            setLane({ target, sessionId, settings: true });
           }
         }),
       );
@@ -2449,14 +1750,6 @@ export default function App() {
     };
   }, []);
 
-  // A successful launch: close the dialog, jump to Agents, and refresh the shared
-  // RC state so the pane re-lists + the sidebar count updates together.
-  const onLaunched = () => {
-    setModal(null);
-    refreshRc();
-    setPane("agents");
-  };
-
   // Sidebar hosts = the configured hosts with reachability (from system_df), NOT the
   // sheds-derived set — so zero-shed hosts still appear, the System badge counts
   // configured hosts, and each dot reflects real reachability.
@@ -2482,7 +1775,6 @@ export default function App() {
           const badge =
             id === "sheds" ? sheds.length
             : id === "agents" ? agentCount
-            : id === "machines" ? rcMachines.length
             : id === "system" ? hosts.length
             : isApprovals && pending ? pending : null;
           const alert = isApprovals && pending > 0;
@@ -2524,21 +1816,6 @@ export default function App() {
             title={h.failure ? `${h.failure.summary}\n\n${h.failure.detail}` : undefined}
           />
         ))}
-        {sidebarMachines.length > 0 && (
-          <>
-            <SidebarSection label="MACHINES" />
-            {sidebarMachines.map((m) => (
-              <SidebarRow
-                key={m.origin}
-                name={m.name}
-                tone={machineSidebarTone(m)}
-                note={machineSidebarNote(m)}
-                title={m.reachable ? m.origin : (m.detail ?? undefined)}
-                onClick={() => setPane("machines")}
-              />
-            ))}
-          </>
-        )}
       </aside>
 
       {/* main column */}
@@ -2573,20 +1850,8 @@ export default function App() {
                 roostTick={roostTick}
                 roostBusy={roostBusy}
                 onOpenConsent={openRoostConsent}
-                machines={rcMachines}
+                hosts={rcHosts}
                 shedCraze={rcShedCraze}
-                onCrazeCreate={openCrazeSheet}
-              />
-            )}
-            {pane === "machines" && (
-              <MachinesPane
-                machines={rcMachines}
-                sessions={rcSessions}
-                refresh={refreshRc}
-                onNew={() => setModal("machine")}
-                roostTick={roostTick}
-                roostBusy={roostBusy}
-                onOpenConsent={openRoostConsent}
                 onCrazeCreate={openCrazeSheet}
               />
             )}
@@ -2594,11 +1859,12 @@ export default function App() {
             {pane === "agents" && (
               <AgentsPane
                 sessions={rcSessions}
-                machines={rcMachines}
-                capabilities={rcCapabilities}
+                hosts={rcHosts}
+                hasUnwatchedRunningShed={sheds.some(
+                  (s) => s.status === "running" && !rcHosts.some((h) => h.target === `roost:${s.host}/${s.name}`),
+                )}
                 load={rcLoad}
                 loadError={rcLoadError}
-                onLaunch={() => setModal("launch")}
                 refresh={refreshRc}
                 // The empty state's offer. A shed's roost-session is installed
                 // and started from the shed's OWN card (the plan-matrix line
@@ -2608,11 +1874,8 @@ export default function App() {
                 onSetUpRoost={() => setPane("sheds")}
                 onCrazeCreate={openCrazeSheet}
                 onTranscript={(s) => {
-                  // Both are guaranteed together (the stamp is machine-only) —
-                  // and the card gates its affordance on the same pair, so this
-                  // never silently does nothing.
-                  if (s.agent_lane && s.machine) {
-                    setLane({ machine: s.machine, kind: s.agent_lane.kind, sessionId: s.agent_lane.session_id });
+                  if (s.source === "craze" && s.agent_lane && s.target) {
+                    setLane({ target: s.target, sessionId: s.agent_lane.session_id });
                   }
                 }}
               />
@@ -2628,9 +1891,8 @@ export default function App() {
           reusing one would leave them pinned to the session you left. */}
       {lane && (
         <LanePanel
-          key={`${lane.machine}/${lane.kind}/${lane.sessionId}`}
-          machine={lane.machine}
-          kind={lane.kind}
+          key={`${lane.target}/${lane.sessionId}`}
+          target={lane.target}
           sessionId={lane.sessionId}
           opens={lane.opens ?? 0}
           settingsOpen={!!lane.settings}
@@ -2639,19 +1901,17 @@ export default function App() {
         />
       )}
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
-      {modal === "machine" && <NewMachineDialog onClose={() => setModal(null)} onAdded={refreshRc} />}
-      {modal === "launch" && <LaunchAgentDialog sheds={sheds} machines={rcMachines} shedCraze={rcShedCraze} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} onCrazeCreate={openCrazeSheet} />}
       {/* Keyed by machine so another machine's sheet REMOUNTS (its options
           read afresh); the draft it edits is the shell's, per machine. */}
       {modal === "craze" && crazeMachine && (
         <CrazeCreateDialog
           key={crazeMachine}
-          machine={crazeMachine}
+          target={crazeMachine}
           // Through the one lookup (plan 026 §3.2): a dormant shed has no
           // status row until a create or its first craze `Ready` lists it, and
           // its `shed_craze` entry is what keeps the sheet from reading it as
           // "no craze" (and disabling Create) meanwhile.
-          craze={crazeStatusFor(crazeMachine, rcMachines, rcShedCraze)}
+          craze={crazeStatusFor(crazeMachine, rcHosts, rcShedCraze)}
           draft={drafts[crazeMachine] ?? EMPTY_DRAFT}
           onEdit={(patch) => updateDraft(crazeMachine, (d) => editCrazeDraft(d, patch))}
           onSubmit={() => void submitCraze(crazeMachine)}

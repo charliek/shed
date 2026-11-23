@@ -3,7 +3,7 @@
 `shed_core::craze` composes the `sh -c` ladder every craze connection sends —
 `craze-bridge-hub`, `craze-bridge-hub-no-start` and `craze-providers-hub` in
 `scenarios.json` ARE its output (the Rust leg asserts the equality). The Rust
-behaviour tests (`crates/shed-core/tests/craze_ladder.rs`) run that ladder
+behaviour tests (`crates/shed-lane/tests/craze_ladder.rs`) run that ladder
 with every absolute rung re-rooted under a temp dir, because only root can put
 a file at `/usr/local/bin`. This module closes the gap: it runs the scenarios'
 argv, byte for byte, against the REAL rung paths.

@@ -1,14 +1,10 @@
-"""The Agents pane: the roost tabs on every listed host, and the ops that
-list, launch, close and inject them.
+"""The Agents pane: the roost tabs on every listed shed, and the ops that
+list and inject them.
 
 **Roost-backed since S6** (`charliek/shed#328`). A shed's agent
-sessions used to be a UNION — the hub's rows, listed by ssh'ing `shed-ext-rc`
-into the shed, beside the tabs its `roost-session` reported. The guest binary,
-the server's routes and the Go engine are gone, so what is left is the roost
-half: `rc.list` returns it, a shed is launched with `roost.launch` on
-`roost:<server>/<shed>` (its 0.9.x alias `rc.launch` was removed in 0.10.0),
-`rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
-snapshot.
+sessions are the tabs its `roost-session` reports. `rc.list` returns them
+(`hosts`, not a machines list) and `rc.inject_test` puts a row into the roost
+snapshot. Launch, kill and the machines pane answer `unknown_op`.
 
 **Hermetic, and genuinely exercising the real code.** The app is launched with
 the test-mode `SHED_TAURI_ROOST_SOCKETS` seam — which swaps roost's SSH
@@ -32,7 +28,7 @@ import pytest
 
 import ui
 from client import ShedError, TauriClient
-from fake_roost import FakeRoost, ownership
+from fake_roost import FakeRoost
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -77,8 +73,8 @@ def agents_app(shed_roost, mock):
     transport choice would be in production — the shared session app is launched
     from `conftest.py` with none.
 
-    **Independent rather than self-managed**, the `test_tauri_downhost.py` /
-    `test_tauri_lane.py` pattern: its own throwaway HOME / XDG_RUNTIME_DIR (hence
+    **Independent rather than self-managed**, the `test_tauri_downhost.py`
+    pattern: its own throwaway HOME / XDG_RUNTIME_DIR (hence
     its own socket and single-instance lock), `ui._state` untouched, the session
     app left running. `ui.quit` + `ui.launch` would leave the session app dead at
     teardown, and the autouse `_reset_policy` / `_reset_mock` fixtures dial its
@@ -139,7 +135,7 @@ def app(agents_app):
     agents_app.call("sheds.list")
     agents_app.wait_until(
         lambda: any(h.get("origin") == TARGET and h.get("reachable")
-                    for h in agents_app.call("rc.list")["machines"]),
+                    for h in agents_app.call("rc.list")["hosts"]),
         timeout=30, what="the shed's roost-session to be probed and watched",
     )
     return agents_app
@@ -178,7 +174,7 @@ def test_list_returns_the_roost_tabs_and_only_the_owned_ones(app):
     assert row["origin_kind"] == "shed"
     assert row["host"] == SERVER, "the server, as a shed row spells it"
     assert row["shed"] == SHED
-    assert row["machine"] == TARGET, "the address every kill/lane op takes"
+    assert row["target"] == TARGET, "the shed address, roost:<server>/<shed>"
     assert row["display_name"] == "OC | demo"
     assert row["workdir"] == "/home/shed/work"
     assert row["stale"] is False
@@ -205,50 +201,28 @@ def test_a_filtered_list_narrows_to_that_shed(app):
     assert _rows(app, host=SERVER, shed="not-a-shed") == {}
 
 
-# ---- launch / kill -------------------------------------------------------
+# ---- removed ops ---------------------------------------------------------
 
-def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
-    """`roost.launch` on the shed's target → a roost `tab.open` on the shed,
-    `rc.kill` → its `tab.close`.
-
-    The launched row carries the same origin stamp the listed ones do.
-    """
-    launched = app.call("roost.launch", {"target": TARGET, "kind": "opencode",
-                                         "workdir": "/home/shed/fresh"})
-    slug = launched["slug"]
-    try:
-        assert launched["origin"] == TARGET
-        assert launched["source"] == "roost"
-        assert launched["shed"] == SHED
-        # `shed_core::roost::launch_argv`'s recipe for the kind — the agent's own
-        # binary, resolved by roost on the far side.
-        opened = shed_roost.opens[-1]
-        assert opened["argv"] == ["opencode"], opened
-        assert opened["cwd"] == "/home/shed/fresh"
-        # A fresh `tab.open` is UNOWNED, and shed's row for it is optimistic: the
-        # watcher's next snapshot keeps only the agent-owned tabs, because an
-        # unclaimed one is somebody's terminal. The adapter claiming it is what
-        # makes the row durable — exactly how it works on a real host — so wait
-        # for the claimed row rather than reading the optimistic one.
-        shed_roost.set_axes(
-            int(slug), lifecycle="working",
-            ownership=ownership("opencode", f"ses_{slug}", "session_status", 1_700_000_100))
-        _wait_for(app, "the claimed tab to reach the listing",
-                  lambda: _rows(app).get(slug))
-    finally:
-        app.call("rc.kill", {"shed": SHED, "slug": slug})
-    app.wait_until(lambda: slug not in _rows(app), timeout=20,
-                   what="the closed tab to leave the list")
-    assert int(slug) not in shed_roost.tab_ids(), "the tab really was closed"
-
-
-def test_launch_refuses_a_kind_this_build_does_not_know(app):
-    """Serde preserves an unknown kind as `Other(raw)` on READ, but you cannot
-    LAUNCH one — the far side would be asked to run something this build has
-    never heard of."""
+@pytest.mark.parametrize("op,params", [
+    ("machines.list", None),
+    ("machines.dump", None),
+    ("machine.add", {"name": "mini4"}),
+    ("machine.kill", {"machine": "mini4", "slug": "1"}),
+    ("machine.capabilities", {"machine": "mini4"}),
+    ("machine.launch", {"target": TARGET, "kind": "opencode"}),
+    ("roost.launch", {"target": TARGET, "kind": "opencode"}),
+    ("roost.run", {"target": TARGET, "command": "true"}),
+    ("rc.kill", {"shed": SHED, "slug": "1"}),
+    ("ui.show_launch", None),
+    ("launch.dump", None),
+])
+def test_removed_session_ops_are_unknown(app, op, params):
+    """Launch, kill and the machines pane are gone. Each door answers the
+    IPC's unknown-op error."""
     with pytest.raises(ShedError) as exc:
-        app.call("roost.launch", {"target": TARGET, "kind": "borg"})
-    assert exc.value.code == "bad_request"
+        app.call(op, params)
+    assert exc.value.code == "unknown_op", exc.value
+    assert exc.value.message == f"unknown op: {op}", exc.value
 
 
 def test_rc_launch_is_an_unknown_op(app, shed_roost):
@@ -262,42 +236,13 @@ def test_rc_launch_is_an_unknown_op(app, shed_roost):
     assert len(shed_roost.opens) == opens, "a removed op opened a tab"
 
 
-def test_kill_refuses_a_slug_that_is_not_a_tab_id(app):
-    """The slug IS the roost tab id, so a row from somewhere else is refused by
-    name rather than sent to roost as a zero."""
-    with pytest.raises(ShedError) as exc:
-        app.call("rc.kill", {"shed": SHED, "slug": "legacy1"})
-    assert exc.value.code == "action_failed"
-
-
-def test_kill_refuses_a_real_tab_id_that_is_not_one_of_this_sheds_rows(app, shed_roost):
-    """**A well-formed tab id is not enough** — it has to be a row this shed
-    LISTED.
-
-    `SHELL_TAB` is a real, live tab on this very shed: somebody's terminal,
-    which is not an agent session, never appears as a card, and was never
-    offered a Kill button. Since S6 a shed's slugs are roost tab ids, so every
-    host's slugs live in one small-integer space and collide across hosts by
-    construction — an id copied from another shed's card is a perfectly valid id
-    here. Parsing was the whole of the old gate, so such an id closed whatever
-    tab it happened to name: exactly this terminal.
-
-    The tab surviving is the assertion; the refusal code is the smaller half.
-    """
-    with pytest.raises(ShedError) as exc:
-        app.call("rc.kill", {"shed": SHED, "slug": str(SHELL_TAB)})
-    assert exc.value.code == "action_failed"
-    assert "lists no agent session" in exc.value.message, exc.value.message
-    assert SHELL_TAB in shed_roost.tab_ids(), "an unrelated terminal was closed"
-
-
 # ---- inject (the render fixture) -----------------------------------------
 
 def test_inject_puts_a_row_into_the_roost_snapshot(app):
     """`rc.inject_test` lands in the ROOST snapshot — the only row source there
-    is — so the injected row is stamped, keyed and closeable exactly like one a
-    session reported."""
-    app.call("rc.inject_test", {"shed": SHED, "slug": "77", "kind": "claude-rc",
+    is — so the injected row is stamped and keyed exactly like one a session
+    reported."""
+    app.call("rc.inject_test", {"target": TARGET, "slug": "77", "kind": "claude-rc",
                                 "display_name": "injected", "workdir": "/home/shed/inj"})
     row = _rows(app)["77"]
     assert row["origin"] == TARGET
@@ -311,7 +256,7 @@ def test_inject_refuses_a_slug_that_is_not_a_tab_id(app):
     """A row whose slug is not a tab id could never be closed, so it is refused
     rather than injected."""
     with pytest.raises(ShedError) as exc:
-        app.call("rc.inject_test", {"shed": SHED, "slug": "legacy1"})
+        app.call("rc.inject_test", {"target": TARGET, "slug": "legacy1"})
     assert exc.value.code == "bad_request"
 
 
@@ -326,7 +271,7 @@ def test_inject_refuses_a_kind_roost_has_no_adapter_for(app, kind):
     and nothing lands.
     """
     with pytest.raises(ShedError) as exc:
-        app.call("rc.inject_test", {"shed": SHED, "slug": "79", "kind": kind})
+        app.call("rc.inject_test", {"target": TARGET, "slug": "79", "kind": kind})
     assert exc.value.code == "bad_request"
     assert "not a session row" in exc.value.message, exc.value.message
     assert "79" not in _rows(app), "a refused injection left a row behind"
@@ -339,7 +284,7 @@ def test_agents_pane_renders_an_injected_session(app):
     needs no display) + a window screenshot where the capture is available —
     macOS-tauri shells out to a Screen-Recording-TCC-gated tool, so the
     Linux/Xvfb render gate covers that pixel."""
-    app.call("rc.inject_test", {"shed": SHED, "slug": "78", "kind": "opencode",
+    app.call("rc.inject_test", {"target": TARGET, "slug": "78", "kind": "opencode",
                                 "display_name": "shot1"})
     app.navigate("agents")
     app.show_window()
@@ -365,7 +310,7 @@ def test_the_empty_pane_says_why_and_offers_the_bootstrap(agents_app, mock):
     which is exactly the everyday case (a shed nobody has bootstrapped).
 
     **`state` is what makes this cell about the right blank.** Four things wear
-    an empty pane — still loading, the load failed, every machine is unreachable,
+    an empty pane — still loading, the load failed, every shed is unreachable,
     and a genuine "nothing here" — and only the last offers the bootstrap. Waiting
     on `state == "empty"` rather than on `sessions == []` is what keeps this from
     passing against the first frame, which is `loading`.

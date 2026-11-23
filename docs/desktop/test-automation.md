@@ -52,7 +52,7 @@ prebuilt binary.
 
 Preferences is a dedicated native window, not a dashboard modal — `ui.show_preferences`
 (alias `ui.open_preferences`) opens or focuses the lazily created window without raising the
-dashboard, so `ui.modal` only ever reports `create`, `launch`, or `null`. The window's UI truth
+dashboard, so `ui.modal` only ever reports `create`, `craze`, or `null`. The window's UI truth
 is `prefs.dump` → `{visible, title, prefs}`: `visible`/`title` are the native window state,
 and `prefs` is the window's own reported `{sections, values, mode}` snapshot — the surface a
 test asserts (gated section visibility, persisted values, theme) instead of pixels, the same

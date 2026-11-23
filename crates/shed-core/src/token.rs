@@ -69,8 +69,8 @@ use tokio::sync::Mutex;
 use crate::certuser::{cert_user_pem, is_user_name, CertUser};
 use crate::csr::ClientKeyPair;
 use crate::http::ShedError;
-use crate::models::dart_trim;
 use crate::tls::{certified_key_from_pem, ClientCertResolver};
+use shed_lane::text::dart_trim;
 
 /// Size caps on the credential exchange, in both directions — the SINGLE
 /// source of truth for every Rust consumer.

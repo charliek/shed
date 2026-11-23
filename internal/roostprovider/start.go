@@ -22,20 +22,20 @@ import (
 //
 // **The choreography is shed-core's**, restated for the same reason: Rust's
 // `State::Start` / `State::PostStart`
-// (crates/shed-core/src/roost/bootstrap/machines.rs:1036-1119) is the twin of
+// (crates/shed-roost/src/bootstrap/machines.rs:1036-1119) is the twin of
 // this file, and every rule below cites the line that owns it. Two clients that
 // start the same daemon must agree on what "it started" means.
 
 const (
 	// startStdoutCap bounds a start's stdout, matching roost's
-	// SMALL_STDOUT_CAP (shed-core's `bootstrap::mod`: "Cap for an exec whose
+	// SMALL_STDOUT_CAP (shed-roost's `bootstrap::mod`: "Cap for an exec whose
 	// output is a line or nothing — prepare, commit, the readiness verdict").
 	// A session that answers this question with more than 4 KiB is not
 	// answering it.
 	startStdoutCap = 4 << 10
 
 	// startRetries is how many times a `already-running` verdict is re-tried
-	// before it is accepted — shed-core's START_RETRIES, and its reasoning
+	// before it is accepted — shed-roost's START_RETRIES, and its reasoning
 	// verbatim: the window `already-running` covers is the sub-second
 	// socket-lock race between two starts, not a slow boot, and what makes
 	// ACCEPTING it safe at the end is the post-start `session.identify` the
@@ -118,10 +118,11 @@ func (e *StartError) Unwrap() error {
 // parsed, with no NDJSON and no request to write. Nothing about the session's
 // IDENTITY is established here — Start says a daemon came up, and only
 // Identify can say it is one this shed speaks to. The caller runs both, inside
-// one budget (pin: shed-core's START_BUDGET covers the start and the post-start
+// one budget (pin: shed-roost's START_BUDGET covers the start and the post-start
 // identify together).
 //
-// **A verdict is only a verdict when the step succeeded** (machines.rs:1041).
+// **A verdict is only a verdict when the step succeeded**
+// (crates/shed-roost/src/bootstrap/machines.rs:1041).
 // A failed step's stdout is still read, but only to mine a REASON out of it —
 // a start that refuses writes `error: …` there and exits 1, and demanding a
 // zero exit before looking would throw that away for "it exited 1". An exec
@@ -158,10 +159,10 @@ func (r *Remote) startOnce(ctx context.Context, t Target) (StartVerdict, error) 
 	if out.failed() {
 		reach := out.reachError(PhaseStart, "start")
 		reason := reach.Detail()
-		// machines.rs:1063-1069: the failed step's first line is read as a
-		// verdict ONLY to mine a reason out of it. A `ready` or
-		// `already-running` line on a failed step says nothing, so the exec's
-		// own detail stands.
+		// crates/shed-roost/src/bootstrap/machines.rs:1063-1069: the failed
+		// step's first line is read as a verdict ONLY to mine a reason out of
+		// it. A `ready` or `already-running` line on a failed step says
+		// nothing, so the exec's own detail stands.
 		if hasLine {
 			if _, failure := parseStartVerdict(line); failure != "" {
 				reason = failure
@@ -170,9 +171,9 @@ func (r *Remote) startOnce(ctx context.Context, t Target) (StartVerdict, error) 
 		return StartVerdict{}, &StartError{Reason: reason, Reach: reach}
 	}
 	if !hasLine {
-		// machines.rs:1071-1073, wording included: stdout carries the verdict
-		// and nothing else, so an empty one is a session that answered the
-		// question with silence.
+		// crates/shed-roost/src/bootstrap/machines.rs:1071-1073, wording
+		// included: stdout carries the verdict and nothing else, so an empty
+		// one is a session that answered the question with silence.
 		return StartVerdict{}, &StartError{Reason: "it printed no readiness line at all"}
 	}
 	verdict, failure := parseStartVerdict(line)

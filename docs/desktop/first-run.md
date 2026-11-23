@@ -28,9 +28,9 @@ The sidebar selects a pane:
 - **Approvals** — pending credential-approval requests, with Approve / Deny (optionally
   confirmed with Touch ID on macOS or a polkit password prompt on Linux). They come from
   the app's own credential broker — see [Credential approvals](approvals.md).
-- **Agents** — the agent sessions on each shed and machine, as [roost](../extensions/roost-session-hosts.md)
-  rows with activity pills, plus craze and opencode sessions with a live transcript,
-  approvals and **New craze session**. See [Agent lanes](agent-lanes.md).
+- **Agents** — agent sessions on each shed: read-only roost rows with activity,
+  and craze sessions with a live transcript, approvals and **New craze session**.
+  See [Agent lanes](agent-lanes.md).
 - **Activity** — the merged audit feed (the broker's credentials + the app's decisions), with
   a "Reveal log" button.
 - **Egress** — per-host egress profiles (allow/deny rules, by source) plus an activity

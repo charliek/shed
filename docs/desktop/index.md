@@ -2,7 +2,7 @@
 
 A native desktop application that ties the [shed](https://github.com/charliek/shed)
 toolchain into one resident control surface: list and create sheds across hosts, see and
-open the agent sessions running in them (roost rows, with craze and opencode lanes), approve
+open the agent sessions running in them (read-only roost rows, with craze lanes), approve
 credential requests, and watch a live activity feed. It is a **Tauri** app on a shared Rust
 core, shipped for **macOS** (DMG + Sparkle auto-update) and **Linux**
 (`apt install shed-desktop`).
@@ -17,15 +17,14 @@ components that already exist on the developer's Mac and on shed hosts (see
 - **credentials / approvals** — the credential broker, which runs in the app (the headline
   feature; see [Credential approvals](approvals.md)).
 - **agents + terminals** — each host's [roost](../extensions/roost-session-hosts.md)
-  sessions are rows in the Agents pane, with live [craze and opencode
-  lanes](agent-lanes.md); the user's terminal app is launched for interactive attach.
+  sessions are rows in the Agents pane, with live [craze lanes](agent-lanes.md); the user's terminal app is launched for interactive attach.
 
 The app on macOS and on Linux is one thin Tauri shell over a shared **Rust core**
-(`shed-core` + `shed-app`); see [Rust core](rust-core.md).
+(`shed-core`, `shed-lane`, `shed-roost`, `shed-app`, `shed-desktop-core`); see [Rust core](rust-core.md).
 
 ## Status
 
-Shipping. The dashboard, lifecycle/create, the Agents pane (roost rows and craze/opencode
+Shipping. The dashboard, lifecycle/create, the Agents pane (read-only roost rows and craze
 lanes), the credential-approval gate, the System (disk) pane, and Sparkle auto-update are all
 implemented on both macOS and Linux (the Egress pane included). Since the [monorepo
 consolidation](https://github.com/charliek/shed) the app moved onto shed's shared `vX.Y.Z`
@@ -36,8 +35,7 @@ component ships.
 |---|---|---|
 | Dashboard + IPC spine | Read-only dashboard across hosts; the drivability socket + screenshots | ✅ |
 | Lifecycle + create | start/stop/reset/delete, create with live SSE progress, terminal launch | ✅ |
-| Agents | Agents pane: roost session rows, craze and opencode lanes, New craze session | ✅ |
-| Machines | Native SSH hosts running `roost-session`, listed beside sheds | ✅ |
+| Agents | Agents pane: read-only roost rows grouped by shed, craze lanes, New craze session | ✅ |
 | Approval gate | Multi-server SSH approval over UDS, policy engine, notifications, merged audit feed | ✅ |
 | System | Per-host disk usage (`/api/system/df`) | ✅ |
 | Packaging | Launch-at-login, preferences, DMG + Sparkle EdDSA auto-update (mac); nfpm `.deb` (Linux) | ✅ |

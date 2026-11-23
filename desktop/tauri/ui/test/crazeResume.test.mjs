@@ -345,13 +345,13 @@ test("CONTROL: a current answer opens its transcript — or says it ended", () =
 });
 
 test("CONTROL (branch review): a resume onto the panel already showing its session opens it AGAIN in place", () => {
-  const target = { machine: "mini3", kind: "craze", sessionId: "aaaaaaaaaaaa" };
+  const target = { target: "roost:mini3/s", sessionId: "aaaaaaaaaaaa" };
   // The finished lane's panel on screen, its settings sheet asked for.
   const shown = { ...target, settings: true };
   const again = laneOnResume(shown, target);
   assert.deepEqual(
-    [again.machine, again.kind, again.sessionId],
-    [target.machine, target.kind, target.sessionId],
+    [again.target, again.sessionId],
+    [target.target, target.sessionId],
     "the same address — the same key, so no remount",
   );
   assert.equal(again.opens, 1, "the open moves");
@@ -361,12 +361,11 @@ test("CONTROL (branch review): a resume onto the panel already showing its sessi
 });
 
 test("a resume onto another session — or no panel — mounts a fresh one, which opens on mount", () => {
-  const target = { machine: "mini3", kind: "craze", sessionId: "aaaaaaaaaaaa" };
+  const target = { target: "roost:mini3/s", sessionId: "aaaaaaaaaaaa" };
   assert.deepEqual(laneOnResume(null, target), target);
   for (const other of [
-    { machine: "mini3", kind: "craze", sessionId: "bbbbbbbbbbbb", opens: 4 },
-    { machine: "localhost", kind: "craze", sessionId: "aaaaaaaaaaaa", opens: 4 },
-    { machine: "mini3", kind: "opencode", sessionId: "aaaaaaaaaaaa", opens: 4 },
+    { target: "roost:mini3/s", sessionId: "bbbbbbbbbbbb", opens: 4 },
+    { target: "roost:localhost/s", sessionId: "aaaaaaaaaaaa", opens: 4 },
   ]) {
     assert.deepEqual(laneOnResume({ ...other, settings: true }, target), target, JSON.stringify(other));
   }
