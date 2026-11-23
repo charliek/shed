@@ -1795,6 +1795,15 @@ type AuditConfig struct {
 	ExecArgv string `yaml:"exec_argv,omitempty"`
 }
 
+// DeliveryConfig configures provisioning by delivery. Every field is
+// optional; a zero value takes its default (ServerConfig.DeliveryTimeout).
+type DeliveryConfig struct {
+	// Timeout is how long a delivery waits for the answer of a connected
+	// source (default 30s, from 1s to 10m). A source that is bound but not
+	// connected is not waited for.
+	Timeout Duration `yaml:"timeout,omitempty"`
+}
+
 // AuditExecArgvFull is audit.exec_argv's one non-default value.
 const AuditExecArgvFull = "full"
 

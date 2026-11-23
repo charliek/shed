@@ -172,7 +172,8 @@ type Last struct {
 }
 
 // Failure is why the last delivery failed: the reason, with the rule an
-// answer broke, or the item a write failed at and its result.
+// answer broke, or the item a write failed at and its result. A write
+// failure with no item is the env file's own.
 type Failure struct {
 	Reason StepReason `json:"reason"`
 	Rule   Rule       `json:"rule,omitempty"`
@@ -482,8 +483,12 @@ func parseLast(n *node) (*Last, *Refusal) {
 			return nil, r
 		}
 		isWrite := f.Reason == ReasonWriteFailed
-		if r := presence(fn, fw, "item", isWrite); r != nil {
-			return nil, r
+		// item only with write_failed, and optional then: absent, the
+		// failure is the env file's own, no item's.
+		if !isWrite {
+			if r := presence(fn, fw, "item", false); r != nil {
+				return nil, r
+			}
 		}
 		if r := presence(fn, fw, "result", isWrite); r != nil {
 			return nil, r
@@ -495,9 +500,12 @@ func parseLast(n *node) (*Last, *Refusal) {
 			}
 		}
 		if isWrite {
-			f.Item, f.Result = fn.get("item").text, ItemResult(fn.get("result").text)
-			if !ValidName(f.Item) {
-				return nil, refuse(RuleBadName, fw+".item")
+			f.Result = ItemResult(fn.get("result").text)
+			if in := fn.get("item"); in != nil {
+				f.Item = in.text
+				if !ValidName(f.Item) {
+					return nil, refuse(RuleBadName, fw+".item")
+				}
 			}
 			if f.Result == ResultOK || !containsT(WriterResults, f.Result) {
 				return nil, refuse(RuleBadResult, fw+".result")

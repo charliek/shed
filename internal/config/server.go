@@ -123,6 +123,11 @@ type ServerConfig struct {
 	// auth.clients is set.
 	Audit *AuditConfig `yaml:"audit,omitempty"`
 
+	// Delivery configures provisioning by delivery: how long the server
+	// waits for a connected source's answer. Default (nil) applies the
+	// defaults below.
+	Delivery *DeliveryConfig `yaml:"delivery,omitempty"`
+
 	// Network sets the default network profile and the isolated profile's
 	// allowed ranges. Default (nil) is the open profile for every shed.
 	Network *NetworkConfig `yaml:"network,omitempty"`
@@ -283,6 +288,39 @@ func (c *ServerConfig) validateExec() error {
 	}
 	if d := c.Exec.MaxTimeout.Duration(); d > MaxExecMaxTimeout {
 		return fmt.Errorf("invalid exec.max_timeout: %s (at most %s, 7 days)", d, MaxExecMaxTimeout)
+	}
+	return nil
+}
+
+// Delivery bounds. A source may have to run a passphrase command before it
+// answers, so the wait is generous by default and may be raised, within
+// reason: a create waits for it.
+const (
+	// DefaultDeliveryTimeout is delivery.timeout when unset.
+	DefaultDeliveryTimeout = 30 * time.Second
+	// MinDeliveryTimeout and MaxDeliveryTimeout bound a set delivery.timeout.
+	MinDeliveryTimeout = time.Second
+	MaxDeliveryTimeout = 10 * time.Minute
+)
+
+// DeliveryTimeout is delivery.timeout, or its default when unset: how long
+// a delivery waits for a connected source's answer.
+func (c *ServerConfig) DeliveryTimeout() time.Duration {
+	if c.Delivery != nil && c.Delivery.Timeout > 0 {
+		return c.Delivery.Timeout.Duration()
+	}
+	return DefaultDeliveryTimeout
+}
+
+// validateDelivery checks the optional delivery block: a set timeout is
+// within [MinDeliveryTimeout, MaxDeliveryTimeout]. Zero means "use the
+// default". Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateDelivery() error {
+	if c.Delivery == nil {
+		return nil
+	}
+	if d := c.Delivery.Timeout.Duration(); d != 0 && (d < MinDeliveryTimeout || d > MaxDeliveryTimeout) {
+		return fmt.Errorf("invalid delivery.timeout: %s (must be from %s to %s)", d, MinDeliveryTimeout, MaxDeliveryTimeout)
 	}
 	return nil
 }
@@ -2340,6 +2378,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateAudit(); err != nil {
 		return err
 	}
+	if err := c.validateDelivery(); err != nil {
+		return err
+	}
 	if err := c.validateNetwork(); err != nil {
 		return err
 	}
@@ -2439,6 +2480,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateAudit(); err != nil {
+		return err
+	}
+	if err := c.validateDelivery(); err != nil {
 		return err
 	}
 	if err := c.validateNetwork(); err != nil {

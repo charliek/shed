@@ -22,6 +22,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/directory"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
@@ -560,6 +561,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
+	// Provisioning by delivery: requests go to each user's bound machine over
+	// the pin; the delivery routes hand answers to the same service the
+	// lifecycle asks.
+	deliveryService := delivery.NewService(pluginRegistry, cfg.DeliveryTimeout())
+	apiServer.SetDelivery(deliveryService)
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
 		// against the LIVE user lookup, so removing an SSH key de-authorizes its

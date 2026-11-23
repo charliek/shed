@@ -358,6 +358,25 @@ func (r *Registry) Subscribe(ctx context.Context, key ListenerKey, m source.Mach
 	if r.holdsCurrent(key, m.ID) {
 		return nil, fmt.Errorf("namespace %q: %w", key.Namespace, ErrDuplicateStream)
 	}
+	gen, err := r.admitLocked(g, b, key.User, m, fmt.Sprintf("a subscription to %q", key.Namespace))
+	if err != nil {
+		return nil, err
+	}
+	if subscribeAdmittedHook != nil {
+		subscribeAdmittedHook(key, m)
+	}
+	return r.register(key, stamp{machine: m.ID, name: m.Name, gen: gen}, func() bool { return b.Current(key.User, m.ID, gen) })
+}
+
+// admitLocked is the admission Subscribe and SubscribeDelivery share, run
+// under user's gate g once the caller has refused a duplicate: a machine the
+// store already remembers for the user that is not the bound one is refused
+// before anything is spent from the rate limit; an admission that would
+// write the store is spent from the user's rate limit (*ThrottledError when
+// there is none); the store admits or refuses the machine. It returns the
+// binding generation the machine was admitted under. what names the request
+// in a refusal's log line.
+func (r *Registry) admitLocked(g *userGate, b source.Bindings, user string, m source.Machine, what string) (uint64, error) {
 	// A machine the store already remembers for the user that is not the
 	// bound one is refused here, also before anything is spent from the rate
 	// limit and without Admit: what it presents now is not recorded, and only
@@ -367,35 +386,31 @@ func (r *Registry) Subscribe(ctx context.Context, key ListenerKey, m source.Mach
 	// rewrite its recorded key on every retry, each a full durable write that
 	// spends the user's budget. Exact under the gate: the binding and the
 	// user's machines change only under it (or at start-up).
-	if bd, ok := b.Get(key.User); ok && bd.MachineID() != m.ID && b.Seen(key.User, m.ID) {
-		bound := boundMachine(b, key.User)
-		g.logRefusal(key.User, bd, m, "a subscription to "+fmt.Sprintf("%q", key.Namespace), bound)
-		return nil, &NotBoundError{User: key.User, Bound: bound}
+	if bd, ok := b.Get(user); ok && bd.MachineID() != m.ID && b.Seen(user, m.ID) {
+		bound := boundMachine(b, user)
+		g.logRefusal(user, bd, m, what, bound)
+		return 0, &NotBoundError{User: user, Bound: bound}
 	}
-	if wouldWrite(b, key.User, m) {
+	if wouldWrite(b, user, m) {
 		if wait, ok := g.take(pinNow()); !ok {
 			if !g.throttled {
 				g.throttled = true
 				log.Printf("credential bus: admissions that change the source records%s are being throttled (machine %s, %q, and any other new or changed machine; retry after %s); logged once until one is admitted",
-					forUser(key.User), m.ID, m.Name, wait.Round(time.Second))
+					forUser(user), m.ID, m.Name, wait.Round(time.Second))
 			}
-			return nil, &ThrottledError{User: key.User, RetryAfter: wait}
+			return 0, &ThrottledError{User: user, RetryAfter: wait}
 		}
 	}
-	d, err := b.Admit(key.User, m)
+	d, err := b.Admit(user, m)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBindingStore, err)
+		return 0, fmt.Errorf("%w: %v", ErrBindingStore, err)
 	}
-	logAdmission(key.User, d)
+	logAdmission(user, d)
 	if !d.Admitted {
-		g.logRefusal(key.User, d.Binding, d.Machine, "a subscription to "+fmt.Sprintf("%q", key.Namespace), d.Bound)
-		return nil, &NotBoundError{User: key.User, Bound: d.Bound}
+		g.logRefusal(user, d.Binding, d.Machine, what, d.Bound)
+		return 0, &NotBoundError{User: user, Bound: d.Bound}
 	}
-	if subscribeAdmittedHook != nil {
-		subscribeAdmittedHook(key, m)
-	}
-	gen := d.Binding.Generation
-	return r.register(key, stamp{machine: m.ID, name: m.Name, gen: gen}, func() bool { return b.Current(key.User, m.ID, gen) })
+	return d.Binding.Generation, nil
 }
 
 // holdsCurrent reports whether key is held by a listener of machine that is
@@ -441,10 +456,14 @@ type SourcesView struct {
 	Binding *source.Binding
 	// Machines are the machines the store remembers for the user.
 	Machines []source.Machine
-	// Connected maps the id of a machine holding listeners of the user to
-	// the namespaces (request types) it holds, sorted. It never names a
-	// machine but the bound one.
+	// Connected maps the id of a machine holding listeners of the user, or
+	// the user's delivery stream, to the namespaces (request types) it
+	// holds, sorted (empty for a machine that holds only the delivery
+	// stream). It never names a machine but the bound one.
 	Connected map[string][]string
+	// Delivery reports whether the bound machine holds the user's delivery
+	// stream.
+	Delivery bool
 }
 
 // MoveResult is what Move did and the user's sources as the move left them,
@@ -489,6 +508,12 @@ func (r *Registry) view(b source.Bindings, user string) SourcesView {
 	for _, l := range r.listeners {
 		if l.User == user && l.MachineID == id && l.Generation == bd.Generation {
 			v.Connected[id] = append(v.Connected[id], l.Namespace)
+		}
+	}
+	if d := r.deliveries[user]; d != nil && d.machine.MachineID == id && d.gen == bd.Generation {
+		v.Delivery = true
+		if v.Connected[id] == nil {
+			v.Connected[id] = []string{}
 		}
 	}
 	r.mu.Unlock()
@@ -540,9 +565,9 @@ func (r *Registry) Move(ctx context.Context, user, machineID, by string) (MoveRe
 	return MoveResult{Move: mv, View: r.view(b, user)}, nil
 }
 
-// retainOnly closes every listener of user not stamped (machine, gen) and
-// frees every pending request of user not stamped with them, and reports how
-// many of each.
+// retainOnly closes every listener and the delivery stream of user not
+// stamped (machine, gen) and frees every pending request of user not stamped
+// with them, and reports how many streams it closed and requests it freed.
 func (r *Registry) retainOnly(user, machine string, gen uint64) (closed, dropped int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -557,6 +582,12 @@ func (r *Registry) retainOnly(user, machine string, gen uint64) (closed, dropped
 			r.freeLocked(m)
 			dropped++
 		}
+	}
+	// The delivery stream of another machine or generation is closed too:
+	// its pending delivery requests fail with it (they are bound to it).
+	if d := r.deliveries[user]; d != nil && (d.machine.MachineID != machine || d.gen != gen) {
+		r.removeDeliveryLocked(d)
+		closed++
 	}
 	return closed, dropped
 }
@@ -595,8 +626,8 @@ func (r *Registry) Connected(user string) []ConnectedMachine {
 	return out
 }
 
-// Close ends the bus for shutdown: every listener is removed (its handler's
-// stream ends) and nothing registers from then on (ErrBusClosed). Pending
+// Close ends the bus for shutdown: every listener and delivery stream is
+// removed (its handler's stream ends) and nothing registers from then on (ErrBusClosed). Pending
 // requests are left to go with the process.
 func (r *Registry) Close() {
 	r.mu.Lock()
@@ -604,5 +635,8 @@ func (r *Registry) Close() {
 	r.closed = true
 	for _, l := range r.listeners {
 		r.removeLocked(l)
+	}
+	for _, d := range r.deliveries {
+		r.removeDeliveryLocked(d)
 	}
 }

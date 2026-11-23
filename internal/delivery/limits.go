@@ -55,7 +55,8 @@ const KeepaliveInterval = 15 * time.Second
 
 // RememberAnswered is the least time the server keeps an ended request's
 // outcome, so a repeated POST is told already_answered or deadline_passed
-// rather than unknown_request.
+// rather than unknown_request, unless 4,096 newer outcomes have been kept
+// since (the contract's "whichever comes first"; table.go's maxRemembered).
 const RememberAnswered = 5 * time.Minute
 
 // The transport's routes, header and event.

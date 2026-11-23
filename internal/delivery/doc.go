@@ -32,6 +32,14 @@
 //     WriterInput (one stage, with NewWriterInput, Marshal and the
 //     writer's own strict ParseWriterInput), WriterLine, the exit codes
 //     and the env file's name.
+//   - Service: the server's delivery. Request asks a user's source for a
+//     shed's bundle over the pin (Pin, Stream: internal/plugin's registry
+//     admits the machine and holds its stream) and waits for the answer;
+//     Claim judges an answer's binding and body for the transport (the
+//     pending-request table, table.go); Write writes one stage of an
+//     accepted bundle into a shed through its agent (Agent). A bundle is
+//     held in memory only and prints as its item count.
 //
-// It is pure: no HTTP handler, no pending-request table, no I/O.
+// It has no HTTP handler and stores nothing: the routes are internal/api's,
+// and the record is its caller's to keep.
 package delivery

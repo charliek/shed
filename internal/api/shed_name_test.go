@@ -111,6 +111,8 @@ func (b *foldingBackend) CreateSnapshot(ctx context.Context, req config.Snapshot
 //	profile    an egress profile, from the config or the profile store: never
 //	           a backend lookup
 //	namespace  a credential-bus namespace: never a backend lookup
+//	request    a delivery request id: looked up in the pending-request
+//	           table (as 32 hex digits), never a backend lookup
 //
 // A route added to Router() with a parameter fails TestShedNameRouteWalk
 // until it is classified here.
@@ -127,6 +129,7 @@ var pathParamRoutes = map[string]string{
 	"DELETE /api/egress/{name}":                       "shed",
 	"GET /api/plugins/listeners/{namespace}/messages": "namespace",
 	"POST /api/plugins/listeners/{namespace}/respond": "namespace",
+	"POST /api/delivery/requests/{id}":                "request",
 	"GET /api/sheds/{name}":                           "shed",
 	"DELETE /api/sheds/{name}":                        "shed",
 	"POST /api/sheds/{name}/start":                    "shed",

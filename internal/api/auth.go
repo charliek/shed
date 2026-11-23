@@ -24,7 +24,8 @@ import (
 // config naming it does not load. An Authorization header is never read.
 //
 // The enforced branch consults one authorization table (authorizeScope): the
-// credential bus (/api/plugins/*) requires credentials scope; the Connect
+// credential bus (/api/plugins/*) and the delivery transport
+// (/api/delivery/*) require credentials scope; the Connect
 // tunnel (/api/sheds/*/connect/*) and the egress audit stream
 // (GET /api/egress/stream) accept control or credentials; everything else
 // requires control. So a leaked control credential can't reach the bus, and a
@@ -230,7 +231,9 @@ func closeIdentityBoundConnection(w http.ResponseWriter, r *http.Request) {
 // The scope semantics are a property of the route, not of the credential.
 func authorizeScope(method, path, scope string) (detail string, ok bool) {
 	switch {
-	case isCredentialBusPath(path):
+	case isCredentialBusPath(path) || isDeliveryPath(path):
+		// The credential bus and the delivery transport: a source's own
+		// routes, never a control credential's.
 		if scope != authtoken.ScopeCredentials {
 			return "credentials scope required", false
 		}

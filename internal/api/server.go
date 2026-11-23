@@ -8,6 +8,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/source"
@@ -20,11 +21,14 @@ import (
 type Server struct {
 	// backend is always a *backend.Guard (or nil): every call is decided by
 	// the access rule for the principal on the request's context.
-	backend     backend.Backend
-	cfg         *config.ServerConfig
-	sshHostKey  string
-	plugins     *plugin.Registry
-	bridge      *plugin.Bridge
+	backend    backend.Backend
+	cfg        *config.ServerConfig
+	sshHostKey string
+	plugins    *plugin.Registry
+	bridge     *plugin.Bridge
+	// delivery is the delivery service the delivery routes hand answers
+	// to (nil until SetDelivery: the routes answer 503).
+	delivery    *delivery.Service
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
 	// users answers "which user owns this SSH key fingerprint?" for the mtls
@@ -149,6 +153,7 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(ContentTypeJSON)
+	r.Use(deliveryNoStore)
 	r.Use(s.authMiddleware)
 }
 
@@ -262,6 +267,13 @@ func (s *Server) Router() chi.Router {
 		r.Post("/sources/use", s.handleUseSource)
 
 		// Plugins / Extensions (the credential bus)
+		// Provisioning by delivery: a person's source holds its delivery
+		// stream and answers the requests it carries (credentials scope).
+		r.Route("/delivery", func(r chi.Router) {
+			r.Get("/requests", s.handleDeliveryStream)
+			r.Post("/requests/{id}", s.handleDeliveryAnswer)
+		})
+
 		r.Route("/plugins", func(r chi.Router) {
 			r.Get("/listeners", s.handleListListeners)
 			r.Get("/listeners/{namespace}/messages", s.handlePluginSubscribe)

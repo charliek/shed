@@ -431,7 +431,8 @@ The five codes of this contract:
 | `answer_refused` | 413, 400 or 422 | the answer broke a rule; `rule` names it (section 2) |
 
 The server keeps an answered or expired request's outcome for at least
-five minutes, so a repeated post is told `already_answered` or
+five minutes, or until 4,096 newer outcomes have been kept, whichever
+comes first, so a repeated post is told `already_answered` or
 `deadline_passed`; after that it may answer `unknown_request`.
 
 ### Every refusal, in order
@@ -539,7 +540,7 @@ sees its `state` alone).
 | `last.at` | a time |
 | `last.reason` | `create` or `provision` |
 | `last.outcome` | an outcome (below) |
-| `last.failure` | optional: `{reason, rule, item, result}`: `reason` a failure reason; `rule` (a rule name) exactly when the reason is `answer_refused`; `item` (an item name) and `result` (a writer result but `ok`) exactly when it is `write_failed` |
+| `last.failure` | optional: `{reason, rule, item, result}`: `reason` a failure reason; `rule` (a rule name) exactly when the reason is `answer_refused`; `result` (a writer result but `ok`) exactly when it is `write_failed`; `item` (an item name) only when it is `write_failed`, and optional then: absent, the failure is the env file's own and no item's (the env file could not be replaced or removed, as when a link, a directory or a FIFO stands where it goes) |
 | `last.source` | optional: `{machine_id, machine_name}`, the machine asked; present when the outcome is `accepted` or `refused` |
 | `last.problems` | optional: the answer's problems (at most 16, each `{provider, code, message}` under the answer's problem rules), only with the outcome `accepted`, and never an empty list (absent means none) |
 | `items` | optional: the items the shed holds or was sent, at most one per target, each `{name, provider, stage, kind, base, target, fingerprint, expires_at, written_at, result}`; never an empty list (absent means none), and present only with `steps` |
@@ -683,7 +684,7 @@ last two are the record's own.
 | Request: repository owner/name, local directory | 255 bytes |
 | Request: project directory | 1,024 bytes |
 | Keep-alive comment | every 15 seconds |
-| An ended request's outcome kept | at least 5 minutes |
+| An ended request's outcome kept | at least 5 minutes, or until 4,096 newer outcomes are kept |
 
 ## The fixtures
 
