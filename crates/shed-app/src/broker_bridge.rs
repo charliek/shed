@@ -625,12 +625,14 @@ impl EmbeddedBroker {
         let minter: Arc<dyn broker_minter::Minter> =
             Arc::new(broker_minter::CredentialMinter::new(KNOWN_HOSTS_PATH));
         // The control mints resolve servers from the shed CLI config (the discovery-source
-        // override is a per-server concern the supervisor owns), matching the daemon. ONE
+        // override is a per-server concern the supervisor owns), matching the daemon, read
+        // by the broker's own discovery reader (the provider takes it injected). ONE
         // provider backs both seams — it implements both traits, and the adapter takes two
         // `dyn` views of it rather than two objects.
         let control_provider = Arc::new(ControlTokenProvider::new(
             minter.clone(),
             DEFAULT_DISCOVERY_SOURCE,
+            Arc::new(shed_broker::discovery::load_discovered_servers),
         ));
         let token_minter: Arc<dyn TokenMinter> = Arc::new(EmbeddedTokenMinter::new(
             control_provider.clone() as Arc<dyn ControlTokenMinter>,

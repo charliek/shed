@@ -242,9 +242,9 @@ core-linux:  ## Build+test the shared crates on Linux in Docker (ubuntu:24.04; r
 	  -v shed-core-linux-cargo:/usr/local/cargo/registry \
 	  -e CARGO_TARGET_DIR=/target \
 	  -w /work shed-core-linux:latest \
-	  bash -lc 'cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked && \
+	  bash -lc 'cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers -p shed-source --all-targets --locked && \
 	            cargo test -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked && \
-	            cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked -- -D warnings && \
+	            cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers -p shed-source --all-targets --locked -- -D warnings && \
 	            cargo clippy -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked -- -D warnings'
 
 # ---- test -------------------------------------------------------------

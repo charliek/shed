@@ -16,6 +16,7 @@ members = [
     "shed-broker-harness",
     "shed-provision",
     "shed-provision-providers",
+    "shed-source",
 ]
 # Every member but `shed-broker-harness` (below) is a default member: a plain
 # `cargo build` / `cargo test` (and `make core-test`) builds every other crate
@@ -45,6 +46,10 @@ members = [
 #     crates, zero tokio/reqwest, no file or process access of its own.
 #   - `shed-provision-providers`: the five providers and delivery.toml.
 #     Depends on `shed-provision` only; no YAML parser.
+#   - `shed-source` (plan 039 §3.7): what a machine needs to be a credential
+#     source (machine identity, state paths, credential store, SSH-bootstrap
+#     minter, control-token provider), extracted from `shed-broker`, which
+#     re-exports it. Reaches only `shed-core`/`shed-lane`; no saphyr-parser.
 #
 # The opencode adapter crate (plan 015) was removed in plan 038 — craze is the sole agent
 # lane. `shed-gx` (plan 017) was retired in plan 025; `sx` and `shed-rc-engine`
@@ -68,6 +73,7 @@ default-members = [
     "shed-broker",
     "shed-provision",
     "shed-provision-providers",
+    "shed-source",
 ]
 
 [workspace.package]

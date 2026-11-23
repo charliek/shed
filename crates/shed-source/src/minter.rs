@@ -43,10 +43,10 @@ use ssh_key::known_hosts::{HostPatterns, KnownHosts};
 use tokio::sync::watch;
 
 use crate::bootstrap::{BootstrapRunner, Params, SystemSshRunner, CLIENT_KIND_BROKER};
-use crate::config::expand_tilde;
 use crate::credstore::CredStore;
-use crate::discovery::ServerTarget;
-use crate::status::now_unix;
+use crate::paths::expand_tilde;
+use crate::target::ServerTarget;
+use crate::time::now_unix;
 
 /// Token scopes the broker mints over SSH: `credentials` for its own bus
 /// brokering, `control` for a `token.get` on the desktop's behalf (`credmint.go:48`).
@@ -135,7 +135,19 @@ pub struct MinterError {
 }
 
 impl MinterError {
+    /// A non-terminal mint failure. Crate-private in a shipped build, as it was in the
+    /// broker; `pub` under `test-support` only, so `shed-broker`'s tests can script a
+    /// `Minter` that fails.
+    #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) fn new(message: String) -> Self {
+        Self {
+            message,
+            terminal: false,
+        }
+    }
+    /// See the shipped-build twin above.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(message: String) -> Self {
         Self {
             message,
             terminal: false,
@@ -734,14 +746,14 @@ pub fn new_credential_source(
 
 /// The store a scope persists to: the durable one for `credentials`, none otherwise.
 fn store_for_scope(scope: &str) -> Option<CredStore> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(root) = TEST_CREDENTIALS_ROOT.with(|r| r.borrow().clone()) {
         return (scope == SCOPE_CREDENTIALS).then(|| CredStore::new(root));
     }
     (scope == SCOPE_CREDENTIALS).then(|| CredStore::for_scope(scope))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test seam: when set, [`store_for_scope`] roots the durable store here instead of
     /// under the production state directory. Per thread, so it reaches only the test that
@@ -753,17 +765,17 @@ thread_local! {
 /// Root the production constructors' durable store at `root` on this thread until the
 /// guard drops (tests of the production wiring, which must not touch the real state
 /// directory).
-#[cfg(test)]
-pub(crate) fn root_credentials_store_at(root: &std::path::Path) -> TestCredentialsRoot {
+#[cfg(any(test, feature = "test-support"))]
+pub fn root_credentials_store_at(root: &std::path::Path) -> TestCredentialsRoot {
     TEST_CREDENTIALS_ROOT.with(|r| *r.borrow_mut() = Some(root.to_path_buf()));
     TestCredentialsRoot
 }
 
 /// Clears [`root_credentials_store_at`]'s override on drop.
-#[cfg(test)]
-pub(crate) struct TestCredentialsRoot;
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestCredentialsRoot;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestCredentialsRoot {
     fn drop(&mut self) {
         TEST_CREDENTIALS_ROOT.with(|r| *r.borrow_mut() = None);
@@ -798,8 +810,8 @@ pub fn new_credential_source_with_store(
 }
 
 /// [`new_group_credential_source`] with an explicit store (tests).
-#[cfg(test)]
-pub(crate) fn new_group_credential_source_with_store(
+#[cfg(any(test, feature = "test-support"))]
+pub fn new_group_credential_source_with_store(
     minter: Arc<dyn Minter>,
     target: ServerTarget,
     scope: &str,
@@ -888,8 +900,8 @@ fn build_credential_source(
 impl CredentialSource {
     /// Test seam: measure the refusal wait on `now` instead of [`Instant::now`]. Called
     /// right after the source is built, before any other handle to it exists.
-    #[cfg(test)]
-    pub(crate) fn with_mono_clock(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_mono_clock(
         mut self: Arc<Self>,
         now: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Arc<Self> {
@@ -901,8 +913,8 @@ impl CredentialSource {
 
     /// Test seam: judge expiry on `now` (unix seconds) instead of the system clock. Called
     /// right after the source is built, before any other handle to it exists.
-    #[cfg(test)]
-    pub(crate) fn with_wall_clock(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_wall_clock(
         mut self: Arc<Self>,
         now: impl Fn() -> i64 + Send + Sync + 'static,
     ) -> Arc<Self> {
@@ -1093,7 +1105,7 @@ impl CredentialSource {
 
     /// Proactively re-mint, best-effort (errors surface on the next obtain). Driven by
     /// [`Self::refresh_loop`] so an idle server's token stays fresh.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn refresh(self: &Arc<Self>) {
         let _ = self.obtain_refresh().await;
     }
@@ -1383,7 +1395,7 @@ impl CredentialSource {
 
     /// Proactively re-mint at ~50% of the time until expiry (jittered), so an idle
     /// server's token stays fresh. Stops when `cancel` resolves. Spawned per secure server
-    /// by the supervisor's group builder ([`crate::bus::spawn_server_group`]).
+    /// by the supervisor's group builder (`shed_broker::bus::spawn_server_group`).
     pub async fn refresh_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let delay = self.next_refresh_delay();
@@ -1494,8 +1506,17 @@ async fn wait_outcome(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// The minter's tests, and the helpers `shed-broker`'s bus, supervisor and egress tests
+/// share (`FakeMinter`, `MonoClock`, `WallClock`, `TestCa`, `TestUser`,
+/// `minted_cert_for`, `tmp_store`, `pat_then_admin`, `MISMATCH`). Under `test-support`
+/// alone (a non-test build of this crate) the `#[test]`s compile away, so the helpers
+/// only they use are dead there; that is expected, not a lint to act on.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+// The helpers became `pub` for the broker's tests; a `Default` for a test clock or CA
+// would add nothing.
+#[allow(clippy::new_without_default)]
+pub mod tests {
     use super::*;
     use crate::bootstrap::{BootstrapError, Bundle};
     use shed_core::token::{REFUSAL_BACKOFF_CEILING, REFUSAL_BACKOFF_FLOOR};
@@ -1690,12 +1711,12 @@ pub(crate) mod tests {
     // ---- CredentialSource (mirror the credmint_test.go source tests) ----------------
 
     /// A `Minter` returning canned results in sequence (repeating the last) + call count.
-    pub(crate) struct FakeMinter {
+    pub struct FakeMinter {
         results: std::sync::Mutex<Vec<Result<Minted, bool>>>, // Err(bool) = terminal?
-        pub(crate) calls: AtomicUsize,
+        pub calls: AtomicUsize,
     }
     impl FakeMinter {
-        pub(crate) fn new(results: Vec<Result<Minted, bool>>) -> Arc<Self> {
+        pub fn new(results: Vec<Result<Minted, bool>>) -> Arc<Self> {
             Arc::new(Self {
                 results: std::sync::Mutex::new(results),
                 calls: AtomicUsize::new(0),
@@ -1723,25 +1744,25 @@ pub(crate) mod tests {
     /// A monotonic clock a test moves by hand, for the refusal wait
     /// ([`CredentialSource::with_mono_clock`]): it reads the same instant until advanced.
     #[derive(Clone)]
-    pub(crate) struct MonoClock(Arc<std::sync::Mutex<Instant>>);
+    pub struct MonoClock(Arc<std::sync::Mutex<Instant>>);
 
     impl MonoClock {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self(Arc::new(std::sync::Mutex::new(Instant::now())))
         }
 
-        pub(crate) fn advance(&self, by: Duration) {
+        pub fn advance(&self, by: Duration) {
             *self.0.lock().unwrap() += by;
         }
 
         /// The source's clock: reads this one.
-        pub(crate) fn reader(&self) -> impl Fn() -> Instant + Send + Sync + 'static {
+        pub fn reader(&self) -> impl Fn() -> Instant + Send + Sync + 'static {
             let at = self.0.clone();
             move || *at.lock().unwrap()
         }
 
         /// `source`, measuring its refusal wait on this clock.
-        pub(crate) fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
+        pub fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
             source.with_mono_clock(self.reader())
         }
     }
@@ -1749,19 +1770,19 @@ pub(crate) mod tests {
     /// A wall clock (unix seconds) a test sets by hand, for expiry
     /// ([`CredentialSource::with_wall_clock`]).
     #[derive(Clone)]
-    pub(crate) struct WallClock(Arc<std::sync::atomic::AtomicI64>);
+    pub struct WallClock(Arc<std::sync::atomic::AtomicI64>);
 
     impl WallClock {
-        pub(crate) fn at(unix: i64) -> Self {
+        pub fn at(unix: i64) -> Self {
             Self(Arc::new(std::sync::atomic::AtomicI64::new(unix)))
         }
 
-        pub(crate) fn set(&self, unix: i64) {
+        pub fn set(&self, unix: i64) {
             self.0.store(unix, Ordering::SeqCst);
         }
 
         /// `source`, judging expiry on this clock.
-        pub(crate) fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
+        pub fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
             let at = self.0.clone();
             source.with_wall_clock(move || at.load(Ordering::SeqCst))
         }
@@ -1770,7 +1791,7 @@ pub(crate) mod tests {
     /// A source held to pat on both clocks: pat's certificate expiring at `expiry`, then
     /// `admin`'s from every later mint (plan 037 A25). The wall clock starts a day before
     /// `expiry`, so pat's is fresh.
-    pub(crate) fn pat_then_admin(
+    pub fn pat_then_admin(
         scope: &str,
         expiry: i64,
     ) -> (Arc<FakeMinter>, Arc<CredentialSource>, MonoClock, WallClock) {
@@ -2101,7 +2122,7 @@ pub(crate) mod tests {
     /// issues that — kept for the refusal tests), or `pat` as an IA5String, which the
     /// reader refuses (a certificate whose user cannot be read).
     #[derive(Clone)]
-    pub(crate) enum TestUser {
+    pub enum TestUser {
         Named(&'static str),
         Implicit,
         Unbound,
@@ -2127,13 +2148,13 @@ pub(crate) mod tests {
     /// A throwaway CA + client certificate, so the source is exercised against REAL
     /// certificate material (the pairing check, the resolver, the store round trip) rather
     /// than strings that happen to look like PEM.
-    pub(crate) struct TestCa {
+    pub struct TestCa {
         cert: rcgen::Certificate,
         key: rcgen::KeyPair,
     }
 
     impl TestCa {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             let key = rcgen::KeyPair::generate().unwrap();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
@@ -2197,7 +2218,7 @@ pub(crate) mod tests {
     }
 
     /// [`minted_cert`] naming a chosen user.
-    pub(crate) fn minted_cert_for(
+    pub fn minted_cert_for(
         ca: &TestCa,
         serial: u64,
         expiry: Option<i64>,
@@ -2215,7 +2236,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn tmp_store() -> (tempfile::TempDir, CredStore) {
+    pub fn tmp_store() -> (tempfile::TempDir, CredStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = CredStore::new(dir.path().join("creds"));
         (dir, store)
@@ -2747,7 +2768,7 @@ pub(crate) mod tests {
 
     // ---- the held user (plan 037 §3.2.2) ----------------------------------------------
 
-    pub(crate) const MISMATCH: &str = "server \"mini3\": the server issued a certificate for user \
+    pub const MISMATCH: &str = "server \"mini3\": the server issued a certificate for user \
         \"admin\", but this entry is held to \"pat\"; it was not used. Fix it with the shed \
         CLI (shed server update mini3 --identity-file /path/to/key, or --refetch \
         --allow-user-change), then restart the app.";
@@ -3101,6 +3122,7 @@ pub(crate) mod tests {
     }
 
     /// Pause the source's next store write: returns `(paused, resume)`.
+    #[cfg(test)]
     fn pause_next_write(
         s: &CredentialSource,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {

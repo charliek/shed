@@ -22,7 +22,6 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::sign_check::{
@@ -71,11 +70,12 @@ pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 pub const DESKTOP_BLOCK_REMOVED: &str = "the `desktop:` block was removed; delete it \
      (a `desktop.timeout_ms` becomes `approval_timeout` with a unit: 30000 ms is `approval_timeout: 30s`)";
 
-/// The shed CLI config the agent discovers servers from when discovery is enabled
-/// without an explicit `source:` (mirror `config.go:DefaultDiscoverySource`). Applied
-/// (and tilde-expanded) by [`DiscoveryConfig::apply_defaults`]; also re-exported by
-/// `controltoken` for its single-server resolve default.
-pub const DEFAULT_DISCOVERY_SOURCE: &str = "~/.shed/config.yaml";
+// The shed CLI config the agent discovers servers from when discovery is enabled
+// without an explicit `source:` (mirror `config.go:DefaultDiscoverySource`). Applied
+// (and tilde-expanded) by `DiscoveryConfig::apply_defaults`. Defined beside the
+// control-token provider in `shed_source::controltoken` (plan 039 §3.7), its
+// single-server resolve default; re-exported here.
+pub use shed_source::controltoken::DEFAULT_DISCOVERY_SOURCE;
 
 /// `effective_policy_from_raw` maps a raw `approval.policy` string to its effective
 /// value: an empty/omitted policy fails closed to deny-all; any other value is
@@ -90,23 +90,9 @@ pub fn effective_policy_from_raw(raw: &str) -> String {
     }
 }
 
-/// `user_home_dir` returns `$HOME`, falling back to `/tmp` when unset (mirrors the
-/// Go daemon's `userHomeDir` → `os.UserHomeDir` with a `/tmp` fallback).
-pub fn user_home_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(h) if !h.is_empty() => PathBuf::from(h),
-        _ => PathBuf::from("/tmp"),
-    }
-}
-
-/// `expand_tilde` expands a leading `~/` to the user's home directory (mirrors the
-/// Go daemon's `expandTilde`).
-pub fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        return user_home_dir().join(rest).to_string_lossy().into_owned();
-    }
-    path.to_string()
-}
+// `user_home_dir` and `expand_tilde` moved to `shed_source::paths` (plan 039 §3.7);
+// re-exported so every `crate::config::…` caller and embedder keeps its path.
+pub use shed_source::paths::{expand_tilde, user_home_dir};
 
 /// Resolve `approval_timeout`'s raw string to a `Duration`, defaulting an
 /// absent/invalid/non-positive value to 25s (fail-safe). Always called by `parse`.
@@ -2108,17 +2094,6 @@ discovery:
         assert_eq!(parse_go_duration_nanos(""), None);
         assert_eq!(parse_go_duration_nanos("10"), None); // no unit
         assert_eq!(parse_go_duration_nanos("abc"), None);
-    }
-
-    #[test]
-    fn expand_tilde_expands_home_prefix_only() {
-        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
-        assert_eq!(expand_tilde("plain"), "plain");
-        let home = user_home_dir();
-        assert_eq!(
-            expand_tilde("~/x/y"),
-            home.join("x/y").to_string_lossy().into_owned()
-        );
     }
 
     // ---- AWS config slice (mirror aws_backend_test.go / config_test.go) ----------

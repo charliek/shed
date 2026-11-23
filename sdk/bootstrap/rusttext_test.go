@@ -12,7 +12,7 @@ import (
 
 // rustBootstrapSource is the Rust broker's copy of this package, relative to
 // this directory: its BootstrapError::NoSshIdentities text must be Go's.
-const rustBootstrapSource = "../../crates/shed-broker/src/bootstrap.rs"
+const rustBootstrapSource = "../../crates/shed-source/src/bootstrap.rs"
 
 // stderrCauseTable is the hand-written table of what ssh's stderr becomes as
 // the refusal's cause, which the Rust broker's diag_text is held to as well.
@@ -115,7 +115,7 @@ func readStderrCauseTable(t *testing.T) []stderrCause {
 
 // TestNoSSHIdentitiesTextMatchesRust: the refusal of every key reads the same
 // whichever client met it — the CLI (this package) or the desktop's broker
-// (crates/shed-broker). It reads the Rust source string and requires it to be
+// (crates/shed-broker, whose bootstrap lives in crates/shed-source). It reads the Rust source string and requires it to be
 // Go's sentinel and hint, then ssh's words, byte for byte; and, for every case
 // of the table both languages read (crates/fixtures/bootstrap-stderr/), Go's
 // error is the Rust text with that case's cause, escaped and clipped as the

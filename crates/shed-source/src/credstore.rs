@@ -690,7 +690,7 @@ fn asn1_time_to_unix(tag: u8, body: &[u8]) -> Option<i64> {
         f(6, 8)?,
         f(8, 10)?
     );
-    crate::status::parse_rfc3339_to_unix(&iso).ok().flatten()
+    crate::time::parse_rfc3339_to_unix(&iso).ok().flatten()
 }
 
 #[cfg(test)]

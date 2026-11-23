@@ -28,6 +28,9 @@ libc = "0.2"
 # leaf-cert TLS pin verifier (tls.rs). Always-on because the bus is not
 # feature-gated.
 shed-core = { path = "../shed-core" }
+# The modules extracted in plan 039 §3.7 (machine identity, state paths, credential
+# store, SSH-bootstrap minter, control-token provider), re-exported under their old paths.
+shed-source = { path = "../shed-source" }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 # The extensions-config reader's YAML parser (config.rs `yaml_lite` mod). The repo's
@@ -153,6 +156,10 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 
 [dev-dependencies]
+# The minter's test seams and helpers (`minter::tests`, the injected clocks, the
+# thread-local store root) the bus/supervisor/egress tests drive. A dev-dependency
+# feature: resolver 2 does not unify it into the shipped (normal) build.
+shed-source = { path = "../shed-source", features = ["test-support"] }
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the reconnect backoff
 # (bus.rs) is proven over minutes of retries with the real backoff constants on a PAUSED
 # clock. tokio's own feature: no package joins the lock, and it changes nothing unless a

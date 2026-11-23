@@ -13,7 +13,7 @@ retired the opencode adapter crate. Default members are every crate below except
 
 ```
 shed-lane (pure leaf: no shed-core, reqwest, roost-ipc, or chrono)
-   ├── shed-core ── shed-broker
+   ├── shed-core ── shed-source ── shed-broker
    │       └── shed-app ── shed-desktop-core
    ├── shed-craze ────────────┘
    └── shed-roost (sole direct roost-ipc consumer) ──┘
@@ -63,9 +63,24 @@ shedctl (no internal deps)
 - **`shedctl`** — a headless UDS/IPC client with no dependency on the other
   crates here (`serde_json`, `base64`, `libc`), shipped in the Linux `.deb`.
   In `default-members`.
+- **`shed-source`** (plan 039 §3.7) — what a machine needs to be a credential source,
+  extracted unchanged from `shed-broker`: `machine` (`<state>/broker/machine.json`),
+  `paths` (`state_dir`: `SHED_BROKER_STATE_DIR`, else the per-user data dir; plus
+  `user_home_dir`/`expand_tilde`), `credstore` (`<state>/broker/creds`), `minter` (the
+  SSH-bootstrap minter and credential source; `bootstrap` is internal), `controltoken`
+  (the control-token provider, which resolves servers through an injected
+  `ServerResolver`: this crate has no YAML parser, so the broker passes its saphyr-backed
+  `discovery::load_discovered_servers`), `target` (`ServerTarget`) and `time` (the RFC3339
+  helpers). `shed-broker` re-exports every module under its old path (`status`,
+  `discovery` and `config` re-export the helpers), so no broker caller or embedder moved.
+  Reaches only `shed-core`/`shed-lane`, never `saphyr-parser`. Its `test-support` feature
+  (the minter's test seams and `minter::tests` helpers) is enabled only by
+  `shed-broker`'s `[dev-dependencies]`, never in a shipped build. The control-token
+  provider's tests stay in the broker (`controltoken_tests.rs`), since they resolve
+  through the broker's reader. Default member.
 - **`shed-broker`** — the embeddable credential broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
-  backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
+  backends, the SSH-bootstrap minter + control-token provider (from `shed-source`), the approval/audit seams
   (incl. the always-compiled `AuditFanout` fan-out and the native `touchid` gate), the
   `config` reader, socket path-resolution + liveness probes, and the health types
   (`ServerHealth`, `SshSigningStatus`). Embedded in-process by the desktop app (through
@@ -101,7 +116,8 @@ shedctl (no internal deps)
   workspace crate, `shed-provision-providers` only `shed-provision`, neither
   `saphyr-parser`/`tokio`/`reqwest`, and `shed-core`, `shed-lane`,
   `shed-roost`, `shed-craze` and default `shed-app` reach neither (shed-mobile
-  links those).
+  links those). `shed-source` reaches only `shed-core`/`shed-lane` and no
+  `saphyr-parser`, and the same mobile crates do not reach it.
 - **`shed-provision`** (plan 039) — the source side of the provision contract
   `tests/provision-contract/v1/`: the documents and every rule that judges
   them, matching `internal/delivery` rule for rule and in order (requests,
@@ -498,6 +514,7 @@ cargo test -p shed-lane --features test-support      # exports lane::conformance
 cargo test -p shed-roost --features test-support     # exports testing::FakeRoost
 cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
 cargo test -p shed-broker -p shed-broker-harness --all-targets   # the broker + its wire-harness host
+cargo test -p shed-source                            # the extracted identity/credstore/minter
 cargo clippy -p shed-broker-harness --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-craze                             # the craze adapter (recipe cells skip)

@@ -28,6 +28,11 @@
 //!   `shed-roost`, `shed-craze` and `shed-app` (default features) reach
 //!   neither, so shed-mobile's build is unchanged. All of these hold across
 //!   normal, build and dev edges.
+//! - `shed-source` (plan 039 §3.7) reaches no workspace crate but `shed-core`
+//!   and `shed-lane`, and never `saphyr-parser`; `shed-core`, `shed-lane`,
+//!   `shed-roost`, `shed-craze` and `shed-app` (default features) do not reach
+//!   it, so shed-mobile's build is unchanged. All across normal, build and dev
+//!   edges.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -337,6 +342,36 @@ fn crate_isolation_invariants() {
             "`shed-app` (default features) must not depend on `{forbidden}` (normal/build/dev)"
         );
     }
+
+    // 8b. `shed-source` (plan 039 §3.7): the machine identity, credential store,
+    //     minter and control-token provider extracted from `shed-broker`. Reaches
+    //     only `shed-core` and `shed-lane` (every feature, `test-support` included,
+    //     and every target), never the broker's YAML parser; shed-mobile's crates
+    //     do not reach it.
+    let deps = resolved_deps("shed-source", "normal,build,dev");
+    let allowed = ["shed-core", "shed-lane"];
+    for member in &workspace {
+        if *member != "shed-source" && !allowed.contains(member) {
+            assert!(
+                !deps.contains(*member),
+                "`shed-source` must reach no workspace crate but {allowed:?}; found `{member}` (normal/build/dev)"
+            );
+        }
+    }
+    assert!(
+        !deps.contains("saphyr-parser"),
+        "`shed-source` must not depend on `saphyr-parser` (normal/build/dev)"
+    );
+    for pkg in ["shed-core", "shed-lane", "shed-roost", "shed-craze"] {
+        assert!(
+            !resolved_deps(pkg, "normal,build,dev").contains("shed-source"),
+            "`{pkg}` must not depend on `shed-source` (normal/build/dev; shed-mobile links it)"
+        );
+    }
+    assert!(
+        !resolved_default_deps("shed-app", "normal,build,dev").contains("shed-source"),
+        "`shed-app` (default features) must not depend on `shed-source` (normal/build/dev)"
+    );
 
     // 9. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`
     //    (across ALL dependency kinds: normal, build, AND dev).

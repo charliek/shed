@@ -84,7 +84,7 @@ jobs:
               # TestNoSSHIdentitiesTextMatchesRust holds Go's text to. A change
               # to only these can stale those checks, so it runs the `test` job.
               - 'crates/fixtures/**'
-              - 'crates/shed-broker/src/bootstrap.rs'
+              - 'crates/shed-source/src/bootstrap.rs'
             rust:
               - 'crates/**'
               # the provision contract, which shed-provision's contract reader
@@ -128,6 +128,9 @@ jobs:
               # does not use this filter: it runs when the go or ci filter
               # matches.)
               - 'crates/shed-broker/**'
+              # the broker's identity, credential store, minter and
+              # control-token provider, extracted in plan 039 (re-exported).
+              - 'crates/shed-source/**'
               - 'crates/shed-app/**'
               - 'crates/shed-broker-harness/**'
               - 'crates/shed-core/**'
@@ -220,7 +223,8 @@ jobs:
       # its reader of the Rust source. (The shared pasteable-word table,
       # crates/fixtures/shellword/, is read by internal/config's
       # TestShellWordSharedTable, which `go test ./...` above runs. The Rust
-      # side of the stderr table, in shed-broker, runs in core-mac and
+      # side of the stderr table, in shed-source (plan 039: moved there from
+      # shed-broker with bootstrap.rs), runs in core-mac, core-linux and
       # broker-wire; of the shellword table, in shed-core, in core-mac and
       # core-linux. A change to only crates/fixtures/** or the Rust text runs
       # this job too: the `gocrossread` filter.)
@@ -552,11 +556,14 @@ jobs:
         # it (lane conformance, FakeRoost). shed-opencode was retired in plan 038.
         # shed-craze's recipe (real hub, SHED_CRAZE_REQUIRE) is the next step.
         # shed-provision and shed-provision-providers (plan 039): the first's
-        # tests read tests/provision-contract/v1 from the checkout.
+        # tests read tests/provision-contract/v1 from the checkout. shed-source
+        # (plan 039 §3.7): the machine identity, credential store and minter
+        # extracted from shed-broker; its state-dir and flock paths differ on
+        # Linux.
         run: |
-          cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked
+          cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers -p shed-source --all-targets --locked
           cargo test -p shed-lane -p shed-roost --all-targets --features test-support --locked
-          cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked -- -D warnings
+          cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers -p shed-source --all-targets --locked -- -D warnings
           cargo clippy -p shed-lane -p shed-roost --all-targets --features test-support --locked -- -D warnings
       # shed-craze (plan 025 C7) runs its recipe cells against the REAL craze
       # hub, craze-fake-host and craze-fake-agent, built here at the pinned
@@ -619,12 +626,13 @@ jobs:
           sudo timeout 300 apt-get install -y build-essential
       - uses: astral-sh/setup-uv@v6
       # The broker core and the harness's host (its unit tests, and the check that
-      # no crate depends on it and it is no default member).
+      # no crate depends on it and it is no default member), and shed-source, the
+      # modules extracted from the broker in plan 039 (their tests moved with them).
       - name: Broker + harness host — test + clippy (Linux)
         working-directory: crates
         run: |
-          cargo test -p shed-broker -p shed-broker-harness --all-targets --locked
-          cargo clippy -p shed-broker -p shed-broker-harness --all-targets --locked -- -D warnings
+          cargo test -p shed-broker -p shed-broker-harness -p shed-source --all-targets --locked
+          cargo clippy -p shed-broker -p shed-broker-harness -p shed-source --all-targets --locked -- -D warnings
       - name: Wire goldens + golden runners
         # Builds shed-broker-harness (conftest) and runs the pytest suite against
         # the recorded goldens + the Rust golden-fixture runners.

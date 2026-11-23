@@ -550,7 +550,7 @@ const MINT_FAILED_REDACTED: &str = "control token mint failed";
 ///
 /// One definition serves both of the app's credential paths: this provider, and the
 /// embedded broker's credential source (`CredentialSource` in
-/// `crates/shed-broker/src/minter.rs`, plan 037 A25), which reads these two constants and
+/// `crates/shed-source/src/minter.rs`, plan 037 A25), which reads these two constants and
 /// [`next_refusal_backoff`] from here. The broker's credential streams reconnect on the
 /// same schedule with their own copy, `INITIAL_BACKOFF` and `MAX_BACKOFF` in
 /// `crates/shed-broker/src/bus.rs` (a stream's backoff, not a refusal's). Keep the two
@@ -766,7 +766,7 @@ pub fn name_jitter(name: &str, max_ms: u64) -> u64 {
 // SSH token-bundle parsing (plan 001 §3.5) — fail-closed ports of mobile's
 // `token_bundle.dart` (itself a port of the orchestrator's controlToken.ts).
 //
-// Sibling, NOT a duplicate: `shed-broker/src/bootstrap.rs:decode_bundle` also
+// Sibling, NOT a duplicate: `shed-source/src/bootstrap.rs:decode_bundle` also
 // decodes a `_bootstrap` bundle, but with Go-parity semantics — expiry is
 // OPTIONAL there (absent/zero → non-expiring `None`). These parsers are the
 // MOBILE-parity view: expiry is REQUIRED and a bundle without one is rejected.
@@ -1302,7 +1302,7 @@ impl State {
 /// COMPLETES as a failure) and never a wrong cached token (the cancelled
 /// mint's result is dropped, not cached). The upgrade, if it ever matters, is
 /// provider-owned in-flight mint state joined by waiters off the lock —
-/// shed-broker's watch-based single-flight (`shed-broker/src/minter.rs`,
+/// shed-broker's watch-based single-flight (`shed-source/src/minter.rs`,
 /// module docs) is the in-repo pattern.
 pub struct ControlTokenProvider {
     server: String,

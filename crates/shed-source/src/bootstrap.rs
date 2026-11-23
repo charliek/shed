@@ -508,7 +508,7 @@ where
     if s.is_empty() {
         return Ok(None);
     }
-    match crate::status::parse_rfc3339_to_unix(s) {
+    match crate::time::parse_rfc3339_to_unix(s) {
         Ok(v) => Ok(v),
         Err(()) => Err(D::Error::custom("invalid RFC3339 expires_at")),
     }
@@ -808,11 +808,14 @@ mod tests {
         assert_eq!(got[45], "-l");
     }
 
-    /// The Go-written fixture (`crates/fixtures/identityfile/`): every accepted entry,
-    /// read through the broker's discovery, gives Go's bootstrap argv byte for byte (scope
-    /// `control`, client kind `cli`, no CSR, the fixture's known_hosts), and every refused
-    /// entry is refused before ssh is spawned (a shim that records any spawn stays
-    /// untouched).
+    /// The Go-written fixture (`crates/fixtures/identityfile/`): every accepted entry
+    /// gives Go's bootstrap argv byte for byte (scope `control`, client kind `cli`, no
+    /// CSR, the fixture's known_hosts), and every refused entry is refused before ssh is
+    /// spawned (a shim that records any spawn stays untouched). Each entry's
+    /// `identity_file`, host and port are the fixture's decoded values; that the broker's
+    /// discovery reader decodes `config.yaml` and `refused.yaml` to exactly those is
+    /// `shed-broker`'s `discovery` test of the same fixture (plan 039 §3.7: this crate
+    /// has no YAML reader).
     #[tokio::test]
     async fn the_go_fixture_gives_go_s_bootstrap_argv_and_its_refusals_spawn_nothing() {
         let root =
@@ -820,26 +823,19 @@ mod tests {
         let expected: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join("expected.json")).unwrap())
                 .unwrap();
-        let config = root.join("config.yaml");
-        let targets = crate::discovery::load_discovered_servers(config.to_str().unwrap()).unwrap();
+        let host = expected["host"].as_str().unwrap();
+        let port = u16::try_from(expected["ssh_port"].as_u64().unwrap()).unwrap();
         let accepted = expected["accepted"].as_array().unwrap();
-        assert_eq!(targets.len(), accepted.len());
         for want in accepted {
             let name = want["entry"].as_str().unwrap();
-            let target = targets.iter().find(|t| t.name == name).unwrap();
-            assert_eq!(
-                target.identity_file,
-                want["identity_file"].as_str().unwrap(),
-                "{name}"
-            );
             let p = Params {
-                host: target.ssh_host.clone(),
-                port: target.ssh_port,
+                host: host.into(),
+                port,
                 known_hosts_path: expected["known_hosts"].as_str().unwrap().into(),
                 scope: "control".into(),
                 client_kind: "cli".into(),
                 csr: String::new(),
-                identity_file: target.identity_file.clone(),
+                identity_file: want["identity_file"].as_str().unwrap().into(),
             };
             validate(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
             let want_argv: Vec<String> = want["bootstrap_argv"]
@@ -851,9 +847,6 @@ mod tests {
             assert_eq!(ssh_args(&p), want_argv, "{name}");
         }
 
-        let refused =
-            crate::discovery::load_discovered_servers(root.join("refused.yaml").to_str().unwrap())
-                .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let spawned = dir.path().join("spawned");
         let body = format!(": > '{}'\nexit 0\n", spawned.display());
@@ -861,14 +854,8 @@ mod tests {
         let runner = SystemSshRunner::with_shim(ssh, Duration::from_secs(5));
         for want in expected["refused"].as_array().unwrap() {
             let name = want["entry"].as_str().unwrap();
-            let target = refused.iter().find(|t| t.name == name).unwrap();
-            assert_eq!(
-                target.identity_file,
-                want["identity_file"].as_str().unwrap(),
-                "{name}: decoded as Go decodes it"
-            );
             let p = Params {
-                identity_file: target.identity_file.clone(),
+                identity_file: want["identity_file"].as_str().unwrap().into(),
                 ..params()
             };
             // The argv-safety gate refuses it on its own, and so does the runner.

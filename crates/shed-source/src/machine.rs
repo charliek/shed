@@ -190,7 +190,7 @@ fn load_or_create_io(path: &Path, io: &Io) -> Result<LoadedIdentity, String> {
         OnDisk::Newer { id, reason } => Ok(newer(io, id, reason)),
         OnDisk::Missing => {
             let identity = new_identity(io.hostname);
-            write(path, &identity, &crate::status::now_rfc3339(), io.sync_dir)?;
+            write(path, &identity, &crate::time::now_rfc3339(), io.sync_dir)?;
             Ok(LoadedIdentity {
                 identity,
                 outcome: LoadOutcome::Created,
@@ -203,7 +203,7 @@ fn load_or_create_io(path: &Path, io: &Io) -> Result<LoadedIdentity, String> {
             reason,
         } => {
             let name = name.unwrap_or_else(|| derive_name(io.hostname, &id));
-            let created_at = created_at.unwrap_or_else(crate::status::now_rfc3339);
+            let created_at = created_at.unwrap_or_else(crate::time::now_rfc3339);
             let identity = MachineIdentity { id, name };
             write(path, &identity, &created_at, io.sync_dir)?;
             Ok(LoadedIdentity {
@@ -229,7 +229,7 @@ fn load_or_create_io(path: &Path, io: &Io) -> Result<LoadedIdentity, String> {
                 )
             })?;
             let identity = new_identity(io.hostname);
-            write(path, &identity, &crate::status::now_rfc3339(), io.sync_dir).map_err(|e| {
+            write(path, &identity, &crate::time::now_rfc3339(), io.sync_dir).map_err(|e| {
                 format!(
                     "machine identity {} has no usable id ({reason}); it was copied to {}, \
                      but writing a new identity in its place failed: {e}",
@@ -524,7 +524,7 @@ fn classify(raw: &[u8]) -> Result<OnDisk, String> {
             }
             let created_at = match obj.get("created_at") {
                 Some(Value::String(s))
-                    if matches!(crate::status::parse_rfc3339_to_unix(s), Ok(Some(_))) =>
+                    if matches!(crate::time::parse_rfc3339_to_unix(s), Ok(Some(_))) =>
                 {
                     Some(s.clone())
                 }
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(v["schema"], 1);
         assert_eq!(v["id"], first.identity.id.as_str());
         assert_eq!(v["name"], "laptop");
-        crate::status::parse_rfc3339_to_unix(v["created_at"].as_str().unwrap())
+        crate::time::parse_rfc3339_to_unix(v["created_at"].as_str().unwrap())
             .unwrap()
             .unwrap();
     }
@@ -962,7 +962,7 @@ mod tests {
             assert_eq!(v["id"], ID, "{raw}");
             assert_eq!(v["name"], want_name, "{raw}");
             let at = v["created_at"].as_str().unwrap();
-            crate::status::parse_rfc3339_to_unix(at).unwrap().unwrap();
+            crate::time::parse_rfc3339_to_unix(at).unwrap().unwrap();
             assert_eq!(at == ts, keeps_ts, "{raw}: created_at {at}");
             // And the repaired file now reads as is.
             let again = load_or_create_with(&path, &host("other"), &|| {}).unwrap();

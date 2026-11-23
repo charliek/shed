@@ -1,9 +1,28 @@
-//! Where the broker keeps its persistent state.
+//! Where the broker keeps its persistent state, and the home-directory helpers it is
+//! built from.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::config::user_home_dir;
+/// `user_home_dir` returns `$HOME`, falling back to `/tmp` when unset (mirrors the
+/// Go daemon's `userHomeDir` → `os.UserHomeDir` with a `/tmp` fallback). Moved here
+/// from `shed-broker`'s `config` (plan 039 §3.7), which re-exports it.
+pub fn user_home_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h),
+        _ => PathBuf::from("/tmp"),
+    }
+}
+
+/// `expand_tilde` expands a leading `~/` to the user's home directory (mirrors the
+/// Go daemon's `expandTilde`). Moved here from `shed-broker`'s `config` (plan 039
+/// §3.7), which re-exports it.
+pub fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        return user_home_dir().join(rest).to_string_lossy().into_owned();
+    }
+    path.to_string()
+}
 
 /// `state_dir` returns the directory holding the broker's own PERSISTENT state: its
 /// client-credential store ([`crate::credstore`]) and this machine's identity
@@ -44,6 +63,17 @@ fn env_nonempty(key: &str) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_tilde_expands_home_prefix_only() {
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("plain"), "plain");
+        let home = user_home_dir();
+        assert_eq!(
+            expand_tilde("~/x/y"),
+            home.join("x/y").to_string_lossy().into_owned()
+        );
+    }
 
     #[test]
     fn state_dir_honors_env_override() {

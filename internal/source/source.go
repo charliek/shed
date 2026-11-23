@@ -178,7 +178,7 @@ const BoundByFirstConnect = "first-connect"
 const MaxMachinesPerUser = 32
 
 // MaxMachineNameBytes is the longest machine name, in bytes of UTF-8. It
-// matches the broker's limit (crates/shed-broker/src/machine.rs).
+// matches the broker's limit (crates/shed-source/src/machine.rs).
 const MaxMachineNameBytes = 63
 
 // MaxTextBytes bounds the other strings the store keeps: a key fingerprint

@@ -3003,6 +3003,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "shed-core",
+ "shed-source",
  "ssh-key",
  "tempfile",
  "thiserror 1.0.69",
@@ -3133,6 +3134,25 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "shed-source"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "libc",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "ssh-key",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
