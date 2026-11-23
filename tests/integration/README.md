@@ -87,6 +87,11 @@ tests they would have run, not the whole session.
 | `SHED_REMOTE_IMAGE`    | _unset_                                            | Image alias every `[remote]` create asks for. Unset, creates boot the server's `remote.default_image` (the vz/fc names `base` and `extensions` do not exist on a remote server). |
 | `SHED_REMOTE_MAX_RUNNING` | `2`                                             | The server's `remote.limits.max_running`, for `test_remote_lifecycle.py::test_create_past_running_limit_is_refused`. |
 | `SHED_IMAGE_HAS_HOME_DIRS` | _unset_                                            | Gates `test_smoke.py::test_home_dirs_owned_by_shed` — a comma list of the backends (`vz`, `fc`) whose `base` image was rebuilt with the shed-owned `~/.local`, `~/.config` and `~/.cache` dirs (#410). `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images carry these dirs only from the 0.9.1 tag). |
+| `SHED_IMAGE_HAS_DELIVERY` | _unset_                                         | Gates the cases of `test_delivery.py` that need this branch's agent, and `test_delivery.py::test_delivery_image_baked` — a comma list of the backends (`vz`, `fc`, `remote`) whose image was rebuilt with this branch's agent protocol 2 and parcel/envsecrets. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc`, `test-integration-remote` sets `remote`; unset for plain `test-integration` (published images have none of it). A listed backend whose dev store has no `full` image FAILS the image test rather than skipping it. |
+| `SHED_PROVISION_REF`   | `bin/test/shed-provision-ref`                      | The provision contract's reference source, which `test_delivery.py` runs as the itest users' machine (`make provision-ref` builds it). |
+| `SHED_DELIVERY_REFUSE_ALL` | _unset_                                         | `1` sends every live-runnable refuse fixture of the provision contract in `test_delivery.py`'s refusal case, instead of one per rule. |
+| `SHED_DELIVERY_OLD_IMAGE` | _unset_                                          | An image alias that boots a published image (an agent below protocol 2), so `test_delivery.py`'s `image_too_old` case runs on a backend `SHED_IMAGE_HAS_DELIVERY` lists. Without it the case runs only where that gate is unset. |
+| `SHED_VZ_DEV_AUDIT_LOG`, `SHED_VZ_DEV_STATE_DIRS`, `SHED_FC_DEV_AUDIT_LOG`, `SHED_FC_DEV_STATE_DIRS`, `SHED_REMOTE_AUDIT_LOG`, `SHED_REMOTE_STATE_DIRS`, `SHED_REMOTE_DEV_DIR` | the dev servers' own | Where `test_delivery.py`'s sentinel sweep reads each dev server's audit log and state directories (comma lists). Defaults: the Mac dev server's directory above `vz.instance_dir` and its `state_dir`; `/var/lib/shed-dev/firecracker/audit.jsonl`, its directory and the `state` directory beside it (on `SHED_FC_HOST`); `~/.shed/dev-remote/remote` and `state`. |
 | `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
 | `SHED_ITEST_SOURCE`    | `config`                                           | Where the users cases' server takes its users from: `config` (`auth.users`) or `directory` (an account service; the run started the server with `render-directory`'s auth block). See [Named users](#named-users-authusers). |
@@ -835,6 +840,34 @@ names: `itest-itest-alice` and `itest-itest-alice-b` (alice), and
 the number of new machine ids small also keeps a run inside the server's
 per-user admission limit (8 admissions that write its store, then one every
 15 s): a run against a server that already knows them writes nothing.
+
+## Provisioning by delivery (`test_delivery.py`)
+
+At create and at `shed provision`, shed-server asks the shed user's credential
+source for a bundle of files and environment values and writes it in two
+stages around the clone (plan 039; `tests/provision-contract/v1/CONTRACT.md`).
+`test_delivery.py` plays alice's machine with the contract's reference source
+(`make provision-ref`), a subprocess in a throwaway HOME with a throwaway
+credentials certificate, on loopback to the server under test (an `ssh -L`
+forward when the server is on another host). The module first makes that
+machine alice's source (`ensure_source`) and puts her default machine back at
+the end.
+
+It runs on `users_env` (a dev server with the itest user list, as the users
+cases do) and needs `bin/` first on PATH. The cases that need the new agent
+skip unless `SHED_IMAGE_HAS_DELIVERY` lists the backend; the `image_too_old`
+case runs only where it does not (or with `SHED_DELIVERY_OLD_IMAGE`). On
+`[remote]` only the core cases run (a create with a canned bundle, an offline
+create finished by `shed provision`, and the sweep): two cloud VMs, one after
+the other, each deleted. The service client's shed is `[fc]` only. Every case
+is listed in the module's docstring.
+
+The sentinel sweep reads the dev server's log (the usual log variables), its
+audit log and its state directories (the variables in the table above); each
+read has a positive control, so a sweep of the wrong file fails instead of
+passing.
+
+    cd tests/integration && uv run pytest -v -rs test_delivery.py
 
 ## Remote backend (cloud sheds)
 

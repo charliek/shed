@@ -41,6 +41,32 @@ All notable changes to this project will be documented in this file.
   of those still gets the protocol report and is never touched. A host already running a
   protocol-6 `roost-session` (0.0.20 to 0.0.25) is compatible and is not upgraded; a shed keeps
   the roost-session its image baked.
+- **Credential delivery (plan 039, part A).** A shed can now be given the credentials its
+  person already has: an SSH key, the token their own `gh` holds, API keys, an envsecrets
+  login, named files. When a shed is created, and when its user runs the new
+  `shed provision <name>` (`--status` prints the record), shed-server asks the person's bound
+  credential source (the desktop app) for them and the in-shed agent writes them. A start
+  contacts no source. New: the provision contract (`tests/provision-contract/v1/`,
+  `make provision-ref`), `shed-agent apply-items` and a per-user `~/.config/environment.d`
+  read, the routes `/api/delivery/requests`, `/api/sheds/{name}/provision` and
+  `/api/activity`, the `delivery` and `activity` feature tokens, a `delivery` record in the
+  shed document and a `DELIVERY` column in `shed list`, the config key `delivery.timeout`
+  (default 30s), the desktop's Preferences → Provisioning section with `delivery.toml`
+  and delivery state on each shed, and the crates `shed-source`, `shed-provision` and
+  `shed-provision-providers`. `parcel` and `envsecrets` are installed from the stridelabs apt
+  repository in the `full` images and the cloud image (`envsecrets` no longer comes from mise).
+  See `docs/reference/delivery.md`.
+  - **Behaviour changes.** The install hook now waits for the clone and for delivery: it runs
+    only after stage 1, the clone and stage 2 are done or skipped, so a bound source that is
+    offline holds it back until `shed provision`. A create on the remote backend resumed after a
+    server restart runs no step until `shed provision` (its bundle was in memory only). The audit
+    log is on by default in `mtls` mode (`audit.enabled: false` turns it off) and now records shed
+    lifecycle and delivery events. The agent protocol is 2: a shed from an older image still boots,
+    but delivery to it ends as `image_too_old`. `shed reset` clears delivered items and names
+    `shed provision`. `--no-provision` skips the install hook only, not delivery, and `shed provision` does not run a hook skipped that way.
+  - **Follow-ups.** Actions the server takes on its own (remote sweeps and reconcile) are not
+    audited yet. The ask-per-use credential helpers stay in this release; their removal and the
+    two-variant image change are a later part of the same plan.
 
 ## v0.10.1 — 2026-11-20
 

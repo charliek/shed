@@ -16,6 +16,7 @@ components that already exist on the developer's Mac and on shed hosts (see
   `~/.shed/config.yaml`; live create-progress over SSE.
 - **credentials / approvals** — the credential broker, which runs in the app (the headline
   feature; see [Credential approvals](approvals.md)).
+- **provisioning** — the app is a person's credential source: it answers a shed's delivery request from `~/.config/shed/delivery.toml` and shows each shed's delivery state (see [Provisioning](provisioning.md)).
 - **agents + terminals** — each host's [roost](../extensions/roost-session-hosts.md)
   sessions are rows in the Agents pane, with live [craze lanes](agent-lanes.md); the user's terminal app is launched for interactive attach.
 
@@ -36,6 +37,7 @@ component ships.
 | Dashboard + IPC spine | Read-only dashboard across hosts; the drivability socket + screenshots | ✅ |
 | Lifecycle + create | start/stop/reset/delete, create with live SSE progress, terminal launch | ✅ |
 | Agents | Agents pane: read-only roost rows grouped by shed, craze lanes, New craze session | ✅ |
+| Provisioning | Preferences → Provisioning (five providers, `delivery.toml`, preview); delivery state and **Deliver again** on each shed | ✅ |
 | Approval gate | Multi-server SSH approval over UDS, policy engine, notifications, merged audit feed | ✅ |
 | System | Per-host disk usage (`/api/system/df`) | ✅ |
 | Packaging | Launch-at-login, preferences, DMG + Sparkle EdDSA auto-update (mac); nfpm `.deb` (Linux) | ✅ |

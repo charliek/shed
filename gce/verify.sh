@@ -189,6 +189,8 @@ verify_live() {
   if [ "${variant}" = extensions ]; then
     check "strix is installed" command -v strix
     check "prox is installed" command -v prox
+    check "parcel is installed" command -v parcel
+    check "envsecrets is installed" command -v envsecrets
     if [ -n "${pins}" ]; then
       local rv rp cv
       rv="$(sed -nE 's/^ROOST_SESSION_VERSION=([0-9.]+)$/\1/p' "${pins}")"

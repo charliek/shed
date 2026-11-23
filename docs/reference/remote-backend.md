@@ -314,12 +314,16 @@ The next periodic pass, at most a minute later, picks up the fix; no restart is 
 
 The check covers VPC firewall rules. It does not read hierarchical or network firewall policies, VPC peering or routes. The network and subnet must be in the project the sheds are in: a network of another project (a Shared VPC) is refused when the server starts, because the check reads that one project's rules.
 
+## Credential delivery
+
+A cloud shed gets [credential delivery](delivery.md) like any other: the user's bound source is asked at create, and `shed provision` delivers again. The create answers `201 starting`, so the outcome is read from the shed document, polled as for any other field. A job never retries a delivery step recorded `failed`, a provision is refused (`409`) while a job for that shed is in flight, and a shed adopted at start-up is recorded with every step skipped and delivery `none`. The cloud image installs `parcel` and `envsecrets` beside `strix` and `prox`. The delivered files are on the shed's boot disk, so a stopped cloud shed holds them.
+
 ## Server restarts
 
 A server stop leaves every VM as it is: running sheds keep running and keep costing money. At start-up the server lists the cloud VMs of its `environment` and reconciles them with its record cache (`state_dir`):
 
 - A VM labelled ready that has no record is adopted under its own shed ID, with the user its `shed_user` label names (see [Users](#users)).
-- A record left `starting` or `stopping` resumes its job.
+- A record left `starting` or `stopping` resumes its job. A create resumed this way has lost its delivery bundle, which was held in memory only: every step not recorded `done` or `skipped` stays `owed`, no step runs, and the server does not ask the source again on its own. The shed document's `delivery` names what is owed, and `shed provision <name>` finishes it.
 - A record whose VM is stopped but was `running` becomes `stopped` with reason `run_limit` or `external`.
 - A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
 - A VM labelled `deleting`, or one with a local delete marker, is deleted. So is a VM still labelled `creating` 15 minutes after the cloud made it that has no record: a create nobody will finish. Nothing else is ever removed.

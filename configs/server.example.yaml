@@ -127,12 +127,21 @@ env_file: ~/.shed/env
 #   max_concurrent_per_shed: 8
 
 # --- Audit log (audit.jsonl next to egress-audit.jsonl) ---
-# Always on when auth.clients is set. exec_argv: "" logs argv[0] and the
+# On by default in mtls mode (it records shed lifecycle and credential
+# delivery events and feeds GET /api/activity); `enabled: false` turns that
+# default off. Always on when auth.clients is set. exec_argv: "" logs argv[0] and the
 # argument count; "full" logs every argument. See
 # docs/reference/configuration.md#audit-log
 # audit:
 #   enabled: false
 #   exec_argv: ""
+
+# --- Credential delivery (docs/reference/delivery.md) ---
+# How long a create (or `shed provision`) waits for the answer of a connected
+# credential source, 1s to 10m. A bound source that is not connected is not
+# waited for.
+# delivery:
+#   timeout: 30s
 
 # --- Network profiles (isolated is Firecracker only) ---
 # isolated: the internet and nothing else (not the host, other sheds, the

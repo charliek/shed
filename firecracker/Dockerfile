@@ -377,8 +377,8 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 # Stage: shed-fc-full
 # Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI, Cursor CLI).
-# mise stays for the envsecrets Go binary (prox now comes from the
-# stridelabs apt repo in `extensions`, so every variant has one). Node/Python/uv
+# mise stays as a tool manager (envsecrets, parcel, strix and prox come from
+# the stridelabs apt repo). Node/Python/uv
 # dropped — Bun is the JS runtime + package manager, and users who
 # need Python can `uv python install 3.13` inside a shed.
 # =============================================================================
@@ -413,6 +413,14 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-docker-forward.conf \
     && SYSTEMD_OFFLINE=1 systemctl enable docker
 
+# parcel and envsecrets from the stridelabs apt repo (configured in the
+# `extensions` stage), unpinned like strix and prox. Plan 039: delivery gives
+# a shed the logins these tools need; envsecrets used to come from mise.
+RUN set -euo pipefail; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends parcel envsecrets; \
+    rm -rf /var/lib/apt/lists/*
+
 # Layer: install all language runtimes + coding agents as the shed user,
 # folded into a single runuser-driven RUN.
 RUN set -euo pipefail && \
@@ -429,15 +437,13 @@ RUN set -euo pipefail && \
     # All shed-user installations happen via `runuser -l shed -c` so the
     # umasks, HOMEs, and downloaders behave as if `shed` ran them.
     runuser -l shed -c 'set -euo pipefail; \
-        # mise (kept for the envsecrets Go binary; no Node/Python). \
+        # mise (kept as a tool manager; no Node/Python). \
         curl https://mise.run | sh && \
         echo "eval \"\$(mise activate bash)\"" >> /home/shed/.bashrc && \
         # Bun (single-binary runtime + package manager for opencode + codex). \
         curl -fsSL https://bun.com/install | bash && \
         # Claude Code (ships its own bundled runtime; not Node-dependent). \
         curl -fsSL https://claude.ai/install.sh | bash && \
-        # Additional mise-managed tools. \
-        mise use -g github:charliek/envsecrets && \
         # OpenCode via Bun. \
         /home/shed/.bun/bin/bun add -g opencode-ai && \
         # Codex CLI via Bun. Bun lays down an npm-style shim \

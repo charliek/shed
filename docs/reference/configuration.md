@@ -100,6 +100,7 @@ log_level: info
 | `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Identity material (see [TLS and network surface](#tls-and-network-surface)). A second server on the same host needs its own `state_dir` and a distinct `name`. |
 | `exec` | object | - | Limits for the HTTPS exec endpoint (see [HTTPS exec](#https-exec)) |
 | `audit` | object | - | The audit log (see [Audit log](#audit-log)) |
+| `delivery` | object | - | Credential delivery (`delivery.timeout`, default `30s`; see [Credential delivery](delivery.md#configuration)) |
 | `network` | object | - | Network profiles (see [Network profiles](#network-profiles)) |
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
@@ -427,7 +428,7 @@ audit:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `audit.enabled` | bool | `false` | Turns the log on for a server without service clients (it then records HTTPS execs). The log is always on when `auth.clients` is set, whatever this says. |
+| `audit.enabled` | bool | on in `mtls` mode, off in open mode | The log is on by default in `mtls` mode and records HTTPS execs, shed lifecycle events and [delivery](delivery.md) events (the feed behind [`GET /api/activity`](api.md#get-apiactivity)). `true` turns it on and requires it: a server that cannot open it does not start. `false` turns the default off. A log that is on only by the default and cannot open is a warning, and the server starts without it. The log is always on when `auth.clients` is set, whatever this says. |
 | `audit.exec_argv` | string | `""` | `""` records only `argv0` and `argc` for each exec; `full` records the whole `argv`, which can carry prompts or secrets. Any other value is refused. |
 
 Each line is one JSON object with `ts` first:

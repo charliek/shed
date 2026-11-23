@@ -42,7 +42,7 @@ steps.
 |---------|-------------|
 | `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, and the shed-agent. No Docker, no coding agents, no language runtimes. |
 | `extensions` | `base` + [credential brokering](extensions.md) (SSH agent forwarding, AWS STS proxy, Docker credential helper) plus `strix` and `prox` from the stridelabs apt repo. No Docker daemon, no coding agents pinned — start here for custom images. |
-| `full` | `extensions` + Docker CE (with `docker compose`), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
+| `full` | `extensions` + Docker CE (with `docker compose`), `parcel` and `envsecrets` (from the stridelabs apt repo), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
 
 Each variant inherits from the one above it as a discrete OCI layer, so
 `shed image pull shed-vz-full` reuses the `base` and `extensions` layers
@@ -56,6 +56,12 @@ already cached locally.
     `full` does **not** ship a system Node.js or Python — install language
     runtimes per-project (e.g. `uv` provisions Python, `bun` is built in).
     See [Provisioning](provisioning.md) for the patterns.
+
+### `full`: parcel and envsecrets
+
+The `full` variant installs `parcel` and `envsecrets` from the stridelabs apt repository, unpinned like `strix` and `prox`; a broken release of either can break an image build. `envsecrets` used to be installed through mise and now comes from apt (mise itself stays). They are what [credential delivery](delivery.md) gives logins to: the `envsecrets-login` provider delivers an envsecrets config and passphrase so the shed pulls secrets for itself. A shed built from an image published before this change has neither tool until it is recreated from a newer image; the agent in such an image also predates delivery protocol 2, so delivery ends as `image_too_old`.
+
+The remote backend's cloud image installs the same two tools beside `strix` and `prox`.
 
 ### `extensions` variant
 

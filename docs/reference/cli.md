@@ -315,7 +315,7 @@ shed create <name> [flags]
 | `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
 | `--mounts` | | `all` | Which server mounts (the server config's `mounts:`) the shed gets: `all`, `none`, or a comma-separated list of mount names (`claude,gh`). Stored with the shed and applied on every start. `none` and a list need a server that advertises `mount_selection`; the CLI refuses them before creating anything otherwise. On a server with users, server mounts are for admins: for a user who is not an admin `all` gives none, and a named mount is refused. |
 | `--network` | | Server default (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only: no host, LAN, tailnet or other sheds). Fixed for the shed's life. `isolated` needs a server that advertises `network_profiles` (Firecracker, or a [remote](remote-backend.md) server); the CLI refuses it before creating anything otherwise. See [Security › Network profiles](security.md#network-profiles). |
-| `--no-provision` | | `false` | Skip provisioning hooks |
+| `--no-provision` | | `false` | Skip the install hook (recorded as skipped, so `shed provision` does not run it later). [Credential delivery](delivery.md) still runs. |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
 | `--timeout` | | `10m` | Timeout for create operation (e.g., `30s`, `5m`, `2h`) |
@@ -381,6 +381,8 @@ codelens      vz         running    codelens@mini-desktop:2222       2026-01-20 
 mcp-test      vz         stopped    -                                2026-01-17 14:00
 ```
 
+A `DELIVERY` column (before `CREATED`) appears only when some listed shed has a [credential delivery](delivery.md) to report: its state (`delivered`, `partial`, `not_delivered`, `not_applicable`), or `-` for a shed with none. A person who never bound a source, and every shed from before delivery, sees the listing as it was. `shed list -vv` adds a `Delivery:` line, with the owed steps and expired items.
+
 A `USER` column (before `CREATED`) appears only when the listed sheds belong to
 more than one user, which on a server with users means an admin's list.
 
@@ -416,7 +418,29 @@ shed start <name> [flags]
 |------|-------|---------|-------------|
 | `--timeout` | | `10m` | Timeout for start operation (e.g., `30s`, `5m`, `2h`) |
 
+A start contacts no credential source. If a delivered item has expired, `shed start` prints one warning per item on stderr: `Warning: delivered item <name> has expired. Run: shed provision <name>`.
+
 On a [remote](remote-backend.md) server the start answers at once with status `starting`. The CLI then polls the shed every 2 s for up to 180 s, printing progress on stderr, and prints "Started" only once the shed is running. If the start is refused (for example `stopped (capacity)`), the command fails and names the reason. CLIs released before this change print "Started" as soon as the server answers.
+
+### shed provision
+
+Delivers a shed's credentials again and finishes the steps its create left owed.
+
+```bash
+shed provision <name> [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--status` | | `false` | Print the shed's delivery record instead of provisioning: its state, each step, the last delivery and the delivered items (names, targets and fingerprints, never values). With `--json`, the record. |
+| `--timeout` | | `10m` | Timeout for the provision |
+
+The shed must be running, and only its own user may provision it (an admin may not provision another user's shed; script keys and service clients are refused). It asks your credential source (the machine bound with [`shed source use`](#shed-source)) for a bundle, then runs stage 1, the clone, stage 2 and the install hook in that order, each only if it is owed or failed; the delivered files are written again whenever your source answers. On a shed whose create finished, this is a re-delivery and nothing else. An existing project directory is never removed. A failure prints `Credentials were not delivered (<reason>). Run: shed provision <name>` Nothing is written when no answer is accepted (the source was offline or timed out, or the answer was refused), but a write failure can leave the items before the failed one written. Run `shed provision <name> --status` to see what the shed holds and what is owed. See [Credential delivery](delivery.md).
+
+```bash
+shed provision codelens
+shed provision codelens --status
+```
 
 ### shed stop
 
@@ -766,7 +790,7 @@ including any repo cloned via `--repo` — `shed reset` deletes it and re-create
 it empty. The shared, read-only lower image is untouched, and host-mounted
 directories from `--local-dir`/`--add-dir` survive (they live outside the
 overlay). This is the equivalent of "throw away anything I wrote inside the VM
-and start fresh from the same image."
+and start fresh from the same image." Delivered credentials go with it: reset clears the delivered items, marks the clone, the install hook and both delivery stages owed, asks no source, and prints `After starting the shed, run: shed provision <name>`.
 
 The shed must be stopped. Otherwise the API returns `SHED_NOT_STOPPED` (HTTP
 409). When using `--json`, `--force` is required.

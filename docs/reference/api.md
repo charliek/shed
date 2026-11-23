@@ -234,6 +234,8 @@ never renamed; treat an unknown token as absent.
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
 | `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
 | `async_lifecycle` | remote backend | Create, start, stop and delete return before the cloud work is done; see [Remote backend](remote-backend.md) |
+| `delivery` | always | The shed record carries `delivery` (see [Delivery in the shed document](#delivery-in-the-shed-document)); [`POST /api/sheds/{name}/provision`](#post-apishedsnameprovision) and the [delivery routes](#delivery-routes) exist |
+| `activity` | while the audit log is open | [`GET /api/activity`](#get-apiactivity) |
 | `source_binding` | a server with a credential bus | One machine per user answers credential requests; every subscribe and respond must carry the machine headers. See [Credential sources](#credential-sources) |
 
 The `shed` CLI refuses `--mounts none|<names>` against a server without
@@ -517,6 +519,66 @@ Deletes a shed and its data.
 
 An admin may delete any shed.
 
+### Delivery in the shed document
+
+Every shed record carries `delivery`, the record of the last delivery of credentials into the shed. It holds no value. A shed created before delivery existed reports `{"state": "none"}`.
+
+```json
+{
+  "delivery": {
+    "state": "partial",
+    "steps": {
+      "stage1": {"state": "done"},
+      "clone": {"state": "done"},
+      "stage2": {"state": "skipped", "reason": "no_items"},
+      "install": {"state": "owed"}
+    },
+    "last": {"at": "2026-11-23T10:00:00Z", "reason": "create", "outcome": "accepted",
+             "source": {"machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", "machine_name": "ada-laptop"}},
+    "items": [{"name": "github", "provider": "github", "stage": 1, "kind": "file", "base": "home",
+               "target": ".config/gh/hosts.yml", "fingerprint": "k3y-fp_01",
+               "written_at": "2026-11-23T10:00:02Z", "result": "ok"}],
+    "owed": ["install"]
+  }
+}
+```
+
+The members `state`, `steps`, `last` and `items` are the contract's record ([section 4](provision-contract.md)). The shed document adds `expired` (names of items past their `expires_at`), `owed` (the owed steps in the order they run) and `withheld` (`true` when the caller is an admin looking at another user's shed: only `state` is then present). See [Credential delivery](delivery.md) for the states and reasons.
+
+### POST /api/sheds/{name}/provision
+
+Delivers the shed's credentials again and finishes whatever its create left owed: the clone and the install hook. The shed must be running and the caller must be its own user. Script keys and service clients are refused with `403 FORBIDDEN`. The response is an SSE progress stream like [create](#sse-progress-streaming) and ends with the shed document.
+
+| Status | Code | When |
+|---|---|---|
+| 403 | `FORBIDDEN` | not the shed's user, a script key, or a service client |
+| 404 | `SHED_NOT_FOUND` | no such shed, or one the caller may not see |
+| 409 | `SHED_NOT_RUNNING` | the shed is not running |
+| 409 | `PROVISION_IN_PROGRESS` | a provision, or a remote job, is already running for the shed |
+
+A failed delivery is a progress warning, `Credentials were not delivered (<reason>). Run: shed provision <name>`, not an error status.
+
+### Delivery routes
+
+The server's channel to a person's credential source; the wire format is the [provision contract](provision-contract.md). Both routes need the `credentials` scope and the machine headers, and are refused for service clients and script keys.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/delivery/requests` | The source's SSE stream of delivery requests; the `200` carries `X-Shed-Delivery-Stream` |
+| `POST /api/delivery/requests/{id}` | The answer to one request; `204` when accepted |
+
+### GET /api/activity
+
+The shed lifecycle and delivery events from the server's audit log, newest first. Control scope, any caller; service clients may read their own. Advertised as the `activity` feature while the audit log is open.
+
+| Query | Meaning |
+|---|---|
+| `since` | an opaque cursor: pass the previous response's `next` to get the following (older) page. Omitted: the newest events. |
+| `shed` | only events about this shed, by name or id |
+| `limit` | a whole number from 1; larger than 500 is taken as 500 (default 100) |
+
+The response is `{events, next}`; pass `next` back as `since` for the following page (`next` is empty when there is nothing older). Each event has `id`, `at`, `kind` (`shed.create`, `shed.start`, `shed.stop`, `shed.delete`, `shed.reset`, `shed.assign`, `shed.provision.start`, `shed.provision.end`, `delivery`; an admin also sees older kinds), `shed` (name, id, user), `actor`, and `result` or `delivery`. A delivery event holds states, reasons, the source machine, item names, results and fingerprints, never a value or a target. Visibility is applied before paging: a person sees events of sheds that were theirs at the time, a service client its own, an admin all.
+
 ### POST /api/sheds/{name}/start
 
 Starts a stopped shed.
@@ -597,7 +659,7 @@ label; see [Remote backend › Users](remote-backend.md#users).
 Wipes and recreates the shed's per-shed writable overlay upper (the shed
 user's home directory, including any repo cloned via `repo`). The shared lower
 image is untouched, and host-mounted `local_dir`/`add_dirs` directories
-(outside the overlay) are unaffected. The shed must be stopped first.
+(outside the overlay) are unaffected. The shed must be stopped first. Reset clears the delivered items and marks every [delivery step](delivery.md) owed; it asks no source, and the CLI's output names `shed provision`.
 
 **Response (200 OK):** the (still-stopped) Shed object, same shape as
 `GET /api/sheds/{name}`.

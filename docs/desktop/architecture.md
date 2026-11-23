@@ -97,6 +97,10 @@ memory only (a server older than 0.10.0 still in token mode, removed in 0.10.0, 
 `open` server is reached over plain `http`, listens on loopback only, and takes no credential.
 The app never exposes a server further.
 
+### The credential source for delivery
+
+Beside the in-process broker, the app runs one delivery stream per configured server (`shed-source`, built on the machine identity and certificate store it shares with the broker). The server asks the stream's machine, the user's bound one, for a shed's credentials; the app answers with `shed-provision` and the five providers from `delivery.toml`, re-read for each request. See [Provisioning](provisioning.md) and [Credential delivery](../reference/delivery.md).
+
 ### The credential broker
 
 The headline feature. The app runs the credential broker **in-process**, from the `shed-broker`

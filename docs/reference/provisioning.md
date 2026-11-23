@@ -24,6 +24,9 @@ The `SHED_WORKSPACE` environment variable equals this landing directory.
 
 ### Create Sequence
 
+!!! note "Credential delivery"
+    On a shed whose user has a bound credential source, create also delivers credentials: a stage 1 write before the clone and a stage 2 write after it. The steps below show where. See [Credential delivery](delivery.md).
+
 When you run `shed create`, the following steps execute in order:
 
 | Step | Firecracker | VZ |
@@ -32,8 +35,10 @@ When you run `shed create`, the following steps execute in order:
 | 2. VM start | Allocate TAP device and IP, install an isolated shed's firewall entry before the VM starts, spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
 | 3. Local-dir mount | 9P mount at `/home/shed/<basename>` (plus each `--add-dir`) | VirtioFS mount at `/home/shed/<basename>` (plus each `--add-dir`) |
 | 4. Mount setup | The shed's selected server mounts (`--mounts`; all by default) mounted via 9P | The shed's selected server mounts (`--mounts`; all by default) mounted via VirtioFS |
+| 4b. Delivery, stage 1 | The user's source is asked once for files and environment values; the stage 1 items are written to the home directory (an SSH key or token the clone can use). Skipped with no bound source | Same |
 | 5. Repo clone | `git clone` into `/home/shed/<reponame>` (skipped if `--local-dir`), with the server's `env_file` variables (a service client's shed: without them) | Same |
-| 6. Install hook | Runs via vsock; state file marks completion | Same as Firecracker |
+| 5b. Delivery, stage 2 | The stage 2 items are written into the project directory (skipped for `--local-dir`) | Same |
+| 6. Install hook | Runs via vsock after stage 1, the clone and stage 2 are done or skipped; state file marks completion | Same as Firecracker |
 | 7. Startup hook | Runs via vsock | Same as Firecracker |
 | 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same |
 
@@ -125,7 +130,7 @@ automatically.
 
 ### Install Hook
 
-Runs once when the shed is created. Use for one-time setup:
+Runs once when the shed is created, after the repository clone and after credential delivery. It waits for both: if delivery failed (a bound source that is offline, say) or the clone failed, the hook stays owed instead of running, until `shed provision` finishes it. Use for one-time setup:
 
 - Installing packages
 - Creating databases
@@ -410,11 +415,17 @@ env:
     EOF
     ```
 
+## Credential delivery and `shed provision`
+
+If you have bound a credential source (`shed source use`), create asks it for files and environment values and writes them around the clone. The same four tracked steps (stage 1, clone, stage 2, install hook) are run by `shed provision <name>`, which finishes whatever a create left owed and delivers again. Delivered environment values land in `~/.config/environment.d/50-shed-delivery.conf` and reach commands started afterwards, so an install hook can use them. See [Credential delivery](delivery.md).
+
 ## Skipping Provisioning
 
 ```bash
 shed create myproject --repo github.com/user/repo --no-provision
 ```
+
+`--no-provision` skips the install hook only, and records it as `skipped` (`no_provision`). `shed provision <name>` retries only steps that are owed or failed, so it does not run that hook later. Credential delivery still runs.
 
 ## Debugging
 

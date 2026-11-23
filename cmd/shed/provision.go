@@ -35,7 +35,8 @@ is. An existing project directory is never removed.
 
 Only the shed's own user can provision it. The shed must be running.
 
---no-provision (on create) skips the install hook, not delivery.
+--no-provision (on create) skips the install hook, not delivery; the hook is
+recorded as skipped, so this command does not run it later.
 
 With --status, print the shed's delivery record instead: its state, each
 step, the last delivery and the delivered items (never their values).`,

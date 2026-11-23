@@ -601,6 +601,7 @@ test-integration-dev: check-no-dev-auth-mode build
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
 	  SHED_IMAGE_HAS_HOME_DIRS=vz \
+	  SHED_IMAGE_HAS_DELIVERY=vz \
 	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
@@ -1132,6 +1133,7 @@ test-integration-remote: build-cli
 	  SHED_FC_DEV_SERVER= \
 	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
 	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
+	  SHED_IMAGE_HAS_DELIVERY=remote \
 	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),remote,) \
 	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
@@ -1208,6 +1210,7 @@ test-integration-dev-fc: check-no-dev-auth-mode
 	  SHED_IMAGE_HAS_ROOST=fc \
 	  SHED_IMAGE_HAS_CRAZE=fc \
 	  SHED_IMAGE_HAS_HOME_DIRS=fc \
+	  SHED_IMAGE_HAS_DELIVERY=fc \
 	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),fc,) \
 	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
