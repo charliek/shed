@@ -649,7 +649,7 @@ func TestRemoteConfigFromYAML(t *testing.T) {
 		{"mounts", minimal + "mounts:\n  claude: {source: /tmp, target: /home/shed/.claude}\n", "mounts are not supported"},
 		{"egress enabled", minimal + "egress:\n  enabled: true\n", "egress.enabled is not supported"},
 		{"allow_cidrs", minimal + "network:\n  allow_cidrs: [192.168.1.0/24]\n", "network.allow_cidrs is not supported"},
-		{"extensions", minimal + "extensions:\n  enabled: [ssh-agent]\n", "extensions.enabled is not supported"},
+		{"extensions", minimal + "extensions:\n  enabled: [my-extension]\n", "extensions.enabled is not supported"},
 		{"client image that is not an alias", minimal + "https_port: 18490\n" + remoteClientYAML, "not an image alias of the remote backend"},
 		{"client server_mounts", minimalAliased + "https_port: 18490\n" + remoteClientYAML + "        server_mounts: [claude]\n", "server_mounts"},
 		{"firewall any beside a client", minimalAliased + "  firewall: {mode: any, acknowledge_any: true}\nhttps_port: 18490\n" + remoteClientYAML, "not allowed with auth.clients"},

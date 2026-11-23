@@ -258,11 +258,10 @@ func (d *doctor) checkExtensions() {
 		return
 	}
 	enabled := d.cfg.Extensions.Enabled
-	// Extensions ship as a directory of *.yaml manifests baked into the
-	// `extensions`/`full` rootfs image under /etc/shed-extensions.d (from
-	// guest/extensions/etc in the tree). If the user enabled an extension
-	// by name but the corresponding manifest isn't present, the credential
-	// broker won't start.
+	// Extensions are a directory of *.yaml manifests under
+	// /etc/shed-extensions.d. This checks only the names the operator
+	// enabled; the retired ssh-agent, aws-credentials and docker-credentials
+	// names are refused at config load, so no helper manifest is expected.
 	const extDir = "/etc/shed-extensions.d"
 	var missing []string
 	for _, name := range enabled {
@@ -272,7 +271,7 @@ func (d *doctor) checkExtensions() {
 		}
 	}
 	if len(missing) > 0 {
-		d.warn("extensions", fmt.Sprintf("enabled in config but manifest missing: %s; create the shed from an `extensions` or `full` image (those variants ship the manifests under /etc/shed-extensions.d)", strings.Join(missing, ", ")))
+		d.warn("extensions", fmt.Sprintf("enabled in config but manifest missing: %s; install the manifest under /etc/shed-extensions.d or remove the name from extensions.enabled", strings.Join(missing, ", ")))
 		return
 	}
 	d.pass("extensions", fmt.Sprintf("%d enabled, all manifests present", len(enabled)))

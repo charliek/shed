@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestExtensionsConfigValidate(t *testing.T) {
 	tests := []struct {
@@ -11,21 +16,21 @@ func TestExtensionsConfigValidate(t *testing.T) {
 		{
 			name: "valid with multiple namespaces",
 			config: &ExtensionsConfig{
-				Enabled: []string{"ssh-agent", "aws-credentials", "my-extension"},
+				Enabled: []string{"my-extension", "other-ext"},
 			},
 			wantErr: false,
 		},
 		{
 			name: "empty namespace rejected",
 			config: &ExtensionsConfig{
-				Enabled: []string{"ssh-agent", ""},
+				Enabled: []string{"my-extension", ""},
 			},
 			wantErr: true,
 		},
 		{
 			name: "duplicate namespace rejected",
 			config: &ExtensionsConfig{
-				Enabled: []string{"ssh-agent", "ssh-agent"},
+				Enabled: []string{"my-extension", "my-extension"},
 			},
 			wantErr: true,
 		},
@@ -63,6 +68,21 @@ func TestExtensionsConfigValidate(t *testing.T) {
 				Enabled: nil,
 			},
 			wantErr: false,
+		},
+		{
+			name:    "retired ssh-agent refused",
+			config:  &ExtensionsConfig{Enabled: []string{"ssh-agent"}},
+			wantErr: true,
+		},
+		{
+			name:    "retired aws-credentials refused",
+			config:  &ExtensionsConfig{Enabled: []string{"my-extension", "aws-credentials"}},
+			wantErr: true,
+		},
+		{
+			name:    "retired docker-credentials refused",
+			config:  &ExtensionsConfig{Enabled: []string{"docker-credentials"}},
+			wantErr: true,
 		},
 		{
 			name: "valid with dots and colons",
@@ -197,5 +217,37 @@ func TestParseUpperSize(t *testing.T) {
 				t.Errorf("ParseUpperSize(%q) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExtensionsConfigRetiredMessage(t *testing.T) {
+	for _, name := range []string{"ssh-agent", "aws-credentials", "docker-credentials"} {
+		err := (&ExtensionsConfig{Enabled: []string{name}}).Validate()
+		if err == nil || !strings.Contains(err.Error(), "docs/upgrades/v0.10-to-v0.11.md") || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: error %v does not name the name and the upgrade guide", name, err)
+		}
+	}
+}
+
+// TestRetiredExtensionsRefusedByTheCLILoader: the CLI's loader refuses a
+// retired helper too, and still takes any other extension name.
+func TestRetiredExtensionsRefusedByTheCLILoader(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "server.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	base := "name: t\ndefault_backend: firecracker\nfirecracker: {}\n"
+	for _, name := range []string{"ssh-agent", "aws-credentials", "docker-credentials"} {
+		_, err := LoadServerConfigForCLI(write(base + "extensions:\n  enabled: [" + name + "]\n"))
+		if err == nil || !strings.Contains(err.Error(), "docs/upgrades/v0.10-to-v0.11.md") {
+			t.Errorf("%s: err = %v, want the upgrade guide named", name, err)
+		}
+	}
+	if _, err := LoadServerConfigForCLI(write(base + "extensions:\n  enabled: [my-extension]\n")); err != nil {
+		t.Errorf("an other extension name was refused: %v", err)
 	}
 }

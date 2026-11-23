@@ -230,9 +230,7 @@ brews:
             # release page).
             # extensions:
             #   enabled:
-            #     - ssh-agent
-            #     - aws-credentials
-            #     - docker-credentials
+            #     - my-extension
 
             vz:
               vfkit_path: vfkit
@@ -297,9 +295,7 @@ brews:
             # release page).
             # extensions:
             #   enabled:
-            #     - ssh-agent
-            #     - aws-credentials
-            #     - docker-credentials
+            #     - my-extension
 
             firecracker:
               kernel_path: /var/lib/shed/firecracker/images/vmlinux

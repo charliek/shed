@@ -170,8 +170,7 @@ log_level: info
 # The agent activates corresponding systemd units at VM startup.
 # extensions:
 #   enabled:
-#     - ssh-agent
-#     - aws-credentials
+#     - my-extension
 
 # Git behaviour for in-VM clones
 # extra_known_hosts: lines appended to ~/.ssh/known_hosts before `git clone`

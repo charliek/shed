@@ -802,14 +802,26 @@ func (c *ServerConfig) validateBindAddress() error {
 // ExtensionsConfig configures which extensions the agent should enable.
 type ExtensionsConfig struct {
 	// Enabled lists the extension namespaces to activate in VMs
-	// (e.g., ["ssh-agent", "aws-credentials"]).
+	// (e.g., ["my-extension"]).
 	Enabled []string `yaml:"enabled"`
+}
+
+// retiredExtensions are the extension names whose in-VM helper binaries were
+// removed in v0.11 (plan 039). Naming one in extensions.enabled fails config
+// load; every other name keeps working through the generic manifest mechanism.
+var retiredExtensions = map[string]bool{
+	"ssh-agent":          true,
+	"aws-credentials":    true,
+	"docker-credentials": true,
 }
 
 // Validate checks that all extension namespaces are valid and unique.
 func (e *ExtensionsConfig) Validate() error {
 	seen := make(map[string]bool, len(e.Enabled))
 	for _, ns := range e.Enabled {
+		if retiredExtensions[ns] {
+			return fmt.Errorf("extension %q was removed in v0.11 and can no longer be enabled; remove it from extensions.enabled (see docs/upgrades/v0.10-to-v0.11.md)", ns)
+		}
 		if ns == "" {
 			return fmt.Errorf("extension namespace must not be empty")
 		}
@@ -2399,6 +2411,12 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	}
 	if err := c.validateNetwork(); err != nil {
 		return err
+	}
+	// The retired helpers are refused by every loader, the CLI's included.
+	if c.Extensions != nil {
+		if err := c.Extensions.Validate(); err != nil {
+			return fmt.Errorf("extensions config: %w", err)
+		}
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}

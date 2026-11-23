@@ -44,12 +44,6 @@ env_file: ~/.shed/env
 
 log_level: debug
 
-extensions:
-  enabled:
-    - ssh-agent
-    - aws-credentials
-    - docker-credentials
-
 default_backend: vz
 
 vz:
