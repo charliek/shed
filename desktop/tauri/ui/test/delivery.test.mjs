@@ -196,3 +196,8 @@ test("an only rule in one line", () => {
   assert.equal(onlyText(null), "");
   assert.equal(onlyText({ servers: ["a", "b"], repos: ["x/*"] }), "servers: a, b · repos: x/*");
 });
+
+test("a blank only entry is kept, never dropped into no restriction", () => {
+  const d = draftFromConfig("github", { enabled: true, only: { servers: [""] } });
+  assert.deepEqual(configFromDraft("github", d, true).only, { servers: [""] });
+});

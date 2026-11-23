@@ -307,6 +307,8 @@ func TestDeliveryWriteThroughAHostileAgent(t *testing.T) {
 	for _, d := range []*portDialer{
 		{notify: probeReply(guest.ApplyItemsProtocol, nil), console: echoing},
 		{notify: probeReply(guest.ApplyItemsProtocol, nil), console: intExit},
+		// A protocol number is the guest's to choose too.
+		{notify: probeReply(-735773577, nil)},
 		{notify: probeReply(0, func(id string) []byte {
 			return []byte(`{"namespace":"` + sentinel + `","type":"response","in_reply_to":"` + id + `"}`)
 		})},

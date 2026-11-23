@@ -354,8 +354,9 @@ export function configFromDraft(provider: string, d: ProviderDraft, enabled: boo
   }
   const only: Record<string, string[]> = {};
   for (const k of ONLY_KEYS) {
-    const list = d.only[k].filter((v) => v !== "");
-    if (list.length) only[k] = list;
+    // Sent exactly, blank entries included: dropping them could turn a
+    // restriction into none. A blank entry is refused by delivery.set.
+    if (d.only[k].length) only[k] = [...d.only[k]];
   }
   if (Object.keys(only).length) out.only = only;
   if (provider === "files") {

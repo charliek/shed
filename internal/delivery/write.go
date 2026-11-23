@@ -138,8 +138,9 @@ func (s *Service) Write(ctx context.Context, agent Agent, stage int, bundle *Bun
 			res.State, res.Reason = StepSkipped, ReasonNoItems
 			return res
 		}
-		log.Printf("delivery: stage %d: the shed's agent speaks protocol %d, below %d: its image cannot take items",
-			stage, info.Protocol, guest.ApplyItemsProtocol)
+		// The number is the guest's to choose: never repeated.
+		log.Printf("delivery: stage %d: the shed's agent speaks a protocol below %d: its image cannot take items",
+			stage, guest.ApplyItemsProtocol)
 		notWritten()
 		res.State, res.Reason = StepFailed, ReasonImageTooOld
 		res.Failure = &Failure{Reason: ReasonImageTooOld}

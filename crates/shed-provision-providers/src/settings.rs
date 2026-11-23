@@ -393,6 +393,16 @@ impl Walk<'_> {
             if items.is_empty() {
                 return Err(self.err(l.span(), Some(&k), SettingsProblem::EmptyList, None));
             }
+            // A blank entry matches nothing; read loosely it would be
+            // dropped, and the list could end up restricting nothing.
+            if let Some(i) = items.iter().position(|(s, _)| s.is_empty()) {
+                return Err(self.err(
+                    items[i].1.clone(),
+                    Some(&format!("{k}[{i}]")),
+                    SettingsProblem::InvalidValue,
+                    None,
+                ));
+            }
             Ok(Some(items))
         };
         let servers = list("servers")?.map(|l| l.into_iter().map(|(s, _)| s).collect());
@@ -721,6 +731,7 @@ mod tests {
             ("[sshkey]\nenabled = true\n", 1, 2, None, UnknownKey),
             ("[github]\ngh = \"gh\"\n", 1, 1, Some("github.enabled"), MissingKey),
             ("[github]\nenabled = true\n[github.only]\nservers = []\n", 4, 11, Some("github.only.servers"), EmptyList),
+            ("[github]\nenabled = true\n[github.only]\nservers = [\"\"]\n", 4, 12, Some("github.only.servers[0]"), InvalidValue),
             ("[github]\nenabled = true\n[github.only]\nrepos = [\"widgets\"]\n", 4, 10, Some("github.only.repos[0]"), InvalidValue),
             ("[github]\nenabled = true\n[github.only]\nbackends = [\"docker\"]\n", 4, 13, Some("github.only.backends[0]"), InvalidValue),
             ("[ssh-key]\nenabled = true\nkey_file = \"id_ed25519\"\n", 3, 12, Some("ssh-key.key_file"), InvalidValue),

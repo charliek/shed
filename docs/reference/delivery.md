@@ -131,7 +131,7 @@ The create streams the warning as progress. On the remote backend, whose create 
 
 ## Where values go
 
-The agent writes each item with its own file mode (`0600` or `0400`), under the shed user's home or the project directory, without following a symbolic link at any step of the path. Environment values go to one file, `~/.config/environment.d/50-shed-delivery.conf` (`0600`), replaced whole at each delivery. The agent reads that directory after `/etc/environment.d` when it builds a command's environment, so the values reach commands and sessions started afterwards. A process already running (a tmux server, a roost session, a craze hub) keeps the environment it started with.
+The agent writes each item with its own file mode (`0600` or `0400`), under the shed user's home or the project directory, without following a symbolic link at any step of the path. Environment values go to one file, `~/.config/environment.d/50-shed-delivery.conf` (`0600`), replaced whole at each delivery. The agent reads that directory after `/etc/environment.d` when it builds a command's environment, so the values reach commands and sessions started afterwards. A process already running (a tmux server, a roost session, a craze hub) keeps the environment it started with. That includes a new tmux session or window opened inside a tmux server that was already running: it inherits the server's environment, not the new values. To pick up a re-delivered value there, end that tmux server (`tmux kill-server`) or run the command through `shed exec`.
 
 The files are plain files. They are in snapshots and on a stopped cloud shed's disk.
 
