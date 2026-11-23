@@ -12,9 +12,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
+	"github.com/charliek/shed/internal/delivery/deliverytest"
 )
 
 // ---------------------------------------------------------------------------
@@ -48,6 +51,19 @@ type mockBackend struct {
 
 	// What the mock's hooks Register on cleanup.
 	cleanupsRun []string
+
+	// The delivery the create runs with: the service (nil: none), the
+	// shed's agent, its project directory, the clone's result, and every
+	// record saved, in order.
+	service     *delivery.Service
+	agent       delivery.Agent
+	projectDir  string
+	cloneResult delivery.Step
+	fl          *fakeLocal
+	// fromSnapshot makes PreFlight's a snapshot restore; cloneEnvs is each
+	// clone's egress env.
+	fromSnapshot bool
+	cloneEnvs    [][]string
 }
 
 func newMockBackend() *mockBackend {
@@ -74,7 +90,7 @@ func (b *mockBackend) PreFlight(ctx context.Context, req config.CreateShedReques
 	// removal in real backends); the mock simulates one to exercise
 	// the early-stage unwind path.
 	c.Register("remove creating marker", b.makeCleanup("remove creating marker"))
-	return mockPreFlight{}, nil
+	return mockPreFlight{fromSnapshot: b.fromSnapshot}, nil
 }
 
 func (b *mockBackend) AllocateNetwork(ctx context.Context, req config.CreateShedRequest, c *backend.Cleanup) (NetworkResources, error) {
@@ -143,17 +159,60 @@ func (b *mockBackend) ConfigureEgressProxy(ctx context.Context, req config.Creat
 	return b.failAt["ConfigureEgressProxy"]
 }
 
-func (b *mockBackend) CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
-	b.record("CloneRepo")
+func (b *mockBackend) DeliveryService() *delivery.Service { return b.service }
+
+// local is the shed the mock creates, as its delivery steps read it: a
+// running shed with the request's repo, every step owed (as
+// BuildAndPersistMetadata saves it), and the mock's agent.
+func (b *mockBackend) local(req config.CreateShedRequest) *fakeLocal {
+	if b.fl == nil {
+		b.fl = &fakeLocal{
+			shed: &config.Shed{Name: req.Name, User: req.User, Owner: req.Owner, Status: config.StatusRunning}, id: "shedid0000000000000000000a",
+			rec: delivery.NewRecord(), repo: req.Repo, projectDir: b.projectDir, writer: b.agent,
+		}
+	}
+	return b.fl
 }
 
-func (b *mockBackend) RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
+// createAll is a backend's CreateShed: the create, then its delivery steps
+// once the lifecycle lock (which the mock does not model) is released.
+func createAll(ctx context.Context, b *mockBackend, req config.CreateShedRequest) (*config.Shed, error) {
+	shed, pending, err := CreateShed(ctx, b, req)
+	if err != nil {
+		return nil, err
+	}
+	if got := pending.Run(ctx, b.local(req)); got == nil {
+		return shed, nil
+	}
+	return shed, nil
+}
+
+func (b *mockBackend) ResetGeneration(MetadataHandle) uint64 { return 0 }
+
+func (b *mockBackend) CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, env []string) delivery.Step {
+	b.record("CloneRepo")
+	b.cloneEnvs = append(b.cloneEnvs, env)
+	if b.cloneResult.State != "" {
+		return b.cloneResult
+	}
+	return delivery.Step{State: delivery.StepDone}
+}
+
+func (b *mockBackend) RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool) {
 	b.record("RunProvisioning")
+	st := delivery.Step{State: delivery.StepDone}
+	if !install {
+		st = delivery.Step{}
+	}
+	if startup != nil && startup(st, install) {
+		b.record("Startup")
+	}
+	return st, install
 }
 
 func (b *mockBackend) ToShedResult(meta MetadataHandle) *config.Shed {
 	b.record("ToShedResult")
-	return &config.Shed{Name: meta.Name(), Backend: config.BackendVZ}
+	return &config.Shed{Name: meta.Name(), ID: "shedid0000000000000000000a", Backend: config.BackendVZ, Status: config.StatusRunning}
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +223,7 @@ func (b *mockBackend) ToShedResult(meta MetadataHandle) *config.Shed {
 // that reorders a step or skips one shows up here.
 func TestCreateShed_HappyPathOrder(t *testing.T) {
 	b := newMockBackend()
-	got, err := CreateShed(context.Background(), b, config.CreateShedRequest{Name: "x"})
+	got, err := createAll(context.Background(), b, config.CreateShedRequest{Name: "x", Repo: "https://git.example.test/example/x.git"})
 	if err != nil {
 		t.Fatalf("happy-path CreateShed returned error: %v", err)
 	}
@@ -182,9 +241,10 @@ func TestCreateShed_HappyPathOrder(t *testing.T) {
 		"MountLocalDir",
 		"SetupCredentials",
 		"ConfigureEgressProxy",
+		"ToShedResult",
 		"CloneRepo",
 		"RunProvisioning",
-		"ToShedResult",
+		"Startup",
 	}
 	if !sliceEqual(b.calls, want) {
 		t.Errorf("hook call order =\n  %v\nwant\n  %v", b.calls, want)
@@ -267,7 +327,7 @@ func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 		t.Run(tc.failAt, func(t *testing.T) {
 			b := newMockBackend()
 			b.failAt[tc.failAt] = errors.New("injected failure")
-			_, err := CreateShed(context.Background(), b, config.CreateShedRequest{Name: "fail-" + tc.failAt})
+			_, err := createAll(context.Background(), b, config.CreateShedRequest{Name: "fail-" + tc.failAt})
 			if err == nil {
 				t.Fatal("expected error from injected failure")
 			}
@@ -291,7 +351,8 @@ func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 // them return error AND the orchestrator started propagating.
 func TestCreateShed_BestEffortHooksDoNotAbort(t *testing.T) {
 	b := newMockBackend()
-	got, err := CreateShed(context.Background(), b, config.CreateShedRequest{Name: "best-effort"})
+	b.cloneResult = delivery.Step{State: delivery.StepFailed, Reason: delivery.ReasonCloneFailed}
+	got, err := createAll(context.Background(), b, config.CreateShedRequest{Name: "best-effort", Repo: "https://git.example.test/example/x.git"})
 	if err != nil {
 		t.Fatalf("CreateShed returned error from best-effort path: %v", err)
 	}
@@ -301,7 +362,9 @@ func TestCreateShed_BestEffortHooksDoNotAbort(t *testing.T) {
 	// All three best-effort hooks must have been called (the failable
 	// egress hook sits between SetupCredentials and CloneRepo and is a
 	// happy-path no-op here).
-	wantTail := []string{"SetupCredentials", "ConfigureEgressProxy", "CloneRepo", "RunProvisioning", "ToShedResult"}
+	// A failed clone leaves the install hook owed: RunProvisioning is not
+	// called, and the shed is still returned.
+	wantTail := []string{"SetupCredentials", "ConfigureEgressProxy", "ToShedResult", "CloneRepo"}
 	gotTail := b.calls[len(b.calls)-len(wantTail):]
 	if !sliceEqual(gotTail, wantTail) {
 		t.Errorf("best-effort tail = %v, want %v", gotTail, wantTail)
@@ -320,4 +383,66 @@ func sliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestCreateShed_DeliverySteps: the create's delivery runs through the
+// backend's hooks with the request the backend names, saves the record at
+// each step, and warns once, with the fixed text, when the source is not
+// connected; a script key's create asks nothing.
+func TestCreateShed_DeliverySteps(t *testing.T) {
+	newSvc := func(mode deliverytest.Mode) (*deliverytest.Source, *delivery.Service) {
+		src := deliverytest.NewSource()
+		svc := delivery.NewService(src, 5*time.Second)
+		src.Attach(svc)
+		src.Set("alice", mode, nil)
+		return src, svc
+	}
+	req := config.CreateShedRequest{Name: "box", User: "alice", Repo: "https://git.example.test/example/box.git"}
+
+	t.Run("offline", func(t *testing.T) {
+		_, svc := newSvc(deliverytest.Offline)
+		b := newMockBackend()
+		b.service, b.agent, b.projectDir = svc, deliverytest.NewAgent(), "/home/shed/box"
+		var warnings []string
+		ctx := backend.ContextWithProgress(context.Background(), func(ev backend.ProgressEvent) {
+			if ev.Warning {
+				warnings = append(warnings, ev.Message)
+			}
+		})
+		if _, err := createAll(ctx, b, req); err != nil {
+			t.Fatal(err)
+		}
+		want := "Credentials were not delivered (source_offline). Run: shed provision box"
+		if len(warnings) != 1 || warnings[0] != want {
+			t.Fatalf("warnings = %q", warnings)
+		}
+		if len(b.fl.saved) != 4 {
+			t.Fatalf("%d saves, want one per step", len(b.fl.saved))
+		}
+		last := b.fl.saved[len(b.fl.saved)-1]
+		if last.Steps.Stage1.Reason != delivery.ReasonSourceOffline || last.Steps.Install.State != delivery.StepOwed {
+			t.Fatalf("record = %+v", last.Steps)
+		}
+		for _, c := range b.calls {
+			if c == "RunProvisioning" {
+				t.Fatal("the install hook ran with stage 1 failed")
+			}
+		}
+	})
+	t.Run("script key", func(t *testing.T) {
+		src, svc := newSvc(deliverytest.Answer)
+		b := newMockBackend()
+		b.service, b.agent = svc, deliverytest.NewAgent()
+		r := req
+		r.ScriptKey = true
+		if _, err := createAll(context.Background(), b, r); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(src.Requests()); n != 0 {
+			t.Fatalf("%d requests for a script key's create", n)
+		}
+		if st := b.fl.saved[len(b.fl.saved)-1].State; st != delivery.StateNotApplicable {
+			t.Fatalf("state = %s", st)
+		}
+	})
 }

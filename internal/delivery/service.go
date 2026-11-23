@@ -56,6 +56,18 @@ type Params struct {
 	FromSnapshot  bool
 }
 
+// Applicable reports whether a delivery for p would ask a source: false for
+// a shed created by a service client, a create with a script key, a
+// snapshot restore, and a user with no bound machine (each not_applicable,
+// with no warning).
+func (s *Service) Applicable(p Params) bool {
+	if s == nil || p.ServiceClient || p.ScriptKey || p.FromSnapshot {
+		return false
+	}
+	_, ok := s.pin.DeliveryBound(p.User)
+	return ok
+}
+
 // Result is what became of one Request.
 type Result struct {
 	// RequestID is the request's id ("" when none was sent).

@@ -79,5 +79,10 @@ func runReset(cmd *cobra.Command, args []string) error {
 
 	printSuccess("Reset shed %s on %s (upper layer recreated)", name, serverName)
 	fmt.Fprintln(os.Stderr, "Note: workspace contents and the lower image are unchanged.")
+	if shed != nil && shed.Delivery != nil {
+		// The delivered credentials went with the upper; nothing is asked
+		// of the source until the person asks.
+		fmt.Fprintf(os.Stderr, "Delivered credentials were removed with it, and the clone and install hook are owed. After starting the shed, run: shed provision %s\n", name)
+	}
 	return nil
 }

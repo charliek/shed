@@ -49,6 +49,13 @@ const (
 	// SOURCE_MACHINE_ID_REQUIRED, SOURCE_NOT_BOUND and
 	// SOURCE_DUPLICATE_STREAM. Advertised by a server with a credential bus.
 	FeatureSourceBinding = "source_binding"
+	// FeatureDelivery signals provisioning by delivery: every shed record
+	// carries "delivery" (its state, and for the shed's own user its steps,
+	// last delivery, items, expired item names and owed steps), POST
+	// /api/sheds/{name}/provision delivers a shed's credentials afresh and
+	// finishes its owed steps, and a source holds GET /api/delivery/requests.
+	// Advertised by a server whose backend can provision.
+	FeatureDelivery = "delivery"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -68,6 +75,9 @@ func (s *Server) serverFeatures() []string {
 	}
 	if s.plugins != nil {
 		features = append(features, FeatureSourceBinding)
+	}
+	if _, ok := backend.AsProvisioner(s.backend); ok {
+		features = append(features, FeatureDelivery)
 	}
 	return features
 }

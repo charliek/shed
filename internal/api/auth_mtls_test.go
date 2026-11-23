@@ -212,6 +212,10 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		{"delivery other path, control cert forbidden", "GET", "/api/delivery/x/y", ctl, 403},
 		{"delivery prefix lookalike, control cert", "GET", "/api/deliveryx", ctl, 200},
 		{"delivery no cert", "GET", "/api/delivery/requests", nil, 401},
+		// `shed provision` is a lifecycle route: control scope, never
+		// credentials (a source cannot cause a delivery).
+		{"provision, control cert", "POST", "/api/sheds/box/provision", ctl, 200},
+		{"provision, credentials cert forbidden", "POST", "/api/sheds/box/provision", cred, 403},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

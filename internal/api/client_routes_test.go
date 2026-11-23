@@ -77,6 +77,8 @@ var clientForbiddenList = []string{
 	"POST /api/plugins/listeners/{namespace}/respond",
 	"GET /api/plugins/sheds",
 	"POST /api/sheds/{name}/reset",
+	// Nobody provisions a service client's shed (plan 039 §3.2).
+	"POST /api/sheds/{name}/provision",
 	"POST /api/sheds/{name}/assign",
 	"GET /api/sheds/{name}/sessions",
 	"DELETE /api/sheds/{name}/sessions/{session}",

@@ -136,6 +136,7 @@ var pathParamRoutes = map[string]string{
 	"POST /api/sheds/{name}/stop":                     "shed",
 	"POST /api/sheds/{name}/assign":                   "shed",
 	"POST /api/sheds/{name}/reset":                    "shed",
+	"POST /api/sheds/{name}/provision":                "shed",
 	"POST /api/sheds/{name}/exec":                     "shed",
 	"GET /api/sheds/{name}/sessions":                  "shed",
 	"DELETE /api/sheds/{name}/sessions/{session}":     "shed",
@@ -202,8 +203,8 @@ func TestShedNameRouteWalk(t *testing.T) {
 			t.Errorf("classified route %s is not registered (stale list)", route)
 		}
 	}
-	if len(shedRoutes) != 13 {
-		t.Errorf("found %d shed routes, want 13: %v", len(shedRoutes), shedRoutes)
+	if len(shedRoutes) != 14 {
+		t.Errorf("found %d shed routes, want 14: %v", len(shedRoutes), shedRoutes)
 	}
 
 	for _, route := range shedRoutes {

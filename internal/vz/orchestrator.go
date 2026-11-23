@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
@@ -46,10 +47,6 @@ func (c *Client) egressGatewaySubnet() (gateway, subnet string) {
 
 type vzCreator struct {
 	c *Client
-	// egressEnv is the proxy env injected by ConfigureEgressProxy, threaded
-	// into the subsequent CloneRepo exec so the clone is audited. nil ⇒ egress
-	// off for this shed.
-	egressEnv []string
 }
 
 // vzPreFlight is the per-create resolved-input bundle handed from
@@ -303,8 +300,15 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		return nil, fmt.Errorf("failed to resolve workspace layout: %w", err)
 	}
 
+	id := req.ID
+	if id == "" {
+		if id, err = config.NewShedID(); err != nil {
+			return nil, err
+		}
+	}
 	meta := &Metadata{
 		Name:           req.Name,
+		ID:             id,
 		Status:         config.StatusStopped,
 		CreatedAt:      time.Now(),
 		Backend:        config.BackendVZ,
@@ -325,6 +329,8 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		// Always explicit for a new shed; nil (a non-API caller) is "all".
 		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
 		NetworkProfile: config.NetworkProfileOpen,
+		// Every step owed until the create's delivery decides it.
+		Delivery: delivery.NewRecord(),
 	}
 
 	// Register BEFORE Save: Save's `os.MkdirAll` runs first, so a
@@ -444,7 +450,7 @@ func (b *vzCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	gateway, subnet := b.c.egressGatewaySubnet()
-	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.CreatedAt, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	port, token, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.CreatedAt, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
 	if err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
@@ -454,55 +460,34 @@ func (b *vzCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("egress: save metadata: %w", err)
 	}
-	b.egressEnv = env
 	return nil
 }
 
-// CloneRepo runs `git clone` inside the guest when --repo is set
-// (and not overridden by --local-dir / --from-snapshot). Best-effort:
-// failures emit a sanitized StatusWarning and the create still
-// completes — matching today's behavior.
-func (b *vzCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
-	if req.Repo == "" || req.LocalDir != "" || req.FromSnapshot != "" {
-		return
-	}
+// ResetGeneration is the new shed's reset generation (orchestrator).
+func (b *vzCreator) ResetGeneration(metaRaw orchestrator.MetadataHandle) uint64 {
+	return metaRaw.(*vzMetaHandle).meta.ResetGen
+}
+
+// DeliveryService is the service the create's delivery steps ask.
+func (b *vzCreator) DeliveryService() *delivery.Service { return b.c.deliverySvc }
+
+// CloneRepo is the clone step: `git clone` inside the guest unless something
+// already stands at the project directory. A failure is a sanitized warning
+// and the create still completes.
+func (b *vzCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle, env []string) delivery.Step {
 	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, req.ServerEnvWithheld(meta.Owner), b.egressEnv); err != nil {
-		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
-		// Status attaches to the current ("clone") phase — see
-		// PR #135's opportunistic cleanup that removed the
-		// `repo=N clone=M repo=K` triple shape.
-		backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
-	} else {
-		backend.Status(ctx, "Repository cloned")
-	}
+	return vmutil.CloneStep(ctx, agent, req.Repo, func(ctx context.Context) error {
+		return vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, req.ServerEnvWithheld(meta.Owner), env)
+	})
 }
 
-// RunProvisioning loads the per-shed provisioning config and runs
-// any hooks it declares (unless the request opted out via
-// NoProvision). Best-effort.
-func (b *vzCreator) RunProvisioning(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
-	if req.NoProvision {
-		return
-	}
+// RunProvisioning runs the shed's hooks as the install step.
+func (b *vzCreator) RunProvisioning(ctx context.Context, _ config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool) {
 	meta := metaRaw.(*vzMetaHandle).meta
-	agent := b.c.newAgentClient(meta.Name)
-	provisioner := vmutil.NewProvisioner(agent, req.Name)
-	provisioner.SetWorkDir(meta.LandingDir)
-	provisioner.SetAddDirs(config.ProjectAddDirTargets(meta.ProjectMounts, meta.LandingDir))
-	provisioner.SetOutput(os.Stdout, os.Stderr)
-	cfg, err := provisioner.LoadConfig(ctx)
-	if err != nil {
-		log.Printf("Warning: failed to load provisioning config: %v", err)
-		return
-	}
-	runInstall := req.FromSnapshot == ""
-	if err := provisioner.RunProvisioning(ctx, cfg, runInstall); err != nil {
-		log.Printf("Warning: provisioning failed: %v", err)
-	}
+	return b.c.provisionerFor(meta).HooksStep(ctx, install, startup)
 }
 
 // ToShedResult returns the *config.Shed value the orchestrator hands

@@ -19,6 +19,8 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
+	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
@@ -154,6 +156,29 @@ type Backend struct {
 	// clone runs one attempt at a create's --repo clone. It is
 	// vmutil.CloneRepo; tests replace it.
 	clone func(ctx context.Context, agent *vmutil.AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error
+	// workTree probes what stands at a repository's project directory
+	// (vmutil.ProbeWorkTree), hooks runs a shed's hooks as the install step
+	// (vmutil.Provisioner.HooksStep), and writer is the agent a delivered
+	// stage is written through (the shed's own). Tests replace them.
+	workTree func(ctx context.Context, agent *vmutil.AgentClient, repo string) (vmutil.WorkTree, error)
+	hooks    func(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool)
+	writer   func(agent *vmutil.AgentClient) delivery.Agent
+	// rmPartial is removePartialClone (tests count it).
+	rmPartial func(ctx context.Context, agent *vmutil.AgentClient, repo string)
+	// saveRecord is the store's SaveRecord for a delivery step's write
+	// (tests fail it).
+	saveRecord func(*state.Record) error
+
+	// deliverySvc asks a shed user's source for its credentials (nil: no
+	// delivery). stepLocks holds a provision's step in hand against a stop
+	// or a delete of the shed (by name); provisioning holds one provision
+	// per shed.
+	deliverySvc  *delivery.Service
+	stepLocks    lockmap.NamedMutexMap
+	provisioning lockmap.NamedMutexMap
+	// halting is raised by a stop or a delete of the shed while it waits
+	// for the step lock: a provision's next step gives way to it.
+	halting lockmap.Flags
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -271,16 +296,21 @@ func New(opts Options) (*Backend, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Backend{
-		opts:        opts,
-		cfg:         opts.Config,
-		prov:        opts.Provider,
-		links:       opts.Links,
-		fw:          fw,
-		store:       store,
-		credMgr:     vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
-		logf:        opts.Logf,
-		now:         opts.Now,
-		clone:       vmutil.CloneRepo,
+		opts:     opts,
+		cfg:      opts.Config,
+		prov:     opts.Provider,
+		links:    opts.Links,
+		fw:       fw,
+		store:    store,
+		credMgr:  vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
+		logf:     opts.Logf,
+		now:      opts.Now,
+		clone:    vmutil.CloneRepo,
+		workTree: vmutil.ProbeWorkTree,
+		hooks: func(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool) {
+			return provisionerFor(agent, rec).HooksStep(ctx, install, startup)
+		},
+		writer:      func(agent *vmutil.AgentClient) delivery.Agent { return agent },
 		rootCtx:     ctx,
 		rootCancel:  cancel,
 		ready:       make(chan struct{}),
@@ -293,6 +323,8 @@ func New(opts Options) (*Backend, error) {
 		conns:       make(map[string]*shedLink),
 		idle:        make(chan struct{}),
 	}
+	b.rmPartial = b.removePartialClone
+	b.saveRecord = b.store.SaveRecord
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
 	}
@@ -417,6 +449,7 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	// every backend's record a selection is reported (mount_selection). Set
 	// on the copy only; the stored record carries none.
 	shed.Mounts = config.SelectedMounts(nil)
+	shed.Delivery = config.NewShedDelivery(r.Delivery, b.now())
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen
@@ -453,6 +486,29 @@ func (b *Backend) saveLocked(r *state.Record) {
 	if err := b.store.SaveRecord(r); err != nil {
 		b.logf("remote: saving the record of shed %s: %v", r.Shed.Name, err)
 	}
+}
+
+// updateDurable applies fn to a copy of the shed's record and writes the
+// copy; it becomes the record in memory only once the write put it in
+// place. It returns errSuperseded when the record is gone, the write's
+// error when nothing was put in place (the record is unchanged), and
+// state.ErrNotDurable when the copy is in place but its flush failed (the
+// record then is the copy, as the disk has it).
+func (b *Backend) updateDurable(name, id string, fn func(*state.Record)) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r := b.currentLocked(name, id)
+	if r == nil {
+		return errSuperseded
+	}
+	cp := r.Clone()
+	fn(cp)
+	err := b.saveRecord(cp)
+	if err != nil && !errors.Is(err, state.ErrNotDurable) {
+		return err
+	}
+	*r = *cp
+	return err
 }
 
 // saveMarkerLocked writes a delete marker and notes it as pending. An error

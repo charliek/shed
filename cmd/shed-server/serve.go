@@ -237,6 +237,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// whatever user its record carries.
 	pluginRegistry := plugin.NewRegistry()
 	pluginBridge := newPluginBridge(cfg, pluginRegistry)
+	// Provisioning by delivery: requests go to each user's bound machine
+	// over the pin; the delivery routes hand answers to the same service the
+	// backends' create and provision ask.
+	deliveryService := delivery.NewService(pluginRegistry, cfg.DeliveryTimeout())
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -268,6 +272,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to create firecracker client: %w", err)
 		}
 		log.Printf("Initialized Firecracker backend (default_image=%q, pull_policy=%s)", fcCfg.DefaultImage, fcCfg.PullPolicy)
+		fcClient.SetDelivery(deliveryService)
 		be = firecracker.NewBackend(fcClient)
 		egressSocketDir = fcCfg.SocketDir
 		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
@@ -286,6 +291,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to create vz client: %w", err)
 		}
 		log.Printf("Initialized VZ backend (default_image=%q, pull_policy=%s)", vzCfg.DefaultImage, vzCfg.PullPolicy)
+		vzClient.SetDelivery(deliveryService)
 		be = vz.NewBackend(vzClient)
 		egressSocketDir = vzCfg.SocketDir
 		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
@@ -300,6 +306,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
 			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
+		rb.SetDelivery(deliveryService)
 		be = rb
 		// Egress control is refused on remote at load, so these two are
 		// never used; they are set so nothing below sees an empty path.
@@ -561,10 +568,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
-	// Provisioning by delivery: requests go to each user's bound machine over
-	// the pin; the delivery routes hand answers to the same service the
-	// lifecycle asks.
-	deliveryService := delivery.NewService(pluginRegistry, cfg.DeliveryTimeout())
 	apiServer.SetDelivery(deliveryService)
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 )
 
 // MetadataVersion is the current metadata schema version.
@@ -50,6 +51,11 @@ type Metadata struct {
 
 	// Name is the shed name
 	Name string `json:"name"`
+
+	// ID is the shed's permanent id (config.NewShedID), given at create. A
+	// shed created before delivery has none until its first `shed
+	// provision`. Additive: the metadata version is unchanged.
+	ID string `json:"id,omitempty"`
 
 	// Status is the VM status (running, stopped, error)
 	Status string `json:"status"`
@@ -135,6 +141,17 @@ type Metadata struct {
 	// NetworkProfile is the shed's network profile. VZ offers only "open";
 	// new sheds store it explicitly and a missing value means open.
 	NetworkProfile string `json:"network_profile,omitempty"`
+
+	// Delivery is the shed's delivery record (the provision contract's
+	// record shape), saved after each step of a create or a provision. Nil
+	// for a shed created before delivery: it reports {"state": "none"}.
+	Delivery *delivery.Record `json:"delivery,omitempty"`
+
+	// ResetGen counts the shed's resets (`shed reset` bumps it). A delivery
+	// step that finds it changed since its run began ends the run: the disk
+	// it was delivering to is gone. Additive: the metadata version is
+	// unchanged.
+	ResetGen uint64 `json:"reset_gen,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

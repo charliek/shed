@@ -140,6 +140,30 @@ func (b *userFakeBackend) StartShed(ctx context.Context, name string) (*config.S
 	return b.GetShed(ctx, name)
 }
 
+func (b *userFakeBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
+	// As the backends do: admission refuses a shed that is not running.
+	b.mu.Lock()
+	sh, ok := b.sheds[name]
+	b.mu.Unlock()
+	if ok && sh.Status != config.StatusRunning {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+	}
+	if err := b.act(ctx, "provision", name); err != nil {
+		return nil, err
+	}
+	return userProvisionRun{b: b, name: name}, nil
+}
+
+type userProvisionRun struct {
+	b    *userFakeBackend
+	name string
+}
+
+func (r userProvisionRun) Run(ctx context.Context) (*config.Shed, error) {
+	return r.b.GetShed(ctx, r.name)
+}
+func (r userProvisionRun) Release() {}
+
 func (b *userFakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.act(ctx, "stop", name); err != nil {
 		return nil, err
@@ -399,6 +423,7 @@ var userRouteClasses = map[string]string{
 	"POST /api/sheds/{name}/stop":                     "shed:manage",
 	"POST /api/sheds/{name}/assign":                   "admin",
 	"POST /api/sheds/{name}/reset":                    "shed:enter",
+	"POST /api/sheds/{name}/provision":                "shed:enter",
 	"POST /api/sheds/{name}/exec":                     "shed:enter",
 	"GET /api/sheds/{name}/sessions":                  "shed:enter",
 	"DELETE /api/sheds/{name}/sessions/{session}":     "shed:enter",
@@ -495,6 +520,7 @@ var userRouteAllowed = map[string]int{
 	// "box" is alice's already (TestAssignShedRoute assigns one with none).
 	"POST /api/sheds/{name}/assign":               http.StatusConflict,
 	"POST /api/sheds/{name}/reset":                http.StatusOK,
+	"POST /api/sheds/{name}/provision":            http.StatusOK,
 	"POST /api/sheds/{name}/exec":                 http.StatusOK,
 	"GET /api/sheds/{name}/sessions":              http.StatusOK,
 	"DELETE /api/sheds/{name}/sessions/{session}": http.StatusNoContent,

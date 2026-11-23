@@ -9,6 +9,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/provider/fake"
 	"github.com/charliek/shed/internal/vmutil"
 )
@@ -263,8 +264,20 @@ func TestCloneWithholdsServerEnvForAUserWhoIsNotAnAdmin(t *testing.T) {
 		if got := e.settled("box"); got.Status != config.StatusRunning || got.ID != id {
 			t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
 		}
+		// A create resumed after a restart runs no step on its own: the
+		// clone stays owed for `shed provision`, which withholds the
+		// server's variables too (the flag is on the record).
+		if got := rec.calls(); len(got) != 0 {
+			t.Fatalf("the resumed create cloned on its own: %v", got)
+		}
+		if st := e.storedRecord("box").Delivery.Steps.Clone.State; st != delivery.StepOwed {
+			t.Fatalf("resumed create's clone is %s, want owed", st)
+		}
+		if _, err := e.b.ProvisionShed(ctxT(t), "box"); err != nil {
+			t.Fatalf("provision: %v", err)
+		}
 		if got := rec.calls(); len(got) != 1 || !got[0] {
-			t.Errorf("resumed clone: owned %v, want [true]", got)
+			t.Errorf("provision's clone: owned %v, want [true]", got)
 		}
 	})
 }

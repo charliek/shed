@@ -24,6 +24,9 @@ var _ backend.SnapshotStamper = (*FirecrackerBackend)(nil)
 // Compile-time check that FirecrackerBackend counts the records its listing skips.
 var _ backend.CountingLister = (*FirecrackerBackend)(nil)
 
+// Compile-time check: `shed provision` is offered.
+var _ backend.Provisioner = (*FirecrackerBackend)(nil)
+
 // FirecrackerBackend implements backend.Backend using Firecracker VMs.
 type FirecrackerBackend struct {
 	client *Client
@@ -103,6 +106,12 @@ func (b *FirecrackerBackend) StampSnapshotUser(ctx context.Context, name, user s
 // ResetShed wipes and recreates a stopped shed's writable upper layer.
 func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.client.ResetShed(ctx, name)
+}
+
+// BeginProvision admits `shed provision` on a running shed
+// (backend.Provisioner).
+func (b *FirecrackerBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
+	return b.client.BeginProvision(ctx, name)
 }
 
 // ListSessions returns all tmux sessions in a shed.

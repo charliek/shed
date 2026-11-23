@@ -62,6 +62,13 @@ type job struct {
 	// included. It is never stored; a create resumed after a restart
 	// clones the stored, stripped URL.
 	repoURL string
+	// deliver is set on the job a create request started: its delivery
+	// steps run and its source is asked. Like repoURL it is never stored:
+	// a create resumed after a restart has lost its bundle and asks no
+	// source on its own (its unfinished steps stay owed). scriptKey is the
+	// create's (no request for a script key's shed).
+	deliver   bool
+	scriptKey bool
 
 	// fastWindow and fastErr are guarded by Backend.mu. While fastWindow is
 	// true the create handler has not answered yet, and a failure is its to
@@ -506,36 +513,10 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, id)
 	})
 
-	if rec.Shed.Repo != "" && !rec.Cloned {
-		repo := j.repoURL
-		if repo == "" {
-			repo = rec.Shed.Repo
-		}
-		backend.Phase(ctx, "repo")
-		backend.Status(ctx, "Cloning repository...")
-		// The server's env_file variables stay out of the clone of a
-		// service client's shed and of a shed of a user who is not an admin
-		// (the record keeps that from the create, across a restart).
-		withheld := owned || rec.NoServerEnv
-		if err := b.cloneRepo(ctx, agent, rec, repo, withheld); err != nil {
-			if ctx.Err() != nil {
-				return errSuperseded
-			}
-			b.logf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(rec.Shed.Repo), err)
-			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
-		} else {
-			backend.Status(ctx, "Repository cloned")
-		}
-		b.update(j.name, j.id, func(r *state.Record) { r.Cloned = true })
-	}
-
-	if !rec.NoProvision && !rec.Provisioned {
-		backend.Phase(ctx, "provision")
-		b.provision(ctx, agent, rec, true)
-		if ctx.Err() != nil {
-			return errSuperseded
-		}
-		b.update(j.name, j.id, func(r *state.Record) { r.Provisioned = true })
+	// The tracked steps: stage 1, the clone, stage 2, the install hook,
+	// each saved in the record as it is decided.
+	if err := b.createSteps(ctx, j, rec, agent, owned); err != nil {
+		return err
 	}
 
 	backend.Phase(ctx, "ready")
@@ -582,8 +563,12 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 // is the commit point: such a shed is never created again and never cleaned
 // up as a failed create, whatever its instance is doing now. The record takes
 // the status an adopted shed would get.
+//
+// The delivery record is left as the create saved it: a step it did not
+// record done or skipped stays owed, and nothing is marked done that the
+// server did not see.
 func (b *Backend) commitCreatedLocked(r *state.Record, inst provider.Instance) {
-	r.Ready, r.Cloned, r.Provisioned = true, true, true
+	r.Ready = true
 	r.Pending = nil
 	if r.Ref == "" {
 		r.Ref = inst.Ref
@@ -719,7 +704,11 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 // Git never prompts (GIT_TERMINAL_PROMPT=0), so a repository that needs
 // credentials the URL lacks fails at once instead of waiting on a terminal.
 // repo may carry credentials; it is never logged.
-func (b *Backend) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, repo string, owned bool) error {
+//
+// Under provision nothing is ever removed: a failed attempt's leftovers are
+// not cleared, and when something stands at the project directory after a
+// failed attempt the clone stops there instead of trying again.
+func (b *Backend) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, repo string, owned, provision bool) error {
 	shown := config.SanitizeRepoURL(rec.Shed.Repo)
 	for attempt := 1; ; attempt++ {
 		actx, cancel := context.WithTimeout(ctx, b.opts.CloneTimeout)
@@ -735,10 +724,17 @@ func (b *Backend) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, rec 
 		if attempt >= cloneAttempts {
 			return fmt.Errorf("after %d attempts: %w", attempt, err)
 		}
-		b.logf("remote: clone of %s into shed %s failed (attempt %d of %d); retrying in %s: %v",
-			shown, rec.Shed.Name, attempt, cloneAttempts, b.opts.CloneRetryPause, err)
+		// The error may quote the guest: only its class is logged.
+		b.logf("remote: clone of %s into shed %s failed (attempt %d of %d, %s); retrying in %s",
+			shown, rec.Shed.Name, attempt, cloneAttempts, vmutil.CloneErrorClass(err), b.opts.CloneRetryPause)
+		if provision {
+			if wt, perr := b.workTree(ctx, agent, rec.Shed.Repo); perr != nil || wt != vmutil.WorkTreeAbsent {
+				return fmt.Errorf("after %d attempts, with the project directory not empty (left as it is): %w", attempt, err)
+			}
+		} else {
+			b.rmPartial(ctx, agent, repo)
+		}
 		backend.Status(ctx, fmt.Sprintf("Clone failed; retrying (attempt %d of %d)...", attempt+1, cloneAttempts))
-		b.removePartialClone(ctx, agent, repo)
 		select {
 		case <-time.After(b.opts.CloneRetryPause):
 		case <-ctx.Done():
@@ -748,7 +744,8 @@ func (b *Backend) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, rec 
 }
 
 // removePartialClone removes what a failed clone left behind, so the next
-// attempt does not find a directory in its way. Best-effort.
+// attempt does not find a directory in its way. Best-effort. A create's own
+// clone only: never under provision.
 func (b *Backend) removePartialClone(ctx context.Context, agent *vmutil.AgentClient, repo string) {
 	dir, err := config.RepoDirName(repo)
 	if err != nil || strings.HasPrefix(dir, "-") {
@@ -764,9 +761,8 @@ func (b *Backend) removePartialClone(ctx context.Context, agent *vmutil.AgentCli
 	})
 }
 
-// provision runs the shed's provisioning hooks through the agent, the same
-// way the local backends do. Best-effort: failures are logged.
-func (b *Backend) provision(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, runInstall bool) {
+// provisionerFor runs rec's hooks through agent in its landing directory.
+func provisionerFor(agent *vmutil.AgentClient, rec *state.Record) *vmutil.Provisioner {
 	workDir := rec.Shed.LandingDir
 	if workDir == "" {
 		workDir = config.HomePath
@@ -774,6 +770,14 @@ func (b *Backend) provision(ctx context.Context, agent *vmutil.AgentClient, rec 
 	provisioner := vmutil.NewProvisioner(agent, rec.Shed.Name)
 	provisioner.SetWorkDir(workDir)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
+	return provisioner
+}
+
+// provision runs the shed's startup hook through the agent (runInstall is
+// false at every start), the same way the local backends do. Best-effort:
+// failures are logged.
+func (b *Backend) provision(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, runInstall bool) {
+	provisioner := provisionerFor(agent, rec)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {
 		b.logf("Warning: failed to load provisioning config for %s: %v", rec.Shed.Name, err)

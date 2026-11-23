@@ -11,6 +11,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 )
@@ -172,6 +173,8 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		Spec:        &spec,
 		Job:         state.JobCreate,
 		NoProvision: req.NoProvision,
+		// Every step owed until the create job decides it.
+		Delivery:    delivery.NewRecord(),
 		NoServerEnv: req.NoServerEnv,
 		Size:        size.Name,
 		DiskGB:      diskGB,
@@ -200,6 +203,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	b.records[req.Name] = rec
 	j := b.newJobLocked(state.JobCreate, req.Name, id)
 	j.repoURL = repoURL
+	j.deliver, j.scriptKey = true, req.ScriptKey
 	j.fastWindow = true
 	first := b.shedOf(rec)
 	b.mu.Unlock()
@@ -350,6 +354,9 @@ func (b *Backend) StopShed(ctx context.Context, name string) (*config.Shed, erro
 	if err := b.checkReady(); err != nil {
 		return nil, err
 	}
+	// A provision's step in hand finishes first; its next step then finds
+	// the stop and ends the provision.
+	defer b.waitStep(name)()
 	b.mu.Lock()
 	r, err := b.lookupLocked(ctx, name)
 	if err != nil {
@@ -423,6 +430,8 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 	if err := b.checkReady(); err != nil {
 		return err
 	}
+	// A provision's step in hand finishes first (see StopShed).
+	defer b.waitStep(name)()
 	b.mu.Lock()
 	r, err := b.lookupLocked(ctx, name)
 	if err != nil {

@@ -300,6 +300,9 @@ func (s *Server) Router() chi.Router {
 				// Give a shed with no user to a user (admin only).
 				r.Post("/assign", s.handleAssignShed)
 				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
+				// Deliver the shed's credentials afresh and finish its
+				// owed steps (control scope; the shed's own user only).
+				r.Post("/provision", s.handleProvisionShed)
 
 				// HTTPS exec: one command, NDJSON output (control scope
 				// in an enforced mode, via authorizeScope's default).

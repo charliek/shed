@@ -1935,6 +1935,40 @@ func (c *APIClient) StopShed(name string) (*config.Shed, error) {
 	return &shed, nil
 }
 
+// ProvisionShedWithProgress runs `shed provision` on a shed, streaming its
+// progress via SSE (a failed delivery arrives as a warning), and returns the
+// shed record it ends with.
+func (c *APIClient) ProvisionShedWithProgress(name string, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
+	defer cancel()
+	url := c.baseURL + "/api/sheds/" + name + "/provision"
+	client := c.newHTTPClient(0)
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq = pinCredential(httpReq, cred)
+		return client.Do(httpReq)
+	}
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+		}
+		return connectFailure(err)
+	}
+	resp, err := c.sendWithReauth(send, wrapSendErr)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.parseError(resp)
+	}
+	return c.readShedSSEStream(resp.Body, onProgress)
+}
+
 // ResetShed resets the per-shed writable upper layer.
 func (c *APIClient) ResetShed(name string) (*config.Shed, error) {
 	var shed config.Shed

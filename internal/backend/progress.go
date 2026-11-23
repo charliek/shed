@@ -1,6 +1,10 @@
 package backend
 
-import "context"
+import (
+	"context"
+
+	"github.com/charliek/shed/internal/delivery"
+)
 
 // ProgressEvent is what crosses the ContextWithProgress wire and, via
 // the SSE handler, what crosses the HTTP wire to the `shed` CLI.
@@ -136,5 +140,15 @@ func TeeProgress(fns ...ProgressFunc) ProgressFunc {
 		for _, fn := range live {
 			fn(e)
 		}
+	}
+}
+
+// DeliveryProgress is where a delivery run reports on ctx: its phases go to
+// the phase timer, its status lines and its warning to the progress stream.
+func DeliveryProgress(ctx context.Context) delivery.Progress {
+	return delivery.Progress{
+		Phase:  func(name string) { Phase(ctx, name) },
+		Status: func(msg string) { Status(ctx, msg) },
+		Warn:   func(msg string) { StatusWarning(ctx, msg) },
 	}
 }

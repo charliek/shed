@@ -17,9 +17,11 @@ import (
 
 	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
 	"github.com/charliek/shed/internal/vmimage"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 var createCmd = &cobra.Command{
@@ -603,6 +605,8 @@ type shedJSON struct {
 	// the server sends none.
 	Isolation string `json:"isolation,omitempty"`
 	Arch      string `json:"arch,omitempty"`
+	// Delivery is the record's delivery, as the server sends it.
+	Delivery *config.ShedDelivery `json:"delivery,omitempty"`
 }
 
 // shedListJSON is the `shed list --json` document.
@@ -631,6 +635,7 @@ func shedListJSON(sheds []listedShed) []shedJSON {
 			NetworkProfile: s.shed.NetworkProfile,
 			Isolation:      s.shed.Isolation,
 			Arch:           s.shed.Arch,
+			Delivery:       s.shed.Delivery,
 		}
 		if s.shed.Status == config.StatusRunning {
 			sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -662,6 +667,30 @@ func mixedUsers(users []string) bool {
 	return false
 }
 
+// deliveryShown reports whether a listing gets a DELIVERY column: only when
+// some shed has a delivery to speak of (delivered, partial or not
+// delivered). A person who never bound a source, and every shed from before
+// delivery, sees the listing as it was.
+func deliveryShown(sheds []listedShed) bool {
+	for _, s := range sheds {
+		if d := s.shed.Delivery; d != nil {
+			switch d.State {
+			case delivery.StateDelivered, delivery.StatePartial, delivery.StateNotDelivered:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deliveryCell is a shed's DELIVERY cell: its state, "-" when it has none.
+func deliveryCell(s config.Shed) string {
+	if s.Delivery == nil || s.Delivery.State == "" || s.Delivery.State == delivery.StateNone {
+		return "-"
+	}
+	return string(s.Delivery.State)
+}
+
 // renderShedTable is the default `shed list` table.
 func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 	users := make([]string, len(sheds))
@@ -669,6 +698,7 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 		users[i] = s.shed.User
 	}
 	withUser := mixedUsers(users)
+	withDelivery := deliveryShown(sheds)
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	header := []string{"NAME"}
@@ -678,6 +708,9 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 	header = append(header, "BACKEND", "STATUS", "SSH")
 	if withUser {
 		header = append(header, "USER")
+	}
+	if withDelivery {
+		header = append(header, "DELIVERY")
 	}
 	header = append(header, "CREATED")
 	fmt.Fprintln(w, strings.Join(header, "\t"))
@@ -694,6 +727,9 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 		row = append(row, valueOrDash(s.shed.Backend), s.shed.Status, ssh)
 		if withUser {
 			row = append(row, valueOrDash(s.shed.User))
+		}
+		if withDelivery {
+			row = append(row, sdkbootstrap.SafeText(deliveryCell(s.shed)))
 		}
 		row = append(row, s.shed.CreatedAt.Format("2006-01-02 15:04"))
 		fmt.Fprintln(w, strings.Join(row, "\t"))
@@ -714,6 +750,7 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 		withID = withID || s.shed.ID != ""
 		withUser = withUser || s.shed.User != ""
 	}
+	withDelivery := deliveryShown(sheds)
 	header := []string{"NAME"}
 	if listAll {
 		header = append(header, "SERVER")
@@ -723,6 +760,9 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 		header = append(header, "USER")
 	}
 	header = append(header, "MOUNTS", "NETWORK", "UPTIME")
+	if withDelivery {
+		header = append(header, "DELIVERY")
+	}
 	if withID {
 		header = append(header, "ID")
 	}
@@ -762,6 +802,9 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 			row = append(row, valueOrDash(s.shed.User))
 		}
 		row = append(row, formatShedMounts(s.shed.Mounts), formatNetworkProfile(s.shed.NetworkProfile), uptime)
+		if withDelivery {
+			row = append(row, sdkbootstrap.SafeText(deliveryCell(s.shed)))
+		}
 		if withID {
 			row = append(row, valueOrDash(s.shed.ID))
 		}
@@ -792,6 +835,16 @@ func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
 		}
 		fmt.Fprintf(out, "Server Mounts:  %s\n", formatShedMounts(s.shed.Mounts))
 		fmt.Fprintf(out, "Network:        %s\n", formatNetworkProfile(s.shed.NetworkProfile))
+		if d := s.shed.Delivery; d != nil && d.State != "" {
+			line := string(d.State)
+			if len(d.Owed) > 0 {
+				line += " (owed: " + strings.Join(d.Owed, ", ") + ")"
+			}
+			if len(d.Expired) > 0 {
+				line += " (expired: " + strings.Join(d.Expired, ", ") + ")"
+			}
+			fmt.Fprintf(out, "Delivery:       %s\n", sdkbootstrap.SafeText(line))
+		}
 		if img := formatShedImage(s.shed); img != "" {
 			fmt.Fprintf(out, "Image:          %s\n", img)
 		}
@@ -1047,6 +1100,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 	printSuccess("Started shed %s", name)
+	// Start asks no source: an item that has expired stays as it is until
+	// the next `shed provision`.
+	warnExpiredItems(os.Stderr, shed)
 	return nil
 }
 
