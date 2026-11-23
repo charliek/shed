@@ -49,7 +49,9 @@ members = [
 #   - `shed-source` (plan 039 §3.7): what a machine needs to be a credential
 #     source (machine identity, state paths, credential store, SSH-bootstrap
 #     minter, control-token provider), extracted from `shed-broker`, which
-#     re-exports it. Reaches only `shed-core`/`shed-lane`; no saphyr-parser.
+#     re-exports it, plus the delivery stream client, server discovery from the
+#     shed CLI config and the per-server tasks (A6). Reaches only
+#     `shed-core`/`shed-lane`/`shed-provision`; no saphyr-parser.
 #
 # The opencode adapter crate (plan 015) was removed in plan 038 — craze is the sole agent
 # lane. `shed-gx` (plan 017) was retired in plan 025; `sx` and `shed-rc-engine`

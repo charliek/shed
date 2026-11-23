@@ -31,6 +31,7 @@
 //! and a `tokio::sync::watch` join. The mutex guard is always dropped before awaiting
 //! the join (Go releases `s.mu` before `<-call.done`).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1195,7 +1196,39 @@ impl CredentialSource {
     /// write is best-effort: the credential is live in memory, the user it is for is
     /// already held, and an unwritten file costs one extra SSH mint after a restart.
     async fn do_mint(self: Arc<Self>, tx: watch::Sender<Option<Arc<MintOutcome>>>) {
-        let result = self.minter.mint(&self.target, &self.scope).await;
+        // One mint at a time per store, server and scope in this process (plan 039 A6: the
+        // broker's bus and the delivery source share the credentials store). Held across
+        // the mint and its write; whoever waited re-reads the store first and adopts what
+        // the other stored instead of minting a second certificate.
+        let mut turn = match self.mint_turn() {
+            Some(turn) => Some(turn.lock_owned().await),
+            None => None,
+        };
+        if let Some(outcome) = self.adopt_newer_stored() {
+            self.state.lock().unwrap().inflight = None;
+            let _ = tx.send(Some(Arc::new(Ok(outcome))));
+            return;
+        }
+        let mint = self.minter.mint(&self.target, &self.scope);
+        let result = match (self.fence.clone(), turn.is_some()) {
+            // A source whose group was stopped writes nothing more (the fence), so it
+            // gives up its turn at once and never holds up the source replacing it.
+            (Some(mut fence), true) => {
+                tokio::pin!(mint);
+                let stopped = async move {
+                    let _ = fence.wait_for(|stopped| *stopped).await;
+                };
+                tokio::select! {
+                    r = &mut mint => r,
+                    () = stopped => {
+                        turn = None;
+                        mint.await
+                    }
+                }
+            }
+            _ => mint.await,
+        };
+        let _turn = turn;
         let step = {
             let mut st = self.state.lock().unwrap();
             self.decide_locked(&mut st, result)
@@ -1239,6 +1272,73 @@ impl CredentialSource {
         self.state.lock().unwrap().inflight = None;
         // The joined callers read THIS call's outcome (not a re-read of shared state).
         let _ = tx.send(Some(Arc::new(outcome)));
+    }
+
+    /// This source's turn to mint (see [`Self::do_mint`]): shared by every source in the
+    /// process over the same store, server and scope; `None` for a source with no store.
+    fn mint_turn(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let store = self.store.as_ref()?;
+        if self.target.name.is_empty() {
+            return None;
+        }
+        type Turns = HashMap<(std::path::PathBuf, String, String), Arc<tokio::sync::Mutex<()>>>;
+        static TURNS: std::sync::LazyLock<Mutex<Turns>> =
+            std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        let key = (
+            store.root().to_path_buf(),
+            self.target.name.clone(),
+            self.scope.clone(),
+        );
+        Some(
+            TURNS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_default()
+                .clone(),
+        )
+    }
+
+    /// A certificate another source stored since this one's was taken (a different
+    /// certificate, still fresh, for the user this source holds), adopted in place of a
+    /// mint; `None` when there is none, when this source's group was stopped (it adopts
+    /// nothing more), or when it holds a credential the server refused that is the same.
+    /// Called with the mint turn held.
+    fn adopt_newer_stored(&self) -> Option<MintOutcomeOk> {
+        let store = self.store.as_ref()?;
+        if self.target.name.is_empty() || self.fence.as_ref().is_some_and(|f| *f.borrow()) {
+            return None;
+        }
+        let stored = store.load(&self.target.name).ok().flatten()?;
+        if stale(stored.not_after_unix, (self.now_unix)()) {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.terminal_err.is_some() {
+            return None;
+        }
+        if let Some(Held::Certificate { cert_pem, .. }) = &st.cred {
+            if *cert_pem == stored.cert_pem {
+                return None;
+            }
+        }
+        match stored_user(&stored.cert_pem, st.held_user.as_deref()) {
+            Ok(CertUser::Named(name)) => {
+                if st.held_user.is_none() {
+                    st.held_user = Some(name);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        let held = Held::Certificate {
+            certified: stored.certified,
+            cert_pem: stored.cert_pem,
+            // Not re-read: nothing rewrites a credential it merely loaded.
+            key_pem: String::new(),
+            serial: String::new(),
+        };
+        Some(self.arm_locked(&mut st, held, stored.not_after_unix))
     }
 
     /// Present (mtls) or withdraw (token) the identity and hold the credential. Caller

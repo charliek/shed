@@ -28,8 +28,8 @@
 //!   `shed-roost`, `shed-craze` and `shed-app` (default features) reach
 //!   neither, so shed-mobile's build is unchanged. All of these hold across
 //!   normal, build and dev edges.
-//! - `shed-source` (plan 039 §3.7) reaches no workspace crate but `shed-core`
-//!   and `shed-lane`, and never `saphyr-parser`; `shed-core`, `shed-lane`,
+//! - `shed-source` (plan 039 §3.7) reaches no workspace crate but `shed-core`,
+//!   `shed-lane` and `shed-provision`, and never `saphyr-parser`; `shed-core`, `shed-lane`,
 //!   `shed-roost`, `shed-craze` and `shed-app` (default features) do not reach
 //!   it, so shed-mobile's build is unchanged. All across normal, build and dev
 //!   edges.
@@ -344,12 +344,15 @@ fn crate_isolation_invariants() {
     }
 
     // 8b. `shed-source` (plan 039 §3.7): the machine identity, credential store,
-    //     minter and control-token provider extracted from `shed-broker`. Reaches
-    //     only `shed-core` and `shed-lane` (every feature, `test-support` included,
+    //     minter and control-token provider extracted from `shed-broker`, and the
+    //     delivery stream client. Reaches only `shed-core`, `shed-lane` and
+    //     `shed-provision` (every feature, `test-support` included,
     //     and every target), never the broker's YAML parser; shed-mobile's crates
     //     do not reach it.
     let deps = resolved_deps("shed-source", "normal,build,dev");
-    let allowed = ["shed-core", "shed-lane"];
+    // `shed-provision` (pure: the contract's documents and the stream's framing) is the
+    // delivery stream client's (plan 039 A6 commit 2); it reaches no workspace crate.
+    let allowed = ["shed-core", "shed-lane", "shed-provision"];
     for member in &workspace {
         if *member != "shed-source" && !allowed.contains(member) {
             assert!(

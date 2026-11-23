@@ -28,12 +28,17 @@
 // The SSH-bootstrap exchange — internal; the `minter` is its only consumer.
 mod bootstrap;
 pub mod controltoken;
+pub mod credentials;
 pub mod credstore;
+pub mod delivery;
+pub mod discovery;
 pub mod machine;
 pub mod minter;
 pub mod paths;
 pub mod target;
+pub mod tasks;
 pub mod time;
+pub mod token_minter;
 
 pub use target::ServerTarget;
 

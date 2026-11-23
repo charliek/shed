@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-source — what a machine needs to be a credential source (plan 039 §3.7): its identity (`<state>/broker/machine.json`), the state directory, the client-credential store, the SSH-bootstrap minter and the control-token provider. Extracted from shed-broker, which re-exports it. Reaches only shed-core and shed-lane; no YAML parser."
+description = "shed-source — what a machine needs to be a source (plan 039 §3.7): its identity (`<state>/broker/machine.json`), the state directory, the client-credential store, the SSH-bootstrap minter and the control-token provider (extracted from shed-broker, which re-exports them), and the delivery side: server discovery from the shed CLI config, the delivery stream client, the per-server tasks and a TokenMinter over the control-token provider. Reaches only shed-core, shed-lane and shed-provision; no YAML parser."
 
 [lib]
 name = "shed_source"
@@ -23,6 +23,13 @@ test-support = ["dep:tempfile", "dep:rcgen"]
 
 [dependencies]
 shed-core = { path = "../shed-core" }
+# The provision contract's documents and the delivery stream's framing
+# (`stream::EventReader`, `parse_request`, `Answer::to_json`). Pure: no tokio, no
+# reqwest, no workspace crate of its own.
+shed-provision = { path = "../shed-provision" }
+# The delivery stream client (`delivery`): the stream GET and the answer POSTs, on the
+# pinned TLS config shed-core builds, presenting the credential source's certificate.
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -51,8 +58,11 @@ tempfile = { version = "3", optional = true }
 rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
-# `#[tokio::test(start_paused = true)]` (the minter's refusal backoff on a paused clock).
-tokio = { workspace = true, features = ["test-util"] }
+# `#[tokio::test(start_paused = true)]` (the minter's refusal backoff on a paused clock);
+# `net` + `io-util` for the delivery client's in-process fake server.
+tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
 tempfile = "3"
 # Throwaway client certificates for the credential-store + credential-source tests.
 rcgen = { workspace = true }
+# The delivery client's mTLS fake (one certificate per stream).
+tokio-rustls = { workspace = true }

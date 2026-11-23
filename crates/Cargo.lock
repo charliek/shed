@@ -3144,14 +3144,17 @@ dependencies = [
  "futures-util",
  "libc",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
  "shed-core",
+ "shed-provision",
  "ssh-key",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 
