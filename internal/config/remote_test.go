@@ -15,7 +15,7 @@ import (
 // validRemote returns a remote block that passes Validate, as a config file
 // naming only the environment and the default image would load.
 func validRemote() *RemoteConfig {
-	c := &RemoteConfig{Environment: "dev-test", DefaultImage: "family/shed-extensions-amd64"}
+	c := &RemoteConfig{Environment: "dev-test", DefaultImage: "family/shed-full-amd64"}
 	c.applyDefaults()
 	return c
 }
@@ -96,7 +96,7 @@ func TestRemoteValidate(t *testing.T) {
 		{"default_image missing", func(c *RemoteConfig) { c.DefaultImage = "" }, "default_image is required"},
 		{"default_image with a space", func(c *RemoteConfig) { c.DefaultImage = "family/shed base" }, "invalid default_image"},
 		{"alias to empty name", func(c *RemoteConfig) { c.ImageAliases = map[string]string{"cloud": ""} }, "image_aliases.cloud"},
-		{"alias", func(c *RemoteConfig) { c.ImageAliases = map[string]string{"cloud": "family/shed-extensions-amd64"} }, ""},
+		{"alias", func(c *RemoteConfig) { c.ImageAliases = map[string]string{"cloud": "family/shed-full-amd64"} }, ""},
 		{"default_size unknown", func(c *RemoteConfig) { c.DefaultSize = "huge" }, "default_size"},
 		{"size without machine type", func(c *RemoteConfig) { c.Sizes["tiny"] = RemoteSizeConfig{CPUs: 1, MemoryMB: 1024, Arch: "amd64"} }, "sizes.tiny.machine_type"},
 		{"size without cpus", func(c *RemoteConfig) {
@@ -341,15 +341,15 @@ func TestRemoteResolveDiskGB(t *testing.T) {
 
 func TestRemoteResolveImage(t *testing.T) {
 	c := validRemote()
-	c.ImageAliases = map[string]string{"cloud": "family/shed-extensions-amd64", "pinned": "shed-extensions-amd64-v1"}
+	c.ImageAliases = map[string]string{"cloud": "family/shed-full-amd64", "pinned": "shed-full-amd64-v1"}
 	tests := []struct {
 		name, image, want string
 		wantErr           bool
 	}{
-		{"default", "", "family/shed-extensions-amd64", false},
-		{"alias", "cloud", "family/shed-extensions-amd64", false},
-		{"alias to exact name", "pinned", "shed-extensions-amd64-v1", false},
-		{"raw image name", "shed-extensions-amd64-v1", "", true},
+		{"default", "", "family/shed-full-amd64", false},
+		{"alias", "cloud", "family/shed-full-amd64", false},
+		{"alias to exact name", "pinned", "shed-full-amd64-v1", false},
+		{"raw image name", "shed-full-amd64-v1", "", true},
 		{"unknown", "full", "", true},
 	}
 	for _, tt := range tests {
@@ -569,8 +569,8 @@ remote:
   allow_test_drivers: false
   environment: dev-one
   state_dir: ~/.shed/dev-remote/remote
-  default_image: family/shed-extensions-amd64
-  image_aliases: {cloud: family/shed-extensions-amd64}
+  default_image: family/shed-full-amd64
+  image_aliases: {cloud: family/shed-full-amd64}
   default_size: standard
   sizes:
     standard: {machine_type: e2-standard-2, cpus: 2, memory_mb: 8192, arch: amd64}
@@ -625,8 +625,8 @@ func TestRemoteConfigFromYAML(t *testing.T) {
 		}
 		return p
 	}
-	minimal := "name: t\ndefault_backend: remote\nremote:\n  environment: dev-a\n  default_image: family/shed-extensions-amd64\n"
-	minimalAliased := minimal + "  image_aliases: {cloud: family/shed-extensions-amd64}\n"
+	minimal := "name: t\ndefault_backend: remote\nremote:\n  environment: dev-a\n  default_image: family/shed-full-amd64\n"
+	minimalAliased := minimal + "  image_aliases: {cloud: family/shed-full-amd64}\n"
 	tests := []struct {
 		name    string
 		body    string
@@ -680,7 +680,7 @@ func TestRemoteConfigFromYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.ActiveDefaultImage(); got != "family/shed-extensions-amd64" {
+	if got := cfg.ActiveDefaultImage(); got != "family/shed-full-amd64" {
 		t.Errorf("ActiveDefaultImage = %q", got)
 	}
 	if cpus, mem := cfg.ActiveDefaultResources(); cpus != 2 || mem != 8192 {

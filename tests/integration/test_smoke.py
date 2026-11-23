@@ -349,151 +349,166 @@ def test_shed_exec_smoke(shed_server, test_shed_name):
 
 
 # ---------------------------------------------------------------------------
-# 6. Extensions image smoke (the shed-extensions layer is wired up)
+# 6. The two image variants, `base` and `full` (plan 039 §3.12)
 # ---------------------------------------------------------------------------
 
 
-# Guest extension binaries built in-tree (from cmd/shed-ext-*, cmd/docker-
-# credential-shed) and staged into the rootfs build context by
-# scripts/stage-guest-binaries.sh, then installed into the `extensions` (and
-# transitively `full`) rootfs layer by the Dockerfile's COPY-via-bind RUN. If
-# a change regresses any of them (missing binary, wrong path, lost +x bit,
-# arch mismatch, stale-cache bake), this test catches it before it ships.
-#
-# Keep this list aligned with the install statements in
-# vz/Dockerfile + firecracker/Dockerfile's `shed-vz-extensions` /
-# `shed-fc-extensions` stage.
-_SHED_EXTENSIONS_BINARIES = (
-    "/usr/local/bin/shed-ext-ssh-agent",
-    "/usr/local/bin/shed-ext-aws-credentials",
-    "/usr/local/bin/docker-credential-shed",
-)
+# Developer tools `full` installs from the stridelabs apt repo (strix: a TUI
+# for staging/diffs; prox: a process manager with an HTTP API + TUI; parcel;
+# envsecrets). `base` has none of them. Keep aligned with the stridelabs RUN
+# in the `full` stage of vz/Dockerfile / firecracker/Dockerfile.
+_STRIDELABS_APT_TOOLS = ("strix", "prox", "parcel", "envsecrets")
 
-# Developer tools installed from the stridelabs apt repo in the extensions
-# stage (strix: a TUI for staging/diffs; prox: a process manager with an
-# HTTP API + TUI). Not part of the shed-extensions credential-brokering
-# payload above, but added by the same stage's Dockerfile RUN block.
-_STRIDELABS_APT_TOOLS = ("strix", "prox")
+# What a rootfs puts in /usr/local/bin and which shed-* units it ships: the
+# agent, first boot and network setup, nothing else. The credential helpers
+# that `extensions` and `full` once installed there (binaries, units, the
+# environment.d file, their manifests, the Docker credsStore) were removed in
+# plan 039; an allow-list proves their absence without naming each one.
+_USR_LOCAL_BIN = ("network-setup.sh", "shed-agent", "shed-firstboot")
+_SHED_UNITS = ("shed-agent.service", "shed-firstboot.service")
 
-# systemd units + config files staged from guest/extensions/etc/ (via
-# stage-guest-binaries.sh -> ext-etc/) and installed by the extensions stage.
-_SHED_EXTENSIONS_UNITS = (
-    "/etc/systemd/system/shed-ext-ssh-agent.service",
-    "/etc/systemd/system/shed-ext-aws-credentials.service",
-)
-_SHED_EXTENSIONS_CONFIGS = (
-    "/etc/environment.d/shed-extensions.conf",
-    "/etc/shed-extensions.d/ssh-agent.yaml",
-    "/etc/shed-extensions.d/aws-credentials.yaml",
-    "/etc/shed-extensions.d/docker-credentials.yaml",
-)
+
+def _image_backends() -> set[str]:
+    """`SHED_IMAGE_HAS_DELIVERY`: the backends whose images were rebuilt
+    from this branch (the two variants, parcel and envsecrets in `full`, the
+    helpers gone). Same split as `SHED_IMAGE_HAS_ROOST`."""
+    raw = os.environ.get("SHED_IMAGE_HAS_DELIVERY", "")
+    return {b.strip() for b in raw.split(",") if b.strip()}
+
+
+def _variant_smoke(shed_server, test_shed_name, variant: str) -> None:
+    """The body of the two variant smoke tests: create `variant`, then check
+    what it has and what it must not have. A backend listed in
+    `SHED_IMAGE_HAS_DELIVERY` whose store has no such image FAILS rather than
+    skips (the `_baked_image_verdict` rule)."""
+    backend_key = "fc" if shed_server.backend == "firecracker" else "vz"
+    listed = _image_backends()
+    if backend_key not in listed:
+        pytest.skip(
+            f"SHED_IMAGE_HAS_DELIVERY does not list {backend_key}: this "
+            "backend still boots a published image, which has three variants "
+            "and the retired helpers"
+        )
+
+    image_present = True
+    try:
+        shed_server.create(test_shed_name, image=variant)
+    except AssertionError as e:
+        msg = str(e)
+        if variant in msg and (
+            "no image tag" in msg or "not found" in msg or "unknown image" in msg
+        ):
+            image_present = False
+        else:
+            raise
+
+    verdict = _baked_image_verdict(backend_key, listed, image_present)
+    if verdict == "fail":
+        pytest.fail(
+            f"SHED_IMAGE_HAS_DELIVERY lists {backend_key!r} but its dev store "
+            f"has no `{variant}` image; build it from this branch per "
+            "docs/development/testing.md (SHED_SOURCE_REF = the dev config's "
+            f"alias), or take {backend_key} out of SHED_IMAGE_HAS_DELIVERY."
+        )
+    assert verdict == "run", f"unexpected _baked_image_verdict result: {verdict!r}"
+
+    # roost-session and craze are in `base`, so in both variants. Their
+    # pinned versions are checked by test_roost_session_baked and
+    # test_craze_baked.
+    for tool in ("roost-session", "craze"):
+        r = shed_server.exec(test_shed_name, ["test", "-x", f"/usr/bin/{tool}"])
+        assert r.returncode == 0, (
+            f"/usr/bin/{tool} missing or not executable in a `{variant}` "
+            f"shed: exit={r.returncode} stderr={r.stderr!r}. Check the "
+            f"roost-session and craze RUN in the base stage of vz/Dockerfile / "
+            f"firecracker/Dockerfile."
+        )
+
+    for tool in _STRIDELABS_APT_TOOLS:
+        r = shed_server.exec(test_shed_name, ["sh", "-c", f"command -v {tool}"])
+        if variant == "full":
+            assert r.returncode == 0, (
+                f"{tool} is not on the login PATH of a `full` shed: "
+                f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+                f"Check the stridelabs apt RUN in the full stage of "
+                f"vz/Dockerfile / firecracker/Dockerfile."
+            )
+        else:
+            assert r.returncode != 0, (
+                f"{tool} is on the PATH of a `base` shed ({r.stdout.strip()!r}); "
+                f"the stridelabs apt tools belong to `full` only."
+            )
+
+    r = shed_server.exec(test_shed_name, ["ls", "-A", "/usr/local/bin"])
+    assert r.returncode == 0, f"ls /usr/local/bin: exit={r.returncode} stderr={r.stderr!r}"
+    assert tuple(sorted(r.stdout.split())) == _USR_LOCAL_BIN, (
+        f"/usr/local/bin in a `{variant}` shed holds {sorted(r.stdout.split())}, "
+        f"want exactly {list(_USR_LOCAL_BIN)}: the retired credential helpers "
+        f"(plan 039) must not come back."
+    )
+
+    r = shed_server.exec(
+        test_shed_name,
+        ["bash", "-c", "systemctl list-unit-files --no-legend 'shed-*' | awk '{print $1}'"],
+    )
+    assert r.returncode == 0, f"systemctl list-unit-files: exit={r.returncode} stderr={r.stderr!r}"
+    assert tuple(sorted(r.stdout.split())) == _SHED_UNITS, (
+        f"the shed-* units in a `{variant}` shed are {sorted(r.stdout.split())}, "
+        f"want exactly {list(_SHED_UNITS)}."
+    )
+
+    r = shed_server.exec(
+        test_shed_name,
+        [
+            "bash",
+            "-c",
+            "! ls /etc/shed-extensions.d/*.yaml >/dev/null 2>&1"
+            " && ! grep -rqs SSH_AUTH_SOCK /etc/environment.d"
+            " && ! grep -qs credsStore /home/shed/.docker/config.json",
+        ],
+    )
+    assert r.returncode == 0, (
+        f"a `{variant}` shed still carries a retired helper's config (an "
+        f"extension manifest, the SSH_AUTH_SOCK environment.d file or the "
+        f"Docker credsStore): exit={r.returncode} stderr={r.stderr!r}."
+    )
 
 
 @pytest.mark.local_vm_only(
-    "the cloud image carries no shed-extensions credential brokering (extensions.enabled is refused on remote)"
+    "checks the vz/fc rootfs variants; the cloud image's are checked when it is baked (gce/verify.sh)"
 )
-def test_extensions_image_smoke(shed_server, test_shed_name):
-    """The `extensions` image variant carries the shed-extensions payload.
+@pytest.mark.skipif(
+    not _image_backends(),
+    reason="SHED_IMAGE_HAS_DELIVERY unset: published images predate the two variants",
+)
+def test_base_image_smoke(shed_server, test_shed_name):
+    """A `base` shed has roost-session and craze, none of the stridelabs apt
+    tools, and none of the retired credential helpers."""
+    _variant_smoke(shed_server, test_shed_name, "base")
 
-    Smoke test for the `extensions` (and transitively `full`) image
-    variants — verifies that the in-tree guest binaries + /etc overlay,
-    staged into the build context by scripts/stage-guest-binaries.sh and
-    installed by the Dockerfile's COPY-via-bind RUN, are all present in the
-    booted rootfs: every binary at its documented path with the executable
-    bit, the two systemd units, the environment.d + shed-extensions.d config
-    files, and the docker credsStore config. This is the gate future changes
-    to the guest extension payload need to survive.
 
-    Skips with a clear message if the server has no `extensions` tag
-    configured (e.g. a dev box pulling only `base`); the test isn't a
-    regression for that environment, it just doesn't apply.
-    """
-    try:
-        shed_server.create(test_shed_name, image="extensions")
-    except AssertionError as e:
-        msg = str(e)
-        if "extensions" in msg and (
-            "no image tag" in msg or "not found" in msg or "unknown image" in msg
-        ):
-            pytest.skip(
-                "server has no `extensions` image tag configured; this "
-                "smoke gate only applies where the extensions variant is "
-                "installed. Configure one with `shed image tag …` or pull "
-                "ghcr.io/charliek/shed-{vz,fc}-extensions:vX.Y.Z."
-            )
-        raise
-
-    for binary in _SHED_EXTENSIONS_BINARIES:
-        r = shed_server.exec(test_shed_name, ["test", "-x", binary])
-        assert r.returncode == 0, (
-            f"{binary!r} missing or not executable in the booted shed: "
-            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-            f"stage-guest-binaries.sh likely failed to stage this binary, or "
-            f"the extensions-stage install RUN in vz/Dockerfile / "
-            f"firecracker/Dockerfile regressed."
-        )
-
-    # shed-ext-rc (the guest RC helper) was removed from the image in plan
-    # 022/S6 — assert it stays gone rather than silently reappearing.
-    r = shed_server.exec(test_shed_name, ["test", "-e", "/usr/local/bin/shed-ext-rc"])
-    assert r.returncode != 0, (
-        "/usr/local/bin/shed-ext-rc is present in the booted shed, but "
-        "shed-ext-rc was removed from the image in plan 022/S6 (shed#328) "
-        "— check the extensions-stage install RUN in vz/Dockerfile / "
-        "firecracker/Dockerfile."
-    )
-
-    for tool in _STRIDELABS_APT_TOOLS:
-        r = shed_server.exec(test_shed_name, [tool, "--version"])
-        assert r.returncode == 0, (
-            f"`{tool} --version` failed in the booted shed: "
-            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-            f"Check the stridelabs apt repo RUN in the extensions stage of "
-            f"vz/Dockerfile / firecracker/Dockerfile."
-        )
-
-    for unit in _SHED_EXTENSIONS_UNITS:
-        r = shed_server.exec(test_shed_name, ["test", "-f", unit])
-        assert r.returncode == 0, (
-            f"{unit!r} missing in the booted shed: "
-            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-            f"Staged from guest/extensions/etc/systemd/system via "
-            f"stage-guest-binaries.sh (ext-etc/); check the extensions-stage "
-            f"install RUN in vz/Dockerfile / firecracker/Dockerfile."
-        )
-
-    for cfg in _SHED_EXTENSIONS_CONFIGS:
-        r = shed_server.exec(test_shed_name, ["test", "-f", cfg])
-        assert r.returncode == 0, (
-            f"{cfg!r} missing in the booted shed: "
-            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-            f"Staged from guest/extensions/etc via stage-guest-binaries.sh "
-            f"(ext-etc/); check the extensions-stage install RUN in "
-            f"vz/Dockerfile / firecracker/Dockerfile."
-        )
-
-    r = shed_server.exec(
-        test_shed_name, ["cat", "/home/shed/.docker/config.json"]
-    )
-    assert r.returncode == 0, (
-        f"~/.docker/config.json missing in the booted shed: "
-        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}."
-    )
-    assert '"credsStore": "shed"' in r.stdout, (
-        f"~/.docker/config.json does not declare the shed credsStore: "
-        f"got {r.stdout!r}. Written by the extensions-stage RUN in "
-        f"vz/Dockerfile / firecracker/Dockerfile."
-    )
+@pytest.mark.local_vm_only(
+    "checks the vz/fc rootfs variants; the cloud image's are checked when it is baked (gce/verify.sh)"
+)
+@pytest.mark.skipif(
+    not _image_backends(),
+    reason="SHED_IMAGE_HAS_DELIVERY unset: published images predate the two variants",
+)
+def test_full_image_smoke(shed_server, test_shed_name):
+    """A `full` shed has everything `base` has plus strix, prox, parcel and
+    envsecrets on the login PATH, and none of the retired credential
+    helpers."""
+    _variant_smoke(shed_server, test_shed_name, "full")
 
 
 # ---------------------------------------------------------------------------
-# 10. roost-session baked into the extensions/full images (plan 023 §3.3)
+# 10. roost-session baked into the base image (plan 023 §3.3; base since plan 039)
 # ---------------------------------------------------------------------------
 
 
 def _roost_baked_backends() -> set[str]:
     """`SHED_IMAGE_HAS_ROOST` is a comma list of the backends whose
-    `extensions` image was rebuilt with the bake (`vz`, `fc`). The dev
+    `base` image was rebuilt with the bake (`vz`, `fc`). The dev
     targets set exactly the one they retargeted, because the suite is
     parameterized over BOTH backends and the other one still boots the
     published image (sol review finding)."""
@@ -507,17 +522,18 @@ def _roost_baked_backends() -> set[str]:
 @pytest.mark.skipif(
     not _roost_baked_backends(),
     reason=(
-        "SHED_IMAGE_HAS_ROOST unset: images built before 0.9.0 carry "
-        "no roost-session"
+        "SHED_IMAGE_HAS_ROOST unset: published images before v0.11 carry "
+        "no roost-session in `base`"
     ),
 )
 def test_roost_session_baked(shed_server, test_shed_name):
-    """`/usr/bin/roost-session` is baked into the `extensions` image, with
-    no systemd unit enabled — the CLI/desktop/phone start it on first
-    contact instead.
+    """`/usr/bin/roost-session` is baked into the `base` image (and so
+    `full`), with no systemd unit enabled — the CLI/desktop/phone start it
+    on first contact instead.
 
-    Gated behind `SHED_IMAGE_HAS_ROOST=<backends>`: images built before 0.9.0 carry
-    no roost-session, so this stays skipped everywhere
+    Gated behind `SHED_IMAGE_HAS_ROOST=<backends>`: images built before 0.9.0
+    carry no roost-session, and before v0.11 only `extensions` and `full`
+    did (not `base`), so this stays skipped everywhere
     except the parallel-dev servers (`test-integration-dev[-fc]`, which
     export the variable — see the root Makefile). The gate is a
     `skipif` marker rather than a runtime `pytest.skip()`, so pytest
@@ -537,14 +553,14 @@ def test_roost_session_baked(shed_server, test_shed_name):
     want_protocol = os.environ.get("SHED_ROOST_SESSION_PROTOCOL", "6")
 
     # A LISTED backend promised its dev store carries the bake, so a missing
-    # `extensions` image is a failure, not a skip (shed#398) -- the same
+    # `base` image is a failure, not a skip (shed#398) -- the same
     # verdict `test_craze_baked` reaches below.
     image_present = True
     try:
-        shed_server.create(test_shed_name, image="extensions")
+        shed_server.create(test_shed_name, image="base")
     except AssertionError as e:
         msg = str(e)
-        if "extensions" in msg and (
+        if "base" in msg and (
             "no image tag" in msg or "not found" in msg or "unknown image" in msg
         ):
             image_present = False
@@ -555,7 +571,7 @@ def test_roost_session_baked(shed_server, test_shed_name):
     if verdict == "fail":
         pytest.fail(
             f"SHED_IMAGE_HAS_ROOST lists {backend_key!r} but its dev store "
-            "has no `extensions` image; build it per "
+            "has no `base` image; build it per "
             "docs/development/testing.md (SHED_SOURCE_REF = the dev "
             "config's alias) before running test-integration-dev"
             f"{'-fc' if backend_key == 'fc' else ''}, or unset "
@@ -570,11 +586,11 @@ def test_roost_session_baked(shed_server, test_shed_name):
         f"/usr/bin/roost-session missing or not executable in the booted "
         f"shed: exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
         f"Two causes: (1) the dev server's image store still holds an "
-        f"`extensions` image built BEFORE the bake — rebuild it into the dev "
+        f"`base` image built BEFORE the bake — rebuild it into the dev "
         f"store (docs/development/testing.md, SHED_SOURCE_REF = the dev "
         f"config's alias) or run with SHED_IMAGE_HAS_ROOST= (empty) to skip "
         f"this cell; (2) the roost-session install steps folded into the "
-        f"stridelabs-apt RUN in the extensions stage of vz/Dockerfile / "
+        f"roost-session and craze RUN in the base stage of vz/Dockerfile / "
         f"firecracker/Dockerfile regressed."
     )
 
@@ -616,13 +632,13 @@ def test_roost_session_baked(shed_server, test_shed_name):
 
 
 # ---------------------------------------------------------------------------
-# 11. craze baked into the extensions/full images (plan 025 §3.9)
+# 11. craze baked into the base image (plan 025 §3.9; base since plan 039)
 # ---------------------------------------------------------------------------
 
 
 def _craze_baked_backends() -> set[str]:
     """`SHED_IMAGE_HAS_CRAZE` is a comma list of the backends whose
-    `extensions` image was rebuilt with craze baked in (`vz`, `fc`). Same
+    `base` image was rebuilt with craze baked in (`vz`, `fc`). Same
     shape as `_roost_baked_backends` above — the dev targets set exactly
     the one they retargeted, because the suite is parameterized over BOTH
     backends and the other one still boots the published image."""
@@ -661,7 +677,7 @@ def _baked_image_verdict(
 ) -> str:
     """Decides what `test_craze_baked` does for `backend`, given the set of
     backends `SHED_IMAGE_HAS_CRAZE` lists (`listed_backends`) and whether
-    the `extensions` image actually exists on the server
+    the image actually exists on the server
     (`image_present`). Returns one of `"run"`, `"skip"`, `"fail"`.
 
     Pulled out as a pure function (cursor/sol review, plan 025 C13 item 3)
@@ -672,7 +688,7 @@ def _baked_image_verdict(
     (`test-integration-dev[-fc]`) set `SHED_IMAGE_HAS_CRAZE` unconditionally,
     so treating a missing image there as a skip let `make
     test-integration-dev` finish green on a store that never got the
-    `extensions` image rebuilt, without ever checking `/usr/bin/craze`.
+    image rebuilt, without ever checking `/usr/bin/craze`.
     """
     if backend not in listed_backends:
         return "skip"
@@ -690,7 +706,7 @@ def _baked_image_verdict(
     ),
 )
 def test_craze_baked(shed_server, test_shed_name):
-    """`/usr/bin/craze` is baked into the `extensions` image (plan 025
+    """`/usr/bin/craze` is baked into the `base` image (plan 025
     §3.9), the same way as `roost-session` above: a standalone release
     asset, checksum-verified at build time, with no systemd unit — the
     desktop's create sheet starts a remote hub; nothing in the CLI runs craze.
@@ -719,10 +735,10 @@ def test_craze_baked(shed_server, test_shed_name):
 
     image_present = True
     try:
-        shed_server.create(test_shed_name, image="extensions")
+        shed_server.create(test_shed_name, image="base")
     except AssertionError as e:
         msg = str(e)
-        if "extensions" in msg and (
+        if "base" in msg and (
             "no image tag" in msg or "not found" in msg or "unknown image" in msg
         ):
             image_present = False
@@ -733,7 +749,7 @@ def test_craze_baked(shed_server, test_shed_name):
     if verdict == "fail":
         pytest.fail(
             f"SHED_IMAGE_HAS_CRAZE lists {backend_key!r} but its dev store "
-            "has no `extensions` image; build it per "
+            "has no `base` image; build it per "
             "docs/development/testing.md (SHED_SOURCE_REF = the dev "
             "config's alias) before running test-integration-dev"
             f"{'-fc' if backend_key == 'fc' else ''}, or unset "
@@ -748,11 +764,11 @@ def test_craze_baked(shed_server, test_shed_name):
         f"/usr/bin/craze missing or not executable in the booted shed: "
         f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
         f"Two causes: (1) the dev server's image store still holds an "
-        f"`extensions` image built BEFORE the bake — rebuild it into the "
+        f"`base` image built BEFORE the bake — rebuild it into the "
         f"dev store (docs/development/testing.md, SHED_SOURCE_REF = the "
         f"dev config's alias) or run with SHED_IMAGE_HAS_CRAZE= (empty) to "
         f"skip this cell; (2) the craze install steps folded into the "
-        f"roost-session RUN in the extensions stage of vz/Dockerfile / "
+        f"roost-session RUN in the base stage of vz/Dockerfile / "
         f"firecracker/Dockerfile regressed."
     )
 

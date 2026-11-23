@@ -493,13 +493,6 @@ jobs:
           # In-VM binaries staged into the Dockerfile build context.
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-firstboot ./cmd/shed-firstboot
-          # Guest extension binaries + /etc overlay staged into the same context.
-          # Same stamps as shed-agent above — bare version, not git-describe's
-          # v-prefixed form (one rootfs, one version convention).
-          VERSION="${{ steps.version.outputs.bare }}" \
-          GIT_COMMIT="${{ steps.version.outputs.sha }}" \
-          BUILD_DATE="${{ steps.version.outputs.date }}" \
-            ./scripts/stage-guest-binaries.sh vz arm64
           # Host-side CLI used to drive OCI conversion + push.
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
@@ -521,7 +514,7 @@ jobs:
             --platform linux/arm64 \
             --output /tmp/shed-initrd-vz.img
 
-      - name: Build OCI images (base, extensions, full)
+      - name: Build OCI images (base, full)
         run: |
           # Local OCI store; shed image build writes here, shed image
           # push streams from here to ghcr.io.
@@ -541,7 +534,7 @@ jobs:
           # cache key honest and matters if a shared buildx cache is enabled.
           install_sha="$(./scripts/install-input-sha.sh vz/)"
           echo "SHED_INSTALL_SHA=${install_sha}"
-          for variant in base extensions full; do
+          for variant in base full; do
             echo "=== building shed-vz-${variant} ==="
             ./bin/shed image build \
               --target "shed-vz-${variant}" \
@@ -578,7 +571,7 @@ jobs:
             start_timeout: 60s
             stop_timeout: 10s
           YAML
-          for variant in base extensions full; do
+          for variant in base full; do
             echo "=== pushing shed-vz-${variant}:${{ steps.version.outputs.tag }} ==="
             ./bin/shed -c /tmp/publish-server.yaml image push \
               "${variant}" \
@@ -635,11 +628,6 @@ jobs:
             -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}"
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-firstboot ./cmd/shed-firstboot
-          # Guest extension binaries + /etc overlay staged into the same context.
-          VERSION="${{ steps.version.outputs.bare }}" \
-          GIT_COMMIT="${{ steps.version.outputs.sha }}" \
-          BUILD_DATE="${{ steps.version.outputs.date }}" \
-            ./scripts/stage-guest-binaries.sh firecracker amd64
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 
@@ -660,14 +648,14 @@ jobs:
             --platform linux/amd64 \
             --output /tmp/shed-initrd-fc.img
 
-      - name: Build OCI images (base, extensions, full)
+      - name: Build OCI images (base, full)
         run: |
           # See VZ job for rationale on --platform, --source-ref, and
           # SHED_INSTALL_SHA (#227 bind-mount cache-bust).
           mkdir -p /tmp/oci-store-fc
           install_sha="$(./scripts/install-input-sha.sh firecracker/)"
           echo "SHED_INSTALL_SHA=${install_sha}"
-          for variant in base extensions full; do
+          for variant in base full; do
             echo "=== building shed-fc-${variant} ==="
             ./bin/shed image build \
               --target "shed-fc-${variant}" \
@@ -704,7 +692,7 @@ jobs:
             start_timeout: 60s
             stop_timeout: 10s
           YAML
-          for variant in base extensions full; do
+          for variant in base full; do
             echo "=== pushing shed-fc-${variant}:${{ steps.version.outputs.tag }} ==="
             ./bin/shed -c /tmp/publish-server.yaml image push \
               "${variant}" \

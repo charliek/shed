@@ -85,7 +85,7 @@ func TestValidateClientImages(t *testing.T) {
 	// The remote backend's aliases are its own block's.
 	remote := mtlsWithClients(map[string]ServiceClientConfig{"nocturn": validClient()})
 	remote.DefaultBackend = BackendRemote
-	remote.Remote = &RemoteConfig{ImageAliases: map[string]string{"cloud": "family/shed-extensions-amd64"}}
+	remote.Remote = &RemoteConfig{ImageAliases: map[string]string{"cloud": "family/shed-full-amd64"}}
 	rc := remote.Auth.Clients["nocturn"]
 	for _, tt := range []struct {
 		name    string
@@ -94,7 +94,7 @@ func TestValidateClientImages(t *testing.T) {
 	}{
 		{"remote alias", []string{"cloud"}, ""},
 		{"remote no images", nil, ""},
-		{"remote raw image name", []string{"family/shed-extensions-amd64"}, "not an image alias of the remote backend"},
+		{"remote raw image name", []string{"family/shed-full-amd64"}, "not an image alias of the remote backend"},
 		{"remote local alias", []string{"itest"}, "not an image alias of the remote backend"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

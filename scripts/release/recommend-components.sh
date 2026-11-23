@@ -67,7 +67,6 @@ PATHS_SERVER=(
   cmd
   internal
   sdk
-  guest
   vz
   firecracker
   build-tools
@@ -78,7 +77,6 @@ PATHS_SERVER=(
   go.sum
   'scripts/build-*-rootfs.sh'
   scripts/build-initramfs.sh
-  scripts/stage-guest-binaries.sh
   scripts/install-input-sha.sh
   .goreleaser.server.yaml
 )

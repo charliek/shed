@@ -62,9 +62,9 @@ remote:
   environment: @SHED_REMOTE_ENV@
   state_dir: @DEV_REMOTE_DIR@/remote
   # The newest image of the family `make gce-image` bakes.
-  default_image: family/shed-extensions-amd64
+  default_image: family/shed-full-amd64
   image_aliases:
-    cloud: family/shed-extensions-amd64
+    cloud: family/shed-full-amd64
   default_size: standard
   disk_gb: 50
   limits:

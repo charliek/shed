@@ -12,8 +12,8 @@ func TestConformance(t *testing.T) {
 	providertest.Run(t, providertest.Harness{
 		Env:    env,
 		Size:   provider.DefaultSizes()[0],
-		Image:  "shed-extensions-amd64-v1",
-		Family: provider.ImagePrefixFamily + "shed-extensions-amd64",
+		Image:  "shed-full-amd64-v1",
+		Family: provider.ImagePrefixFamily + "shed-full-amd64",
 		New: func(t *testing.T) (provider.Provider, providertest.Controls) {
 			p := New(Options{Env: env})
 			return p, providertest.Controls{

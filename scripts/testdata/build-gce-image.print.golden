@@ -1,4 +1,4 @@
-# build-gce-image: image shed-remote-extensions-v0-0-0-test-20260101-000000 (family shed-extensions-amd64) from builder shed-image-builder-20260101-000000
+# build-gce-image: image shed-remote-full-v0-0-0-test-20260101-000000 (family shed-full-amd64) from builder shed-image-builder-20260101-000000
 WORK=$(mktemp -d)
 ==> building the agent for linux/amd64
 make build-agent GOARCH=amd64
@@ -32,13 +32,13 @@ ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout
 ==> copying the bake files
 scp -p -r -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes ${WORK}/stage 'shedbake@<builder-ip>:/tmp/shed-bake'
 ==> running gce/bake.sh on the builder
-ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes 'shedbake@<builder-ip>' 'sudo /tmp/shed-bake/bake.sh --variant extensions --arch amd64 --bake-user shedbake'
+ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes 'shedbake@<builder-ip>' 'sudo /tmp/shed-bake/bake.sh --variant full --arch amd64 --bake-user shedbake'
 # the last line of its output must be BAKE OK
 ==> stopping the builder
 gcloud compute instances stop shed-image-builder-20260101-000000 --project example-project --zone example-zone-a
-==> creating image shed-remote-extensions-v0-0-0-test-20260101-000000 in family shed-extensions-amd64
-gcloud compute images create shed-remote-extensions-v0-0-0-test-20260101-000000 --project example-project --source-disk shed-image-builder-20260101-000000 --source-disk-zone example-zone-a --family shed-extensions-amd64 --labels shed_layout=1,shed_protocol=2,shed_arch=amd64,shed_variant=extensions,shed_version=v0-0-0-test --description 'shed remote guest layout 1, agent protocol 2, variant extensions, amd64, shed v0.0.0-test, from <newest ubuntu-2404-lts-amd64>'
+==> creating image shed-remote-full-v0-0-0-test-20260101-000000 in family shed-full-amd64
+gcloud compute images create shed-remote-full-v0-0-0-test-20260101-000000 --project example-project --source-disk shed-image-builder-20260101-000000 --source-disk-zone example-zone-a --family shed-full-amd64 --labels shed_layout=1,shed_protocol=2,shed_arch=amd64,shed_variant=full,shed_version=v0-0-0-test --description 'shed remote guest layout 1, agent protocol 2, variant full, amd64, shed v0.0.0-test, from <newest ubuntu-2404-lts-amd64>'
 ==> deleting the builder
 gcloud compute instances delete shed-image-builder-20260101-000000 --project example-project --zone example-zone-a --quiet
 rm -rf "${WORK}"
-==> image shed-remote-extensions-v0-0-0-test-20260101-000000 (family shed-extensions-amd64)
+==> image shed-remote-full-v0-0-0-test-20260101-000000 (family shed-full-amd64)

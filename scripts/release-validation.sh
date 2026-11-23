@@ -6,8 +6,8 @@
 #
 #   1. Build the CLI + server binaries locally (Mac, VZ, arm64).
 #   2. Rsync sources to mini2 (Linux, FC, amd64) and build there too.
-#   3. On each machine: spin up a local registry:2 container, build all
-#      three variants (base, extensions, full), push, wipe the images
+#   3. On each machine: spin up a local registry:2 container, build
+#      both variants (base, full), push, wipe the images
 #      store, pull back, validate the OCI layout with crane, create a
 #      shed against each variant, exec a sanity command, delete.
 #   4. Cross-validate: pull the arm64 manifest on mini2 and expect a
@@ -42,7 +42,7 @@ SKIP_BUILDS="${SKIP_BUILDS:-0}"
 REGISTRY_NAME="shed-test-registry"
 REGISTRY_PORT="5050"
 LOCAL_REGISTRY="localhost:${REGISTRY_PORT}"
-VARIANTS=("base" "extensions" "full")
+VARIANTS=("base" "full")
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -169,11 +169,6 @@ docker run -d --rm --name "${REGISTRY_NAME}" -p "${REGISTRY_PORT}:5000" registry
 # Build + push each variant on Mac                                     #
 # -------------------------------------------------------------------- #
 if [[ "${SKIP_BUILDS}" != "1" ]]; then
-    # Stage the guest extension binaries + /etc overlay into the vz/ context so
-    # the extensions/full targets install them from /ctx (they are no longer
-    # pulled from a ghcr shed-extensions image). Must run BEFORE the context
-    # hash below so the staged files are covered by it.
-    "${REPO_ROOT}/scripts/stage-guest-binaries.sh" "${REPO_ROOT}/vz" arm64
     # Content hash of the build context so a changed agent busts BuildKit's
     # bind-mount cache (#227); without it this pre-release gate could validate
     # a stale-cached agent. Same value across variants.
@@ -254,10 +249,6 @@ if [[ "${SKIP_REMOTE}" != "1" ]]; then
         || fail "remote registry"
 
     if [[ "${SKIP_BUILDS}" != "1" ]]; then
-        step "Stage guest extension binaries into firecracker/ context on mini2"
-        run_remote "cd /tmp/shed-validation && ./scripts/stage-guest-binaries.sh firecracker amd64" \
-            && ok "stage guest binaries (mini2)" \
-            || fail "stage guest binaries (mini2)"
         for variant in "${VARIANTS[@]}"; do
             step "Build shed-fc-${variant} on mini2"
             run_remote "cd /tmp/shed-validation && docker buildx build --platform linux/amd64 --target shed-fc-${variant} -t ${LOCAL_REGISTRY}/shed-fc-${variant}:test --build-arg SHED_INSTALL_SHA=\$(./scripts/install-input-sha.sh firecracker) --load -f firecracker/Dockerfile firecracker" \

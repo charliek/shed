@@ -58,7 +58,6 @@ vz:
   default_image: ghcr.io/charliek/shed-vz-full:v0.5.9
   image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.9
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.9
     full: ghcr.io/charliek/shed-vz-full:v0.5.9
   pull_policy: missing
   

@@ -1,3 +1,0 @@
-namespace: ssh-agent
-systemd_unit: shed-ext-ssh-agent.service
-description: SSH agent forwarding via shed message bus

@@ -10,7 +10,6 @@
 # Usage:
 #   ./scripts/build-firecracker-rootfs.sh                      # Build full variant
 #   ./scripts/build-firecracker-rootfs.sh --variant base        # Build base variant
-#   ./scripts/build-firecracker-rootfs.sh --variant extensions  # Build extensions variant
 #   ./scripts/build-firecracker-rootfs.sh --variant full        # Build full variant
 #   ./scripts/build-firecracker-rootfs.sh --all                  # Build all variants
 
@@ -25,7 +24,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-/var/lib/shed/firecracker/images}"
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-fc-<name> stages can be built too.
-KNOWN_VARIANTS="base extensions full"
+KNOWN_VARIANTS="base full"
 
 # Defaults
 VARIANT="full"
@@ -108,12 +107,7 @@ cleanup() {
     if [ -n "$SHED_INITRD" ] && [ -f "$SHED_INITRD" ]; then
         rm -f "$SHED_INITRD"
     fi
-    # Includes the guest extension binaries + /etc overlay staged by
-    # stage-guest-binaries.sh.
-    rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot" \
-          "$FIRECRACKER_DIR/shed-ext-ssh-agent" "$FIRECRACKER_DIR/shed-ext-aws-credentials" \
-          "$FIRECRACKER_DIR/docker-credential-shed"
-    rm -rf "$FIRECRACKER_DIR/ext-etc"
+    rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot"
 }
 
 trap cleanup EXIT
@@ -128,8 +122,8 @@ build_prereqs() {
     echo ""
     echo "=== Building shed-agent binary (linux/amd64) ==="
     cd "$PROJECT_ROOT"
-    # Same stamps + derivation as stage-guest-binaries.sh (env-overridable;
-    # commit-date BuildDate keeps the BuildKit bind-mount layer cache stable).
+    # Version stamps (env-overridable; commit-date BuildDate keeps the
+    # BuildKit bind-mount layer cache stable).
     GV="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
     GC="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
     GD="${BUILD_DATE:-$(git show -s --format=%cI HEAD 2>/dev/null || echo unknown)}"
@@ -138,9 +132,6 @@ build_prereqs() {
 
     echo "=== Building shed-firstboot binary (linux/amd64) ==="
     GOOS=linux GOARCH=amd64 go build -ldflags "$GUEST_LDFLAGS" -o "$FIRECRACKER_DIR/shed-firstboot" ./cmd/shed-firstboot
-
-    echo "=== Staging guest extension binaries + /etc overlay (linux/amd64) ==="
-    "$SCRIPT_DIR/stage-guest-binaries.sh" "$FIRECRACKER_DIR" amd64
 
     echo "=== Building host shed CLI ==="
     mkdir -p "$PROJECT_ROOT/bin"

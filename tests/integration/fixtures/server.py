@@ -991,7 +991,7 @@ class CloudServer(LocalServer):
 
       - Images. A remote server names images by alias (`remote.image_aliases`)
         or falls back to `remote.default_image`; the vz/fc image names the
-        suite passes (`base`, `extensions`) do not exist there. `create`
+        suite passes (`base`, `full`) do not exist there. `create`
         therefore sends `--image` only when `image` was set on this object
         (`SHED_REMOTE_IMAGE`), and otherwise boots the server's default.
       - Timeouts. A cloud create takes about a minute, a stop about 30 s and a

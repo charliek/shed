@@ -1213,9 +1213,8 @@ func applyImageVersionDefaults(backend, defaultImage string, aliases map[string]
 	}
 	if len(aliases) == 0 {
 		aliases = map[string]string{
-			"base":       version.RootfsRef(backend, "base", tag),
-			"extensions": version.RootfsRef(backend, "extensions", tag),
-			"full":       version.RootfsRef(backend, "full", tag),
+			"base": version.RootfsRef(backend, "base", tag),
+			"full": version.RootfsRef(backend, "full", tag),
 		}
 	}
 	return defaultImage, aliases

@@ -183,7 +183,7 @@ log_level: info
 # --- Images and the server version ---
 # When default_image / image_aliases are omitted, a released shed-server
 # pulls the rootfs images published in lockstep with its own version —
-# ghcr.io/charliek/shed-<backend>-{base,extensions,full}:vX.Y.Z. Upgrading
+# ghcr.io/charliek/shed-<backend>-{base,full}:vX.Y.Z. Upgrading
 # the server is all it takes to move to the new images; no config edit.
 #
 # To pin a custom or mirrored ref while still tracking the server version,

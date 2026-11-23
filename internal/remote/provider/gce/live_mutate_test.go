@@ -18,7 +18,7 @@ import (
 // VM that costs money, so it runs only with SHED_GCE_LIVE_MUTATE=1 and the
 // variables TestLiveReadOnly needs, plus:
 //
-//	SHED_GCE_LIVE_IMAGE      image to boot (default family/shed-extensions-amd64)
+//	SHED_GCE_LIVE_IMAGE      image to boot (default family/shed-full-amd64)
 //	SHED_REMOTE_SSH_KEY_FILE the OpenSSH private key; its ".pub" twin is put
 //	                         in shed-link-authorized-keys
 //
@@ -52,7 +52,7 @@ func TestLiveMutate(t *testing.T) {
 	}
 	image := os.Getenv("SHED_GCE_LIVE_IMAGE")
 	if image == "" {
-		image = provider.ImagePrefixFamily + "shed-extensions-amd64"
+		image = provider.ImagePrefixFamily + "shed-full-amd64"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)

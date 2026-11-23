@@ -225,9 +225,8 @@ brews:
             # Environment file (KEY=value per line, injected into VMs)
             # env_file: ~/.shed/env
 
-            # Extensions provide credential brokering from host to VM.
-            # The shed desktop app brokers credentials (install it from the
-            # release page).
+            # Extensions to enable in VMs: each name matches a manifest in
+            # the image's /etc/shed-extensions.d/.
             # extensions:
             #   enabled:
             #     - my-extension
@@ -237,7 +236,7 @@ brews:
               kernel_path: ~/Library/Application Support/shed/vz/vmlinux
               initrd_path: ~/Library/Application Support/shed/vz/initrd.img
               # default_image / image_aliases resolve from the server version
-              # when unset: ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z.
+              # when unset: ghcr.io/charliek/shed-vz-{base,full}:vX.Y.Z.
               # Pin explicitly to override the registry or variant.
               pull_policy: missing
               instance_dir: ~/Library/Application Support/shed/vz/instances
@@ -290,9 +289,8 @@ brews:
             # Environment file (KEY=value per line, injected into VMs)
             # env_file: ~/.shed/env
 
-            # Extensions provide credential brokering from host to VM.
-            # The shed desktop app brokers credentials (install it from the
-            # release page).
+            # Extensions to enable in VMs: each name matches a manifest in
+            # the image's /etc/shed-extensions.d/.
             # extensions:
             #   enabled:
             #     - my-extension
@@ -300,7 +298,7 @@ brews:
             firecracker:
               kernel_path: /var/lib/shed/firecracker/images/vmlinux
               # default_image / image_aliases resolve from the server version
-              # when unset: ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z.
+              # when unset: ghcr.io/charliek/shed-fc-{base,full}:vX.Y.Z.
               # Pin explicitly to override the registry or variant.
               pull_policy: missing
               instance_dir: /var/lib/shed/firecracker/instances
@@ -340,8 +338,8 @@ brews:
       The shed-server config has been installed to:
         #{HOMEBREW_PREFIX}/etc/shed/server.yaml
 
-      Edit the config to enable credential mounts and extensions,
-      then start shed-server as a background service:
+      Edit the config to set credential mounts, then start shed-server
+      as a background service:
         brew services start shed
 
       By default shed-server listens on 127.0.0.1 only, in open mode (the
@@ -350,9 +348,8 @@ brews:
       bind_address in the config. auth.mode: token and secure, and
       allow_insecure_exposure, were removed in v0.10.0 and fail to load.
 
-      To enable extensions (SSH agent forwarding, AWS credentials,
-      Docker credentials), the shed desktop app brokers credentials
-      (install it from the release page).
+      The shed desktop app delivers credentials into a shed when it is
+      created (install it from the release page).
 
       Logs: #{var}/log/shed-server.log
 

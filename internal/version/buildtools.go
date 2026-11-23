@@ -72,7 +72,7 @@ func ReleaseBuildToolsRef() string {
 }
 
 // RootfsRef returns the canonical rootfs image ref for the given backend
-// ("vz" or "fc") and variant ("base", "extensions", or "full") at the
+// ("vz" or "fc") and variant ("base" or "full") at the
 // given v-prefixed tag — e.g. RootfsRef("vz", "full", "v0.6.2") yields
 // "ghcr.io/charliek/shed-vz-full:v0.6.2". Pair with CurrentReleaseTag to
 // build the ref for the running binary's version.
