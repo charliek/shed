@@ -372,7 +372,8 @@ proxy half-close). What bit, by backend:
   `git bundle create f HEAD --tags` and clone the bundle, so `git describe`
   and `RELEASE_BUILD_TOOLS_REF` resolve.
 - **Proving the agent in a VM:** since the probe change, `shed-agent version`
-  prints one JSON line, `{"version":"v…-g<sha>","protocol":1,"layout":0}`;
+  prints one JSON line, `{"version":"v…-g<sha>","protocol":2,"layout":0}`
+  (`"protocol":1` before delivery, plan 039);
   `shed -s <dev> exec <shed> -- /usr/local/bin/shed-agent version` is the
   quickest step-4 check (an older agent has no `version` command).
 
@@ -402,6 +403,40 @@ proxy half-close). What bit, by backend:
   firecracker v1.14.1, old and new agent alike), so a test that expects a
   guest `CloseWrite` to reach the host as EOF holds on VZ and fails on FC by
   design. The `probe:true` health check works with old and new agents on both.
+
+## Rough edges from the delivery run on a third FC server (plan 039, 2026-11)
+
+- **Agent protocol 2.** Since delivery (`shed-agent apply-items`), `shed-agent version`
+  prints `{"version":"v…-g<sha>","protocol":2,"layout":0}`; a published image before it
+  reports `"protocol":1`, and the server ends a delivery to it as `image_too_old`. The
+  protocol number is the quickest step-4 check that the image is this branch's.
+- **An old-agent image beside the branch's build, in the same store.** `shed image pull
+  ghcr.io/charliek/shed-fc-base:<last release>` labels the pull with a cosmetic tag taken
+  from the ref's repository (`base`), which OVERWRITES the branch build's `base` label in
+  that store. Creates are unaffected (`--image base` resolves the alias to its ref first),
+  but put the label back and give the old image its own, by digest (`shed image tag`
+  takes a tag or a digest as its source, never a ref):
+  `shed image tag sha256:<branch base digest> base` and
+  `shed image tag sha256:<old digest> published-<ver>`. That label is what
+  `SHED_DELIVERY_OLD_IMAGE` names (`test_delivery.py`'s `image_too_old` case).
+- **A git server a shed can clone from over SSH.** `CloneRepo` seeds the shed's
+  `~/.ssh/known_hosts` from GitHub's keys plus the server's `git.extra_known_hosts`
+  only, so a throwaway sshd needs its host key in the server config (a restart). A
+  container on the FC host published on the bridge address works
+  (`docker run -p <bridge ip>:<port>:22`): the shed reaches it through the bridge.
+  `git daemon` in a second container gives a public `git://` repository the same way.
+- **To prove what the clone's environment held**, deliver (the `files` provider) a
+  `~/.ssh/config` with `Match exec "sh ~/.ssh/env-probe.sh"` and a script that appends
+  `env` names and `SSH_AUTH_SOCK=${SSH_AUTH_SOCK-unset}` to a file and exits 1 (so it
+  never matches): every ssh the shed runs, the clone's included, records its environment.
+- **In PR A's `extensions`/`full` images every command has `SSH_AUTH_SOCK`.** The guest overlay's
+  `/etc/environment.d/shed-extensions.conf` sets it to `/run/shed-extensions/ssh-agent.sock`, and the
+  ssh-agent helper's unit runs whatever the server's `extensions.enabled` says (that list only shapes the
+  health handshake). A clone in such a shed asks the helper first, which asks the user's source over the
+  bus (the desktop app's Activity shows `ssh-agent list`). To show a clone used only delivered files, use
+  `--image base` until the helpers are removed.
+- **A waiter that greps for the build's own script with `pgrep -f`** inside `bash -c`
+  matches itself and never ends. Wait on the background job's notification instead.
 
 ## When you hit a NEW rough edge
 
