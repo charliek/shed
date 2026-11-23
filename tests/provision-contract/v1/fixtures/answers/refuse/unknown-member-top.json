@@ -1,0 +1,17 @@
+{
+  "name": "unknown-member-top",
+  "description": "An unknown member at the top level.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [],
+    "comment": "hello"
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "unknown_member"
+  }
+}

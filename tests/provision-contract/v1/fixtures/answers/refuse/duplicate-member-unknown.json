@@ -1,0 +1,11 @@
+{
+  "name": "duplicate-member-unknown",
+  "description": "An unknown member named twice: a duplicate first (it comes first in the text).",
+  "request": "create-repo",
+  "answer_text": "{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[],\"x\":1,\"x\":2}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_member"
+  }
+}

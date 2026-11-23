@@ -105,6 +105,17 @@ func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, n
 	return port, token, pe.EnvPairs(), nil
 }
 
+// EgressCloneEnv is the proxy environment of a shed whose egress listener
+// is port with token, as SetupEgress returns it for the create's clone: what
+// a later clone into the shed (`shed provision`) runs with. Nil for port 0
+// (egress off for the shed).
+func EgressCloneEnv(gateway, subnet string, port int, token string) []string {
+	if port == 0 {
+		return nil
+	}
+	return EgressProxyEnv{Gateway: gateway, Port: port, Token: token, NoProxy: BuildNoProxy(gateway, subnet)}.EnvPairs()
+}
+
 // ApplyEgressLive (re)configures a running shed's listener and re-injects the
 // guest env — the live `shed egress set` path (no create-transaction cleanup).
 // On an inject failure it rolls back the listener it just opened. Returns the

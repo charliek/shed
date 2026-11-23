@@ -1,0 +1,34 @@
+{
+  "name": "items-and-problems",
+  "description": "Items with problems beside them: valid; the items are written and the problems recorded.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "example-api-key",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "EXAMPLE_API_KEY",
+        "value": "fixture",
+        "fingerprint": "fp-example-api-key"
+      }
+    ],
+    "problems": [
+      {
+        "provider": "github",
+        "code": "signed_out",
+        "message": "gh is not signed in"
+      },
+      {
+        "provider": "envsecrets-login",
+        "code": "missing_input",
+        "message": ""
+      }
+    ]
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

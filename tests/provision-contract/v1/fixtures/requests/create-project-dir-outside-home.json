@@ -1,0 +1,18 @@
+{
+  "name": "create-project-dir-outside-home",
+  "description": "A request whose project directory is outside home. shed-server does not make one; it is here for the answer rules.",
+  "request": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "reason": "create",
+    "deadline": "2026-11-23T10:00:30Z",
+    "user": "ada",
+    "shed": {
+      "name": "widgets",
+      "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "backend": "vz",
+      "local_dir": "widgets",
+      "project_dir": "/srv/widgets"
+    }
+  }
+}

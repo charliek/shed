@@ -1,0 +1,35 @@
+{
+  "name": "empty-items",
+  "description": "An empty items list: absent means none.",
+  "record": {
+    "state": "delivered",
+    "steps": {
+      "stage1": {
+        "state": "done"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "done"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "accepted",
+      "source": {
+        "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+        "machine_name": "ada-laptop"
+      }
+    },
+    "items": []
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "empty_list"
+  }
+}

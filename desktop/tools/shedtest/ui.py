@@ -245,7 +245,8 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 roost_install_bin: object | None = None,
                 roost_session_bin: object | None = None,
                 craze_home: object | None = None,
-                craze_runtime_dir: object | None = None) -> dict[str, str]:
+                craze_runtime_dir: object | None = None,
+                delivery_config: object | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME/XDG_STATE_HOME are
@@ -302,6 +303,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #    the developer's own /usr/bin/roost-session.
     #  * SOCKET — cleared unconditionally so the XDG default (under
     #    runtime_dir) is used.
+    #  * DELIVERY_CONFIG — the delivery settings (`delivery.toml`, plan 039): set
+    #    by a cell that writes its own (inside runtime_dir, `broker_env.validate`
+    #    holds it there), else cleared so the default under the throwaway HOME is
+    #    read and an inherited one never points a run at the developer's settings.
     #  * LOG_FILE — cleared unconditionally, like SOCKET (#414): an inherited
     #    one would send a hermetic run's log into the developer's file (or
     #    theirs into this run's), and `app_log_path` would no longer say where
@@ -319,6 +324,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         "ROOST_JAIL": "1" if roost_jail else None,
         "SOCKET": None,
         "LOG_FILE": None,
+        "DELIVERY_CONFIG": str(delivery_config) if delivery_config else None,
     }
     for suffix, value in managed.items():
         key = f"{cfg.env_prefix}_{suffix}"

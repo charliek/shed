@@ -1,0 +1,11 @@
+{
+  "name": "not-json-string",
+  "description": "A JSON string, not an object.",
+  "request": "create-repo",
+  "answer_text": "\"answer\"",
+  "expect": {
+    "result": "refused",
+    "status": 400,
+    "rule": "not_json"
+  }
+}

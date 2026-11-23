@@ -18,6 +18,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/source"
@@ -138,6 +139,30 @@ func (b *userFakeBackend) StartShed(ctx context.Context, name string) (*config.S
 	}
 	return b.GetShed(ctx, name)
 }
+
+func (b *userFakeBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
+	// As the backends do: admission refuses a shed that is not running.
+	b.mu.Lock()
+	sh, ok := b.sheds[name]
+	b.mu.Unlock()
+	if ok && sh.Status != config.StatusRunning {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+	}
+	if err := b.act(ctx, "provision", name); err != nil {
+		return nil, err
+	}
+	return userProvisionRun{b: b, name: name}, nil
+}
+
+type userProvisionRun struct {
+	b    *userFakeBackend
+	name string
+}
+
+func (r userProvisionRun) Run(ctx context.Context) (*config.Shed, error) {
+	return r.b.GetShed(ctx, r.name)
+}
+func (r userProvisionRun) Release() {}
 
 func (b *userFakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.act(ctx, "stop", name); err != nil {
@@ -288,6 +313,7 @@ func usersTestServer(t *testing.T, b backend.Backend) (*Server, http.Handler) {
 	s := NewServer(b, cfg, "", reg, plugin.NewBridge(reg, true))
 	s.SetUserLookup(userLookup())
 	pinBus(s)
+	s.SetDelivery(delivery.NewService(reg, 10*time.Second))
 	store, err := config.OpenUserProfileStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -312,10 +338,10 @@ func doAs(h http.Handler, fp, method, path, body string) apiResp {
 // ends shortly.
 func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 	scope := "control"
-	if strings.HasPrefix(userRouteClasses[route], "bus") {
+	if strings.HasPrefix(userRouteClasses[route], "bus") || strings.HasPrefix(userRouteClasses[route], "delivery") {
 		scope = "credentials"
 	}
-	if route != "GET /api/egress/stream" && route != "GET /api/plugins/listeners/{namespace}/messages" {
+	if route != "GET /api/egress/stream" && route != "GET /api/plugins/listeners/{namespace}/messages" && route != "GET /api/delivery/requests" {
 		return do(h, testClientCert(fp, scope, time.Hour), method, path, body)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -345,10 +371,15 @@ func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 //	pin:list|use             a user's credential source: every user reads and
 //	                         moves their own; only an admin may name another
 //	                         user, 403 otherwise
+//	delivery:stream          a delivery stream: any user, as themselves
+//	delivery:answer          an answer to a delivery request for alice's
+//	                         shed "box": alice only (no admin exception),
+//	                         refused otherwise and never consumed
 //
 // A route added to Router() fails TestUserRouteWalk until it is classified.
 var userRouteClasses = map[string]string{
 	"GET /api/info":                                   "any",
+	"GET /api/activity":                               "any",
 	"GET /api/ssh-host-key":                           "any",
 	"GET /api/sessions":                               "any",
 	"GET /api/overview":                               "any",
@@ -379,6 +410,8 @@ var userRouteClasses = map[string]string{
 	"GET /api/users/status":                           "admin",
 	"GET /api/sources":                                "pin:list",
 	"POST /api/sources/use":                           "pin:use",
+	"GET /api/delivery/requests":                      "delivery:stream",
+	"POST /api/delivery/requests/{id}":                "delivery:answer",
 	"GET /api/plugins/listeners":                      "bus:list",
 	"GET /api/plugins/listeners/{namespace}/messages": "bus:subscribe",
 	"POST /api/plugins/listeners/{namespace}/respond": "bus:respond",
@@ -391,6 +424,7 @@ var userRouteClasses = map[string]string{
 	"POST /api/sheds/{name}/stop":                     "shed:manage",
 	"POST /api/sheds/{name}/assign":                   "admin",
 	"POST /api/sheds/{name}/reset":                    "shed:enter",
+	"POST /api/sheds/{name}/provision":                "shed:enter",
 	"POST /api/sheds/{name}/exec":                     "shed:enter",
 	"GET /api/sheds/{name}/sessions":                  "shed:enter",
 	"DELETE /api/sheds/{name}/sessions/{session}":     "shed:enter",
@@ -441,6 +475,7 @@ func routeRequest(route string) (method, path, body string) {
 // the walk also checks that the dial reached the backend.
 var userRouteAllowed = map[string]int{
 	"GET /api/info":                                   http.StatusOK,
+	"GET /api/activity":                               http.StatusOK,
 	"GET /api/ssh-host-key":                           http.StatusOK,
 	"GET /api/sessions":                               http.StatusOK,
 	"GET /api/overview":                               http.StatusOK,
@@ -471,6 +506,8 @@ var userRouteAllowed = map[string]int{
 	"GET /api/users/status":                           http.StatusOK,
 	"GET /api/sources":                                http.StatusOK,
 	"POST /api/sources/use":                           http.StatusOK,
+	"GET /api/delivery/requests":                      http.StatusOK,
+	"POST /api/delivery/requests/{id}":                http.StatusNoContent,
 	"GET /api/plugins/listeners":                      http.StatusOK,
 	"GET /api/plugins/listeners/{namespace}/messages": http.StatusOK,
 	"POST /api/plugins/listeners/{namespace}/respond": http.StatusNoContent,
@@ -485,6 +522,7 @@ var userRouteAllowed = map[string]int{
 	// "box" is alice's already (TestAssignShedRoute assigns one with none).
 	"POST /api/sheds/{name}/assign":               http.StatusConflict,
 	"POST /api/sheds/{name}/reset":                http.StatusOK,
+	"POST /api/sheds/{name}/provision":            http.StatusOK,
 	"POST /api/sheds/{name}/exec":                 http.StatusOK,
 	"GET /api/sheds/{name}/sessions":              http.StatusOK,
 	"DELETE /api/sheds/{name}/sessions/{session}": http.StatusNoContent,
@@ -559,6 +597,10 @@ func TestUserRouteWalk(t *testing.T) {
 		}
 		if kind == "pin" {
 			walkPinRoute(t, s, router, be, route)
+			continue
+		}
+		if kind == "delivery" {
+			walkDeliveryRoute(t, s, router, be, route, action)
 			continue
 		}
 
@@ -735,6 +777,85 @@ func walkPinRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBack
 	}
 	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceM.ID || bd.Generation != gen {
 		t.Errorf("the walk of %s changed alice's binding: %+v", route, bd)
+	}
+}
+
+// walkDeliveryRoute checks one delivery route of the walk for bob, root and
+// alice: delivery reaches no shed through the backend; each holds a stream
+// as themselves (their own machine, bound for them); an answer to a request
+// for alice's shed is alice's alone: bob and the admin are refused (their
+// machine is not alice's, and the request is not theirs) and consume
+// nothing, and alice's answer is then accepted.
+func walkDeliveryRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBackend, route, action string) {
+	t.Helper()
+	method, path, _ := routeRequest(route)
+	if action == "stream" {
+		for _, who := range []struct{ name, fp string }{{"bob", bobFP}, {"admin", rootFP}, {"alice", aliceFP}} {
+			be.reset()
+			r := doRouteAs(router, who.fp, route, method, path, "")
+			if r.code != http.StatusOK || len(r.header.Get(delivery.HeaderStream)) != 32 || r.header.Get("Cache-Control") != "no-store" {
+				t.Errorf("%s %s = %d %v %s, want 200 naming its stream, no-store", who.name, route, r.code, r.header, r.body)
+			}
+			if got := be.actedSnapshot(); len(got) != 0 {
+				t.Errorf("%s %s reached the backend: %v", who.name, route, got)
+			}
+		}
+		return
+	}
+	// A request for alice's shed, on alice's stream.
+	st, err := s.plugins.SubscribeDelivery(context.Background(), "alice", testMachineFor(aliceFP), "")
+	if err != nil {
+		t.Fatalf("alice's delivery stream: %v", err)
+	}
+	defer s.plugins.UnregisterDelivery(st)
+	done := make(chan delivery.Result, 1)
+	go func() {
+		res, err := s.delivery.Request(context.Background(), delivery.Params{
+			Reason: delivery.ReasonCreate, User: "alice",
+			Shed: delivery.RequestShed{Name: "box", ID: "boxid", Backend: delivery.BackendFirecracker},
+		})
+		if err != nil {
+			t.Errorf("request: %v", err)
+		}
+		done <- res
+	}()
+	var out delivery.Outgoing
+	select {
+	case out = <-st.Requests():
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request reached alice's stream")
+	}
+	answerPath := delivery.AnswerPathPrefix + out.ID
+	body := fmt.Sprintf(`{"version":1,"id":%q,"items":[],"problems":[]}`, out.ID)
+	for _, who := range []struct{ name, fp string }{{"bob", bobFP}, {"admin", rootFP}, {"alice", aliceFP}} {
+		be.reset()
+		r := do(router, testClientCert(who.fp, "credentials", time.Hour), method, answerPath, body, delivery.HeaderStream, st.ID())
+		if got := be.actedSnapshot(); len(got) != 0 {
+			t.Errorf("%s %s reached the backend: %v", who.name, route, got)
+		}
+		if r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s %s answered without no-store: %v", who.name, route, r.header)
+		}
+		if who.name != "alice" {
+			code := r.errCode(t)
+			unknown := r.code == http.StatusNotFound && code == delivery.CodeUnknownRequest
+			notBound := r.code == http.StatusForbidden && code == config.ErrSourceNotBound
+			if !unknown && !notBound {
+				t.Errorf("%s %s = %d %s, want 404 unknown_request or 403 SOURCE_NOT_BOUND", who.name, route, r.code, r.body)
+			}
+			continue
+		}
+		if want := userRouteAllowed[route]; r.code != want {
+			t.Errorf("alice %s = %d %s, want %d", route, r.code, r.body, want)
+		}
+	}
+	select {
+	case res := <-done:
+		if res.Outcome != delivery.OutcomeAccepted {
+			t.Errorf("alice's request ended %+v, want accepted", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("alice's request did not end")
 	}
 }
 

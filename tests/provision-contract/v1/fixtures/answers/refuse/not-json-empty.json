@@ -1,0 +1,11 @@
+{
+  "name": "not-json-empty",
+  "description": "An empty body.",
+  "request": "create-repo",
+  "answer_text": "",
+  "expect": {
+    "result": "refused",
+    "status": 400,
+    "rule": "not_json"
+  }
+}

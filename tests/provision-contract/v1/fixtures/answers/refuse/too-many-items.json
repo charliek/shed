@@ -1,0 +1,537 @@
+{
+  "name": "too-many-items",
+  "description": "65 items.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "item-00",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_00",
+        "value": "x",
+        "fingerprint": "fp-item-00"
+      },
+      {
+        "name": "item-01",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_01",
+        "value": "x",
+        "fingerprint": "fp-item-01"
+      },
+      {
+        "name": "item-02",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_02",
+        "value": "x",
+        "fingerprint": "fp-item-02"
+      },
+      {
+        "name": "item-03",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_03",
+        "value": "x",
+        "fingerprint": "fp-item-03"
+      },
+      {
+        "name": "item-04",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_04",
+        "value": "x",
+        "fingerprint": "fp-item-04"
+      },
+      {
+        "name": "item-05",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_05",
+        "value": "x",
+        "fingerprint": "fp-item-05"
+      },
+      {
+        "name": "item-06",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_06",
+        "value": "x",
+        "fingerprint": "fp-item-06"
+      },
+      {
+        "name": "item-07",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_07",
+        "value": "x",
+        "fingerprint": "fp-item-07"
+      },
+      {
+        "name": "item-08",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_08",
+        "value": "x",
+        "fingerprint": "fp-item-08"
+      },
+      {
+        "name": "item-09",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_09",
+        "value": "x",
+        "fingerprint": "fp-item-09"
+      },
+      {
+        "name": "item-10",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_10",
+        "value": "x",
+        "fingerprint": "fp-item-10"
+      },
+      {
+        "name": "item-11",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_11",
+        "value": "x",
+        "fingerprint": "fp-item-11"
+      },
+      {
+        "name": "item-12",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_12",
+        "value": "x",
+        "fingerprint": "fp-item-12"
+      },
+      {
+        "name": "item-13",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_13",
+        "value": "x",
+        "fingerprint": "fp-item-13"
+      },
+      {
+        "name": "item-14",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_14",
+        "value": "x",
+        "fingerprint": "fp-item-14"
+      },
+      {
+        "name": "item-15",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_15",
+        "value": "x",
+        "fingerprint": "fp-item-15"
+      },
+      {
+        "name": "item-16",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_16",
+        "value": "x",
+        "fingerprint": "fp-item-16"
+      },
+      {
+        "name": "item-17",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_17",
+        "value": "x",
+        "fingerprint": "fp-item-17"
+      },
+      {
+        "name": "item-18",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_18",
+        "value": "x",
+        "fingerprint": "fp-item-18"
+      },
+      {
+        "name": "item-19",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_19",
+        "value": "x",
+        "fingerprint": "fp-item-19"
+      },
+      {
+        "name": "item-20",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_20",
+        "value": "x",
+        "fingerprint": "fp-item-20"
+      },
+      {
+        "name": "item-21",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_21",
+        "value": "x",
+        "fingerprint": "fp-item-21"
+      },
+      {
+        "name": "item-22",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_22",
+        "value": "x",
+        "fingerprint": "fp-item-22"
+      },
+      {
+        "name": "item-23",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_23",
+        "value": "x",
+        "fingerprint": "fp-item-23"
+      },
+      {
+        "name": "item-24",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_24",
+        "value": "x",
+        "fingerprint": "fp-item-24"
+      },
+      {
+        "name": "item-25",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_25",
+        "value": "x",
+        "fingerprint": "fp-item-25"
+      },
+      {
+        "name": "item-26",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_26",
+        "value": "x",
+        "fingerprint": "fp-item-26"
+      },
+      {
+        "name": "item-27",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_27",
+        "value": "x",
+        "fingerprint": "fp-item-27"
+      },
+      {
+        "name": "item-28",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_28",
+        "value": "x",
+        "fingerprint": "fp-item-28"
+      },
+      {
+        "name": "item-29",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_29",
+        "value": "x",
+        "fingerprint": "fp-item-29"
+      },
+      {
+        "name": "item-30",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_30",
+        "value": "x",
+        "fingerprint": "fp-item-30"
+      },
+      {
+        "name": "item-31",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_31",
+        "value": "x",
+        "fingerprint": "fp-item-31"
+      },
+      {
+        "name": "item-32",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_32",
+        "value": "x",
+        "fingerprint": "fp-item-32"
+      },
+      {
+        "name": "item-33",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_33",
+        "value": "x",
+        "fingerprint": "fp-item-33"
+      },
+      {
+        "name": "item-34",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_34",
+        "value": "x",
+        "fingerprint": "fp-item-34"
+      },
+      {
+        "name": "item-35",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_35",
+        "value": "x",
+        "fingerprint": "fp-item-35"
+      },
+      {
+        "name": "item-36",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_36",
+        "value": "x",
+        "fingerprint": "fp-item-36"
+      },
+      {
+        "name": "item-37",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_37",
+        "value": "x",
+        "fingerprint": "fp-item-37"
+      },
+      {
+        "name": "item-38",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_38",
+        "value": "x",
+        "fingerprint": "fp-item-38"
+      },
+      {
+        "name": "item-39",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_39",
+        "value": "x",
+        "fingerprint": "fp-item-39"
+      },
+      {
+        "name": "item-40",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_40",
+        "value": "x",
+        "fingerprint": "fp-item-40"
+      },
+      {
+        "name": "item-41",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_41",
+        "value": "x",
+        "fingerprint": "fp-item-41"
+      },
+      {
+        "name": "item-42",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_42",
+        "value": "x",
+        "fingerprint": "fp-item-42"
+      },
+      {
+        "name": "item-43",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_43",
+        "value": "x",
+        "fingerprint": "fp-item-43"
+      },
+      {
+        "name": "item-44",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_44",
+        "value": "x",
+        "fingerprint": "fp-item-44"
+      },
+      {
+        "name": "item-45",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_45",
+        "value": "x",
+        "fingerprint": "fp-item-45"
+      },
+      {
+        "name": "item-46",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_46",
+        "value": "x",
+        "fingerprint": "fp-item-46"
+      },
+      {
+        "name": "item-47",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_47",
+        "value": "x",
+        "fingerprint": "fp-item-47"
+      },
+      {
+        "name": "item-48",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_48",
+        "value": "x",
+        "fingerprint": "fp-item-48"
+      },
+      {
+        "name": "item-49",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_49",
+        "value": "x",
+        "fingerprint": "fp-item-49"
+      },
+      {
+        "name": "item-50",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_50",
+        "value": "x",
+        "fingerprint": "fp-item-50"
+      },
+      {
+        "name": "item-51",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_51",
+        "value": "x",
+        "fingerprint": "fp-item-51"
+      },
+      {
+        "name": "item-52",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_52",
+        "value": "x",
+        "fingerprint": "fp-item-52"
+      },
+      {
+        "name": "item-53",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_53",
+        "value": "x",
+        "fingerprint": "fp-item-53"
+      },
+      {
+        "name": "item-54",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_54",
+        "value": "x",
+        "fingerprint": "fp-item-54"
+      },
+      {
+        "name": "item-55",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_55",
+        "value": "x",
+        "fingerprint": "fp-item-55"
+      },
+      {
+        "name": "item-56",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_56",
+        "value": "x",
+        "fingerprint": "fp-item-56"
+      },
+      {
+        "name": "item-57",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_57",
+        "value": "x",
+        "fingerprint": "fp-item-57"
+      },
+      {
+        "name": "item-58",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_58",
+        "value": "x",
+        "fingerprint": "fp-item-58"
+      },
+      {
+        "name": "item-59",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_59",
+        "value": "x",
+        "fingerprint": "fp-item-59"
+      },
+      {
+        "name": "item-60",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_60",
+        "value": "x",
+        "fingerprint": "fp-item-60"
+      },
+      {
+        "name": "item-61",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_61",
+        "value": "x",
+        "fingerprint": "fp-item-61"
+      },
+      {
+        "name": "item-62",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_62",
+        "value": "x",
+        "fingerprint": "fp-item-62"
+      },
+      {
+        "name": "item-63",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_63",
+        "value": "x",
+        "fingerprint": "fp-item-63"
+      },
+      {
+        "name": "item-64",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "VAR_64",
+        "value": "x",
+        "fingerprint": "fp-item-64"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "too_many_items"
+  }
+}

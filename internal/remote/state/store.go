@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/provider"
 )
 
@@ -71,8 +72,15 @@ type Record struct {
 	// key is pinned and the agent answered. A shed that is Ready is never
 	// re-learned and never has its create steps run again.
 	Ready bool `json:"ready,omitempty"`
-	// Cloned and Provisioned record which create steps have run, so a
-	// resumed create does not repeat them.
+	// Delivery is the shed's delivery record: the four tracked steps
+	// (stage 1, clone, stage 2, install hook), saved after each, the last
+	// delivery and the delivered items, never a value. Nil for a shed
+	// created before delivery existed, which reports {"state": "none"}.
+	Delivery *delivery.Record `json:"delivery,omitempty"`
+	// Cloned and Provisioned are what a server from before delivery
+	// recorded of a create's clone and hooks. They are read, never
+	// written: a record with no Delivery reads cloned as the clone done and
+	// provisioned as the install hook done (LegacySteps).
 	Cloned      bool `json:"cloned,omitempty"`
 	Provisioned bool `json:"provisioned,omitempty"`
 	// NoProvision is the create request's no_provision.
@@ -82,6 +90,10 @@ type Record struct {
 	// is not an admin). It is kept so a create resumed after a restart
 	// withholds them too.
 	NoServerEnv bool `json:"no_server_env,omitempty"`
+	// ScriptKey says the create was called with a script key, for which no
+	// delivery applies. It is kept so a create resumed after a restart
+	// knows no source would be asked, and runs its clone and hooks.
+	ScriptKey bool `json:"script_key,omitempty"`
 
 	// Address is the last address the cloud reported; AddressAt is when.
 	Address   string    `json:"address,omitempty"`
@@ -111,6 +123,7 @@ func (r *Record) Clone() *Record {
 		return nil
 	}
 	out := *r
+	out.Delivery = r.Delivery.Clone()
 	if r.Pending != nil {
 		p := *r.Pending
 		out.Pending = &p
@@ -133,6 +146,24 @@ func cloneMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// LegacySteps is how a record written before delivery existed reads as
+// steps: nil when it has a delivery record or recorded nothing; otherwise
+// every step owed but the clone (done when Cloned) and the install hook
+// (done when Provisioned).
+func (r *Record) LegacySteps() *delivery.Steps {
+	if r == nil || r.Delivery != nil || (!r.Cloned && !r.Provisioned) {
+		return nil
+	}
+	s := *delivery.NewRecord().Steps
+	if r.Cloned {
+		s.Clone = delivery.Step{State: delivery.StepDone}
+	}
+	if r.Provisioned {
+		s.Install = delivery.Step{State: delivery.StepDone}
+	}
+	return &s
 }
 
 // Marker says a delete was acknowledged for a shed and its VM may still

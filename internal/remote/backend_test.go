@@ -18,6 +18,7 @@ import (
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
@@ -190,6 +191,9 @@ type env struct {
 	// clone, when set, replaces the backend's repo clone before it starts
 	// (so a create resumed at start-up uses it too).
 	clone func(ctx context.Context, agent *vmutil.AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error
+	// seams, when set, edits the backend's delivery seams (and service)
+	// before it starts, as clone does.
+	seams func(*Backend)
 
 	autoStop chan struct{}
 	autoDone chan struct{}
@@ -287,6 +291,14 @@ func (e *env) open() *Backend {
 	}
 	if e.clone != nil {
 		b.clone = e.clone
+	}
+	// The fake agent has no console: the project directory reads as empty
+	// unless a test says otherwise, and the delivery seams are the test's.
+	b.workTree = func(context.Context, *vmutil.AgentClient, string) (vmutil.WorkTree, error) {
+		return vmutil.WorkTreeAbsent, nil
+	}
+	if e.seams != nil {
+		e.seams(b)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -852,6 +864,14 @@ func TestAdoptionAfterCacheLoss(t *testing.T) {
 	after, err := e.b.ListSheds(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The delivery records differ, and must: an adopted shed's history is
+	// not known, so every step is skipped as adopted and its state is none.
+	for i := range after {
+		if d := after[i].Delivery; d == nil || d.State != delivery.StateNone || d.Steps == nil || d.Steps.Clone.Reason != delivery.ReasonAdopted {
+			t.Fatalf("adopted shed %s reports delivery %+v, want every step skipped as adopted", after[i].Name, d)
+		}
+		before[i].Delivery, after[i].Delivery = nil, nil
 	}
 	wantJSON, _ := json.MarshalIndent(before, "", " ")
 	gotJSON, _ := json.MarshalIndent(after, "", " ")

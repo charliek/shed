@@ -86,6 +86,10 @@ pub struct Env {
     /// else `~/.config/shed/extensions.yaml`). The harness overrides it to keep a run
     /// hermetic.
     pub broker_extensions_path: PathBuf,
+    /// The delivery settings (plan 039 §3.8, `delivery.toml`): `SHED_TAURI_DELIVERY_CONFIG`,
+    /// else `~/.config/shed/delivery.toml`, beside `extensions.yaml`. The harness overrides
+    /// it, as it does the broker's config, to keep a run hermetic.
+    pub delivery_settings_path: PathBuf,
     /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
     /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
     /// `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log`.
@@ -185,6 +189,9 @@ impl Env {
             broker_extensions_path: var("SHED_TAURI_EXTENSIONS_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_extensions_path),
+            delivery_settings_path: var("SHED_TAURI_DELIVERY_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_delivery_path),
             log_file: crate::applog::resolve_path(
                 crate::applog::MAC,
                 var("SHED_TAURI_LOG_FILE").as_deref(),
@@ -300,6 +307,13 @@ fn default_extensions_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default();
     home.join(".config/shed/extensions.yaml")
+}
+
+fn default_delivery_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    shed_desktop_core::delivery::providers::settings_path(&home)
 }
 
 fn default_config_path() -> PathBuf {

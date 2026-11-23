@@ -270,7 +270,7 @@ func TestSSHEntryIntoAClientsShedIsAudited(t *testing.T) {
 		}
 		for k := range l {
 			switch k {
-			case "ts", "event", "identity", "remote", "shed", "owner", "channel", "port":
+			case "ts", "seq", "event", "identity", "remote", "shed", "owner", "channel", "port":
 			default:
 				t.Errorf("line %d carries %q: %v", i, k, l)
 			}

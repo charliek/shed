@@ -24,6 +24,9 @@ var _ backend.SnapshotStamper = (*VZBackend)(nil)
 // Compile-time check that VZBackend counts the records its listing skips.
 var _ backend.CountingLister = (*VZBackend)(nil)
 
+// Compile-time check: `shed provision` is offered.
+var _ backend.Provisioner = (*VZBackend)(nil)
+
 // VZBackend implements backend.Backend using Apple Virtualization.framework VMs via vfkit.
 type VZBackend struct {
 	client *Client
@@ -103,6 +106,12 @@ func (b *VZBackend) StampSnapshotUser(ctx context.Context, name, user string) (*
 // ResetShed wipes and recreates a stopped shed's writable upper layer.
 func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.client.ResetShed(ctx, name)
+}
+
+// BeginProvision admits `shed provision` on a running shed
+// (backend.Provisioner).
+func (b *VZBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
+	return b.client.BeginProvision(ctx, name)
 }
 
 // ListSessions returns all tmux sessions in a shed.

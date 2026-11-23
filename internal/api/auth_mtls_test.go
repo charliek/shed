@@ -202,6 +202,25 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		{"sources, credentials cert forbidden", "GET", "/api/sources", cred, 403},
 		{"sources use, control cert", "POST", "/api/sources/use", ctl, 200},
 		{"sources use, credentials cert forbidden", "POST", "/api/sources/use", cred, 403},
+		// The delivery transport is a source's, as the bus is: credentials
+		// only, at every path under it.
+		{"delivery stream, credentials cert", "GET", "/api/delivery/requests", cred, 200},
+		{"delivery stream, control cert forbidden", "GET", "/api/delivery/requests", ctl, 403},
+		{"delivery answer, credentials cert", "POST", "/api/delivery/requests/0123456789abcdef0123456789abcdef", cred, 200},
+		{"delivery answer, control cert forbidden", "POST", "/api/delivery/requests/0123456789abcdef0123456789abcdef", ctl, 403},
+		{"delivery root, control cert forbidden", "GET", "/api/delivery", ctl, 403},
+		{"delivery other path, control cert forbidden", "GET", "/api/delivery/x/y", ctl, 403},
+		{"delivery prefix lookalike, control cert", "GET", "/api/deliveryx", ctl, 200},
+		{"delivery no cert", "GET", "/api/delivery/requests", nil, 401},
+		// `shed provision` is a lifecycle route: control scope, never
+		// credentials (a source cannot cause a delivery).
+		{"provision, control cert", "POST", "/api/sheds/box/provision", ctl, 200},
+		{"provision, credentials cert forbidden", "POST", "/api/sheds/box/provision", cred, 403},
+		// The activity feed is the control plane's: a source's credentials
+		// certificate does not read it.
+		{"activity, control cert", "GET", "/api/activity", ctl, 200},
+		{"activity, credentials cert forbidden", "GET", "/api/activity", cred, 403},
+		{"activity, no cert", "GET", "/api/activity", nil, 401},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

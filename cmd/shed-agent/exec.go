@@ -91,8 +91,11 @@ func handleExecConnection(conn net.Conn, user *userInfo) {
 		cmd.Dir = "/"
 	}
 
-	// Build environment: system env + environment.d + request-provided env
-	env := append(os.Environ(), loadEnvironmentD("/etc/environment.d")...)
+	// Build environment: system env + /etc/environment.d + the shed user's
+	// ~/.config/environment.d (delivered values; later entries win, so a
+	// user value beats a system default for the same key, and the refused
+	// variables are never taken from it) + request-provided env.
+	env := append(os.Environ(), environmentDEntries("/etc/environment.d", user)...)
 	env = append(env, req.Env...)
 
 	// When running as a non-root user, force HOME and USER to match the

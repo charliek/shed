@@ -7,7 +7,7 @@
 //! `(test_mode, mock_base_url, config_path)` rather than a client's `SHED_*_` env
 //! struct, so the GTK + Tauri clients share one implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -412,9 +412,20 @@ impl Backend {
     pub async fn refresh(&self) -> Reachability {
         let mut sheds = Vec::new();
         let mut host_errors = Vec::new();
-        for (name, result) in self.per_host(async |c: &Client| c.list_sheds().await).await {
+        let mut delivery = HashMap::new();
+        for (name, result) in self
+            .per_host(async |c: &Client| c.list_sheds_with_delivery().await)
+            .await
+        {
             match result {
-                Ok(mut s) => sheds.append(&mut s),
+                Ok(rows) => {
+                    for (s, d) in rows {
+                        if let Some(d) = d {
+                            delivery.insert((s.host.clone(), s.name.clone()), d);
+                        }
+                        sheds.push(s);
+                    }
+                }
                 Err(e) => host_errors.push(HostFailure::from_error(&name, &e)),
             }
         }
@@ -427,6 +438,7 @@ impl Backend {
             sheds,
             last_error,
             host_errors,
+            delivery,
         }
     }
 
@@ -662,6 +674,10 @@ pub struct Reachability {
     /// host is not the only case (plan 006 D6). `last_error` stays as the
     /// pre-existing string rollup; consumers that can render structure use this.
     pub host_errors: Vec<HostFailure>,
+    /// Each listed shed's delivery record (plan 039 §3.6), keyed by `(host, name)`, as
+    /// its server sent it. A shed from a server older than delivery has none.
+    #[serde(skip)]
+    pub delivery: HashMap<(String, String), serde_json::Value>,
 }
 
 /// One host's failure in presentation shape (plan 006 D6 / shed#300): `kind` is
@@ -1246,6 +1262,40 @@ mod tests {
         assert_eq!(sheds.len(), 1);
         assert_eq!(sheds[0].name, "g");
         assert_eq!(sheds[0].host, "good");
+    }
+
+    #[tokio::test]
+    async fn refresh_keys_each_delivery_record_by_host_and_shed() {
+        let a = MockServer::start_async().await;
+        a.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200).body(
+                r#"{"sheds":[{"name":"w","status":"running","delivery":{"state":"partial"}},
+                             {"name":"old","status":"running"}]}"#,
+            );
+        })
+        .await;
+        let b = MockServer::start_async().await;
+        b.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200)
+                .body(r#"{"sheds":[{"name":"w","status":"running","delivery":{"state":"none"}}]}"#);
+        })
+        .await;
+        let backend = backend_with(vec![
+            client_at("a", a.base_url()),
+            client_at("b", b.base_url()),
+        ]);
+        let r = backend.refresh().await;
+        assert_eq!(r.sheds.len(), 3);
+        let state = |h: &str, n: &str| {
+            r.delivery
+                .get(&(h.to_string(), n.to_string()))
+                .map(|d| d["state"].as_str().unwrap().to_string())
+        };
+        assert_eq!(state("a", "w").as_deref(), Some("partial"));
+        assert_eq!(state("b", "w").as_deref(), Some("none"));
+        assert_eq!(state("a", "old"), None);
     }
 
     #[tokio::test]

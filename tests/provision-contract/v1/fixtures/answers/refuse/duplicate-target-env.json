@@ -1,0 +1,33 @@
+{
+  "name": "duplicate-target-env",
+  "description": "Two env items naming the same variable.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "one",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "a",
+        "fingerprint": "fp-one"
+      },
+      {
+        "name": "two",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "b",
+        "fingerprint": "fp-two"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_target"
+  }
+}

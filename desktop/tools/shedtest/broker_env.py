@@ -17,7 +17,8 @@ launch env before the app is spawned:
 * `apply(env, overrides)` sets or removes each override.
 * `validate(env, info)` raises `HermeticityError` unless the env and files are
   hermetic: no `SSH_AUTH_SOCK`; HOME, every `XDG_*_HOME`, `XDG_RUNTIME_DIR`,
-  `SHED_BROKER_STATE_DIR` and `SHED_TAURI_EXTENSIONS_CONFIG` inside the runtime
+  `SHED_BROKER_STATE_DIR`, `SHED_TAURI_EXTENSIONS_CONFIG` and
+  `SHED_TAURI_DELIVERY_CONFIG` inside the runtime
   dir; a written `extensions.yaml` with `ssh.mode: local-keys` whose discovery
   source is inside the runtime dir; and every server URL in the broker's files
   `http://127.0.0.1:<port>` of a mock the caller passed.
@@ -311,6 +312,9 @@ def validate(env: dict[str, str], info: BrokerInfo) -> None:
     ext = env.get("SHED_TAURI_EXTENSIONS_CONFIG")
     if ext is not None:
         dirs["SHED_TAURI_EXTENSIONS_CONFIG"] = ext
+    delivery = env.get("SHED_TAURI_DELIVERY_CONFIG")
+    if delivery is not None:
+        dirs["SHED_TAURI_DELIVERY_CONFIG"] = delivery
     outside = {k: v for k, v in dirs.items() if not _inside(v, root)}
     if outside:
         raise HermeticityError(f"outside the runtime dir {root}: {outside}")

@@ -1,0 +1,39 @@
+{
+  "name": "cross-base-nested",
+  "description": "With the project directory /home/shed/widgets, home:widgets/secrets is a file and project:secrets/key needs it to be a directory.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "home-secrets",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "widgets/secrets",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-home-secrets"
+      },
+      {
+        "name": "project-key",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": "secrets/key",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-project-key"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "nested_target"
+  }
+}

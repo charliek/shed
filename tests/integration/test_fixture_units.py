@@ -4977,3 +4977,509 @@ def test_connect_line_example_in_the_configuration_reference():
     assert len(examples) == 1, examples
     ex = examples[0]
     assert auditlog.connect_entry_problems(ex, shed=ex["shed"], owner="build-1", admin=True, user="pat", port=8080) == []
+
+
+@pytest.mark.parametrize("seq", [_DROP, 1, 42, 10**12])
+def test_audit_lines_take_seq_or_none(seq):
+    """A server that writes the lifecycle and delivery events puts the log's
+    counter, `seq`, on every line; an older one writes none. Either is what
+    the server writes."""
+    line = _ssh_line(seq=seq)
+    assert auditlog.ssh_entry_problems(line, shed="itest-svc-1", owner="itest", channel="exec") == []
+    line = _connect_line(seq=seq)
+    assert auditlog.connect_entry_problems(line, shed="itest-svc-1", owner="itest") == []
+
+
+@pytest.mark.parametrize("seq", [0, -1, True, "3", 1.5, None])
+def test_audit_lines_refuse_a_bad_seq(seq):
+    problems = auditlog.ssh_entry_problems(_ssh_line(seq=seq), shed="itest-svc-1", owner="itest", channel="exec")
+    assert any("seq is" in p for p in problems), problems
+    problems = auditlog.connect_entry_problems(_connect_line(seq=seq), shed="itest-svc-1", owner="itest")
+    assert any("seq is" in p for p in problems), problems
+
+
+# ----------------------------------------------------------------------------
+# fixtures/delivery.py: provisioning by delivery (test_delivery.py)
+# ----------------------------------------------------------------------------
+
+import random  # noqa: E402
+import sys as _sys  # noqa: E402
+
+from fixtures import delivery as dlv  # noqa: E402
+
+_GO_LIFECYCLE = dc.REPO_ROOT / "internal" / "delivery" / "lifecycle.go"
+_GO_CLI_PROVISION = dc.REPO_ROOT / "cmd" / "shed" / "provision.go"
+_GO_WRITER = dc.REPO_ROOT / "internal" / "delivery" / "writer.go"
+_GO_OVERVIEW = dc.REPO_ROOT / "internal" / "api" / "overview.go"
+_GO_REF_MAIN = dc.REPO_ROOT / "internal" / "delivery" / "refsource" / "cmd" / "shed-provision-ref" / "main.go"
+_GO_REF_SOURCE = dc.REPO_ROOT / "internal" / "delivery" / "refsource" / "source.go"
+
+
+def test_delivery_texts_are_the_servers_own():
+    """The warning, the expired-item line, the env file and the feature
+    tokens the cases match are the ones the Go source writes."""
+    life = _GO_LIFECYCLE.read_text()
+    assert 'fmt.Sprintf("Credentials were not delivered (%s). Run: shed provision %s", FailureText(f), shed)' in life
+    assert dlv.WARNING_FORMAT.replace("{failure}", "%s").replace("{shed}", "%s") in life
+    assert ('fmt.Sprintf("Credentials were not delivered (%s). Recreate the shed from a current image.", FailureText(f))'
+            in life)
+    assert dlv.IMAGE_TOO_OLD_FORMAT.replace("{failure}", "%s") in life
+    for form in ('"%s: %s", f.Reason, f.Rule', '"%s: %s %s", f.Reason, f.Item, f.Result', '"%s: the env file %s"'):
+        assert form in life, form
+    cli = _GO_CLI_PROVISION.read_text()
+    assert ('"Warning: delivered item %s has expired. Run: shed provision %s\\n"' in cli)
+    assert dlv.EXPIRED_FORMAT.replace("{item}", "%s").replace("{shed}", "%s") in cli
+    writer = _GO_WRITER.read_text()
+    env_dir, env_name = dlv.ENV_FILE.rsplit("/", 1)
+    assert f'EnvFileName = "{env_name}"' in writer
+    assert re.search(r"UserEnvDir\s*=\s*refusedHomeTree", writer)
+    text = (dc.REPO_ROOT / "internal" / "delivery" / "text.go").read_text()
+    assert f'const refusedHomeTree = "{env_dir}"' in text, env_dir
+    overview = _GO_OVERVIEW.read_text()
+    for f in dlv.FEATURES:
+        assert f'= "{f}"' in overview, f
+
+
+@pytest.mark.parametrize("reason, kw, want", [
+    ("source_offline", {}, "source_offline"),
+    ("answer_refused", {"rule": "refused_variable"}, "answer_refused: refused_variable"),
+    ("write_failed", {"item": "itest-is-dir", "result": "is_directory"}, "write_failed: itest-is-dir is_directory"),
+    ("write_failed", {"result": "io"}, "write_failed: the env file io"),
+])
+def test_delivery_warning_text(reason, kw, want):
+    assert dlv.failure_text(reason, **kw) == want
+    assert dlv.delivery_warning("s1", reason, **kw) == f"Credentials were not delivered ({want}). Run: shed provision s1"
+
+
+def test_image_too_old_warning_names_a_recreate():
+    """An image too old to take a delivery is never finished by `shed
+    provision`, so its warning does not send the person there."""
+    assert dlv.delivery_warning("s1", "image_too_old") == (
+        "Credentials were not delivered (image_too_old). Recreate the shed from a current image.")
+
+
+def test_delivery_warnings_are_picked_from_cli_output():
+    out = ("  Requesting credentials from your source...\n"
+           "  Warning: Credentials were not delivered (source_offline). Run: shed provision s1\n"
+           "  Warning: Failed to clone repository (see server logs for details)\n"
+           "Created shed s1\n"
+           "Warning: delivered item gh has expired. Run: shed provision s1\n")
+    assert dlv.delivery_warnings(out) == ["Credentials were not delivered (source_offline). Run: shed provision s1"]
+    assert dlv.expired_warnings(out) == [dlv.expired_warning("s1", "gh")]
+    assert dlv.delivery_warnings("Created shed s1\n") == []
+
+
+def test_delivery_canned_items_follow_the_contract():
+    f = dlv.file_item("k", ".ssh/id_x", b"key\n", mode="0400")
+    assert f == {"name": "k", "provider": "files", "kind": "file", "stage": 1, "base": "home", "path": ".ssh/id_x",
+                 "mode": "0400", "content": "a2V5Cg==", "fingerprint": "fp-k"}
+    e = dlv.env_item("api.key", "EXAMPLE_KEY", "a b", expires_at="2020-01-01T00:00:00Z")
+    assert e["fingerprint"] == "fp-api-key" and e["expires_at"] == "2020-01-01T00:00:00Z" and "stage" not in e
+    p = dlv.file_item("p", ".env", b"x", stage=2, base="project")
+    assert dlv.canned([f, e, p]) == {"items": [f, e, p], "problems": []}
+    assert dlv.item_target(e) == "EXAMPLE_KEY" and dlv.item_target(p) == ".env"
+    assert dlv.item_shed_path(f, None) == "/home/shed/.ssh/id_x"
+    assert dlv.item_shed_path(p, "/home/shed/repo/") == "/home/shed/repo/.env"
+    with pytest.raises(ValueError):
+        dlv.item_shed_path(p, None)
+    assert dlv.env_file_text([f, e, dlv.env_item("b", "B", "x$y")]) == "EXAMPLE_KEY=a b\nB=x$y\n"
+
+
+@pytest.mark.parametrize("make", [
+    lambda: dlv.file_item("Bad", "a", b"x"),
+    lambda: dlv.file_item("a", ".ssh/./authorized_keys", b"x"),
+    lambda: dlv.file_item("a", "a/../b", b"x"),
+    lambda: dlv.file_item("a", "/abs", b"x"),
+    lambda: dlv.file_item("a", "trailing/", b"x"),
+    lambda: dlv.file_item("a", ".ssh/authorized_keys", b"x"),
+    lambda: dlv.file_item("a", ".config/environment.d/x.conf", b"x"),
+    lambda: dlv.file_item("a", "a", b"x", mode="0700"),
+    lambda: dlv.file_item("a", "a", b"x", base="project"),
+    lambda: dlv.file_item("a", "a", b"x" * (dlv.MAX_FILE_BYTES + 1)),
+    lambda: dlv.env_item("a", "PATH", "x"),
+    lambda: dlv.env_item("a", "LD_PRELOAD", "x"),
+    lambda: dlv.env_item("a", "SHED_X", "x"),
+    lambda: dlv.env_item("a", "lower", "x"),
+    lambda: dlv.env_item("a", "A", " lead"),
+    lambda: dlv.env_item("a", "A", "trail "),
+    lambda: dlv.env_item("a", "A", ""),
+    lambda: dlv.env_item("a", "A", "tab\there"),
+    lambda: dlv.env_item("a", "A", "x" * 8193),
+])
+def test_delivery_canned_items_refuse_what_the_contract_refuses(make):
+    with pytest.raises(ValueError):
+        make()
+
+
+def test_delivery_standard_bundle_carries_the_sentinel_in_values_only():
+    import test_delivery as td
+
+    s = dlv.new_sentinel()
+    assert re.fullmatch(r"itestsntl[0-9a-f]{24}", s)
+    items = td.standard_items(s)
+    assert all(not dlv.item_problems(i) for i in items)
+    for i in items:
+        assert s not in i["name"] + i.get("path", "") + i.get("variable", "") + i["fingerprint"], i["name"]
+    carriers = [i for i in items if (i["kind"] == "env" and s in i["value"])
+                or (i["kind"] == "file" and s.encode() in dlv.item_content(i))]
+    assert len(carriers) == len(items) - 1, "every content and value but the public key's carries the sentinel"
+    value = next(i["value"] for i in items if i["variable" if i["kind"] == "env" else "name"] == td.VALUE_VAR)
+    for ch in ("'", '"', "$", "  ", "`", "\\"):
+        assert ch in value, ch
+    modes = {i["mode"] for i in items if i["kind"] == "file"}
+    assert modes == {"0400", "0600", "0644"}
+    assert {i["stage"] for i in items if i["kind"] == "file"} == {1, 2}
+
+
+def test_delivery_refsource_argv_uses_only_its_flags():
+    flags = set(re.findall(r'fs\.(?:String|Bool|Duration)\("([a-z-]+)"', _GO_REF_MAIN.read_text()))
+    assert {"server", "cert", "key", "ca", "machine-id", "machine-name", "items", "refuse-fixture", "silent",
+            "delay", "twice", "second-connection", "answer-machine-id", "answer-cert", "answer-key", "once"} <= flags
+    ident = dlv.SourceIdentity("https://127.0.0.1:1", "/ca", "/c", "/k", "a" * 32, "m")
+    argv = dlv.refsource_argv("/bin/ref", ident, items_file="/i.json", silent=True, delay=8, twice=True,
+                              second_connection=True, answer_machine_id="b" * 32, answer_cert=("/c2", "/k2"), once=True)
+    used = {a[2:] for a in argv if a.startswith("--")}
+    assert used <= flags, used - flags
+    assert argv[:3] == ["/bin/ref", "--server", "https://127.0.0.1:1"]
+    assert argv[argv.index("--delay") + 1] == "8s"
+    assert argv[argv.index("--answer-cert") + 1:argv.index("--answer-cert") + 4] == ["/c2", "--answer-key", "/k2"]
+    plain = dlv.refsource_argv("/bin/ref", ident, refuse_fixture="/f.json")
+    assert "--refuse-fixture" in plain and "--items" not in plain and "--silent" not in plain
+    with pytest.raises(ValueError):
+        dlv.refsource_argv("/bin/ref", ident, items_file="/i", refuse_fixture="/f")
+
+
+def test_delivery_event_lines():
+    kinds = set(re.findall(r'Kind: "([a-z_]+)"', _GO_REF_SOURCE.read_text()))
+    assert kinds == set(dlv.EVENT_KINDS), kinds
+    assert dlv.parse_event_line('{"event":"request","id":"x","shed":"s"}\n') == {"event": "request", "id": "x", "shed": "s"}
+    for bad in ("", "not json", "[]", '{"event":"other"}', '{"id":"x"}'):
+        assert dlv.parse_event_line(bad) is None, bad
+
+
+def test_delivery_source_env_carries_nothing_of_the_developers(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test")
+    env = dlv.source_env(tmp_path)
+    assert set(env) == {"HOME", "PATH", "LC_ALL"} and env["HOME"] == str(tmp_path)
+
+
+_FAKE_REF = """import json, sys, time
+print(json.dumps({"event": "refused", "status": 409, "code": "SOURCE_DUPLICATE_STREAM"}), flush=True)
+print(json.dumps({"event": "stream", "stream": "s1"}), flush=True)
+print("not an event", flush=True)
+print(json.dumps({"event": "request", "stream": "s1", "id": "r1", "reason": "create", "shed": "a", "user": "u"}), flush=True)
+print(json.dumps({"event": "answer", "stream": "s1", "id": "r1", "attempt": 1, "status": 204}), flush=True)
+time.sleep(60)
+"""
+
+
+def test_delivery_refsource_process_reads_events_and_stops(tmp_path):
+    script = tmp_path / "fake_ref.py"
+    script.write_text(_FAKE_REF)
+    src = dlv.RefSource([_sys.executable, str(script)], tmp_path, label="fake")
+    try:
+        assert src.wait_stream(timeout=20)["stream"] == "s1"
+        assert src.wait_request("a", timeout=20)["id"] == "r1"
+        assert src.wait_for(lambda e: e["event"] == "answer", 20)["status"] == 204
+        assert [e["id"] for e in src.requests("a")] == ["r1"] and src.requests("b") == []
+        assert src.answers("r1")[0]["attempt"] == 1 and src.stream_id() == "s1"
+        assert src.wait_for(lambda e: e["event"] == "end", 0.2) is None
+    finally:
+        t0 = time.monotonic()
+        src.stop()
+    assert src.proc.poll() is not None and time.monotonic() - t0 < 15
+    src.stop()  # idempotent
+    with pytest.raises(AssertionError, match="did not open its stream"):
+        quiet = tmp_path / "quiet.py"
+        quiet.write_text("import time; time.sleep(30)\n")
+        q = dlv.RefSource([_sys.executable, str(quiet)], tmp_path, label="quiet")
+        try:
+            q.wait_stream(timeout=0.5)
+        finally:
+            q.stop()
+
+
+def _delivery_record(**steps):
+    rec = {"state": "delivered", "steps": {n: {"state": "done"} for n in dlv.STEP_NAMES},
+           "last": {"at": "2026-11-23T10:00:00Z", "reason": "create", "outcome": "accepted"}, "items": []}
+    for k, v in steps.items():
+        rec["steps"][k] = v
+    return rec
+
+
+def test_delivery_record_steps_and_items():
+    f = dlv.file_item("k", "a/k", b"x")
+    e = dlv.env_item("v", "V", "x", expires_at="2099-01-01T00:00:00Z")
+    p = dlv.file_item("p", ".env", b"x", stage=2, base="project")
+    rec = _delivery_record(install={"state": "skipped", "reason": "no_hook"})
+    rec["items"] = [
+        {**dlv.expected_record_item(f), "written_at": "2026-11-23T10:00:01Z"},
+        {**dlv.expected_record_item(e), "written_at": "2026-11-23T10:00:01Z"},
+        dlv.expected_record_item(p, result="not_written"),
+    ]
+    assert rec["items"][1]["stage"] == 1 and "base" not in rec["items"][1]
+    assert rec["items"][2]["base"] == "project" and rec["items"][2]["target"] == ".env"
+    assert dlv.steps_of(rec)["install"] == ("skipped", "no_hook")
+    assert dlv.steps_of({})["stage1"] == (None, None)
+    assert dlv.step_problems(rec, {"stage1": ("done", None), "install": ("skipped", "no_hook")}) == []
+    assert dlv.step_problems(rec, {"install": ("owed", None)}) != []
+    assert dlv.record_item_problems(rec, [f, e, p], results={"p": "not_written"}) == []
+    # A result, a written_at, a member that would carry a value, a missing item.
+    assert dlv.record_item_problems(rec, [f, e, p]) != []
+    bad = json.loads(json.dumps(rec))
+    bad["items"][0]["content"] = "eA=="
+    assert any("carries ['content']" in x for x in dlv.record_item_problems(bad, [f], results={}))
+    bad = json.loads(json.dumps(rec))
+    del bad["items"][0]["written_at"]
+    assert any("written_at" in x for x in dlv.record_item_problems(bad, [f]))
+    assert any("not in the record" in x for x in dlv.record_item_problems(rec, [dlv.file_item("z", "z", b"x")]))
+    again = json.loads(json.dumps(rec))
+    again["last"]["at"] = "2026-11-23T11:00:00Z"
+    again["items"][0]["written_at"] = "2026-11-23T11:00:01Z"
+    assert dlv.without_times(again) == dlv.without_times(rec) and again != rec
+    again["items"][0]["fingerprint"] = "other"
+    assert dlv.without_times(again) != dlv.without_times(rec)
+
+
+@pytest.mark.parametrize("prefix_len", range(8))
+def test_delivery_sentinel_forms_find_it_in_any_base64(prefix_len):
+    s = dlv.new_sentinel()
+    forms = dlv.sentinel_forms(s)
+    assert forms[0] == s and all(len(f) >= 12 for f in forms) and len(forms) == 4
+    rnd = random.Random(prefix_len)
+    for suffix_len in range(4):
+        blob = bytes(rnd.randrange(256) for _ in range(prefix_len)) + s.encode() + b"tail"[:suffix_len]
+        enc = base64.b64encode(blob).decode()
+        assert dlv.found_forms(enc, forms), (prefix_len, suffix_len)
+        assert dlv.found_forms(json.dumps({"content": enc}).encode(), forms)
+    assert dlv.found_forms(f'{{"value":"x {s} y"}}', forms) == [s]
+    assert dlv.found_forms("nothing here " + base64.b64encode(b"other").decode(), forms) == []
+    assert dlv.found_forms(None, forms) == []
+
+
+def _scan_tree_fixture(tmp_path: Path, s: str) -> Path:
+    root = tmp_path / "state"
+    (root / "instances" / "a").mkdir(parents=True)
+    (root / "blobs" / "sha256").mkdir(parents=True)
+    (root / "instances" / "a" / "meta.json").write_text(f'{{"x": "{s}"}}')
+    (root / "instances" / "a" / "clean.json").write_text("{}")
+    (root / "instances" / "a" / "disk.img").write_bytes(s.encode() + b"\0" * 4096)
+    (root / "blobs" / "sha256" / "blob").write_text(s)
+    (root / "audit.jsonl").write_text(base64.b64encode(b"ab" + s.encode()).decode() + "\n")
+    (tmp_path / "outside").write_text(s)
+    (root / "link").symlink_to(tmp_path / "outside")
+    return root
+
+
+def test_delivery_scan_tree(tmp_path):
+    s = dlv.new_sentinel()
+    root = _scan_tree_fixture(tmp_path, s)
+    hits = dlv.scan_tree([root], dlv.sentinel_forms(s), max_bytes=1024)
+    assert sorted({Path(p).relative_to(root).as_posix() for p, _ in hits}) == ["audit.jsonl", "instances/a/meta.json"]
+    assert dlv.scan_tree([root], ["absent-needle"], max_bytes=1024) == []
+    with pytest.raises(dlv.ScanError, match="not a directory"):
+        dlv.scan_tree([tmp_path / "missing"], [s])
+
+
+_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_ROOT, reason="root reads a mode-000 file or directory")
+@pytest.mark.parametrize("what", ["file", "dir"])
+def test_delivery_scan_tree_fails_on_what_it_cannot_read(tmp_path, what):
+    """A file or directory the sweep cannot read fails it, naming the path:
+    a sweep that skipped it would prove nothing."""
+    s = dlv.new_sentinel()
+    root = _scan_tree_fixture(tmp_path, s)
+    target = root / "instances" / ("a" if what == "dir" else "a/clean.json")
+    target.chmod(0)
+    try:
+        with pytest.raises(dlv.ScanError, match="could not read 1 paths") as e:
+            dlv.scan_tree([root], dlv.sentinel_forms(s), max_bytes=1024)
+        assert str(target) in str(e.value)
+    finally:
+        target.chmod(0o700)
+
+
+def test_delivery_scan_tree_skips_only_a_vanished_file(tmp_path, monkeypatch):
+    s = dlv.new_sentinel()
+    root = _scan_tree_fixture(tmp_path, s)
+    real = dlv._read_for_scan
+    gone = str(root / "instances" / "a" / "meta.json")
+
+    def vanish(path):
+        if path == gone:
+            raise FileNotFoundError(2, "No such file or directory", path)
+        return real(path)
+
+    monkeypatch.setattr(dlv, "_read_for_scan", vanish)
+    hits = dlv.scan_tree([root], dlv.sentinel_forms(s), max_bytes=1024)
+    assert sorted({Path(p).name for p, _ in hits}) == ["audit.jsonl"]
+
+    def refuse(path):
+        if path == gone:
+            raise PermissionError(13, "Permission denied", path)
+        return real(path)
+
+    monkeypatch.setattr(dlv, "_read_for_scan", refuse)
+    with pytest.raises(dlv.ScanError, match="cannot be read: Permission denied"):
+        dlv.scan_tree([root], dlv.sentinel_forms(s), max_bytes=1024)
+
+
+def test_delivery_remote_scan_command_scans_as_scan_tree(tmp_path):
+    """The command run on the server's host, with `sudo -n` standing in as a
+    shim that runs its arguments: the same files as `scan_tree`."""
+    if shutil.which("bash") is None or shutil.which("xargs") is None:
+        pytest.skip("needs bash and xargs")
+    r = subprocess.run(["find", "--version"], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip("needs GNU find (-xdev, -print0, -size -Nk)")
+    s = dlv.new_sentinel()
+    root = _scan_tree_fixture(tmp_path, s)
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "sudo").write_text('#!/bin/sh\n[ "$1" = "-n" ] && shift\nexec "$@"\n')
+    (shim / "sudo").chmod(0o755)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"}
+    cmd = dlv.remote_scan_command([str(root)], dlv.sentinel_forms(s), max_bytes=4096)
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=60)
+    found = sorted(Path(p).relative_to(root).as_posix() for p in dlv.parse_remote_scan(r.stdout))
+    assert found == ["audit.jsonl", "instances/a/meta.json"], (r.stdout, r.stderr)
+    r = subprocess.run(["bash", "-c", dlv.remote_scan_command([str(root)], ["absent-needle"])],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert dlv.parse_remote_scan(r.stdout) == []
+    r = subprocess.run(["bash", "-c", dlv.remote_scan_command([str(root), str(tmp_path / "missing")], [s])],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == dlv.SCAN_MISSING_ROOT and "missing" in r.stderr
+
+    # A file that vanishes between find and grep is skipped (a grep shim
+    # removes it first); one that cannot be read fails the scan (grep's exit 2
+    # is an error, never "no match"), and so does a directory find cannot
+    # list.
+    real_grep = shutil.which("grep")
+    (shim / "grep").write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in *vanish) rm -f "$a";; esac; done\n'
+                               f'exec {real_grep} "$@"\n')
+    (shim / "grep").chmod(0o755)
+    (root / "instances" / "a" / "vanish").write_text(s)
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert sorted(Path(p).name for p in dlv.parse_remote_scan(r.stdout)) == ["audit.jsonl", "meta.json"]
+    (shim / "grep").unlink()
+    if _ROOT:
+        return  # root reads a mode-000 file or directory
+    unreadable = root / "instances" / "a" / "clean.json"
+    unreadable.chmod(0)
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == dlv.SCAN_GREP_FAILED and str(unreadable) in r.stderr, (r.returncode, r.stderr)
+        assert dlv.SCAN_DONE not in r.stdout
+    finally:
+        unreadable.chmod(0o600)
+    locked = root / "instances" / "a"
+    locked.chmod(0)
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == dlv.SCAN_FIND_FAILED and "find failed" in r.stderr, (r.returncode, r.stderr)
+    finally:
+        locked.chmod(0o700)
+    with pytest.raises(AssertionError, match="did not finish"):
+        dlv.parse_remote_scan("partial output")
+    with pytest.raises(ValueError):
+        dlv.remote_scan_command([], [s])
+
+
+def test_delivery_audit_events_skip_torn_lines():
+    text = '{"event":"delivery","shed":"a"}\n{"event":"shed.cre\n\n[1]\n{"event":"shed.delete","shed":"a"}\n'
+    assert [e["event"] for e in dlv.audit_events(text)] == ["delivery", "shed.delete"]
+
+
+def test_delivery_server_files(monkeypatch):
+    fc = dlv.server_files("fc", ssh_host="h", environ={})
+    assert fc == dlv.ServerFiles("/var/lib/shed-dev/firecracker/audit.jsonl",
+                                 ("/var/lib/shed-dev/firecracker", "/var/lib/shed-dev/state"), "h")
+    third = dlv.server_files("fc", ssh_host="h", environ={"SHED_FC_DEV_AUDIT_LOG": "/var/lib/shed-third/firecracker/audit.jsonl"})
+    assert third.state_dirs == ("/var/lib/shed-third/firecracker", "/var/lib/shed-third/state")
+    moved = dlv.server_files("fc", environ={"SHED_FC_DEV_STATE_DIRS": "/a, /b"})
+    assert moved.state_dirs == ("/a", "/b")
+    remote = dlv.server_files("remote", environ={"SHED_REMOTE_DEV_DIR": "/r"})
+    assert remote == dlv.ServerFiles("/r/remote/audit.jsonl", ("/r/remote", "/r/state"))
+    vz = dlv.server_files("vz", environ={"SHED_VZ_DEV_AUDIT_LOG": "/v/audit.jsonl", "SHED_VZ_DEV_STATE_DIRS": "/v,/s"})
+    assert vz == dlv.ServerFiles("/v/audit.jsonl", ("/v", "/s"))
+    monkeypatch.setenv("HOME", "/Users/dev")
+    vz = dlv.server_files("vz", environ={})
+    assert vz.audit_log == "/Users/dev/Library/Application Support/shed-dev/vz/audit.jsonl"
+    assert vz.state_dirs == ("/Users/dev/Library/Application Support/shed-dev/vz", "/Users/dev/.shed/dev/state")
+    assert vz.ssh_host is None
+    with pytest.raises(ValueError):
+        dlv.server_files("docker", environ={})
+
+
+def test_delivery_refuse_fixture_selection():
+    fixtures = dlv.load_refuse_fixtures()
+    assert len(fixtures) > 100
+    live = [f for f in fixtures if dlv.runs_live(f)]
+    left_out = {f.name for f in fixtures} - {f.name for f in live}
+    assert left_out == {f.name for f in fixtures if f.request != "create-repo" or f.name.startswith("cross-base-")}
+    assert all(f.request == "create-repo" and not f.name.startswith("cross-base-") for f in live)
+    chosen = dlv.select_refuse_fixtures(fixtures)
+    assert [f.rule for f in chosen] == sorted({f.rule for f in live}), "one fixture per rule, every rule"
+    by_rule = {f.rule: f.name for f in chosen}
+    for rule, name in dlv.PREFERRED.items():
+        assert by_rule[rule] == name, rule
+    assert all(f.status in (400, 413, 422) for f in chosen)
+    everything = dlv.select_refuse_fixtures(fixtures, everything=True)
+    assert {f.name for f in everything} == {f.name for f in live}
+    # Every family of rules the contract names keeps a live fixture.
+    rules = {f.rule for f in chosen}
+    for family in ("not_json", "duplicate_member", "null_value", "unknown_member", "path_dot_segment",
+                   "path_dot_dot_segment", "refused_target", "refused_variable", "nested_target",
+                   "duplicate_target", "value_not_printable", "file_too_large", "total_too_large", "env_too_large"):
+        assert family in rules, family
+
+
+def test_delivery_paths_script_reads_files_as_the_shed_does(tmp_path):
+    """PATHS_SCRIPT, run here with bash, GNU stat and base64 as in a shed."""
+    for tool, arg in (("stat", ["-c", "%a", str(tmp_path)]), ("base64", ["-w0", "/dev/null"])):
+        if subprocess.run([tool, *arg], capture_output=True).returncode != 0:
+            pytest.skip(f"needs GNU {tool}")
+    owner = subprocess.run(["stat", "-c", "%U", str(tmp_path)], capture_output=True, text=True).stdout.strip()
+    d = tmp_path / ".itest-delivery"
+    d.mkdir(mode=0o700)
+    d.chmod(0o700)
+    key = d / "id"
+    key.write_bytes(b"key \x00\xff\n")
+    key.chmod(0o400)
+    (tmp_path / "link").symlink_to(key)
+    paths = [str(key), str(d), str(tmp_path / "link"), str(tmp_path / "missing")]
+    r = subprocess.run(["bash", "-c", dlv.PATHS_SCRIPT, "_", *paths], capture_output=True, text=True, timeout=30)
+    got = dlv.parse_paths(r.stdout)
+    assert got[str(key)] == dlv.ShedPath(str(key), "file", "400", owner, b"key \x00\xff\n")
+    assert (got[str(d)].kind, got[str(d)].mode) == ("dir", "700")
+    assert got[str(tmp_path / "link")].kind == "link" and got[str(tmp_path / "missing")].kind == "missing"
+    item = dlv.file_item("k", ".itest-delivery/id", b"key \x00\xff\n", mode="0400")
+    moved = {str(Path(dlv.item_shed_path(item, None))): dlv.ShedPath("p", "file", "400", "shed", b"key \x00\xff\n")}
+    assert dlv.file_problems(moved, [item], None) == []
+    wrong = {k: dlv.ShedPath("p", "file", "600", "root", b"other") for k in moved}
+    assert len(dlv.file_problems(wrong, [item], None)) == 3
+    assert dlv.file_problems({}, [item], None) != []
+
+
+def test_delivery_image_gate():
+    assert dlv.delivery_image_backends({}) == set()
+    assert dlv.delivery_image_backends({"SHED_IMAGE_HAS_DELIVERY": " vz, fc ,,remote"}) == {"vz", "fc", "remote"}
+    assert dlv.backend_key("firecracker") == "fc" and dlv.backend_key("vz") == "vz"
+
+
+def test_delivery_activity_paging():
+    events = [{"id": str(i)} for i in range(5)]
+
+    def fetch(since):
+        start = int(since) if since else 0
+        return {"events": events[start:start + 2], "next": str(start + 2) if start + 2 < len(events) else ""}
+
+    assert dlv.page_all(fetch) == events
+    with pytest.raises(AssertionError, match="came twice"):
+        dlv.page_all(lambda since: {"events": [{"id": "x"}], "next": "c" + str(since)})
+    with pytest.raises(AssertionError, match="cursor"):
+        dlv.page_all(lambda since: {"events": [{"id": since or "first"}], "next": "same"})

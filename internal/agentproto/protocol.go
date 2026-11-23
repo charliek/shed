@@ -91,6 +91,16 @@ func writeAll(w io.Writer, data []byte) error {
 
 // ReadMessage reads a framed message.
 func ReadMessage(r io.Reader) (byte, []byte, error) {
+	return ReadMessageMax(r, MaxMessageSize)
+}
+
+// ReadMessageMax reads a framed message whose payload is at most max bytes
+// (and at most MaxMessageSize): a longer frame is refused from its header,
+// before anything is allocated for its payload.
+func ReadMessageMax(r io.Reader, max int) (byte, []byte, error) {
+	if max <= 0 || max > MaxMessageSize {
+		max = MaxMessageSize
+	}
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return 0, nil, err
@@ -103,8 +113,8 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 		return msgType, nil, nil
 	}
 
-	if length > MaxMessageSize {
-		return 0, nil, fmt.Errorf("message size %d exceeds maximum %d", length, MaxMessageSize)
+	if uint64(length) > uint64(max) {
+		return 0, nil, fmt.Errorf("message size %d exceeds maximum %d", length, max)
 	}
 
 	payload := make([]byte, length)

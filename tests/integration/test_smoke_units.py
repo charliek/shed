@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+import test_delivery
 import test_smoke
 
 
@@ -91,8 +92,11 @@ class _FakeServer:
 
     def __init__(self, backend: str):
         self.backend = backend
+        self.name = "unit-dev"
+        self.created = []
 
     def create(self, name, image=None, **kwargs):
+        self.created.append(name)
         raise AssertionError(f"shed create {name}: no image tag {image!r} found")
 
     def exec(self, *args, **kwargs):  # pragma: no cover - must not be reached
@@ -105,8 +109,9 @@ class _FakeServer:
         (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
         (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
         (test_smoke.test_home_dirs_owned_by_shed, "SHED_IMAGE_HAS_HOME_DIRS"),
+        (test_delivery.test_delivery_image_baked, "SHED_IMAGE_HAS_DELIVERY"),
     ],
-    ids=["roost", "craze", "home_dirs"],
+    ids=["roost", "craze", "home_dirs", "delivery"],
 )
 @pytest.mark.parametrize(
     "backend, key", [("firecracker", "fc"), ("vz", "vz")], ids=["fc", "vz"]
@@ -116,6 +121,9 @@ def test_baked_body_listed_backend_missing_image_fails(
 ):
     monkeypatch.setenv(env_var, key)
     monkeypatch.setenv("SHED_CRAZE_VERSION", "0.0.0")  # skip the pin-file read
+    # The delivery body checks its server is a dev server before it creates;
+    # the fake is not in any config (test_delivery_image_body_guards_first).
+    monkeypatch.setattr(test_delivery, "_assert_dev_target", lambda name: None)
     # A Skipped outcome would propagate out of `pytest.raises(Failed)` and be
     # reported as a skip (exit 0), so convert it into a real failure.
     try:
@@ -133,10 +141,46 @@ def test_baked_body_listed_backend_missing_image_fails(
         (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
         (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
         (test_smoke.test_home_dirs_owned_by_shed, "SHED_IMAGE_HAS_HOME_DIRS"),
+        (test_delivery.test_delivery_image_baked, "SHED_IMAGE_HAS_DELIVERY"),
     ],
-    ids=["roost", "craze", "home_dirs"],
+    ids=["roost", "craze", "home_dirs", "delivery"],
 )
 def test_baked_body_unlisted_backend_skips(monkeypatch, body, env_var):
     monkeypatch.setenv(env_var, "vz")
     with pytest.raises(pytest.skip.Exception):
         body(_FakeServer("firecracker"), "unit-shed")
+
+
+def test_delivery_image_body_guards_first(monkeypatch):
+    """test_delivery_image_baked runs the dev-target guard on its server
+    before it creates anything: a server the guard refuses (an installed
+    one) gets no shed."""
+    monkeypatch.setenv("SHED_IMAGE_HAS_DELIVERY", "fc")
+    seen = []
+
+    def refuse(name):
+        seen.append(name)
+        raise RuntimeError(f"refusing to reconfigure non-dev server {name!r}")
+
+    monkeypatch.setattr(test_delivery, "_assert_dev_target", refuse)
+    server = _FakeServer("firecracker")
+    with pytest.raises(RuntimeError, match="non-dev server"):
+        test_delivery.test_delivery_image_baked(server, "unit-shed")
+    assert seen == ["unit-dev"] and server.created == []
+
+
+def test_delivery_module_uses_dev_targets_only():
+    """No case of test_delivery.py takes a fixture that reaches an installed
+    server (`shed_server`, `test_shed_name`, `vz_server`, `fc_server`): its
+    image check takes `shed_server_dev`, every other case `users_env`."""
+    import ast
+    from pathlib import Path
+
+    banned = {"shed_server", "test_shed_name", "vz_server", "fc_server"}
+    tree = ast.parse(Path(test_delivery.__file__).read_text())
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            assert not params & banned, f"{fn.name} takes {params & banned}"
+            if fn.name == "test_delivery_image_baked":
+                assert params == {"shed_server_dev", "delivery_image_name"}, params

@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,6 +77,38 @@ var provisionReadBackoffs = []time.Duration{
 	500 * time.Millisecond,
 	1 * time.Second,
 	2 * time.Second,
+}
+
+// The errors LoadConfig returns. Each is a fixed text: nothing of the
+// config's content, of a parser's message about it or of the guest's
+// answer is in it.
+var (
+	ErrProvisionConfigTooLarge   = fmt.Errorf("the repository's .shed/provision.yaml is larger than the server reads: %w", errGuestReadTooLarge)
+	ErrProvisionConfigInvalid    = errors.New("the repository's .shed/provision.yaml did not load (it does not parse)")
+	ErrProvisionConfigUnreadable = errors.New("the repository's .shed/provision.yaml could not be read")
+)
+
+// yamlLocation finds the first "line N" (and ", column M") in a YAML
+// parser's message.
+var yamlLocation = regexp.MustCompile(`\bline ([0-9]{1,9})\b(?:, column ([0-9]{1,9})\b)?`)
+
+// configParseError is ErrProvisionConfigInvalid with, when the parser's
+// message gives one, its location: numbers only, re-formatted from the
+// parsed integers. Nothing else of the message (it can quote the config's
+// values, or name its fields) is kept.
+func configParseError(err error) error {
+	m := yamlLocation.FindStringSubmatch(err.Error())
+	if m == nil {
+		return ErrProvisionConfigInvalid
+	}
+	line, lerr := strconv.Atoi(m[1])
+	if lerr != nil || line <= 0 {
+		return ErrProvisionConfigInvalid
+	}
+	if col, cerr := strconv.Atoi(m[2]); m[2] != "" && cerr == nil && col > 0 {
+		return fmt.Errorf("%w, at line %d, column %d", ErrProvisionConfigInvalid, line, col)
+	}
+	return fmt.Errorf("%w, at line %d", ErrProvisionConfigInvalid, line)
 }
 
 // errProvisionConfigNotReady marks a read that succeeded but returned no content
@@ -161,19 +195,27 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 		return err
 	})
 
+	// The errors returned are fixed classifications: the config is the
+	// repository's (and may be a delivered file), so neither its text nor
+	// a parser's quote of it, nor what the guest said while reading it, is
+	// ever repeated in an error that reaches a log.
 	switch {
 	case errors.Is(readErr, errGuestReadTooLarge):
-		return nil, fmt.Errorf("failed to read provision config: %w", readErr)
+		return nil, ErrProvisionConfigTooLarge
 	case strings.TrimSpace(content) != "":
 		// Got config content (possibly after retries) — parse it.
-		return provision.ParseConfigContent([]byte(content))
+		cfg, err := provision.ParseConfigContent([]byte(content))
+		if err != nil {
+			return nil, configParseError(err)
+		}
+		return cfg, nil
 	case lastCode == 66 || lastCode == 0:
 		// Dir served but no config file (66), or an empty config file (0):
 		// genuinely no provisioning. Not an error.
 		return &provision.Config{Env: make(map[string]string)}, nil
 	case readErr != nil:
 		// Drained retries on a mount that never served (75) or an RPC error.
-		return nil, fmt.Errorf("failed to read provision config: %w", readErr)
+		return nil, ErrProvisionConfigUnreadable
 	default:
 		return &provision.Config{Env: make(map[string]string)}, nil
 	}
@@ -197,47 +239,62 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 			return fmt.Errorf("failed to check install state: %w", err)
 		}
 		if !installRan {
-			fmt.Fprintln(p.output, "Running install hook...")
-			backend.Phase(ctx, "provision")
-			backend.Status(ctx, "Running install hook...")
-			if err := p.runHook(ctx, cfg, provision.HookTypeInstall, cfg.Hooks.Install); err != nil {
-				if hookErr, ok := err.(*provision.HookError); ok {
-					fmt.Fprintf(p.errOut, "Install hook failed (exit code %d)\n", hookErr.ExitCode)
-					fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
-					fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
-					backend.Phase(ctx, "provision")
-					backend.StatusWarning(ctx, fmt.Sprintf("Install hook failed (exit code %d)", hookErr.ExitCode))
-					_ = state.MarkInstallFailed(ctx, err)
-				}
+			if err := p.runInstall(ctx, cfg, state); err != nil {
 				return err
 			}
-			fmt.Fprintln(p.output, "Install hook complete")
-			backend.Phase(ctx, "provision")
-			backend.Status(ctx, "Install hook complete")
-			_ = state.MarkInstallComplete(ctx)
 		}
 	}
 
 	// Run startup hook
 	if cfg.HasStartupHook() {
-		fmt.Fprintln(p.output, "Running startup hook...")
-		backend.Phase(ctx, "provision")
-		backend.Status(ctx, "Running startup hook...")
-		if err := p.runHook(ctx, cfg, provision.HookTypeStartup, cfg.Hooks.Startup); err != nil {
-			if hookErr, ok := err.(*provision.HookError); ok {
-				fmt.Fprintf(p.errOut, "Startup hook failed (exit code %d)\n", hookErr.ExitCode)
-				fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
-				fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
-				backend.Phase(ctx, "provision")
-				backend.StatusWarning(ctx, fmt.Sprintf("Startup hook failed (exit code %d)", hookErr.ExitCode))
-			}
-			return err
-		}
-		fmt.Fprintln(p.output, "Startup hook complete")
-		backend.Phase(ctx, "provision")
-		backend.Status(ctx, "Startup hook complete")
+		return p.runStartup(ctx, cfg)
 	}
 
+	return nil
+}
+
+// runInstall runs cfg's install hook and records its outcome in the guest's
+// state file.
+func (p *Provisioner) runInstall(ctx context.Context, cfg *provision.Config, state *ProvisionState) error {
+	fmt.Fprintln(p.output, "Running install hook...")
+	backend.Phase(ctx, "provision")
+	backend.Status(ctx, "Running install hook...")
+	if err := p.runHook(ctx, cfg, provision.HookTypeInstall, cfg.Hooks.Install); err != nil {
+		if hookErr, ok := err.(*provision.HookError); ok {
+			fmt.Fprintf(p.errOut, "Install hook failed (exit code %d)\n", hookErr.ExitCode)
+			fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
+			fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
+			backend.Phase(ctx, "provision")
+			backend.StatusWarning(ctx, fmt.Sprintf("Install hook failed (exit code %d)", hookErr.ExitCode))
+			_ = state.MarkInstallFailed(ctx, err)
+		}
+		return err
+	}
+	fmt.Fprintln(p.output, "Install hook complete")
+	backend.Phase(ctx, "provision")
+	backend.Status(ctx, "Install hook complete")
+	_ = state.MarkInstallComplete(ctx)
+	return nil
+}
+
+// runStartup runs cfg's startup hook.
+func (p *Provisioner) runStartup(ctx context.Context, cfg *provision.Config) error {
+	fmt.Fprintln(p.output, "Running startup hook...")
+	backend.Phase(ctx, "provision")
+	backend.Status(ctx, "Running startup hook...")
+	if err := p.runHook(ctx, cfg, provision.HookTypeStartup, cfg.Hooks.Startup); err != nil {
+		if hookErr, ok := err.(*provision.HookError); ok {
+			fmt.Fprintf(p.errOut, "Startup hook failed (exit code %d)\n", hookErr.ExitCode)
+			fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
+			fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
+			backend.Phase(ctx, "provision")
+			backend.StatusWarning(ctx, fmt.Sprintf("Startup hook failed (exit code %d)", hookErr.ExitCode))
+		}
+		return err
+	}
+	fmt.Fprintln(p.output, "Startup hook complete")
+	backend.Phase(ctx, "provision")
+	backend.Status(ctx, "Startup hook complete")
 	return nil
 }
 

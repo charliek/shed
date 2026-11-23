@@ -73,8 +73,8 @@ func TestRecordShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(raw), `{"ts":"2026-11-11T03:04:05.000000006Z","event":"api",`) {
-		t.Errorf("ts must come first: %s", raw)
+	if !strings.HasPrefix(string(raw), `{"ts":"2026-11-11T03:04:05.000000006Z","seq":1,"event":"api",`) {
+		t.Errorf("ts and seq must come first: %s", raw)
 	}
 	lines := readLines(t, path)
 	if len(lines) != 3 {
@@ -100,8 +100,8 @@ func TestRecordShape(t *testing.T) {
 	if _, ok := exec["argv"]; ok {
 		t.Error("argv must be absent unless set")
 	}
-	if len(lines[2]) != 1 || lines[2]["ts"] == nil {
-		t.Errorf("an empty object records only ts: %v", lines[2])
+	if len(lines[2]) != 2 || lines[2]["ts"] == nil || lines[2]["seq"] != float64(3) {
+		t.Errorf("an empty object records only ts and seq: %v", lines[2])
 	}
 
 	st, err := os.Stat(path)
@@ -296,6 +296,7 @@ func TestSSHEventShape(t *testing.T) {
 			t.Fatal(err)
 		}
 		want["ts"] = lines[i]["ts"]
+		want["seq"] = float64(i + 1)
 		got, _ := json.Marshal(lines[i])
 		wantJSON, _ := json.Marshal(want)
 		if string(got) != string(wantJSON) {

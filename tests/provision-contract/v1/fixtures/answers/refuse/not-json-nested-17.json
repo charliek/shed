@@ -1,0 +1,11 @@
+{
+  "name": "not-json-nested-17",
+  "description": "A document nested 17 levels deep (the top-level object is level 1).",
+  "request": "create-repo",
+  "answer_text": "{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[],\"x\":[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]}",
+  "expect": {
+    "result": "refused",
+    "status": 400,
+    "rule": "not_json"
+  }
+}

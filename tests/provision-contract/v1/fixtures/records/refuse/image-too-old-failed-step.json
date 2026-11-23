@@ -1,0 +1,34 @@
+{
+  "name": "image-too-old-failed-step",
+  "description": "Stage 1 failed as image_too_old: an image too old for delivery skips the stage, so failed is not a state that reason takes.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "image_too_old"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested",
+      "failure": {
+        "reason": "image_too_old"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "bad_reason"
+  }
+}

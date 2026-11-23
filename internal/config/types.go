@@ -112,6 +112,11 @@ var (
 	// profiles). The API answers 422 for a create field and 501 for a route.
 	ErrFeatureUnsupportedSentinel = errors.New("feature is not supported by this backend")
 
+	// ErrProvisionBusySentinel is returned by `shed provision` on a shed that
+	// a provision (or its create's delivery, or a remote job) is already
+	// working on. The API answers 409 PROVISION_IN_PROGRESS.
+	ErrProvisionBusySentinel = errors.New("a provision of this shed is in progress")
+
 	// ErrForbiddenSentinel is returned when the caller may see a shed or a
 	// resource but not do what was asked: an admin entering another user's
 	// shed, or a user who is not an admin asking for an admin-only one. The
@@ -256,8 +261,10 @@ func ShedOwnership(owner, user string) (string, string) {
 type Shed struct {
 	Name string `json:"name" yaml:"name"`
 	// ID is the shed's permanent identifier (NewShedID). A name can be
-	// reused after a delete; an ID never is. Only the remote backend sets
-	// it; a Firecracker or VZ shed reports none.
+	// reused after a delete; an ID never is. Every shed created since
+	// delivery existed has one, on every backend; a Firecracker or VZ shed
+	// created before reports none until its first `shed provision` gives it
+	// one.
 	ID     string `json:"id,omitempty" yaml:"id,omitempty"`
 	Status string `json:"status" yaml:"status"`
 	// StatusReason says why the shed is in Status when that is not the
@@ -323,6 +330,12 @@ type Shed struct {
 	// closed: an isolated shed on a backend with no isolation kind reports
 	// "none".
 	Isolation string `json:"isolation,omitempty" yaml:"-"`
+	// Delivery is the shed's delivery record as the API reports it
+	// (ShedDelivery): never nil in a record a backend returns. The access
+	// guard keeps only its state for a caller who may not enter the shed.
+	// It is never stored as part of a Shed: each backend keeps the record
+	// beside it.
+	Delivery *ShedDelivery `json:"delivery,omitempty" yaml:"-"`
 	// Arch is the guest's architecture, "amd64" or "arm64". The remote
 	// backend stores it (from the size at create, from the instance on
 	// adoption; a record written before it existed has none and reports
@@ -1280,6 +1293,10 @@ type CreateShedRequest struct {
 	// shed. The access guard sets it for a user who is not an admin; it
 	// never comes from the wire.
 	NoServerEnv bool `json:"-"`
+	// ScriptKey marks a create called with a script key (automation, not a
+	// person): no delivery is requested for its shed. The access guard sets
+	// it from the caller; it never comes from the wire.
+	ScriptKey bool `json:"-"`
 }
 
 // ServerEnvWithheld reports whether the server's env_file variables are kept
@@ -1432,6 +1449,9 @@ const (
 	// running" refusal. Exec never auto-starts a shed. Other routes keep
 	// SHED_ALREADY_STOPPED for the same condition.
 	ErrShedNotRunning = "SHED_NOT_RUNNING"
+	// ErrProvisionInProgress (409): a provision of the shed is already
+	// running, or its create or a remote job is still at work.
+	ErrProvisionInProgress = "PROVISION_IN_PROGRESS"
 	// ErrExecLimit (429) means the shed already runs
 	// exec.max_concurrent_per_shed HTTPS execs.
 	ErrExecLimit = "EXEC_LIMIT"
@@ -1786,13 +1806,27 @@ type ExecConfig struct {
 // AuditConfig turns on and shapes shed-server's audit log (<state>/audit.jsonl).
 // The log is on whenever auth.clients is set, whatever Enabled says.
 type AuditConfig struct {
-	// Enabled turns the audit log on for a server with no service clients
-	// (it then records HTTPS execs; admin API requests are never logged).
-	Enabled bool `yaml:"enabled,omitempty"`
+	// Enabled is the audit log's switch for a server with no service
+	// clients (auth.clients always turns it on). true turns it on and
+	// requires it: a server that cannot open it does not start. false
+	// turns it off. Unset leaves the default: on in mtls mode, where a
+	// server that cannot open it logs a warning and starts without it;
+	// off in open mode. With the log on, HTTPS execs and the shed lifecycle
+	// and delivery events are recorded (admin API requests never are).
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// ExecArgv is "" (the default: an exec.end line records argv[0] and the
 	// argument count) or "full" (the whole argv, which may carry prompts or
 	// secrets).
 	ExecArgv string `yaml:"exec_argv,omitempty"`
+}
+
+// DeliveryConfig configures provisioning by delivery. Every field is
+// optional; a zero value takes its default (ServerConfig.DeliveryTimeout).
+type DeliveryConfig struct {
+	// Timeout is how long a delivery waits for the answer of a connected
+	// source (default 30s, from 1s to 10m). A source that is bound but not
+	// connected is not waited for.
+	Timeout Duration `yaml:"timeout,omitempty"`
 }
 
 // AuditExecArgvFull is audit.exec_argv's one non-default value.

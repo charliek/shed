@@ -7,8 +7,10 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -61,6 +63,10 @@ type Guard struct {
 	// them.
 	now  func() time.Time
 	logf func(format string, args ...any)
+
+	// audit is the server's audit log, where the lifecycle events are
+	// written (nil: none). See SetAuditLog.
+	audit atomic.Pointer[audit.Log]
 }
 
 // maskedLogInterval is how often a lookup failure answered as not found is
@@ -92,6 +98,74 @@ func Guarded(b Backend) *Guard {
 		return g
 	}
 	return NewGuard(b)
+}
+
+// SetAuditLog attaches the server's audit log. The guard then writes a
+// lifecycle event (audit.ShedEvent) for every create, start, stop, delete,
+// reset, assignment and provision that passed the access rule, however it
+// ended: the shed as it was when the action was authorized (its name, id and
+// whose it was; for a create or an assignment, as it was made), who acted,
+// and whether it succeeded. A call the rule refused writes none. The guard
+// is where these are written because every front door (the API, the SSH
+// server's wake, the reaper) and every backend goes through it, and it holds
+// both the caller and the shed it authorized. nil writes none.
+func (g *Guard) SetAuditLog(l *audit.Log) { g.audit.Store(l) }
+
+// actor is who p is as an audit event names them: the actor the front door
+// put on ctx (audit.WithActor, which also names the caller's key and
+// certificate) when it is the same principal, or p itself.
+func actor(ctx context.Context, p Principal) audit.Identity {
+	if id, ok := audit.ActorFrom(ctx); ok && actorIs(id, p) {
+		return id
+	}
+	switch p.Kind {
+	case PrincipalSystem:
+		return audit.SystemIdentity()
+	case PrincipalClient:
+		return audit.ClientIdentity(p.Client, "")
+	}
+	return audit.PersonIdentity(p.Kind == PrincipalUser, p.User, p.Implicit, p.IsAdmin(), p.Script, "", "")
+}
+
+// actorIs reports whether id names the principal p.
+func actorIs(id audit.Identity, p Principal) bool {
+	switch p.Kind {
+	case PrincipalSystem:
+		return id.Kind == audit.KindSystem
+	case PrincipalClient:
+		return id.Kind == audit.KindClient && id.Name == p.Client
+	case PrincipalUser:
+		return id.Kind == audit.KindUser && id.Implicit == p.Implicit && id.User == p.User &&
+			id.Script != nil && *id.Script == p.Script
+	}
+	return false
+}
+
+// withActor returns ctx carrying p's actor, so what the backend does with it
+// (a delivery's own event) names the same caller.
+func withActor(ctx context.Context, p Principal) context.Context {
+	return audit.WithActor(ctx, actor(ctx, p))
+}
+
+// shedRef is shed as an event names it.
+func shedRef(shed *config.Shed) audit.ShedRef {
+	return audit.ShedRef{Shed: shed.Name, ShedID: shed.ID, ShedUser: shed.User, ShedOwner: shed.Owner}
+}
+
+// record writes one lifecycle event: kind, done by p (as ctx names them) to
+// the shed ref, ending in err.
+func (g *Guard) record(ctx context.Context, p Principal, kind string, ref audit.ShedRef, err error) {
+	l := g.audit.Load()
+	if l == nil {
+		return
+	}
+	result := audit.ResultOK
+	if err != nil {
+		result = audit.ResultFailed
+	}
+	if werr := l.Record(audit.ShedEvent{Event: kind, Identity: actor(ctx, p), ShedRef: ref, Result: result}); werr != nil {
+		g.logf("audit: %v", werr)
+	}
 }
 
 // Inner returns the backend g wraps. Only code that acts as the server
@@ -296,10 +370,14 @@ func (g *Guard) shownWith(ctx context.Context, caps Capabilities, shed *config.S
 	if cp.Arch == "" {
 		cp.Arch = caps.GuestArch
 	}
-	if cp.Repo != "" || cp.LandingDir != "" {
+	if cp.Repo != "" || cp.LandingDir != "" || cp.Delivery != nil {
 		p, _ := PrincipalFrom(ctx)
 		if Authorize(p, cp.Owner, cp.User, ActionEnter) != nil {
+			// The delivery record goes the same way: its items, their
+			// targets and the source's problems are the shed's user's,
+			// and only the state is shown.
 			cp.Repo, cp.LandingDir = "", ""
+			cp.Delivery = cp.Delivery.StateOnly()
 		}
 	}
 	return &cp
@@ -340,6 +418,8 @@ func (g *Guard) CreateShed(ctx context.Context, req config.CreateShedRequest) (*
 		req.Owner, req.User = p.Client, ""
 	case PrincipalUser:
 		req.Owner, req.User = "", p.User
+		// A script key's create asks no source for its shed.
+		req.ScriptKey = p.Script
 		if !p.IsAdmin() {
 			if what := hostResourceAsked(req); what != "" {
 				return nil, AuthorizeAdmin(p, what)
@@ -353,7 +433,13 @@ func (g *Guard) CreateShed(ctx context.Context, req config.CreateShedRequest) (*
 		}
 	}
 	g.acting("CreateShed", req.Name)
+	ctx = withActor(ctx, p)
 	shed, err := g.inner.CreateShed(ctx, req)
+	ref := audit.ShedRef{Shed: req.Name, ShedID: req.ID, ShedUser: req.User, ShedOwner: req.Owner}
+	if err == nil && shed != nil {
+		ref = shedRef(shed)
+	}
+	g.record(ctx, p, audit.EventShedCreate, ref, err)
 	if err != nil && errors.Is(err, config.ErrShedAlreadyExistsSentinel) && !p.unrestricted() {
 		// Names are unique per server, across users. A taken name is the
 		// usual conflict, worded the same whoever holds it, so it tells the
@@ -409,29 +495,42 @@ func (g *Guard) ListSheds(ctx context.Context) ([]config.Shed, error) {
 
 // DeleteShed needs the right to manage the shed.
 func (g *Guard) DeleteShed(ctx context.Context, name string) error {
-	bctx, _, err := g.bind(ctx, "DeleteShed", name, ActionManage)
+	bctx, shed, err := g.bind(ctx, "DeleteShed", name, ActionManage)
 	if err != nil {
 		return err
 	}
-	return g.inner.DeleteShed(bctx, name)
+	err = g.inner.DeleteShed(bctx, name)
+	g.recordOn(ctx, audit.EventShedDelete, shed, err)
+	return err
+}
+
+// recordOn writes a lifecycle event for the principal on ctx, on the shed as
+// bind authorized it.
+func (g *Guard) recordOn(ctx context.Context, kind string, shed *config.Shed, err error) {
+	p, _ := PrincipalFrom(ctx)
+	g.record(ctx, p, kind, shedRef(shed), err)
 }
 
 // StartShed needs the right to enter the shed.
 func (g *Guard) StartShed(ctx context.Context, name string) (*config.Shed, error) {
-	bctx, _, err := g.bind(ctx, "StartShed", name, ActionEnter)
+	bctx, shed, err := g.bind(ctx, "StartShed", name, ActionEnter)
 	if err != nil {
 		return nil, err
 	}
-	return g.showFor(ctx)(g.inner.StartShed(bctx, name))
+	started, err := g.inner.StartShed(bctx, name)
+	g.recordOn(ctx, audit.EventShedStart, shed, err)
+	return g.showFor(ctx)(started, err)
 }
 
 // StopShed needs the right to manage the shed.
 func (g *Guard) StopShed(ctx context.Context, name string) (*config.Shed, error) {
-	bctx, _, err := g.bind(ctx, "StopShed", name, ActionManage)
+	bctx, shed, err := g.bind(ctx, "StopShed", name, ActionManage)
 	if err != nil {
 		return nil, err
 	}
-	return g.showFor(ctx)(g.inner.StopShed(bctx, name))
+	stopped, err := g.inner.StopShed(bctx, name)
+	g.recordOn(ctx, audit.EventShedStop, shed, err)
+	return g.showFor(ctx)(stopped, err)
 }
 
 // AssignUser is admin-only. The admin is checked before the shed is looked
@@ -455,20 +554,30 @@ func (g *Guard) AssignUser(ctx context.Context, name string, req config.AssignSh
 		return nil, err
 	}
 	req.AllowHostResources = false
-	bctx, _, err := g.bind(ctx, "AssignUser", name, ActionManage)
+	bctx, shed, err := g.bind(ctx, "AssignUser", name, ActionManage)
 	if err != nil {
 		return nil, err
 	}
-	return g.showFor(ctx)(g.inner.AssignUser(bctx, name, req))
+	assigned, err := g.inner.AssignUser(bctx, name, req)
+	// An assignment is the new user's from here on: the event names the
+	// shed as it was made (with its user), or as it was when it failed.
+	ref := shedRef(shed)
+	if err == nil && assigned != nil {
+		ref = shedRef(assigned)
+	}
+	g.record(ctx, p, audit.EventShedAssign, ref, err)
+	return g.showFor(ctx)(assigned, err)
 }
 
 // ResetShed needs the right to enter the shed.
 func (g *Guard) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
-	bctx, _, err := g.bind(ctx, "ResetShed", name, ActionEnter)
+	bctx, shed, err := g.bind(ctx, "ResetShed", name, ActionEnter)
 	if err != nil {
 		return nil, err
 	}
-	return g.showFor(ctx)(g.inner.ResetShed(bctx, name))
+	reset, err := g.inner.ResetShed(bctx, name)
+	g.recordOn(ctx, audit.EventShedReset, shed, err)
+	return g.showFor(ctx)(reset, err)
 }
 
 // ListSessions needs the right to enter the shed.
@@ -714,11 +823,12 @@ func (a guardedAsync) WaitSettled(ctx context.Context, name string) (*config.She
 // not authorized again: it is authorized once, for the delete, and follows
 // the incarnation the delete acted on, through its tombstone. A destroy that
 // failed is reported (the wrapped backend's error), never as success.
-func (a guardedAsync) DeleteAndWait(ctx, jobCtx context.Context, name string) error {
+func (a guardedAsync) DeleteAndWait(ctx, jobCtx context.Context, name string) (err error) {
 	bctx, shed, err := a.g.bind(ctx, "DeleteShed", name, ActionManage)
 	if err != nil {
 		return err
 	}
+	defer func() { a.g.recordOn(ctx, audit.EventShedDelete, shed, err) }()
 	if err := a.g.inner.DeleteShed(PinOwnership(PinCreatedAt(jobCtx, shed.CreatedAt), shed.Owner, shed.User), name); err != nil {
 		return err
 	}
@@ -782,4 +892,151 @@ func (e guardedEgress) ClearShedEgress(ctx context.Context, name string) (*confi
 		return nil, err
 	}
 	return e.g.showFor(ctx)(e.inner.ClearShedEgress(bctx, name))
+}
+
+// Provisioner is the optional capability behind `shed provision`: deliver a
+// running shed's credentials afresh and finish its owed steps (stage 1, the
+// clone, stage 2, the install hook, in that order). Every backend implements
+// it; a backend that does not gives a 501 at the API.
+//
+// BeginProvision admits one provision: it takes the shed's one provisioning
+// slot and checks the shed, before any work (so a caller can refuse with a
+// plain status before it opens a stream). It returns
+// config.ErrProvisionBusySentinel while a provision of the shed (or its
+// create's delivery, or on the remote backend a job for it) is in flight,
+// and config.ErrShedNotRunningSentinel for a shed that is not running. The
+// slot is held until the run's Release, which the caller must call.
+type Provisioner interface {
+	BeginProvision(ctx context.Context, name string) (ProvisionRun, error)
+}
+
+// ProvisionRun is an admitted provision.
+type ProvisionRun interface {
+	// Run does the delivery and returns the shed as it then stands.
+	Run(ctx context.Context) (*config.Shed, error)
+	// Release gives the shed's provisioning slot back; it may be called
+	// more than once.
+	Release()
+}
+
+// Provision begins, runs and releases one provision of the named shed.
+func Provision(ctx context.Context, pv Provisioner, name string) (*config.Shed, error) {
+	run, err := pv.BeginProvision(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	defer run.Release()
+	return run.Run(ctx)
+}
+
+// AsProvisioner returns b as a Provisioner when it is one. Through a Guard it
+// returns a guarded one (AuthorizeProvision).
+func AsProvisioner(b Backend) (Provisioner, bool) {
+	if g, ok := b.(*Guard); ok {
+		pv, ok := AsProvisioner(g.inner)
+		if !ok {
+			return nil, false
+		}
+		return guardedProvisioner{g: g, inner: pv}, true
+	}
+	pv, ok := b.(Provisioner)
+	return pv, ok
+}
+
+type guardedProvisioner struct {
+	g     *Guard
+	inner Provisioner
+}
+
+// BeginProvision needs the right to enter the shed, and more: the caller
+// must be the shed's own user (AuthorizeProvision). The run it returns
+// reports the shed as the caller may see it.
+func (pv guardedProvisioner) BeginProvision(ctx context.Context, name string) (ProvisionRun, error) {
+	bctx, shed, err := pv.g.bind(ctx, "BeginProvision", name, ActionEnter)
+	if err != nil {
+		return nil, err
+	}
+	p, _ := PrincipalFrom(ctx)
+	if err := AuthorizeProvision(p, shed); err != nil {
+		return nil, err
+	}
+	run, err := pv.inner.BeginProvision(bctx, name)
+	ref := pv.g.admittedRef(bctx, name, shed)
+	pv.g.record(ctx, p, audit.EventProvisionStart, ref, err)
+	if err != nil {
+		return nil, err
+	}
+	return guardedRun{g: pv.g, inner: run, createdAt: shed.CreatedAt, owner: shed.Owner, user: shed.User,
+		p: p, actor: actor(ctx, p), ref: ref}, nil
+}
+
+// admittedRef is the shed's reference for a provision's events, read after
+// admission: a Firecracker or VZ shed made before shed ids is given its id
+// there, and the delivery's own event carries it, so the start and end
+// events must too (else a filter by the new id misses them). The lookup is
+// made only for a shed that had no id, on ctx bound to the incarnation
+// authorized; if it fails, the shed as authorized stands.
+func (g *Guard) admittedRef(ctx context.Context, name string, shed *config.Shed) audit.ShedRef {
+	ref := shedRef(shed)
+	if shed.ID != "" {
+		return ref
+	}
+	if now, err := g.inner.GetShed(ctx, name); err == nil && now != nil && now.CreatedAt.Equal(shed.CreatedAt) {
+		ref.ShedID = now.ID
+	}
+	return ref
+}
+
+// guardedRun is an admitted provision run behind the guard. Run's context
+// (its cancellation and progress are the caller's) is bound to the shed the
+// admission authorized, as bind binds every guarded call: its creation time
+// and its reported owner and user. So nothing the run reads or acts on, its
+// final lookup included, can be a shed deleted and created again under the
+// name meanwhile, or one whose user changed.
+type guardedRun struct {
+	g           *Guard
+	inner       ProvisionRun
+	createdAt   time.Time
+	owner, user string
+	// p and actor are who was admitted, and ref the shed as it was then,
+	// for the run's events.
+	p     Principal
+	actor audit.Identity
+	ref   audit.ShedRef
+}
+
+// Run carries the admitted caller as its actor, so the delivery's event
+// names them, and writes the provision's end event.
+func (r guardedRun) Run(ctx context.Context) (*config.Shed, error) {
+	ctx = audit.WithActor(ctx, r.actor)
+	bctx := PinOwnership(PinCreatedAt(ctx, r.createdAt), r.owner, r.user)
+	shed, err := r.inner.Run(bctx)
+	r.g.record(ctx, r.p, audit.EventProvisionEnd, r.ref, err)
+	return r.g.showFor(ctx)(shed, err)
+}
+
+func (r guardedRun) Release() { r.inner.Release() }
+
+// AuthorizeProvision is the rule for `shed provision`, applied after the
+// right to enter the shed (as the shed was reported): only the person whose
+// shed it is may cause a delivery to it, because the delivery asks that
+// person's own source. That is the shed's user, or the implicit user of a
+// server with no user list for a shed with no user. A service client's shed
+// is provisioned by nobody, an admin provisions no one else's shed (not even
+// a service client's, which an admin may enter), a script key is automation
+// and not a person, and the server never provisions on its own.
+func AuthorizeProvision(p Principal, shed *config.Shed) error {
+	switch {
+	case p.Kind == PrincipalClient:
+		return fmt.Errorf("%w: a service client cannot provision a shed", config.ErrForbiddenSentinel)
+	case p.Kind != PrincipalUser:
+		return fmt.Errorf("%w: only the shed's user can provision it", config.ErrForbiddenSentinel)
+	case p.Script:
+		return fmt.Errorf("%w: a script key cannot provision a shed; its user can, with a key of their own", config.ErrForbiddenSentinel)
+	case shed.Owner != "":
+		return fmt.Errorf("%w: shed %s belongs to a service client; nobody provisions it", config.ErrForbiddenSentinel, shed.Name)
+	case shed.User != p.User:
+		return fmt.Errorf("%w: only the shed's user can provision shed %s", config.ErrForbiddenSentinel, shed.Name)
+	}
+	return nil
 }

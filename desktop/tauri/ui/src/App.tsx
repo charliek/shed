@@ -34,6 +34,8 @@ import {
   type CrazeResume, type CrazeSheetMode, type LaneTarget,
 } from "@/lib/crazeResume";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
+import { DeliveryBadge, ShedDeliveryDetail, provisionRunOf, useShedDelivery, type ShedDeliveryState } from "@/components/ShedDelivery";
+import { readDelivery } from "@/lib/delivery";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
   reportShedRoost, renderedText, useRoostBoard,
@@ -243,8 +245,10 @@ export function needsYou(s: RcSession): boolean {
   return s.activity === "needs_input" || s.activity === "needs_approval";
 }
 
-function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, hosts, shedCraze, onCrazeCreate }: {
+function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, hosts, shedCraze, onCrazeCreate, delivery: dlv }: {
   sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void;
+  /** The open delivery detail and every shed's Deliver again run (plan 039 A7). */
+  delivery: ShedDeliveryState;
   roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
   /** `rc.list`'s status rows and `shed_craze` — what each running shed's craze
    *  is read from ([`crazeStatusFor`], plan 026 §3.2). */
@@ -318,15 +322,25 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                 const running = s.status === "running";
                 const busy = isBusy(s);
                 const dotColor = running ? "var(--shed-ok)" : busy ? "var(--shed-attention)" : "var(--shed-text-muted)";
+                const delivery = readDelivery(s.delivery);
+                const deliveryShown = !!delivery && dlv.open?.server === s.host && dlv.open?.shed === s.name;
                 return (
                   <div key={`${host}/${s.name}`} data-shed-row data-shed-host={s.host} data-shed-name={s.name}
-                    className={cn(cardCls, "flex items-center gap-3.5 px-[18px] py-[15px]")} style={{ animation: "shed-in .25s ease" }}>
+                    className={cardCls} style={{ animation: "shed-in .25s ease" }}>
+                  <div className="flex items-center gap-3.5 px-[18px] py-[15px]">
                     <Dot className="h-2.5 w-2.5" style={{ background: dotColor }} />
                     <div className="min-w-0 flex-1">
                       <div className="mb-1.5 flex flex-wrap items-center gap-2.5">
                         <span className="text-[16px] font-semibold text-shed-text">{s.name}</span>
                         {s.backend && <Tag kind={s.backend} />}
                         {s.image && <ImageChip>{s.image}</ImageChip>}
+                        {delivery && (
+                          <DeliveryBadge
+                            rec={delivery}
+                            open={deliveryShown}
+                            onToggle={() => dlv.setOpen(deliveryShown ? null : { server: s.host, shed: s.name })}
+                          />
+                        )}
                       </div>
                       <MetaLine s={s} />
                       {running && (() => {
@@ -377,6 +391,15 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                         </>
                       )}
                     </div>
+                  </div>
+                  {deliveryShown && delivery && (
+                    <ShedDeliveryDetail
+                      shed={s}
+                      rec={delivery}
+                      prov={provisionRunOf(dlv, s.host, s.name)}
+                      onDeliver={() => dlv.deliver(s.host, s.name, refresh)}
+                    />
+                  )}
                   </div>
                 );
               })}
@@ -1304,6 +1327,9 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 /* ---- shell ---------------------------------------------------------------- */
 export default function App() {
   const [pane, setPane] = useState<Pane>("sheds");
+  // The open shed delivery detail, its `ui.show_shed_delivery` doors, and every
+  // shed's Deliver again run (plan 039 A7).
+  const shedDelivery = useShedDelivery(setPane);
   const [mode, setMode] = useState<"light" | "dark">("light");
   // The open modal — and its LIVE value (`modalNow`), written synchronously by
   // the one setter, which is what a craze create that resolves later decides
@@ -1853,6 +1879,7 @@ export default function App() {
                 hosts={rcHosts}
                 shedCraze={rcShedCraze}
                 onCrazeCreate={openCrazeSheet}
+                delivery={shedDelivery}
               />
             )}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}

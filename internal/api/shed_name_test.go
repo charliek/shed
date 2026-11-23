@@ -111,6 +111,8 @@ func (b *foldingBackend) CreateSnapshot(ctx context.Context, req config.Snapshot
 //	profile    an egress profile, from the config or the profile store: never
 //	           a backend lookup
 //	namespace  a credential-bus namespace: never a backend lookup
+//	request    a delivery request id: looked up in the pending-request
+//	           table (as 32 hex digits), never a backend lookup
 //
 // A route added to Router() with a parameter fails TestShedNameRouteWalk
 // until it is classified here.
@@ -127,12 +129,14 @@ var pathParamRoutes = map[string]string{
 	"DELETE /api/egress/{name}":                       "shed",
 	"GET /api/plugins/listeners/{namespace}/messages": "namespace",
 	"POST /api/plugins/listeners/{namespace}/respond": "namespace",
+	"POST /api/delivery/requests/{id}":                "request",
 	"GET /api/sheds/{name}":                           "shed",
 	"DELETE /api/sheds/{name}":                        "shed",
 	"POST /api/sheds/{name}/start":                    "shed",
 	"POST /api/sheds/{name}/stop":                     "shed",
 	"POST /api/sheds/{name}/assign":                   "shed",
 	"POST /api/sheds/{name}/reset":                    "shed",
+	"POST /api/sheds/{name}/provision":                "shed",
 	"POST /api/sheds/{name}/exec":                     "shed",
 	"GET /api/sheds/{name}/sessions":                  "shed",
 	"DELETE /api/sheds/{name}/sessions/{session}":     "shed",
@@ -199,8 +203,8 @@ func TestShedNameRouteWalk(t *testing.T) {
 			t.Errorf("classified route %s is not registered (stale list)", route)
 		}
 	}
-	if len(shedRoutes) != 13 {
-		t.Errorf("found %d shed routes, want 13: %v", len(shedRoutes), shedRoutes)
+	if len(shedRoutes) != 14 {
+		t.Errorf("found %d shed routes, want 14: %v", len(shedRoutes), shedRoutes)
 	}
 
 	for _, route := range shedRoutes {

@@ -659,10 +659,12 @@ def test_unarmed_server_has_no_source_rows():
         assert e.value.code == "unsupported", e.value
         assert "does not support credential sources" in e.value.message
         _open_prefs(client)
-        client.wait_until(lambda: "ssh" in (_prefs_report(client).get("sections") or []),
-                          timeout=20, what="the gated ssh section")
+        client.wait_until(
+            lambda: {"ssh", "provisioning"} <= set(_prefs_report(client).get("sections") or []),
+            timeout=20, what="the gated ssh section and Provisioning")
         report = _prefs_report(client)
-        assert report["sections"] == ["general", "terminal", "broker", "ssh"], report
+        # Provisioning (plan 039 A7) is always there; the source rows add no section.
+        assert report["sections"] == ["general", "terminal", "broker", "provisioning", "ssh"], report
         assert report["values"]["sources"] == [], report
         assert report["values"]["this_machine_name"] is None, report
 

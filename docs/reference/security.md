@@ -913,6 +913,19 @@ and TLS fingerprints for confirmation (or pass `--fingerprint` /
 `--tls-fingerprint` to verify out-of-band). After that, every byte travels
 over pinned TLS or pinned-host-key SSH.
 
+## Credential delivery
+
+[Credential delivery](delivery.md) puts a person's credentials into their shed when it is created and when they run `shed provision`: an SSH key, a GitHub token, API keys, an envsecrets login, named files. This is a different trade from the credential bus below, and it is stated plainly here.
+
+- **A usable credential is inside the shed while it runs.** Anything in the shed can read it: the shed user, every process running as it, and the coding agents in the image. The bus decides per use, on the person's own machine; a delivered credential has no per-use check once it is in the shed. Deliver only what you would let that shed use.
+- **The server sees values in transit.** An answer passes through shed-server on its way to the shed's agent. The server holds it in memory for the create or provision, never stores it, and never logs or returns it, but a compromised server can see it. A compromised server can also ask a connected source for a bundle for a shed that does not exist, and the source answers without a prompt. What limits this is less than it may seem. Only the user's **bound** machine is asked, but the first machine that connects for a user is bound automatically, and the desktop app opens a delivery stream to every server in its shed config. Of a provider's `only` rules, only `only.servers` is judged on the person's machine (the server the request came in on); `only.backends` and `only.repos` are matched against the request the server wrote, so a dishonest server can satisfy them. With a provider enabled and no `only.servers`, any configured server can draw that provider's items with no prompt. **Give every enabled provider an `only.servers` list** ([What limits a source's answers](delivery.md#what-limits-a-sources-answers)).
+- **The files are plain files** (`0600`, or `0400` where asked) in the shed's home or project directory. They are in snapshots and on a stopped cloud shed's disk.
+- **A shed assigned to a person may hold what someone else put there.** `shed assign` gives an unassigned shed to a user; a provision of such a shed writes the new user's credentials into a filesystem they did not build. Assigning is rare and admin-only.
+- **Who may cause a delivery.** Only the shed's own user. An admin cannot provision another user's shed and sees its delivery state alone. A service client, a script key and a snapshot restore get none.
+- **The envsecrets login** lets a shed read, and with the owner's current bucket key also change, every project's secrets. Prefer a read-only key.
+- **The audit log is on by default in `mtls` mode** and records delivery and lifecycle events (states, reasons, the source machine, item names, results and fingerprints, never a value or a target). `audit.enabled: false` turns it off.
+- **The writer is bounded.** The agent writes without following a symbolic link at any step, refuses a directory on another file system than the home, and the server trusts none of its output beyond a closed list of results. A hostile shed can misreport its own delivery and nothing more.
+
 ## Credential bus
 
 The credential bus carries live secrets (SSH signatures, AWS and Docker

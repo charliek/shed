@@ -70,8 +70,8 @@ func TestRunVersion(t *testing.T) {
 		wantCode int
 		wantOut  string
 	}{
-		{name: "layout file", args: []string{"--layout-file", layoutOne}, wantOut: `{"version":"v0.9.2","protocol":1,"layout":1}` + "\n"},
-		{name: "missing layout file", args: []string{"--layout-file", filepath.Join(dir, "none")}, wantOut: `{"version":"v0.9.2","protocol":1,"layout":0}` + "\n"},
+		{name: "layout file", args: []string{"--layout-file", layoutOne}, wantOut: `{"version":"v0.9.2","protocol":2,"layout":1}` + "\n"},
+		{name: "missing layout file", args: []string{"--layout-file", filepath.Join(dir, "none")}, wantOut: `{"version":"v0.9.2","protocol":2,"layout":0}` + "\n"},
 		{name: "bad layout file", args: []string{"--layout-file", bad}, wantCode: 1},
 		{name: "extra argument", args: []string{"extra"}, wantCode: 2},
 		{name: "unknown flag", args: []string{"--nope"}, wantCode: 2},

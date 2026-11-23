@@ -1082,13 +1082,40 @@ impl Client {
     /// `GET /api/sheds` -> sheds stamped with this host's config name (the server
     /// omits `host`; the client stamps it).
     pub async fn list_sheds(&self) -> Result<Vec<Shed>, ShedError> {
-        let list: ShedList = self.get_json(&["api", "sheds"], &[]).await?;
+        Ok(self
+            .list_sheds_with_delivery()
+            .await?
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect())
+    }
+
+    /// [`list_sheds`](Self::list_sheds), each shed beside its `delivery` record (plan
+    /// 039 §3.6) as the server sent it: an object, else `None` (a server older than
+    /// delivery sends none). Undecoded: the record is read by the clients, and an
+    /// admin looking at another user's shed is sent its `state` alone.
+    pub async fn list_sheds_with_delivery(
+        &self,
+    ) -> Result<Vec<(Shed, Option<serde_json::Value>)>, ShedError> {
+        let raw: serde_json::Value = self.get_json(&["api", "sheds"], &[]).await?;
+        let records: Vec<Option<serde_json::Value>> = raw
+            .get("sheds")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| r.get("delivery").filter(|d| d.is_object()).cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let list: ShedList =
+            serde_json::from_value(raw).map_err(|e| ShedError::Decode(e.to_string()))?;
         Ok(list
             .sheds
             .into_iter()
-            .map(|mut s| {
+            .zip(records.into_iter().chain(std::iter::repeat(None)))
+            .map(|(mut s, d)| {
                 s.host = self.server_name.clone();
-                s
+                (s, d)
             })
             .collect())
     }
@@ -1341,6 +1368,264 @@ impl Client {
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// A refusal from one of the delivery-era routes (plan 039: the shed document, the
+/// provision route, the activity feed): the status when there was one, the API error's
+/// `code` and its `message`, cleaned for display. Its own type, so no existing match over
+/// [`ShedError`] learns a case.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApiFailure {
+    pub status: Option<u16>,
+    pub code: String,
+    pub message: String,
+}
+
+impl ApiFailure {
+    fn from_shed(e: &ShedError) -> Self {
+        ApiFailure {
+            status: match *e {
+                ShedError::BadStatus(s) => Some(s),
+                _ => None,
+            },
+            code: String::new(),
+            message: e.to_string(),
+        }
+    }
+
+    /// A non-2xx answer: its API error body's code and message when it has one.
+    fn from_body(status: u16, body: &[u8]) -> Self {
+        let (code, message) = api_error_parts(body);
+        ApiFailure {
+            status: Some(status),
+            message: if message.is_empty() {
+                format!("shed-server returned HTTP {status}")
+            } else {
+                message
+            },
+            code,
+        }
+    }
+}
+
+/// An API error body's (`{"error":{"code","message"}}`, or a bare `{"code","message"}`)
+/// code and message, both cleaned for display; empty when it has none.
+fn api_error_parts(body: &[u8]) -> (String, String) {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let detail = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
+    let text = |k: &str, max: usize| {
+        detail
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(|s| crate::models::display_source_text(s, max))
+            .unwrap_or_default()
+    };
+    (text("code", 64), text("message", 1024))
+}
+
+/// One progress line of a provision (`shed provision`'s stream).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProvisionProgress {
+    pub message: String,
+    /// A step that failed and was recorded owed (a failed delivery is one).
+    pub warning: bool,
+}
+
+/// What a provision did: its progress, then the shed document it ended with, or why it
+/// failed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisionOutcome {
+    pub progress: Vec<ProvisionProgress>,
+    pub result: Result<serde_json::Value, ApiFailure>,
+}
+
+/// The most a shed document or an activity page may be.
+const MAX_DOCUMENT_BYTES: usize = 8 << 20;
+/// The most of an error body read.
+const MAX_ERROR_BODY_BYTES: usize = 16 << 10;
+/// The most progress lines a provision keeps.
+const MAX_PROVISION_PROGRESS: usize = 512;
+
+impl Client {
+    /// GET a JSON document, bounded, with its refusal's API error.
+    async fn get_document(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<serde_json::Value, ApiFailure> {
+        let url = self
+            .build_url(segments, query)
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        let answer = self
+            .request_with_status(
+                reqwest::Method::GET,
+                &url,
+                GET_TIMEOUT,
+                None,
+                MAX_DOCUMENT_BYTES,
+                MAX_ERROR_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        if !(200..300).contains(&answer.status) {
+            return Err(ApiFailure::from_body(answer.status, &answer.body));
+        }
+        serde_json::from_slice(&answer.body).map_err(|e| ApiFailure {
+            status: Some(answer.status),
+            code: String::new(),
+            message: format!("decode error: {e}"),
+        })
+    }
+
+    /// `GET /api/sheds/{name}`: the shed document as the server wrote it (its delivery
+    /// record included, plan 039 §3.6), undecoded.
+    pub async fn shed_document(&self, name: &str) -> Result<serde_json::Value, ApiFailure> {
+        self.get_document(&["api", "sheds", name], &[]).await
+    }
+
+    /// `GET /api/activity?since=&shed=&limit=` (plan 039 §3.6): one page of the server's
+    /// activity feed, newest first, `{events, next}`, undecoded.
+    pub async fn activity(
+        &self,
+        since: Option<&str>,
+        shed: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, ApiFailure> {
+        let mut query = Vec::new();
+        if let Some(s) = since.filter(|s| !s.is_empty()) {
+            query.push(("since", s.to_string()));
+        }
+        if let Some(s) = shed.filter(|s| !s.is_empty()) {
+            query.push(("shed", s.to_string()));
+        }
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
+        self.get_document(&["api", "activity"], &query).await
+    }
+
+    /// `POST /api/sheds/{name}/provision` with `Accept: text/event-stream` (plan 039,
+    /// `shed provision`): its progress, then the shed document it ended with or the
+    /// error it ended on. A refusal before the stream (the shed is not running, not the
+    /// caller's, a provision already in flight) is the result's error, with its status.
+    /// One request, never retried after it is sent: the server runs the steps whatever
+    /// the client does.
+    pub async fn provision_shed(&self, name: &str) -> ProvisionOutcome {
+        let mut progress = Vec::new();
+        let result = self.provision_stream(name, &mut progress).await;
+        ProvisionOutcome { progress, result }
+    }
+
+    async fn provision_stream(
+        &self,
+        name: &str,
+        progress: &mut Vec<ProvisionProgress>,
+    ) -> Result<serde_json::Value, ApiFailure> {
+        let url = self
+            .build_url(&["api", "sheds", name, "provision"], &[])
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        let connect = self.send_resolved(CREATE_IDLE_TIMEOUT, |http| {
+            http.post(url.clone())
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+        });
+        let sent = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, connect).await {
+            Err(_) => {
+                return Err(ApiFailure::from_shed(&ShedError::Transport(
+                    "provision stream idle timeout".into(),
+                )))
+            }
+            Ok(r) => r.map_err(|e| ApiFailure::from_shed(&e))?,
+        };
+        let status = sent.resp.status().as_u16();
+        let _transport = sent.transport;
+        let mut resp = sent.resp;
+        if !(200..300).contains(&status) {
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = resp.chunk().await {
+                let room = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if body.len() >= MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            return Err(ApiFailure::from_body(status, &body));
+        }
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut done: Option<Result<serde_json::Value, ApiFailure>> = None;
+        let handle =
+            |ev: crate::sse::SseEvent,
+             progress: &mut Vec<ProvisionProgress>,
+             done: &mut Option<Result<serde_json::Value, ApiFailure>>| {
+                match ev.event.as_str() {
+                    "progress" => {
+                        #[derive(serde::Deserialize)]
+                        struct P {
+                            message: Option<String>,
+                            warning: Option<bool>,
+                        }
+                        if let Ok(p) = serde_json::from_str::<P>(&ev.data) {
+                            if let Some(m) = p.message.filter(|m| !m.is_empty()) {
+                                if progress.len() < MAX_PROVISION_PROGRESS {
+                                    progress.push(ProvisionProgress {
+                                        message: m,
+                                        warning: p.warning.unwrap_or(false),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "complete" => {
+                        *done = Some(serde_json::from_str(&ev.data).map_err(|e| ApiFailure {
+                            status: Some(status),
+                            code: String::new(),
+                            message: format!("decode error: {e}"),
+                        }));
+                    }
+                    "error" => {
+                        let (code, message) = api_error_parts(ev.data.as_bytes());
+                        *done = Some(Err(ApiFailure {
+                            status: None,
+                            code,
+                            message: if message.is_empty() {
+                                "provision failed".into()
+                            } else {
+                                message
+                            },
+                        }));
+                    }
+                    _ => {}
+                }
+            };
+        loop {
+            match tokio::time::timeout(CREATE_IDLE_TIMEOUT, stream.next()).await {
+                Err(_) => {
+                    return Err(ApiFailure::from_shed(&ShedError::Transport(
+                        "provision stream idle timeout".into(),
+                    )))
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.map_err(|e| {
+                        ApiFailure::from_shed(&ShedError::Transport(crate::authfail::flatten(&e)))
+                    })?;
+                    for ev in parser.feed(&chunk) {
+                        handle(ev, progress, &mut done);
+                    }
+                }
+            }
+        }
+        for ev in parser.finish() {
+            handle(ev, progress, &mut done);
+        }
+        done.unwrap_or_else(|| {
+            Err(ApiFailure {
+                status: Some(status),
+                code: String::new(),
+                message: "the provision stream ended before a complete event".into(),
+            })
+        })
     }
 }
 
@@ -1819,6 +2104,31 @@ mod tests {
         assert_eq!(sheds.len(), 1);
         assert_eq!(sheds[0].name, "hello-world");
         assert_eq!(sheds[0].host, "mini2"); // stamped by the client
+    }
+
+    #[tokio::test]
+    async fn list_sheds_carry_each_delivery_record() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200).body(
+                    r#"{"sheds":[
+                        {"name":"a","status":"running","delivery":{"state":"partial","owed":["install"]}},
+                        {"name":"b","status":"stopped"},
+                        {"name":"c","status":"running","delivery":"delivered"},
+                        {"name":"d","status":"running","delivery":{"state":"delivered"}}]}"#,
+                );
+            })
+            .await;
+        let got = client(&server).list_sheds_with_delivery().await.unwrap();
+        let names: Vec<_> = got.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        assert!(got.iter().all(|(s, _)| s.host == "mini2"));
+        assert_eq!(got[0].1.as_ref().unwrap()["owed"][0], "install");
+        assert_eq!(got[1].1, None, "an older server sends no record");
+        assert_eq!(got[2].1, None, "a record that is not an object is none");
+        assert_eq!(got[3].1.as_ref().unwrap()["state"], "delivered");
     }
 
     #[tokio::test]
@@ -2737,6 +3047,112 @@ mod tests {
         assert_eq!(shed.name, "folio");
         assert_eq!(shed.host, "mini2"); // stamped on the SSE-complete path
         assert!(s.error.is_none());
+    }
+
+    // ---- the delivery-era routes (plan 039) ----
+
+    #[tokio::test]
+    async fn provision_streams_progress_and_ends_with_the_document() {
+        let server = MockServer::start_async().await;
+        let sse = "event: progress\ndata: {\"phase\":\"stage1\",\"message\":\"delivering\"}\n\n\
+                   event: progress\ndata: {\"message\":\"no source connected\",\"warning\":true}\n\n\
+                   event: complete\ndata: {\"name\":\"folio\",\"delivery\":{\"state\":\"delivered\"}}\n\n";
+        server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/folio/provision")
+                    .header("accept", "text/event-stream");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(sse);
+            })
+            .await;
+        let out = client(&server).provision_shed("folio").await;
+        assert_eq!(
+            out.progress,
+            vec![
+                ProvisionProgress {
+                    message: "delivering".into(),
+                    warning: false
+                },
+                ProvisionProgress {
+                    message: "no source connected".into(),
+                    warning: true
+                },
+            ]
+        );
+        assert_eq!(out.result.unwrap()["delivery"]["state"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn provision_refusals_and_error_events_carry_the_api_error() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/busy/provision");
+                t.status(409).body(
+                    r#"{"error":{"code":"PROVISION_IN_PROGRESS","message":"a provision is running"}}"#,
+                );
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/bad/provision");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("event: error\ndata: {\"error\":{\"code\":\"BACKEND_ERROR\",\"message\":\"clone failed\"}}\n\n");
+            })
+            .await;
+        let c = client(&server);
+        let e = c.provision_shed("busy").await.result.unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str(), e.message.as_str()),
+            (Some(409), "PROVISION_IN_PROGRESS", "a provision is running")
+        );
+        let e = c.provision_shed("bad").await.result.unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("BACKEND_ERROR", "clone failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shed_document_and_an_activity_page_are_read_whole() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/folio");
+                t.status(200)
+                    .body(r#"{"name":"folio","delivery":{"state":"none"}}"#);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/activity")
+                    .query_param("since", "c1")
+                    .query_param("limit", "5");
+                t.status(200).body(r#"{"events":[],"next":""}"#);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/gone");
+                t.status(404)
+                    .body(r#"{"error":{"code":"SHED_NOT_FOUND","message":"no such shed"}}"#);
+            })
+            .await;
+        let c = client(&server);
+        assert_eq!(
+            c.shed_document("folio").await.unwrap()["delivery"]["state"],
+            "none"
+        );
+        assert_eq!(
+            c.activity(Some("c1"), None, Some(5)).await.unwrap()["next"],
+            ""
+        );
+        let e = c.shed_document("gone").await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
     }
 
     #[tokio::test]

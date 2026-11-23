@@ -22,6 +22,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/directory"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
@@ -236,6 +237,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// whatever user its record carries.
 	pluginRegistry := plugin.NewRegistry()
 	pluginBridge := newPluginBridge(cfg, pluginRegistry)
+	// Provisioning by delivery: requests go to each user's bound machine
+	// over the pin; the delivery routes hand answers to the same service the
+	// backends' create and provision ask.
+	deliveryService := delivery.NewService(pluginRegistry, cfg.DeliveryTimeout())
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -267,6 +272,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to create firecracker client: %w", err)
 		}
 		log.Printf("Initialized Firecracker backend (default_image=%q, pull_policy=%s)", fcCfg.DefaultImage, fcCfg.PullPolicy)
+		fcClient.SetDelivery(deliveryService)
 		be = firecracker.NewBackend(fcClient)
 		egressSocketDir = fcCfg.SocketDir
 		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
@@ -285,6 +291,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to create vz client: %w", err)
 		}
 		log.Printf("Initialized VZ backend (default_image=%q, pull_policy=%s)", vzCfg.DefaultImage, vzCfg.PullPolicy)
+		vzClient.SetDelivery(deliveryService)
 		be = vz.NewBackend(vzClient)
 		egressSocketDir = vzCfg.SocketDir
 		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
@@ -299,6 +306,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
 			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
+		rb.SetDelivery(deliveryService)
 		be = rb
 		// Egress control is refused on remote at load, so these two are
 		// never used; they are set so nothing below sees an empty path.
@@ -537,20 +545,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// The audit log (service client requests, HTTPS execs, max_age reaps, a
-	// person's entries into service clients' sheds), next to the egress
-	// audit log in the backend's state directory. On when auth.clients is
-	// set or audit.enabled; a server that needs it and can't open it does
-	// not start. Once serving, runFrontDoors closes it, after every server
-	// has drained; this close (a no-op then) is for a return before that.
-	var auditLog *audit.Log
-	if cfg.AuditEnabled() {
-		auditPath := filepath.Join(egressStateDir, audit.FileName)
-		auditLog, err = audit.Open(auditPath, audit.DefaultMaxBytes, audit.DefaultKeep)
-		if err != nil {
-			return fmt.Errorf("audit: open %s: %w", auditPath, err)
-		}
+	// person's entries into service clients' sheds, the shed lifecycle and
+	// delivery events), next to the egress audit log in the backend's state
+	// directory (openAuditLog). Once serving, runFrontDoors closes it, after
+	// every server has drained; this close (a no-op then) is for a return
+	// before that.
+	auditLog, err := openAuditLog(cfg, egressStateDir, log.Printf)
+	if err != nil {
+		return err
+	}
+	if auditLog != nil {
 		defer func() { _ = auditLog.Close() }()
-		log.Printf("Audit log: %s", auditPath)
 	}
 
 	// Initialize HTTP API server
@@ -560,6 +565,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
+	apiServer.SetDelivery(deliveryService)
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
 		// against the LIVE user lookup, so removing an SSH key de-authorizes its
@@ -1123,10 +1129,34 @@ func sshKeyAuth(l userSource) sshd.KeyAuth {
 	}
 }
 
+// openAuditLog opens the server's audit log in dir when cfg turns it on
+// (config.ServerConfig.AuditEnabled), and returns nil when it is off. A log
+// that is required (auth.clients, or audit.enabled: true) and cannot be
+// opened is an error: the server does not start. A log on only by the mtls
+// default that cannot be opened is a warning (through logf), and the server
+// starts without it, as it would have before the default.
+func openAuditLog(cfg *config.ServerConfig, dir string, logf func(format string, args ...any)) (*audit.Log, error) {
+	if !cfg.AuditEnabled() {
+		return nil, nil
+	}
+	path := filepath.Join(dir, audit.FileName)
+	l, err := audit.Open(path, audit.DefaultMaxBytes, audit.DefaultKeep)
+	if err != nil {
+		if cfg.AuditRequired() {
+			return nil, fmt.Errorf("audit: open %s: %w", path, err)
+		}
+		logf("WARNING: audit: the audit log %s, on by default in mtls mode, could not be opened (%v): starting without it, so no events are recorded and the activity feed is empty. audit.enabled: true makes it required; audit.enabled: false turns it off.", path, err)
+		return nil, nil
+	}
+	logf("Audit log: %s", path)
+	return l, nil
+}
+
 // attachAuditLog hands the one audit log to both front doors: the API server
-// (service client requests, HTTPS execs, max_age reaps) and the SSH server (a
-// person's entry into a service client's shed). Called before either serves.
-// A nil log (audit off) records nothing on either.
+// (service client requests, HTTPS execs, max_age reaps; and, through it, the
+// access guard's lifecycle events and the delivery service's events) and the
+// SSH server (a person's entry into a service client's shed). Called before
+// either serves. A nil log (audit off) records nothing on either.
 func attachAuditLog(l *audit.Log, apiServer *api.Server, sshServer *sshd.Server) {
 	apiServer.SetAuditLog(l)
 	sshServer.SetAuditLog(l)

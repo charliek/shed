@@ -1,0 +1,77 @@
+{
+  "name": "total-at-4mib",
+  "description": "Four files of 1 MiB each: exactly 4 MiB together, the most allowed. The contents are filled in by the harness (fill).",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "big-0",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "big-0.bin",
+        "mode": "0600",
+        "content": "",
+        "fingerprint": "fp-big-0"
+      },
+      {
+        "name": "big-1",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "big-1.bin",
+        "mode": "0600",
+        "content": "",
+        "fingerprint": "fp-big-1"
+      },
+      {
+        "name": "big-2",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "big-2.bin",
+        "mode": "0600",
+        "content": "",
+        "fingerprint": "fp-big-2"
+      },
+      {
+        "name": "big-3",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "big-3.bin",
+        "mode": "0600",
+        "content": "",
+        "fingerprint": "fp-big-3"
+      }
+    ],
+    "problems": []
+  },
+  "fill": [
+    {
+      "item": 0,
+      "bytes": 1048576
+    },
+    {
+      "item": 1,
+      "bytes": 1048576
+    },
+    {
+      "item": 2,
+      "bytes": 1048576
+    },
+    {
+      "item": 3,
+      "bytes": 1048576
+    }
+  ],
+  "expect": {
+    "result": "accepted"
+  }
+}

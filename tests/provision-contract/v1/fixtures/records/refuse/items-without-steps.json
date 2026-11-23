@@ -1,0 +1,24 @@
+{
+  "name": "items-without-steps",
+  "description": "Items on a record with no steps.",
+  "record": {
+    "state": "none",
+    "items": [
+      {
+        "name": "ssh-key",
+        "provider": "ssh-key",
+        "stage": 1,
+        "kind": "file",
+        "base": "home",
+        "target": ".ssh/id_ed25519",
+        "fingerprint": "k3y-fp_01",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "unexpected_member"
+  }
+}

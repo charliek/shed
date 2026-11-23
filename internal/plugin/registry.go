@@ -91,7 +91,9 @@ package plugin
 //     still current (admit, under the transport's write lock).
 //   - Move: Move asks the store (Bindings.Use) and then, without letting the
 //     gate go, closes every listener of the user that is not the new
-//     binding's and drops the user's requests stamped otherwise.
+//     binding's and drops the user's requests stamped otherwise. It also
+//     closes the user's delivery stream when it is not the new binding's,
+//     which fails every delivery request it carried (delivery.go).
 //
 // The user's gate (pin.go: userGate, one per user) is the per-user critical
 // section: admission and registration (Subscribe), a move with its clean-up
@@ -367,6 +369,8 @@ type Registry struct {
 	// by SetBindings, before any listener registers; read under mu, or
 	// through pin().
 	bindings source.Bindings
+	// deliveries is each user's delivery stream (delivery.go), at most one.
+	deliveries map[string]*DeliveryStream
 	// closed is set by Close: nothing registers from then on.
 	closed bool
 
@@ -379,10 +383,11 @@ type Registry struct {
 // NewRegistry creates a new empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		listeners: make(map[ListenerKey]*Listener),
-		pending:   make(map[string]*Message),
-		conns:     make(map[uint64]*connUsage),
-		gates:     make(map[string]*userGate),
+		listeners:  make(map[ListenerKey]*Listener),
+		pending:    make(map[string]*Message),
+		conns:      make(map[uint64]*connUsage),
+		gates:      make(map[string]*userGate),
+		deliveries: make(map[string]*DeliveryStream),
 	}
 }
 

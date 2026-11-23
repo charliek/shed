@@ -1,0 +1,16 @@
+{
+  "name": "bad-id-short",
+  "description": "An id of 31 hex digits.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcde",
+    "items": [],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_id"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "create-repo-dot-ssh",
+  "description": "A create with a repository named .ssh, cloned into /home/shed/.ssh: the answer rules place its project items inside ~/.ssh.",
+  "request": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "reason": "create",
+    "deadline": "2026-11-23T10:00:30Z",
+    "user": "ada",
+    "shed": {
+      "name": "widgets",
+      "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "backend": "firecracker",
+      "repo": {
+        "url": "git@git.example.test:example/.ssh.git",
+        "name": "example/.ssh"
+      },
+      "project_dir": "/home/shed/.ssh"
+    }
+  }
+}

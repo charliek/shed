@@ -8,6 +8,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/source"
@@ -20,11 +21,14 @@ import (
 type Server struct {
 	// backend is always a *backend.Guard (or nil): every call is decided by
 	// the access rule for the principal on the request's context.
-	backend     backend.Backend
-	cfg         *config.ServerConfig
-	sshHostKey  string
-	plugins     *plugin.Registry
-	bridge      *plugin.Bridge
+	backend    backend.Backend
+	cfg        *config.ServerConfig
+	sshHostKey string
+	plugins    *plugin.Registry
+	bridge     *plugin.Bridge
+	// delivery is the delivery service the delivery routes hand answers
+	// to (nil until SetDelivery: the routes answer 503).
+	delivery    *delivery.Service
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
 	// users answers "which user owns this SSH key fingerprint?" for the mtls
@@ -54,6 +58,9 @@ type Server struct {
 
 	// audit is the audit log (nil: off). See audit.go.
 	audit *audit.Log
+	// activityScan is how many lines one page of GET /api/activity looks
+	// at (0: activityBudget's). A test seam.
+	activityScan int
 	// connects holds each person's Connect into a service client's shed
 	// from just before its guarded dial until its connect line is written
 	// (or it failed): DrainEntries waits for them (connect.go).
@@ -149,6 +156,7 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(ContentTypeJSON)
+	r.Use(deliveryNoStore)
 	r.Use(s.authMiddleware)
 }
 
@@ -255,6 +263,10 @@ func (s *Server) Router() chi.Router {
 		// state of its list (admin only; control scope).
 		r.Get("/users/status", s.handleUsersStatus)
 
+		// Activity: the audit log's lifecycle and delivery events, as the
+		// caller may see them (control scope; every caller, filtered).
+		r.Get("/activity", s.handleActivity)
+
 		// Credential sources: which of a user's machines answers their
 		// credential requests, and moving that (control scope: outside
 		// /api/plugins, so a credentials certificate cannot reach them).
@@ -262,6 +274,13 @@ func (s *Server) Router() chi.Router {
 		r.Post("/sources/use", s.handleUseSource)
 
 		// Plugins / Extensions (the credential bus)
+		// Provisioning by delivery: a person's source holds its delivery
+		// stream and answers the requests it carries (credentials scope).
+		r.Route("/delivery", func(r chi.Router) {
+			r.Get("/requests", s.handleDeliveryStream)
+			r.Post("/requests/{id}", s.handleDeliveryAnswer)
+		})
+
 		r.Route("/plugins", func(r chi.Router) {
 			r.Get("/listeners", s.handleListListeners)
 			r.Get("/listeners/{namespace}/messages", s.handlePluginSubscribe)
@@ -288,6 +307,9 @@ func (s *Server) Router() chi.Router {
 				// Give a shed with no user to a user (admin only).
 				r.Post("/assign", s.handleAssignShed)
 				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
+				// Deliver the shed's credentials afresh and finish its
+				// owed steps (control scope; the shed's own user only).
+				r.Post("/provision", s.handleProvisionShed)
 
 				// HTTPS exec: one command, NDJSON output (control scope
 				// in an enforced mode, via authorizeScope's default).

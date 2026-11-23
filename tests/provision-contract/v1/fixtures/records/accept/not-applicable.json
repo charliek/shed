@@ -1,0 +1,31 @@
+{
+  "name": "not-applicable",
+  "description": "A create by a person with no bound machine: no request, no warning.",
+  "record": {
+    "state": "not_applicable",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "not_applicable"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "not_applicable"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested"
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

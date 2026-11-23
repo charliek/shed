@@ -1,0 +1,33 @@
+{
+  "name": "from-snapshot",
+  "description": "A shed restored from a snapshot: it carries the snapshot's files, every step skipped, no request.",
+  "record": {
+    "state": "not_applicable",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "from_snapshot"
+      },
+      "clone": {
+        "state": "skipped",
+        "reason": "from_snapshot"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "from_snapshot"
+      },
+      "install": {
+        "state": "skipped",
+        "reason": "from_snapshot"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested"
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

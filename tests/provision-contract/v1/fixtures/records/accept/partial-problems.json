@@ -1,0 +1,54 @@
+{
+  "name": "partial-problems",
+  "description": "Every step done, but the source reported a problem beside its items.",
+  "record": {
+    "state": "partial",
+    "steps": {
+      "stage1": {
+        "state": "done"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "no_items"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "accepted",
+      "source": {
+        "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+        "machine_name": "ada-laptop"
+      },
+      "problems": [
+        {
+          "provider": "github",
+          "code": "signed_out",
+          "message": "gh is not signed in"
+        }
+      ]
+    },
+    "items": [
+      {
+        "name": "ssh-key",
+        "provider": "ssh-key",
+        "stage": 1,
+        "kind": "file",
+        "base": "home",
+        "target": ".ssh/id_ed25519",
+        "fingerprint": "k3y-fp_01",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      }
+    ]
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

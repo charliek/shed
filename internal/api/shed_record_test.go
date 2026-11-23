@@ -33,6 +33,7 @@ var recordRoutes = []string{
 	"POST /api/sheds/{name}/stop",
 	"POST /api/sheds/{name}/assign",
 	"POST /api/sheds/{name}/reset",
+	"POST /api/sheds/{name}/provision",
 	"POST /api/egress/{name}",
 	"DELETE /api/egress/{name}",
 	"GET /api/overview",
@@ -40,6 +41,9 @@ var recordRoutes = []string{
 
 // notRecordRoutes return no shed record.
 var notRecordRoutes = []string{
+	"GET /api/activity",
+	"GET /api/delivery/requests",
+	"POST /api/delivery/requests/{id}",
 	"GET /api/info",
 	"GET /api/ssh-host-key",
 	"GET /api/sessions",
@@ -255,6 +259,12 @@ func TestShedRecordRoutesCarryIsolation(t *testing.T) {
 		},
 		"POST /api/sheds/{name}/reset": func(t *testing.T) {
 			checkRecords(t, "reset", recordsOf(t, "reset", asRoot(http.MethodPost, "/api/sheds/rbox/reset", "")), runtime.GOARCH, stored)
+		},
+		"POST /api/sheds/{name}/provision": func(t *testing.T) {
+			// rbox is root's own: the admin provisions it as its user.
+			checkRecords(t, "provision (JSON)", recordsOf(t, "provision (JSON)", asRoot(http.MethodPost, "/api/sheds/rbox/provision", "")), runtime.GOARCH, stored)
+			resp := asRoot(http.MethodPost, "/api/sheds/rbox/provision", "", "Accept", "text/event-stream")
+			checkRecords(t, "provision (stream)", recordsOf(t, "provision (stream)", resp), runtime.GOARCH, stored)
 		},
 		"POST /api/egress/{name}": func(t *testing.T) {
 			checkRecords(t, "egress set", recordsOf(t, "egress set", asRoot(http.MethodPost, "/api/egress/rbox", `{"profiles":["off"]}`)), runtime.GOARCH, stored)

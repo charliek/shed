@@ -1,0 +1,39 @@
+{
+  "name": "nested-target-project",
+  "description": "Nested targets under the project base.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "one",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": "config",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-one"
+      },
+      {
+        "name": "two",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": "config/app.toml",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-two"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "nested_target"
+  }
+}

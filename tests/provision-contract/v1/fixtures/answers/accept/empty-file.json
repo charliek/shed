@@ -1,0 +1,26 @@
+{
+  "name": "empty-file",
+  "description": "A file item with empty content: valid, an empty file.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "empty",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".config/x/empty",
+        "mode": "0600",
+        "content": "",
+        "fingerprint": "fp-empty"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

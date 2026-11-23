@@ -4430,6 +4430,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "shed-core",
+ "shed-source",
  "ssh-key",
  "thiserror 1.0.69",
  "tokio",
@@ -4477,13 +4478,17 @@ version = "0.10.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "shed-app",
  "shed-core",
  "shed-craze",
  "shed-lane",
+ "shed-provision",
+ "shed-provision-providers",
  "shed-roost",
+ "shed-source",
  "tokio",
  "tracing",
  "uuid",
@@ -4535,6 +4540,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-provision"
+version = "0.10.1"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.12.1",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "shed-provision-providers"
+version = "0.10.1"
+dependencies = [
+ "base64 0.22.1",
+ "shed-provision",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "shed-roost"
 version = "0.10.1"
 dependencies = [
@@ -4552,6 +4576,25 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "shed-source"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "libc",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "shed-provision",
+ "ssh-key",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

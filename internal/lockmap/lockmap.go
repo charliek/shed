@@ -60,3 +60,41 @@ func (m *NamedMutexMap) mutex(name string) *sync.Mutex {
 	}
 	return mu
 }
+
+// Flags counts, per name, the callers that have raised a flag and not yet
+// lowered it. A long operation that runs in steps under a NamedMutexMap
+// lock checks it between steps, so a caller waiting for that lock (a stop
+// or a delete of the shed) is not overtaken by the operation's next step:
+// a waiter raises the flag before it waits, and the operation gives way.
+// The zero value is ready to use.
+type Flags struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+// Raise raises name's flag and returns the closure that lowers it again.
+func (f *Flags) Raise(name string) func() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.n == nil {
+		f.n = make(map[string]int)
+	}
+	f.n[name]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.n[name]--; f.n[name] <= 0 {
+				delete(f.n, name)
+			}
+		})
+	}
+}
+
+// Raised reports whether anyone holds name's flag raised.
+func (f *Flags) Raised(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n[name] > 0
+}

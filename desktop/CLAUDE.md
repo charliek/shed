@@ -121,7 +121,8 @@ daemon. It embeds `crates/shed-broker` via `shed-app`'s non-default `broker` fea
 `desktop/tauri/src-tauri/src/broker.rs`. There is no mode to choose: a malformed
 `extensions.yaml` fails the broker closed (approvals dark, reported in `broker.status`) and
 the app keeps running. This machine's identity is `<state>/broker/machine.json`
-(`shed_broker::machine`, `<state>` = `shed_broker::paths::state_dir`); it is the only id
+(`shed_broker::machine`, `<state>` = `shed_broker::paths::state_dir`; both live in
+`crates/shed-source` since plan 039 and are re-exported by the broker, same paths); it is the only id
 `source.use` ever sends. Full behavior is documented user-facing in
 [docs/desktop/architecture.md § The credential
 broker](../docs/desktop/architecture.md#the-credential-broker).

@@ -36,12 +36,25 @@ const (
 	MinLayout = 1
 
 	// AgentProtocol is the agent wire protocol this build speaks. It covers
-	// the framing and messages on the three agent ports.
-	AgentProtocol = 1
+	// the framing and messages on the three agent ports, and the agent's
+	// subcommands the server runs through them. Every backend's agent
+	// reports it in the same probe reply.
+	//
+	//   1: the probe reply.
+	//   2: "shed-agent apply-items" (the delivery writer) and the shed
+	//      user's environment directory.
+	AgentProtocol = 2
 	// MinAgentProtocol is the oldest agent protocol the server accepts. An
 	// agent that reports nothing (every agent before the probe reply
-	// existed) is protocol 0.
+	// existed) is protocol 0. It stays 1 so that an image baked before
+	// protocol 2 still boots; such an agent has no writer
+	// (ApplyItemsProtocol), and a delivery to it ends as image_too_old.
 	MinAgentProtocol = 1
+	// ApplyItemsProtocol is the oldest agent protocol that has
+	// "shed-agent apply-items". The server compares the probed protocol
+	// with it before it sends any value; it never tries the subcommand to
+	// find out.
+	ApplyItemsProtocol = 2
 )
 
 // Users and groups in the guest.

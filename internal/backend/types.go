@@ -55,6 +55,12 @@ type ExecOptions struct {
 	// ResizeChan receives terminal resize events.
 	ResizeChan <-chan TerminalSize
 
+	// MaxFrameBytes, when positive, is the largest frame the exec takes from
+	// the guest agent: a longer one ends the exec, refused from its header
+	// before its payload is read or allocated. Zero is the protocol's own
+	// limit.
+	MaxFrameBytes int
+
 	// OnStarted, when set, is called once, synchronously, right after the
 	// exec request has been written to the guest agent: the point after which
 	// the command may be running. It is not called when the exec fails before

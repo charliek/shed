@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 )
@@ -31,6 +32,9 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, _ *plugin.B
 func (c *Client) Close() error {
 	return nil
 }
+
+// SetDelivery is a no-op for the stub client.
+func (c *Client) SetDelivery(_ *delivery.Service) {}
 
 // SetEgressManager is a no-op for the stub client.
 func (c *Client) SetEgressManager(_ *egress.Manager) {}
@@ -96,6 +100,11 @@ func (b *VZBackend) AssignUser(ctx context.Context, name string, req config.Assi
 
 // ResetShed returns an error on non-darwin platforms.
 func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return nil, errNonDarwin
+}
+
+// BeginProvision is not supported on non-darwin builds.
+func (b *VZBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
 	return nil, errNonDarwin
 }
 

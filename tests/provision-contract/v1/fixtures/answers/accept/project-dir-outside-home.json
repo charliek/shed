@@ -1,0 +1,48 @@
+{
+  "name": "project-dir-outside-home",
+  "description": "A project directory outside home (/srv/widgets): its items land there, so project:.ssh/authorized_keys is no home target, and home:.ssh/config and project:.ssh/config are two files.",
+  "request": "create-project-dir-outside-home",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "p1",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": ".ssh/authorized_keys",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-p1"
+      },
+      {
+        "name": "h1",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/config",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-h1"
+      },
+      {
+        "name": "p2",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": ".ssh/config",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-p2"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

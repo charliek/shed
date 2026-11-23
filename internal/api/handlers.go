@@ -146,18 +146,16 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	req.User = ""
 	req.NoServerEnv = false
 	req.ResolvedMounts = nil
-	// The shed ID is server-minted, like Owner. Only an asynchronous backend
-	// (remote) stores it today; Firecracker and VZ get none.
-	req.ID = ""
+	// The shed ID is server-minted, like Owner, and every backend stores
+	// it: a delivery request names the shed by it, and an answer for a shed
+	// whose id changed is dropped.
 	asyncBackend, isAsync := backend.IsAsync(s.backend)
-	if isAsync {
-		id, err := config.NewShedID()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, config.ErrBackendError, "mint shed id: "+err.Error())
-			return
-		}
-		req.ID = id
+	id, err := config.NewShedID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "mint shed id: "+err.Error())
+		return
 	}
+	req.ID = id
 
 	// A remote server offers named sizes: the request's cpus and memory pick
 	// one, and the record carries that size's numbers. This runs before the
@@ -964,6 +962,9 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrShedNotRunningSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+	if errors.Is(err, config.ErrProvisionBusySentinel) {
+		return http.StatusConflict, config.ErrProvisionInProgress, err.Error()
 	}
 	if errors.Is(err, config.ErrShedNotStoppedSentinel) {
 		return http.StatusConflict, config.ErrShedNotStopped, err.Error()

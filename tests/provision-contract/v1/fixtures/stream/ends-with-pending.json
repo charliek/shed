@@ -1,0 +1,28 @@
+{
+  "name": "ends-with-pending",
+  "description": "Two requests, then the stream ends before the source has answered either: both fail at once on the server, and the source drops them. It does not answer them after it reconnects, and the next stream does not carry them again.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+      "X-Shed-Delivery-Stream": "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    }
+  },
+  "chunks": [
+    {
+      "at_ms": 0,
+      "text": "event: request\ndata: {\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"create\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"ada\",\"shed\":{\"name\":\"widgets\",\"id\":\"q6c3g4ymb5m2dkxwe7kyz5hhzu\",\"backend\":\"firecracker\",\"repo\":{\"url\":\"git@git.example.test:example/widgets.git\",\"name\":\"example/widgets\"},\"project_dir\":\"/home/shed/widgets\"}}\n\n"
+    },
+    {
+      "at_ms": 10,
+      "text": "event: request\ndata: {\"version\":1,\"id\":\"89abcdef0123456789abcdef01234567\",\"reason\":\"provision\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"ada\",\"shed\":{\"name\":\"gadgets\",\"id\":\"b7n4k2xq5w3e6r7t3y5u2i3o4p\",\"backend\":\"vz\",\"local_dir\":\"gadgets\",\"project_dir\":\"/home/shed/gadgets\"}}\n\n"
+    }
+  ],
+  "expect": {
+    "requests": [
+      "0123456789abcdef0123456789abcdef",
+      "89abcdef0123456789abcdef01234567"
+    ]
+  }
+}

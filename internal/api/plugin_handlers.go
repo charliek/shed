@@ -256,7 +256,7 @@ func (s *Server) streamListener(w http.ResponseWriter, r *http.Request, listener
 	ctx := r.Context()
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
-	stillTheCaller := s.busCallerCheck(r, listener)
+	stillTheCaller := s.busCallerCheck(r, listener.User)
 
 	for {
 		select {
@@ -306,16 +306,16 @@ func (s *Server) streamListener(w http.ResponseWriter, r *http.Request, listener
 	}
 }
 
-// busCallerCheck is the check a credential-bus stream makes again before each
-// message it sends, on a server whose user lookup is
+// busCallerCheck is the check a credential-bus or delivery stream makes again
+// before each message it sends, on a server whose user lookup is
 // users.BoundCredentialsOnly (a directory server, whose users change while it
 // runs): the request's client certificate must still be inside its validity
 // dates (certValidAt, as the mtls middleware checks every request's) and
-// still authenticate the listener's user (CertificateUser, against the lookup
+// still authenticate the stream's user (CertificateUser, against the lookup
 // as it is then). nil on any other server, whose streams are authorized once,
 // when they open, as they always were. A request with no client certificate
 // fails the check.
-func (s *Server) busCallerCheck(r *http.Request, listener *plugin.Listener) func() bool {
+func (s *Server) busCallerCheck(r *http.Request, user string) func() bool {
 	if _, ok := s.users.(users.BoundCredentialsOnly); !ok {
 		return nil
 	}
@@ -336,7 +336,7 @@ func (s *Server) busCallerCheck(r *http.Request, listener *plugin.Listener) func
 			return false
 		}
 		u, _, ok := CertificateUser(s.users, leaf, now)
-		return ok && !u.Implicit && u.Name == listener.User
+		return ok && !u.Implicit && u.Name == user
 	}
 }
 

@@ -52,9 +52,11 @@ package orchestrator
 
 import (
 	"context"
+	"log"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 )
 
 // PreFlightResult is the orchestrator-opaque output of the backend's
@@ -204,18 +206,32 @@ type BackendCreator interface {
 	// clone is itself routed through (and audited by) the proxy.
 	ConfigureEgressProxy(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
 
-	// CloneRepo clones `req.Repo` into the guest's workspace if
-	// specified. Best-effort: hook implementations log + emit
-	// `backend.StatusWarning` on failure and return nothing — the
-	// orchestrator continues to the next step regardless. Matches
-	// today's behavior in both backends.
-	CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
+	// DeliveryService is the delivery service the create's steps ask
+	// (nil: none, every delivery not applicable).
+	DeliveryService() *delivery.Service
 
-	// RunProvisioning runs the shed's provisioning hooks (loaded
-	// from .shed/provision.yaml inside the guest workspace) unless
-	// the request opted out via NoProvision. Best-effort — same
-	// contract as SetupCredentials.
-	RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
+	// CloneRepo is the clone step for a shed with a repository (the
+	// orchestrator does not call it otherwise): vmutil.CloneStep, which
+	// clones `req.Repo` into ~/<name> unless something already stands
+	// there. It returns the step's result for the record; a failure is
+	// logged and warned about, and the create continues.
+	//
+	// env is the egress proxy environment the clone runs with besides the
+	// server's own, rebuilt from the shed's metadata as the step in hand read
+	// it (LocalShed.CloneEnv): an egress set or cleared since the create's
+	// own proxy setup is the one the clone gets.
+	CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, env []string) delivery.Step
+
+	// ResetGeneration is the shed's reset generation as persisted with the
+	// metadata (0 for a new shed): `shed reset` bumps it, and a delivery
+	// step that finds it changed ends its run.
+	ResetGeneration(meta MetadataHandle) uint64
+
+	// RunProvisioning runs the shed's provisioning hooks (loaded from
+	// .shed/provision.yaml in the landing directory) as the install step:
+	// see delivery.Host.Hooks for install, startup and what it returns.
+	// The orchestrator never calls it for a --no-provision create.
+	RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, install bool, startup func(st delivery.Step, ran bool) bool) (delivery.Step, bool)
 
 	// ToShedResult returns the *config.Shed value to hand back to
 	// the orchestrator's caller. Called once the create is fully
@@ -236,56 +252,114 @@ type BackendCreator interface {
 // validation beyond what a backend's PreFlight does — call sites (the
 // backend's existing CreateShed wrapper) keep that responsibility
 // per the package doc-comment contract.
-func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequest) (*config.Shed, error) {
+func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequest) (*config.Shed, *PendingDelivery, error) {
 	cleanup := backend.NewCleanup()
 	defer cleanup.Run()
 
 	pre, err := b.PreFlight(ctx, req, cleanup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Network allocation runs first (fail-cheap; matches FC's
 	// existing order). VZ's hook is a no-op and registers nothing.
 	net, err := b.AllocateNetwork(ctx, req, cleanup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	backend.Phase(ctx, "rootfs")
 	backend.Status(ctx, "Allocating writable upper layer...")
 	upper, err := b.AllocateUpper(ctx, req, pre, cleanup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	meta, err := b.BuildAndPersistMetadata(ctx, req, pre, upper, net, cleanup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	backend.Phase(ctx, "vm")
 	backend.Status(ctx, "Starting virtual machine...")
 	vm, err := b.StartVM(ctx, meta, upper, net, cleanup)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := b.FinalizeStartedVM(ctx, meta, vm, cleanup); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := b.MountLocalDir(ctx, req, meta, vm); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	b.SetupCredentials(ctx, req, meta, vm)
 	if err := b.ConfigureEgressProxy(ctx, req, meta, vm, cleanup); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	b.CloneRepo(ctx, req, meta, vm)
-	b.RunProvisioning(ctx, req, meta, vm)
 
 	cleanup.Commit()
-	return b.ToShedResult(meta), nil
+	shed := b.ToShedResult(meta)
+	// The tracked steps (stage 1, clone, stage 2, install hook) are not run
+	// here: the caller holds the shed's lifecycle lock, and the steps take it
+	// one at a time (never across the wait for a source). The caller runs
+	// the pending delivery once it has released the lock.
+	return shed, &PendingDelivery{
+		svc: b.DeliveryService(), name: req.Name, shed: shed,
+		scriptKey: req.ScriptKey, fromSnapshot: pre.IsFromSnapshot(), noProvision: req.NoProvision,
+		// The baseline every step is checked against, taken here, under
+		// the create's lock: the shed's id, creation time and reset
+		// generation, and the record BuildAndPersistMetadata saved.
+		base: runBase{id: shed.ID, createdAt: shed.CreatedAt, gen: b.ResetGeneration(meta), rec: delivery.NewRecord()},
+		clone: func(ctx context.Context, ls *LocalShed) delivery.Step {
+			return b.CloneRepo(ctx, req, meta, vm, ls.CloneEnv)
+		},
+		hooks: func(ctx context.Context, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool) {
+			return b.RunProvisioning(ctx, req, meta, vm, install, startup)
+		},
+	}, nil
+}
+
+// PendingDelivery is a create's delivery steps, run after the create
+// (Run). The caller holds the shed's provisioning slot from before the create
+// until Run returns, so a provision of the shed meanwhile is refused (409).
+type PendingDelivery struct {
+	svc                                  *delivery.Service
+	name                                 string
+	shed                                 *config.Shed
+	scriptKey, fromSnapshot, noProvision bool
+	base                                 runBase
+	clone                                func(ctx context.Context, ls *LocalShed) delivery.Step
+	hooks                                func(ctx context.Context, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool)
+}
+
+// Run runs the create's delivery steps through lb, once the caller has
+// released the shed's lifecycle lock: each step takes the lock, checks the
+// shed, and gives way to a stop or a delete waiting for it, as a provision's
+// do. A delivery that ends early is logged: the shed was created, and it
+// starts either way. It returns the shed as it then stands (as created, when
+// it can no longer be read).
+func (p *PendingDelivery) Run(ctx context.Context, lb LocalBackend) *config.Shed {
+	unlock := lb.LockShed(p.name)
+	ls, err := lb.LoadShed(ctx, p.name, false)
+	unlock()
+	if err != nil {
+		log.Printf("Warning: create of %s: the shed could not be read for its delivery: %v", p.name, err)
+		return p.shed
+	}
+	r := &LocalRun{
+		lb: lb, svc: p.svc, name: p.name, reason: delivery.ReasonCreate, first: ls,
+		scriptKey: p.scriptKey, fromSnapshot: p.fromSnapshot, noProvision: p.noProvision,
+		base: &p.base, clone: p.clone, hooks: p.hooks,
+	}
+	shed, err := r.Run(ctx)
+	if err != nil {
+		log.Printf("Warning: create of %s: the delivery steps ended early: %v", p.name, err)
+	}
+	if shed == nil {
+		return p.shed
+	}
+	return shed
 }

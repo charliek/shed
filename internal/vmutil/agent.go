@@ -1,6 +1,7 @@
 package vmutil
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/guest"
 )
@@ -310,7 +312,7 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	go func() {
 		defer close(done)
 		for {
-			msgType, data, err := agentproto.ReadMessage(conn)
+			msgType, data, err := agentproto.ReadMessageMax(conn, opts.MaxFrameBytes)
 			if err != nil {
 				if err == io.EOF {
 					done <- fmt.Errorf("connection closed before exit code received")
@@ -355,6 +357,14 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					}
 				}
 			default:
+				// A bounded exec (MaxFrameBytes set: the credential writer)
+				// takes no unexpected frame: each would be read without
+				// counting against its output budget. A fixed error, no
+				// guest text.
+				if opts.MaxFrameBytes > 0 {
+					done <- errUnexpectedFrame
+					return
+				}
 				// Don't write unknown frames to stdout — this channel may carry a
 				// binary stdout protocol (Zed, SFTP), and injecting unexpected bytes
 				// is the corruption MsgTypeStderr separation fixes. Log for parity
@@ -377,3 +387,133 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 		return ctx.Err()
 	}
 }
+
+// Errors Run returns. They are fixed: Run never returns an error that
+// carries anything the guest sent (an exec error can quote a malformed
+// frame), so a caller may log them whatever the command was given.
+var (
+	// ErrRunFailed: the command did not run or did not finish (a dial
+	// failure, a broken link, a malformed reply, ctx ending).
+	ErrRunFailed = errors.New("the command did not run or did not finish")
+	// ErrRunOutputTooLarge: the command's output passed Run's limit, and
+	// the command was stopped.
+	ErrRunOutputTooLarge = errors.New("the command's output passed its limit; it was stopped")
+)
+
+// Run runs argv in the shed as the shed user (the agent's exec path, no
+// TTY), with stdin as its standard input and its standard output written to
+// stdout, and returns its exit code: a non-zero exit is not an error. It is
+// what internal/delivery's Agent asks of a shed's agent, and is built for
+// input that must not outlive it:
+//
+//   - When Run returns, nothing of the exec touches stdin or stdout again:
+//     both are fenced (a read or write in progress is waited for; later
+//     ones see EOF or an error), and Exec has closed the connection. A
+//     caller may then clear its input and read its output.
+//   - maxOutput, when positive, bounds what the command may send: its
+//     standard output and standard error together (standard error is read
+//     and discarded), and any one frame, refused from its header. Past it
+//     the exec is stopped (ErrRunOutputTooLarge).
+//   - Its errors are fixed (ErrRunFailed, ErrRunOutputTooLarge), with code
+//     -1.
+func (c *AgentClient) Run(ctx context.Context, argv []string, stdin io.Reader, stdout io.Writer, maxOutput int) (int, error) {
+	budget := &runBudget{max: maxOutput}
+	in := &fencedReader{r: stdin}
+	opts := backend.ExecOptions{
+		Cmd:           argv,
+		Stdin:         io.NopCloser(in),
+		Stdout:        &fencedWriter{w: stdout, b: budget},
+		Stderr:        &fencedWriter{w: io.Discard, b: budget},
+		MaxFrameBytes: maxOutput,
+	}
+	if stdin == nil {
+		in.r = bytes.NewReader(nil)
+	}
+	err := c.Exec(ctx, opts)
+	in.fence()
+	over := budget.fence()
+	var exitErr *ExitError
+	switch {
+	case over:
+		return -1, ErrRunOutputTooLarge
+	case err == nil:
+		return 0, nil
+	case errors.As(err, &exitErr):
+		return exitErr.Code, nil
+	}
+	return -1, ErrRunFailed
+}
+
+// errFenced is what a fenced reader or writer returns once Run has
+// returned.
+var errFenced = errors.New("the exec has ended")
+
+// errUnexpectedFrame ends a bounded exec that received a frame type it
+// does not take.
+var errUnexpectedFrame = errors.New("unexpected frame on a bounded exec")
+
+// fencedReader reads from r until fenced; a read holds the lock, so fence
+// waits for one in progress.
+type fencedReader struct {
+	mu     sync.Mutex
+	r      io.Reader
+	fenced bool
+}
+
+func (f *fencedReader) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fenced {
+		return 0, io.EOF
+	}
+	return f.r.Read(p)
+}
+
+func (f *fencedReader) fence() {
+	f.mu.Lock()
+	f.fenced = true
+	f.mu.Unlock()
+}
+
+// runBudget is what Run's output writers share: the bytes they took, the
+// limit, and the fence.
+type runBudget struct {
+	mu     sync.Mutex
+	max    int
+	n      int
+	over   bool
+	fenced bool
+}
+
+// fence ends every later write and reports whether the limit was passed.
+func (b *runBudget) fence() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.fenced = true
+	return b.over
+}
+
+// fencedWriter writes to w within b; a write holds b's lock.
+type fencedWriter struct {
+	w io.Writer
+	b *runBudget
+}
+
+func (f *fencedWriter) Write(p []byte) (int, error) {
+	f.b.mu.Lock()
+	defer f.b.mu.Unlock()
+	if f.b.fenced {
+		return 0, errFenced
+	}
+	if f.b.max > 0 && f.b.n+len(p) > f.b.max {
+		f.b.over = true
+		return 0, ErrRunOutputTooLarge
+	}
+	f.b.n += len(p)
+	return f.w.Write(p)
+}
+
+func (f *fencedWriter) Close() error { return nil }
+
+// AgentClient is what internal/delivery writes a stage through.
+var _ delivery.Agent = (*AgentClient)(nil)

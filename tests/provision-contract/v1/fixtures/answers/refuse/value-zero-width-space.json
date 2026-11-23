@@ -1,0 +1,25 @@
+{
+  "name": "value-zero-width-space",
+  "description": "A value holding U+200B ZERO WIDTH SPACE, a format character: not printable (two values that look the same would differ).",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "abc\u200bdef",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "value_not_printable"
+  }
+}

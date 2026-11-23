@@ -1,0 +1,9 @@
+{
+  "name": "member-in-another-case",
+  "description": "The member State: member names are exact.",
+  "record_text": "{\"State\":\"none\"}",
+  "expect": {
+    "result": "refused",
+    "rule": "unknown_member"
+  }
+}

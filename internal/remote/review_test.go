@@ -26,6 +26,18 @@ type hookProvider struct {
 	create  func(ctx context.Context, spec provider.Spec) (provider.Pending, error)
 	list    func(ctx context.Context, sel provider.Selector) ([]provider.Instance, error)
 	resolve func(ctx context.Context, image string) (string, error)
+	// setLabels, when set, runs before the provider's SetLabels; an error
+	// from it is returned instead.
+	setLabels func(ctx context.Context, ref provider.Ref, labels map[string]string) error
+}
+
+func (h *hookProvider) SetLabels(ctx context.Context, ref provider.Ref, labels map[string]string) error {
+	if h.setLabels != nil {
+		if err := h.setLabels(ctx, ref, labels); err != nil {
+			return err
+		}
+	}
+	return h.Provider.SetLabels(ctx, ref, labels)
 }
 
 func (h *hookProvider) Create(ctx context.Context, spec provider.Spec) (provider.Pending, error) {

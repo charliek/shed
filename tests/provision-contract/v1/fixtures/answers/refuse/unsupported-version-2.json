@@ -1,0 +1,16 @@
+{
+  "name": "unsupported-version-2",
+  "description": "version 2.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "unsupported_version"
+  }
+}

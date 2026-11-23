@@ -285,6 +285,20 @@ func (b *recBackend) ClearShedEgress(ctx context.Context, name string) (*config.
 	return nil, b.act(ctx, "ClearShedEgress", name)
 }
 
+// The provision capability: admission records the act (with the context
+// the guard bound), the run does nothing more.
+func (b *recBackend) BeginProvision(ctx context.Context, name string) (ProvisionRun, error) {
+	if err := b.act(ctx, "ProvisionShed", name); err != nil {
+		return nil, err
+	}
+	return recRun{}, nil
+}
+
+type recRun struct{}
+
+func (recRun) Run(context.Context) (*config.Shed, error) { return nil, nil }
+func (recRun) Release()                                  {}
+
 var (
 	t0      = time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
 	alice   = UserPrincipal("alice", false)

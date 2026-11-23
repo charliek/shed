@@ -2,9 +2,14 @@
 // <state>/audit.jsonl, rotated by size. It records what service clients do
 // (one "api" line per request), every HTTPS exec ("exec.end"), the max_age
 // reaper's deletions ("reap"), each time a person enters a service client's
-// shed over SSH ("ssh"), and each tunnel a person opens into one through the
-// HTTPS Connect API ("connect"). It is on when auth.clients is set or
-// audit.enabled is true; otherwise no file is created.
+// shed over SSH ("ssh"), each tunnel a person opens into one through the
+// HTTPS Connect API ("connect"), and the shed lifecycle and delivery events
+// (shed.go). It is on when auth.clients is set, when audit.enabled is true,
+// and by default in mtls mode; otherwise no file is created.
+//
+// Every line carries "ts" and "seq" first. seq is the log's own counter: it
+// rises by one with every record, across rotations and restarts (Open reads
+// the last one back), so a reader pages by it (ReadBack, read.go).
 package audit
 
 import (
@@ -331,12 +336,20 @@ type Log struct {
 	f        *os.File
 	size     int64
 	now      func() time.Time
+	// seq is the last sequence number given to a record (0: none yet).
+	seq uint64
 }
 
 // Open opens (creating, mode 0600) or appends to the log at path. When a line
 // would take the file past maxBytes it is rotated first: path becomes
 // path.1, path.1 becomes path.2, and so on, keeping keep old files. maxBytes
 // <= 0 and keep <= 0 take the defaults.
+//
+// The next record's seq follows the highest one already in the files: Open
+// reads the files back from the newest line until it finds one that carries
+// a seq (lines an older server wrote carry none and are passed over). A
+// current file whose last line is cut short (a crash mid-write) is ended
+// with a newline first, so the next record starts a line of its own.
 func Open(path string, maxBytes int64, keep int) (*Log, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
@@ -348,7 +361,50 @@ func Open(path string, maxBytes int64, keep int) (*Log, error) {
 	if err := l.openLocked(); err != nil {
 		return nil, err
 	}
+	if err := l.endPartialLineLocked(); err != nil {
+		_ = l.f.Close()
+		return nil, fmt.Errorf("audit: ending a cut-short line: %w", err)
+	}
+	seq, err := lastSeq(l.files())
+	if err != nil {
+		_ = l.f.Close()
+		return nil, fmt.Errorf("audit: reading the last seq: %w", err)
+	}
+	l.seq = seq
 	return l, nil
+}
+
+// endPartialLineLocked writes a newline when the current file does not end
+// with one.
+func (l *Log) endPartialLineLocked() error {
+	if l.size == 0 {
+		return nil
+	}
+	r, err := os.Open(l.path)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	var last [1]byte
+	if _, err := r.ReadAt(last[:], l.size-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	n, err := l.f.Write([]byte{'\n'})
+	l.size += int64(n)
+	return err
+}
+
+// files is the log's files, newest first: the current file, then path.1 to
+// path.keep.
+func (l *Log) files() []string {
+	out := []string{l.path}
+	for i := 1; i <= l.keep; i++ {
+		out = append(out, l.rotated(i))
+	}
+	return out
 }
 
 func (l *Log) openLocked() error {
@@ -375,7 +431,9 @@ func (l *Log) Path() string {
 }
 
 // Record appends v, which must marshal to a JSON object, as one line with a
-// "ts" field (RFC 3339, UTC, nanoseconds) first.
+// "ts" field (RFC 3339, UTC, nanoseconds) and then a "seq" field first. seq
+// is given under the log's lock, so the lines are in seq order in the files.
+// v must not have a "ts" or "seq" field of its own.
 func (l *Log) Record(v any) error {
 	if l == nil {
 		return nil
@@ -395,9 +453,12 @@ func (l *Log) Record(v any) error {
 		return fmt.Errorf("audit: log is closed")
 	}
 	ts := strconv.Quote(l.now().UTC().Format(time.RFC3339Nano))
-	line := make([]byte, 0, len(body)+len(ts)+8)
+	l.seq++
+	line := make([]byte, 0, len(body)+len(ts)+32)
 	line = append(line, `{"ts":`...)
 	line = append(line, ts...)
+	line = append(line, `,"seq":`...)
+	line = strconv.AppendUint(line, l.seq, 10)
 	if inner := body[1 : len(body)-1]; len(bytes.TrimSpace(inner)) > 0 {
 		line = append(line, ',')
 		line = append(line, inner...)

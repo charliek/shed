@@ -1,0 +1,24 @@
+[package]
+name = "shed-provision-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-provision-providers — the five delivery providers (ssh-key, github, api-keys, envsecrets-login, files) and the delivery.toml settings. Depends on shed-provision only; no YAML parser."
+
+[lib]
+name = "shed_provision_providers"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-provision = { path = "../shed-provision" }
+toml = { workspace = true }
+# The OpenSSH private key container is base64: read to tell an encrypted key.
+base64 = { workspace = true }
+
+[dev-dependencies]
+# The preview is checked as the JSON a shell would be handed.
+serde_json = { workspace = true }

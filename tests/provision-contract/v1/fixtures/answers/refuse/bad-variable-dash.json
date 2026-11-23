@@ -1,0 +1,25 @@
+{
+  "name": "bad-variable-dash",
+  "description": "A variable holding a dash.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "MY-KEY",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_variable"
+  }
+}

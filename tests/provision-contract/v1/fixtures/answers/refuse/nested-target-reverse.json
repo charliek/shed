@@ -1,0 +1,39 @@
+{
+  "name": "nested-target-reverse",
+  "description": "The deeper path first (a/b/c), then its ancestor a.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "one",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "a/b/c",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-one"
+      },
+      {
+        "name": "two",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "a",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-two"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "nested_target"
+  }
+}

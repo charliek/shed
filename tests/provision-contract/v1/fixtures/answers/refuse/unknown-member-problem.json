@@ -1,0 +1,23 @@
+{
+  "name": "unknown-member-problem",
+  "description": "An unknown member in a problem.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m",
+        "detail": "x"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "unknown_member"
+  }
+}

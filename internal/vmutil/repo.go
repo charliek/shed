@@ -2,6 +2,7 @@ package vmutil
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/redact"
 )
+
+// errInvalidRepoURL marks a clone URL no directory name can be derived from.
+var errInvalidRepoURL = errors.New("invalid repository URL")
 
 // CloneRepo clones a git repository into the VM's home directory at
 // ~/<reponame> (the same directory name `git clone` would choose).
@@ -33,7 +37,7 @@ func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.Server
 
 	dirName, err := config.RepoDirName(repo)
 	if err != nil {
-		return fmt.Errorf("invalid repository URL: %w", err)
+		return fmt.Errorf("%w: %w", errInvalidRepoURL, err)
 	}
 
 	if config.IsSSHRepoURL(repo) {

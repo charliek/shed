@@ -207,7 +207,7 @@ func TestConnectIntoAClientsShedIsAudited(t *testing.T) {
 	}
 	for k := range l {
 		switch k {
-		case "ts", "event", "identity", "remote", "shed", "owner", "port":
+		case "ts", "seq", "event", "identity", "remote", "shed", "owner", "port":
 		default:
 			t.Errorf("the line carries %q: %v", k, l)
 		}

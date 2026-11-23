@@ -15,12 +15,13 @@ from __future__ import annotations
 import json
 import queue
 import re
+import secrets
 import select
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 # A non-zero GET /api/system/df payload (M7) so the System pane renders real numbers.
 _GiB = 1024 ** 3
@@ -79,9 +80,94 @@ DEFAULT_INFO = {
     "backend": "vz",
 }
 
+# ---------------------------------------------------------------------------
+# Provisioning by delivery (plan 039 A6): the shed document's delivery record, the
+# delivery transport, the provision route and the activity feed.
+#
+# Shapes are the server's, pinned against the provision contract
+# (`tests/provision-contract/v1/`, `CONTRACT.md` §3-4) and the Go handlers
+# (`internal/api/delivery_handlers.go`, `provision.go`, `activity.go`):
+#   * the stream: `GET /api/delivery/requests`, `200` with `Content-Type:
+#     text/event-stream`, `Cache-Control: no-store` and `X-Shed-Delivery-Stream:
+#     <32 hex>`; each request one `event: request` + `data: <request>` event; a
+#     `: keepalive` comment while idle; no replay: a request whose stream ended fails;
+#   * the answer: `POST /api/delivery/requests/{id}` with the machine headers and the
+#     stream's id; `204`, or the contract's refusals in its order (`unknown_request`
+#     404, `not_stream_owner` 403, `already_answered` 409, `deadline_passed` 410,
+#     `answer_refused` 400 `not_json`), each as `{"error": {"code", "message"}}`;
+#   * provision: `POST /api/sheds/{name}/provision`, the create stream's SSE frames
+#     (`progress`, then `complete` with the shed document, or `error`);
+#   * activity: `GET /api/activity?since=&shed=&limit=` -> `{events, next}`.
+# `test_mockserver_delivery.py` holds the record and stream shapes to the contract's
+# own fixtures.
+DELIVERY_STREAM_HEADER = "X-Shed-Delivery-Stream"
+_DELIVERY_STREAM_PATH = "/api/delivery/requests"
+_DELIVERY_ANSWER_RE = re.compile(r"^/api/delivery/requests/([^/]+)$")
+_SHED_DOC_RE = re.compile(r"^/api/sheds/([^/]+)$")
+_PROVISION_RE = re.compile(r"^/api/sheds/([^/]+)/provision$")
+_ACTIVITY_PATH = "/api/activity"
+
+#: The contract's `records/accept/delivered.json` record (byte-equal JSON; pinned).
+DELIVERED_RECORD = {
+    "state": "delivered",
+    "steps": {"stage1": {"state": "done"}, "clone": {"state": "done"},
+              "stage2": {"state": "done"}, "install": {"state": "done"}},
+    "last": {"at": "2026-11-23T10:00:00Z", "reason": "create", "outcome": "accepted",
+             "source": {"machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+                        "machine_name": "ada-laptop"}},
+    "items": [
+        {"name": "ssh-key", "provider": "ssh-key", "stage": 1, "kind": "file", "base": "home",
+         "target": ".ssh/id_ed25519", "fingerprint": "k3y-fp_01",
+         "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
+        {"name": "ssh-key.pub", "provider": "ssh-key", "stage": 1, "kind": "file",
+         "base": "home", "target": ".ssh/id_ed25519.pub", "fingerprint": "k3y-fp_01",
+         "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
+        {"name": "github", "provider": "github", "stage": 1, "kind": "file", "base": "home",
+         "target": ".config/gh/hosts.yml", "fingerprint": "gh-fp-1",
+         "expires_at": "2026-12-23T10:00:00Z", "written_at": "2026-11-23T10:00:02Z",
+         "result": "ok"},
+        {"name": "example-api-key", "provider": "api-keys", "stage": 1, "kind": "env",
+         "target": "EXAMPLE_API_KEY", "fingerprint": "api-fp-1",
+         "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
+        {"name": "project-env", "provider": "files", "stage": 2, "kind": "file",
+         "base": "project", "target": ".envrc", "fingerprint": "proj-fp-1",
+         "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
+    ],
+}
+#: The contract's `records/accept/none.json` record: a shed from before delivery.
+NONE_RECORD = {"state": "none"}
+
+#: The activity feed served by default (newest first), shaped as `activity.go`'s
+#: `ActivityEvent`.
+DEFAULT_ACTIVITY = [
+    {"id": "c5", "at": "2026-11-23T10:05:00Z", "kind": "shed.provision.end",
+     "shed": {"name": "hello-world", "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu"},
+     "actor": {"kind": "user", "implicit": True}, "result": "ok"},
+    {"id": "c4", "at": "2026-11-23T10:04:00Z", "kind": "delivery",
+     "shed": {"name": "hello-world", "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu"},
+     "actor": {"kind": "system"}, "delivery": {"state": "delivered"}},
+    {"id": "c3", "at": "2026-11-23T10:03:00Z", "kind": "shed.provision.start",
+     "shed": {"name": "hello-world", "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu"},
+     "actor": {"kind": "user", "implicit": True}},
+    {"id": "c2", "at": "2026-11-23T10:02:00Z", "kind": "shed.stop",
+     "shed": {"name": "callbell"}, "actor": {"kind": "user", "implicit": True}, "result": "ok"},
+    {"id": "c1", "at": "2026-11-23T10:01:00Z", "kind": "shed.create",
+     "shed": {"name": "hello-world", "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu"},
+     "actor": {"kind": "user", "implicit": True}, "result": "ok"},
+]
+
+
+def _api_error(code: str, message: str, **extra) -> dict:
+    body = {"error": {"code": code, "message": message}}
+    body.update(extra)
+    return body
+
+
 DEFAULT_SHEDS = [
     {
         "name": "hello-world",
+        "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+        "delivery": DELIVERED_RECORD,
         "status": "running",
         "created_at": "2026-05-31T13:33:00.884935839-05:00",
         "container_id": "fc-hello-world",
@@ -349,6 +435,39 @@ class MockShedServer:
         self._src_late_reads: list[float] = []
         self._src_gets = 0  # GET /api/sources answered (busy and late ones included)
         self._src_late_answered = 0  # late GETs whose (old) answer has been written
+        # ---- provisioning by delivery (plan 039 A6); all under _dlv_cond ----
+        self._dlv_cond = threading.Condition()
+        # machine id -> the live stream {"id", "end", "queue"} it holds (one per machine).
+        self._dlv_live: dict[str, dict] = {}
+        # every stream opened: {"id", "machine_id", "machine_name", "at"}.
+        self._dlv_streams: list[dict] = []
+        # every GET of the stream route, refused or not (machine id, decoded name).
+        self._dlv_attempts: list[tuple[str | None, str | None]] = []
+        # request id -> {"stream", "machine_id", "deadline" (epoch), "request"}: sent, unanswered.
+        self._dlv_pending: dict[str, dict] = {}
+        # request id -> {"stream", "machine_id"}: answered (a repeat is already_answered).
+        self._dlv_done: dict[str, dict] = {}
+        # request ids written on a stream (what proves one was sent).
+        self._dlv_written: list[str] = []
+        # every answer POST: {"id", "stream", "machine_id", "machine_name", "status",
+        # "code", "body" (the parsed answer, or None)}.
+        self._dlv_answers: list[dict] = []
+        # the next stream GETs answer these (status, body) first.
+        self._dlv_refuse: list[tuple[int, dict]] = []
+        # seconds between keepalive comments on an idle stream (the contract's 15).
+        self.delivery_keepalive = 15.0
+        # provision controls and the activity feed.
+        self.provision_progress = ["stage1: delivered", "clone: done", "stage2: delivered",
+                                  "install: done"]
+        self.provision_warning: str | None = None
+        self.provision_should_fail = False
+        self.provision_record = DELIVERED_RECORD
+        self.provisions: list[str] = []
+        # Armed (`hold_provisions`): each provision waits, after its progress, for
+        # `release_provisions` (at most 30 s), so a cell can act while one is in flight.
+        self._provision_gate: threading.Event | None = None
+        self.activity_events: list[dict] = [dict(e) for e in DEFAULT_ACTIVITY]
+        self.activity_queries: list[dict] = []
 
     @property
     def base_url(self) -> str:
@@ -378,6 +497,18 @@ class MockShedServer:
             self.sheds = [dict(s) for s in DEFAULT_SHEDS]
             self.create_should_fail = False
             self.last_create_body = None
+            self.provision_progress = ["stage1: delivered", "clone: done",
+                                       "stage2: delivered", "install: done"]
+            self.provision_warning = None
+            self.provision_should_fail = False
+            self.provision_record = DELIVERED_RECORD
+            self.provisions = []
+            gate, self._provision_gate = self._provision_gate, None
+        if gate is not None:
+            gate.set()
+        with self._lock:
+            self.activity_events = [dict(e) for e in DEFAULT_ACTIVITY]
+            self.activity_queries = []
         self.release_sheds_list()  # never leave a handler thread parked
 
     # -- the one-shot sheds-list hold (plan 026 §3.4, shed#400) ------------
@@ -435,6 +566,17 @@ class MockShedServer:
     def last_create(self) -> dict | None:
         with self._lock:
             return None if self.last_create_body is None else dict(self.last_create_body)
+
+    def hold_provisions(self) -> None:
+        """From now on each provision waits, after its progress, for the release."""
+        with self._lock:
+            self._provision_gate = threading.Event()
+
+    def release_provisions(self) -> None:
+        with self._lock:
+            gate, self._provision_gate = self._provision_gate, None
+        if gate is not None:
+            gate.set()
 
     def shed(self, name: str) -> dict | None:
         with self._lock:
@@ -898,6 +1040,182 @@ class MockShedServer:
                 del self._bus_live[ns]
                 self._bus_cond.notify_all()
 
+    # -- provisioning by delivery (plan 039 A6): test-facing helpers -------
+    def _dlv_wait(self, what: str, cond, timeout: float):
+        """Wait (under _dlv_cond) until `cond()` is truthy; return it."""
+        deadline = time.monotonic() + timeout
+        with self._dlv_cond:
+            while True:
+                got = cond()
+                if got:
+                    return got
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError(f"mock: timed out waiting for {what}")
+                self._dlv_cond.wait(left)
+
+    def delivery_streams(self) -> list[dict]:
+        """Every delivery stream opened, in order: `{id, machine_id, machine_name, at}`."""
+        with self._dlv_cond:
+            return [dict(s) for s in self._dlv_streams]
+
+    def delivery_attempts(self) -> list[tuple[str | None, str | None]]:
+        """Every GET of the stream route, refused ones too."""
+        with self._dlv_cond:
+            return list(self._dlv_attempts)
+
+    def live_delivery_stream(self, timeout: float = 10.0, after: int = 0) -> dict:
+        """The live stream once one is open and at least `after` + 1 were opened."""
+        def find():
+            if len(self._dlv_streams) <= after:
+                return None
+            for live in self._dlv_live.values():
+                return {"id": live["id"], "machine_id": live["machine_id"]}
+            return None
+        return self._dlv_wait("a live delivery stream", find, timeout)
+
+    def refuse_delivery_stream(self, status: int, code: str, message: str = "refused",
+                               times: int = 1) -> None:
+        """The next `times` stream GETs answer `status` with the API error `code`."""
+        with self._dlv_cond:
+            self._dlv_refuse.extend([(status, _api_error(code, message))] * times)
+
+    def push_delivery_request(self, *, shed: str = "widgets", backend: str = "vz",
+                              repo: str | None = None, reason: str = "create",
+                              user: str = "", local_dir: str | None = None,
+                              project_dir: str | None = None, deadline_s: int = 60,
+                              timeout: float = 10.0) -> dict:
+        """Send a request (CONTRACT.md §1) on the live stream; returns it. `repo` is an
+        `owner/name`; its URL is `git@git.example.test:<repo>.git`."""
+        req_shed = {"name": shed, "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu", "backend": backend}
+        if repo:
+            req_shed["repo"] = {"url": f"git@git.example.test:{repo}.git", "name": repo}
+            req_shed["project_dir"] = f"/home/shed/{repo.split('/')[1]}"
+        if local_dir:
+            req_shed["local_dir"] = local_dir
+        if project_dir:
+            req_shed["project_dir"] = project_dir
+        deadline = time.time() + deadline_s
+        req = {"version": 1, "id": secrets.token_hex(16), "reason": reason,
+               "deadline": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(deadline)),
+               "user": user, "shed": req_shed}
+        live = self.live_delivery_stream(timeout)
+        with self._dlv_cond:
+            stream = next((l for l in self._dlv_live.values() if l["id"] == live["id"]), None)
+            if stream is None:
+                raise RuntimeError("mock: the delivery stream ended before the push")
+            self._dlv_pending[req["id"]] = {"stream": stream["id"],
+                                            "machine_id": stream["machine_id"],
+                                            "deadline": deadline, "request": req}
+            stream["queue"].put(json.dumps(req, separators=(",", ":")))
+        return req
+
+    def wait_delivery_written(self, request_id: str, timeout: float = 10.0) -> None:
+        """Until `request_id` was written on its stream."""
+        self._dlv_wait(f"request {request_id} written",
+                       lambda: request_id in self._dlv_written, timeout)
+
+    def end_delivery_stream(self) -> None:
+        """End every live delivery stream (the server closes it): its pending requests
+        fail at once and are never sent again."""
+        with self._dlv_cond:
+            for live in list(self._dlv_live.values()):
+                live["end"].set()
+            self._dlv_cond.notify_all()
+
+    def await_delivery_answer(self, request_id: str, timeout: float = 10.0) -> dict:
+        """The answer to `request_id` the mock accepted (`204`)."""
+        return self._dlv_wait(
+            f"an accepted answer to {request_id}",
+            lambda: next((a for a in self._dlv_answers
+                          if a["id"] == request_id and a["status"] == 204), None),
+            timeout)
+
+    def delivery_answers(self) -> list[dict]:
+        with self._dlv_cond:
+            return [dict(a) for a in self._dlv_answers]
+
+    def _dlv_open(self, mid: str, name: str) -> tuple[int, dict] | dict:
+        """Admit a stream for machine `mid`: a scripted refusal, the duplicate refusal,
+        or the new stream's record."""
+        with self._dlv_cond:
+            self._dlv_attempts.append((mid, name))
+            self._dlv_cond.notify_all()
+            if self._dlv_refuse:
+                return self._dlv_refuse.pop(0)
+            if mid in self._dlv_live:
+                return (409, _api_error(
+                    "SOURCE_DUPLICATE_STREAM",
+                    "this machine already holds its delivery stream on this server; it is retried"))
+            live = {"id": secrets.token_hex(16), "machine_id": mid, "end": threading.Event(),
+                    "queue": queue.Queue()}
+            self._dlv_live[mid] = live
+            self._dlv_streams.append({"id": live["id"], "machine_id": mid,
+                                      "machine_name": name, "at": time.monotonic()})
+            self._dlv_cond.notify_all()
+            return live
+
+    def _dlv_close(self, live: dict) -> None:
+        """The stream ended: unregister it and fail its pending requests."""
+        with self._dlv_cond:
+            if self._dlv_live.get(live["machine_id"]) is live:
+                del self._dlv_live[live["machine_id"]]
+            for rid in [r for r, p in self._dlv_pending.items() if p["stream"] == live["id"]]:
+                del self._dlv_pending[rid]
+            self._dlv_cond.notify_all()
+
+    def _dlv_mark_written(self, frame: str) -> None:
+        with self._dlv_cond:
+            self._dlv_written.append(json.loads(frame)["id"])
+            self._dlv_cond.notify_all()
+
+    def _dlv_answer(self, rid: str, stream: str | None, mid: str, name: str,
+                    raw: bytes) -> tuple[int, dict | None]:
+        """Judge one answer in the contract's order; record it."""
+        with self._dlv_cond:
+            known = self._dlv_pending.get(rid) or self._dlv_done.get(rid)
+            if known is None:
+                status, body = 404, _api_error("unknown_request", "no such request is waiting")
+            elif known["stream"] != stream or known["machine_id"] != mid:
+                status, body = 403, _api_error(
+                    "not_stream_owner", "the answer did not come on the request's stream")
+            elif rid in self._dlv_done:
+                status, body = 409, _api_error("already_answered", "answered already")
+            elif time.time() > known["deadline"]:
+                del self._dlv_pending[rid]
+                self._dlv_done[rid] = known
+                status, body = 410, _api_error("deadline_passed", "the deadline passed")
+            else:
+                del self._dlv_pending[rid]
+                self._dlv_done[rid] = known
+                try:
+                    parsed = json.loads(raw)
+                    status, body = 204, None
+                except ValueError:
+                    parsed = None
+                    status, body = 400, _api_error("answer_refused",
+                                                   "the answer breaks the rule not_json",
+                                                   rule="not_json")
+            self._dlv_answers.append({
+                "id": rid, "stream": stream, "machine_id": mid, "machine_name": name,
+                "status": status, "code": (body or {}).get("error", {}).get("code"),
+                "body": parsed if status == 204 else None})
+            self._dlv_cond.notify_all()
+            return status, body
+
+    def _activity_page(self, since: str, shed: str, limit: int) -> dict:
+        with self._lock:
+            self.activity_queries.append({"since": since, "shed": shed, "limit": limit})
+            events = [dict(e) for e in self.activity_events]
+        if shed:
+            events = [e for e in events if e.get("shed", {}).get("name") == shed]
+        if since:
+            ids = [e["id"] for e in events]
+            events = events[ids.index(since) + 1:] if since in ids else []
+        page = events[:limit]
+        more = len(events) > limit
+        return {"events": page, "next": page[-1]["id"] if more and page else ""}
+
     def _bus_record_response(self, ns: str, env: dict) -> None:
         with self._bus_cond:
             self._bus_responses.setdefault(ns, []).append(env)
@@ -1010,6 +1328,28 @@ class MockShedServer:
                         if delay:
                             state._src_late_done()
                     return
+                # -- provisioning by delivery (plan 039 A6) --
+                if path == _DELIVERY_STREAM_PATH:
+                    self._serve_delivery_stream()
+                    return
+                if path == _ACTIVITY_PATH:
+                    q = parse_qs(urlsplit(self.path).query)
+                    one = lambda k: (q.get(k) or [""])[0]  # noqa: E731
+                    try:
+                        limit = int(one("limit") or 100)
+                    except ValueError:
+                        limit = 100
+                    self._send(200, state._activity_page(one("since"), one("shed"),
+                                                         max(1, min(limit, 500))))
+                    return
+                m = _SHED_DOC_RE.match(path)
+                if m:
+                    doc = state.shed(unquote(m.group(1)))
+                    if doc is None:
+                        self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
+                    else:
+                        self._send(200, doc)
+                    return
                 if self.path == "/api/sheds":
                     state._await_sheds_release()
                 info, sheds = state.snapshot()
@@ -1061,6 +1401,138 @@ class MockShedServer:
                                      machine_id=identity[0], gen=gen)
                 finally:
                     state._bus_release(ns, token)
+
+            # -- provisioning by delivery (plan 039 A6) ------------------
+            def _delivery_machine(self) -> tuple[str, str] | None:
+                """The machine headers, valid (32 lowercase hex; a name of 1 to 63
+                bytes decoded, no control character), or None."""
+                mid = self.headers.get(MACHINE_ID_HEADER) or ""
+                raw = self.headers.get(MACHINE_NAME_HEADER)
+                try:
+                    name = unquote(raw, errors="strict") if raw is not None else ""
+                except UnicodeDecodeError:
+                    return None
+                if not _MACHINE_ID_RE.fullmatch(mid):
+                    return None
+                if not 1 <= len(name.encode()) <= 63 or any(ord(c) < 0x20 or ord(c) == 0x7f
+                                                            for c in name):
+                    return None
+                return mid, name
+
+            def _machine_required(self):
+                self._send_raw(403, _api_error(
+                    "SOURCE_MACHINE_ID_REQUIRED",
+                    "this server needs to know which machine is asking"),
+                    {"Cache-Control": "no-store"})
+
+            def _serve_delivery_stream(self):
+                machine = self._delivery_machine()
+                if machine is None:
+                    with state._dlv_cond:
+                        state._dlv_attempts.append(self._identity())
+                        state._dlv_cond.notify_all()
+                    self._machine_required()
+                    return
+                opened = state._dlv_open(*machine)
+                if isinstance(opened, tuple):
+                    status, body = opened
+                    self._send_raw(status, body, {"Cache-Control": "no-store"})
+                    return
+                live = opened
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header(DELIVERY_STREAM_HEADER, live["id"])
+                    self.end_headers()
+                    self.wfile.flush()
+                except OSError:
+                    state._dlv_close(live)
+                    return
+                state._bus_register_sse_thread()
+                quiet_since = time.monotonic()
+                try:
+                    while not state._bus_shutdown.is_set() and not live["end"].is_set():
+                        if self._peer_gone():
+                            break
+                        try:
+                            frame = live["queue"].get(timeout=_SSE_POLL)
+                        except queue.Empty:
+                            if time.monotonic() - quiet_since >= state.delivery_keepalive:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                                quiet_since = time.monotonic()
+                            continue
+                        if frame is None:
+                            break
+                        self.wfile.write(f"event: request\ndata: {frame}\n\n".encode())
+                        self.wfile.flush()
+                        quiet_since = time.monotonic()
+                        state._dlv_mark_written(frame)
+                except OSError:
+                    pass
+                finally:
+                    state._dlv_close(live)
+                    state._bus_unregister_sse_thread()
+
+            def _serve_delivery_answer(self, rid: str):
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b""
+                machine = self._delivery_machine()
+                if machine is None:
+                    self._machine_required()
+                    return
+                status, body = state._dlv_answer(
+                    rid, self.headers.get(DELIVERY_STREAM_HEADER), machine[0], machine[1], raw)
+                if body is None:
+                    self.send_response(204)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self._send_raw(status, body, {"Cache-Control": "no-store"})
+
+            def _serve_provision(self, name: str):
+                doc = state.shed(name)
+                with state._lock:
+                    state.provisions.append(name)
+                    progress = list(state.provision_progress)
+                    warning = state.provision_warning
+                    fail = state.provision_should_fail
+                    record = state.provision_record
+                if doc is None:
+                    self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
+                    return
+                if doc.get("status") != "running":
+                    self._send(409, _api_error("SHED_NOT_RUNNING",
+                                               f"shed {name} is not running"))
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+
+                def frame(event: str, data: dict):
+                    self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+                    self.wfile.flush()
+
+                for msg in progress:
+                    frame("progress", {"phase": "provision", "message": msg})
+                with state._lock:
+                    gate = state._provision_gate
+                if gate is not None:
+                    gate.wait(30)
+                if warning:
+                    frame("progress", {"phase": "provision", "message": warning, "warning": True})
+                if fail:
+                    frame("error", _api_error("BACKEND_ERROR", f"could not provision {name}"))
+                    return
+                with state._lock:
+                    for s in (state.sheds or []):
+                        if s["name"] == name:
+                            s["delivery"] = record
+                            doc = dict(s)
+                frame("complete", doc)
 
             def _serve_egress(self):
                 """The always-on egress-audit consumer route. Record the hit, then
@@ -1150,6 +1622,14 @@ class MockShedServer:
                 if self._unauthorized():
                     return
                 path = urlsplit(self.path).path
+                m = _DELIVERY_ANSWER_RE.match(path)
+                if m:
+                    self._serve_delivery_answer(unquote(m.group(1)))
+                    return
+                m = _PROVISION_RE.match(path)
+                if m:
+                    self._serve_provision(unquote(m.group(1)))
+                    return
                 m = _RESPOND_RE.match(path)
                 if m:
                     self._serve_respond(unquote(m.group(1)))

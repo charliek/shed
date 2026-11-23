@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 )
@@ -33,6 +34,9 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, _ 
 func (c *Client) Close() error {
 	return nil
 }
+
+// SetDelivery is a no-op for the stub client.
+func (c *Client) SetDelivery(_ *delivery.Service) {}
 
 // SetEgressManager is a no-op for the stub client.
 func (c *Client) SetEgressManager(_ *egress.Manager) {}
@@ -101,6 +105,11 @@ func (b *FirecrackerBackend) AssignUser(ctx context.Context, name string, req co
 
 // ResetShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return nil, errNonLinux()
+}
+
+// BeginProvision is not supported on non-linux builds.
+func (b *FirecrackerBackend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
 	return nil, errNonLinux()
 }
 

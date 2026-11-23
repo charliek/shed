@@ -29,7 +29,9 @@ shed through the HTTPS Connect API (`shed tunnels`): `{"event": "connect",
 (the server's request id can come from a caller's `X-Request-Id` header).
 `connect_lines_by` and `connect_entry_problems` are its two helpers. Every
 line carries `ts`, its RFC 3339 UTC time, first, in exactly the shape the
-server writes (`TS_SHAPE`).
+server writes (`TS_SHAPE`), and then, from the server that writes the shed
+lifecycle and delivery events on, `seq`, the log's own counter (a positive
+integer); a line from an older server has none.
 """
 
 from __future__ import annotations
@@ -42,9 +44,9 @@ from .identity import DEV_USER, ITEST_SOURCES, LOCAL_ADMIN
 
 CLIENT_MEMBERS = frozenset({"kind", "name", "serial"})
 PERSON_MEMBERS = frozenset({"kind", "user", "implicit", "admin", "script", "subject", "serial"})
-SSH_MEMBERS = frozenset({"ts", "event", "identity", "remote", "shed", "owner", "channel", "port"})
+SSH_MEMBERS = frozenset({"ts", "seq", "event", "identity", "remote", "shed", "owner", "channel", "port"})
 SSH_CHANNELS = ("shell", "exec", "sftp", "tunnel")
-CONNECT_MEMBERS = frozenset({"ts", "event", "identity", "remote", "shed", "owner", "port"})
+CONNECT_MEMBERS = frozenset({"ts", "seq", "event", "identity", "remote", "shed", "owner", "port"})
 
 # The `ts` the server writes: Go's time.RFC3339Nano of a UTC time, so the
 # date and time, then a fraction of one to nine digits with its trailing
@@ -187,6 +189,17 @@ def _ts_problems(line: dict) -> list[str]:
     return []
 
 
+def _seq_problems(line: dict) -> list[str]:
+    """The line's `seq`, when it has one: a positive integer (an older
+    server writes none)."""
+    if "seq" not in line:
+        return []
+    seq = line["seq"]
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return [f"seq is {seq!r}: the log's counter, a positive integer"]
+    return []
+
+
 def _port_problems(got, want: Optional[int]) -> list[str]:
     if not isinstance(got, int) or isinstance(got, bool) or not 1 <= got <= 65535:
         return [f"port is {got!r}: the line names the shed's port"]
@@ -211,7 +224,7 @@ def connect_entry_problems(line, *, shed: str, owner: str, admin: Optional[bool]
     problems = []
     if line.get("event") != "connect":
         problems.append(f"event is {line.get('event')!r}, not 'connect'")
-    problems += _ts_problems(line)
+    problems += _ts_problems(line) + _seq_problems(line)
     extra = sorted(set(line) - CONNECT_MEMBERS)
     if extra:
         problems.append(f"a connect line carries {extra}")
@@ -243,7 +256,7 @@ def ssh_entry_problems(line, *, shed: str, owner: str, channel: str, admin: Opti
     problems = []
     if line.get("event") != "ssh":
         problems.append(f"event is {line.get('event')!r}, not 'ssh'")
-    problems += _ts_problems(line)
+    problems += _ts_problems(line) + _seq_problems(line)
     extra = sorted(set(line) - SSH_MEMBERS)
     if extra:
         problems.append(f"an ssh line carries {extra}")

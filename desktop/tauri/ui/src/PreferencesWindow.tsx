@@ -8,6 +8,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Segmented, Select, Switch } from "@/components/dialog";
+import { Footnote, Section } from "@/components/prefsKit";
+import { ProvisioningSection, type ProvisioningReport } from "@/components/ProvisioningSection";
 import {
   inTauri,
   fetchTerminalPresets, getPrefs, setTerminalPref,
@@ -51,22 +53,6 @@ const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration:
   { id: "always-deny", label: "Always Deny", prompts: false, usesDuration: false },
 ];
 
-/** A titled grouped card: the mac per-section mono label + the rounded container
-    the section's rows live in. The optional Footnote is a separate sibling. */
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <>
-      <div className="mb-1.5 font-mono text-[11px] font-semibold uppercase tracking-wider text-shed-text-muted">{title}</div>
-      <div className="mb-5 overflow-hidden rounded-[10px] border border-shed-border bg-shed-surface">{children}</div>
-    </>
-  );
-}
-
-/** The muted footnote below a grouped card (mac's per-section footer text). */
-function Footnote({ children }: { children: React.ReactNode }) {
-  return <p className="-mt-3.5 mb-5 px-1 text-[12px] leading-relaxed text-shed-text-muted">{children}</p>;
-}
-
 /** An AWS/Docker provider section: a Segmented Allow|Deny + the mac live-note. */
 function ProviderSection({ title, mode, onChange }:
   { title: string; mode: "approve" | "deny"; onChange: (v: "approve" | "deny") => void }) {
@@ -106,6 +92,9 @@ export default function PreferencesWindow() {
   const [providerModes, setModes] = useState<ProviderModes>({});
   const [shedRules, setShedRules] = useState<ShedRule[]>([]);
   const [broker, setBroker] = useState<BrokerStatus | null>(null);
+  // Provisioning (plan 039 A7): what its section rendered, and a key that re-reads it.
+  const [provisioning, setProvisioning] = useState<ProvisioningReport | null>(null);
+  const [provisioningKey, setProvisioningKey] = useState(0);
   // Credential sources (plan 035 §3.4): every server's row + this machine's identity,
   // reconciled per server by `lib/sources.ts` (reads in issue order, a move owning its
   // row while in flight). The ref is the truth every async step reads and replaces;
@@ -215,6 +204,7 @@ export default function PreferencesWindow() {
     });
     // Ordered per server by its own sequence (`lib/sources.ts`), not by `fresh()`.
     sourceOps.reload();
+    setProvisioningKey((k) => k + 1);
     // SSH keeps its own guard on top: applySsh bumps sshGen on an optimistic
     // edit, so a slow load must not clobber a newer edit (not just a newer reload).
     const mine = ++sshGen.current;
@@ -361,7 +351,10 @@ export default function PreferencesWindow() {
     if (inTauri()) {
       void (async () => {
         const { listen } = await import("@tauri-apps/api/event");
-        const un = await listen("prefs-shown", () => sourceOps.refresh());
+        const un = await listen("prefs-shown", () => {
+          sourceOps.refresh();
+          setProvisioningKey((k) => k + 1);
+        });
         if (cancelled) un();
         else unlisten = un;
       })();
@@ -422,6 +415,7 @@ export default function PreferencesWindow() {
     "general",
     "terminal",
     ...(broker ? ["broker"] : []),
+    ...(provisioning ? ["provisioning"] : []),
     ...(anyGated ? [] : ["approvals-empty"]),
     ...(sshGated ? ["ssh"] : []),
     ...(awsGated ? ["aws"] : []),
@@ -458,6 +452,7 @@ export default function PreferencesWindow() {
       })),
       this_machine_name: sourceRows.length ? (thisMachine?.name ?? null) : null,
       this_machine_error: sourceRows.length ? thisMachineError : null,
+      provisioning,
     },
     mode,
   };
@@ -541,11 +536,25 @@ export default function PreferencesWindow() {
                 </div>
               )}
             </div>
+          </Section>
+        </>
+      )}
+
+      {/* Provisioning (plan 039 A7): the providers, the credential source rows (which
+          machine answers for you on each server), and the preview. */}
+      <ProvisioningSection
+        reloadKey={provisioningKey}
+        onReport={setProvisioning}
+        sourcesKey={JSON.stringify(report.values.sources)}
+        sources={
+          sourceRows.length > 0 && (
+            <>
+              <Section title="Source machine" id="sources">
             {/* Credential sources (plan 035 §3.4): which machine answers for you on each
                 server that supports it. Machine names come from other machines — text
                 nodes only, never a title or tooltip. */}
             {sourceRows.length > 0 && (
-              <div className="border-t border-shed-border px-3.5 py-2.5" data-source-this-machine>
+              <div className="border-t border-shed-border px-3.5 py-2.5 first:border-t-0" data-source-this-machine>
                 <div className="text-[12px] text-shed-text-muted">
                   This machine:{" "}
                   <span className="font-medium text-shed-text">{thisMachine ? thisMachine.name : "unknown"}</span>
@@ -562,7 +571,7 @@ export default function PreferencesWindow() {
               const live = canUse(src, r.host);
               const failure = src.errors[r.host] ?? r.error;
               return (
-                <div key={r.host} className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5" data-source-row={r.host}>
+                <div key={r.host} className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5 first:border-t-0" data-source-row={r.host}>
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] text-shed-text">{r.host}</div>
                     <div className="truncate text-[12px] text-shed-text-muted">
@@ -612,7 +621,7 @@ export default function PreferencesWindow() {
                 </div>
               );
             })}
-          </Section>
+              </Section>
           {sourceRows.length > 0 && (
             <Footnote>
               <span data-source-footnote>
@@ -623,8 +632,10 @@ export default function PreferencesWindow() {
               </span>
             </Footnote>
           )}
-        </>
-      )}
+            </>
+          )
+        }
+      />
 
       {!anyGated && (
         <Section title="Approvals">

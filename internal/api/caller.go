@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/users"
@@ -92,11 +93,14 @@ func userCaller(u users.User, k users.Key, cn, serial string) Caller {
 
 type callerKey struct{}
 
-// withCaller returns ctx carrying c and the backend.Principal it stands for.
+// withCaller returns ctx carrying c, the backend.Principal it stands for,
+// and the actor the audit log's events name it by (auditIdentity: with the
+// certificate's subject and serial, which the principal does not carry).
 func withCaller(ctx context.Context, c Caller) context.Context {
 	ctx = context.WithValue(ctx, callerKey{}, c)
 	if p, ok := c.principal(); ok {
 		ctx = backend.WithPrincipal(ctx, p)
+		ctx = audit.WithActor(ctx, auditIdentity(c))
 	}
 	return ctx
 }

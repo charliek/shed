@@ -17,6 +17,17 @@ shed-craze = { path = "../shed-craze" }
 # Default features ONLY — never enable `broker` (keeps `shed-broker` and
 # `saphyr-parser` out of `shed-desktop-core` and default `shed-app`).
 shed-app = { path = "../shed-app" }
+# Plan 039: the source's answers are built from delivery.toml's providers
+# (the runtime that serves them is A6's). Neither crate reaches another
+# workspace crate but shed-provision.
+shed-provision = { path = "../shed-provision" }
+shed-provision-providers = { path = "../shed-provision-providers" }
+# The source runtime (plan 039 A6): the delivery stream client, the per-server
+# tasks, discovery from the shed CLI config, this machine's identity and the
+# credential store. No YAML parser (isolation rule 6).
+shed-source = { path = "../shed-source" }
+# The disk reader's non-blocking open and the command runner's kill.
+libc = "0.2"
 async-trait.workspace = true
 futures-util.workspace = true
 serde.workspace = true

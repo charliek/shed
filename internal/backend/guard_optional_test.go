@@ -35,9 +35,13 @@ const (
 // package other than Backend. A new one fails
 // TestGuardClassifiesEveryOptionalInterface until it is listed here.
 var optionalInterfaces = map[string]string{
-	"AsyncLifecycle":         optionalGuarded,
-	"AsyncDeleter":           optionalGuarded,
-	"EgressController":       optionalGuarded,
+	"AsyncLifecycle":   optionalGuarded,
+	"AsyncDeleter":     optionalGuarded,
+	"EgressController": optionalGuarded,
+	"Provisioner":      optionalGuarded,
+	// ProvisionRun is what a guarded BeginProvision returns: reached only
+	// through it, so its methods are walked through it.
+	"ProvisionRun":           optionalGuarded,
 	"NetworkProfiles":        optionalQuestion,
 	"CapabilityReporter":     optionalQuestion,
 	"CountingLister":         optionalServer,
@@ -51,6 +55,8 @@ var optionalTypes = map[string]reflect.Type{
 	"AsyncLifecycle":         reflect.TypeOf((*AsyncLifecycle)(nil)).Elem(),
 	"AsyncDeleter":           reflect.TypeOf((*AsyncDeleter)(nil)).Elem(),
 	"EgressController":       reflect.TypeOf((*EgressController)(nil)).Elem(),
+	"Provisioner":            reflect.TypeOf((*Provisioner)(nil)).Elem(),
+	"ProvisionRun":           reflect.TypeOf((*ProvisionRun)(nil)).Elem(),
 	"NetworkProfiles":        reflect.TypeOf((*NetworkProfiles)(nil)).Elem(),
 	"CapabilityReporter":     reflect.TypeOf((*CapabilityReporter)(nil)).Elem(),
 	"CountingLister":         reflect.TypeOf((*CountingLister)(nil)).Elem(),
@@ -133,6 +139,28 @@ func optionalCases() map[string]optionalCall {
 		},
 		"EgressController.ClearShedEgress": func(t *testing.T, g *Guard, ctx context.Context) error {
 			_, err := egress(t, g).ClearShedEgress(ctx, "box")
+			return err
+		},
+		"ProvisionRun.Run": func(t *testing.T, g *Guard, ctx context.Context) error {
+			pv, _ := AsProvisioner(g)
+			_, err := Provision(ctx, pv, "box")
+			return err
+		},
+		"ProvisionRun.Release": func(t *testing.T, g *Guard, ctx context.Context) error {
+			pv, _ := AsProvisioner(g)
+			run, err := pv.BeginProvision(ctx, "box")
+			if err != nil {
+				return err
+			}
+			run.Release()
+			return nil
+		},
+		"Provisioner.BeginProvision": func(t *testing.T, g *Guard, ctx context.Context) error {
+			pv, ok := AsProvisioner(g)
+			if !ok {
+				t.Fatal("the guard hides the provision capability")
+			}
+			_, err := Provision(ctx, pv, "box")
 			return err
 		},
 	}

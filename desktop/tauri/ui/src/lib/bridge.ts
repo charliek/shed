@@ -32,6 +32,9 @@ export type Shed = {
   image?: string | null;
   cpus?: number | null;
   memory_mb?: number | null;
+  /** The shed's delivery record (plan 039 §3.6) as its server sent it, or null from
+   *  a server older than delivery. Read with `readDelivery` (`lib/delivery`). */
+  delivery?: unknown;
 };
 
 /** Why a host couldn't be listed. `other` is the open set (rendered generically). */
@@ -170,6 +173,8 @@ type ReportPayload = {
 export type ShedRowRendered = {
   status_text: string | null;
   controls: { spinner: boolean; buttons: string[] } | null;
+  /** The delivery badge's text (plan 039 A7), or null when the row shows none. */
+  delivery_badge: string | null;
 };
 
 /** The reported shed rows: each row with its [ShedRowRendered]. A card is found
@@ -190,6 +195,7 @@ function withRenderedRows(sheds: Shed[]): (Shed & ShedRowRendered)[] {
     return {
       ...s,
       status_text: card?.querySelector("[data-shed-status]")?.textContent ?? null,
+      delivery_badge: card?.querySelector("[data-shed-delivery-badge]")?.textContent ?? null,
       controls: controls
         ? {
             spinner: !!controls.querySelector(".animate-spin"),
@@ -625,6 +631,92 @@ export async function makeThisMachineSource(host: string): Promise<{ row: Source
   return { ...res, row: cleanRow(res.row) };
 }
 
+/* ---- provisioning by delivery (plan 039 A6) ----------------------------------- */
+
+/* The same ops as the IPC socket's `delivery.*`, `shed.delivery`, `shed.provision` and
+ * `activity.server_list` (`desktop/tauri/src-tauri/src/delivery.rs`). Nothing here
+ * carries a delivered value: previews and records hold names, targets, sizes and
+ * fingerprints only. Each call THROWS the refusal in plain words. */
+
+/** One provider's settings: `config` is its `delivery.toml` table as flat JSON, the
+ *  shape `setDeliveryProvider` takes back. */
+export interface DeliveryProvider {
+  name: string;
+  configured: boolean;
+  enabled: boolean;
+  only: { servers?: string[]; backends?: string[]; repos?: string[] } | null;
+  config: Record<string, unknown> | null;
+}
+
+export interface DeliverySettings {
+  path: string;
+  exists: boolean;
+  /** Why the file cannot be used (fixed words, never its text), or null. */
+  error: string | null;
+  providers: DeliveryProvider[];
+}
+
+/** One merged activity page: events newest first, each with its `server`; `next` is the
+ *  opaque cursor for the page after (null: nothing older anywhere). */
+export interface ActivityPage {
+  events: Array<Record<string, unknown> & { server: string; id: string; at: string; kind: string }>;
+  next: string | null;
+  errors: Array<{ server: string; status: number | null; code: string; message: string }>;
+}
+
+async function invokeStrict<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke<T>(cmd, args);
+}
+
+/** The source runtime: this machine, each server's stream, recent answers (redacted). */
+export function getDeliveryStatus(): Promise<Record<string, unknown>> {
+  return invokeStrict("delivery_status");
+}
+
+export function getDeliverySettings(): Promise<DeliverySettings> {
+  return invokeStrict("delivery_settings");
+}
+
+/** Replace one provider's table (`config` null removes it); answers the new settings. */
+export function setDeliveryProvider(
+  provider: string,
+  config: Record<string, unknown> | null,
+): Promise<DeliverySettings> {
+  return invokeStrict("delivery_set", { provider, config });
+}
+
+/** What `shed` on `server` would be delivered (or, with no shed, what the providers
+ *  have at all): names, targets, stages, sizes, fingerprints and problems. */
+export function previewDelivery(server: string, shed?: string): Promise<Record<string, unknown>> {
+  return invokeStrict("delivery_preview", { server, shed: shed ?? null });
+}
+
+/** The delivery record of a shed's document (null for a server older than delivery). */
+export function getShedDelivery(server: string, shed: string): Promise<Record<string, unknown>> {
+  return invokeStrict("shed_delivery", { server, shed });
+}
+
+/** "Deliver again": run `shed provision` on the shed and report its progress and outcome. */
+export function provisionShed(server: string, shed: string): Promise<Record<string, unknown>> {
+  return invokeStrict("shed_provision", { server, shed });
+}
+
+/** One page of every configured server's activity, merged newest first. */
+export function listServerActivity(opts: { limit?: number; cursor?: string | null; shed?: string } = {}): Promise<ActivityPage> {
+  return invokeStrict("activity_server_list", {
+    limit: opts.limit ?? null,
+    cursor: opts.cursor ?? null,
+    shed: opts.shed ?? null,
+  });
+}
+
+/** What the open shed delivery detail rendered (`shed_delivery.dump`), or null when
+ *  none is open. Built off the detail's own nodes by its reporting effect. */
+export function reportShedDelivery(snapshot: Record<string, unknown> | null): void {
+  void invoke("ui_report", { snapshot: { shed_delivery: snapshot } });
+}
+
 /** Open a shed in the user's chosen terminal (best-effort; a no-op in a browser
  *  and disabled server-side under test mode). A non-empty `session` attaches that
  *  tmux session (the Agents console button → `tmux attach -t rc-<slug>`). */
@@ -837,6 +929,8 @@ export type PrefsReport = {
     }[];
     this_machine_name: string | null;
     this_machine_error: string | null;
+    /** The Provisioning section's rendered report (plan 039 A7), null until it has one. */
+    provisioning: Record<string, unknown> | null;
   };
   mode: string;
 };

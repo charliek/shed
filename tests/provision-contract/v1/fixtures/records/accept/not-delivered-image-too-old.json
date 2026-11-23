@@ -1,0 +1,34 @@
+{
+  "name": "not-delivered-image-too-old",
+  "description": "A create on an image whose agent predates delivery: no request is made, both stages are skipped with the failure recorded, and the clone and install hook run.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "image_too_old"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "image_too_old"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested",
+      "failure": {
+        "reason": "image_too_old"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

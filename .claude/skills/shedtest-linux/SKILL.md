@@ -139,6 +139,27 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   lands at exactly +8 s. Preferences re-reads the rows when a hidden window is shown again
   (the native `prefs-shown` event, plus the DOM `focus`/`visibilitychange`, throttled to
   one read per 5 s); under Xvfb either path alone refreshes a reopen.
+- **Provisioning (plan 039 A7).** Preferences → Provisioning holds the five providers'
+  switches and editors, the source rows (moved there from the broker section; same
+  `data-source-*` nodes, same `values.sources`), and a Preview. Read it back from
+  `prefs.dump`'s `values.provisioning` (built off the rendered nodes: each provider's
+  switch state, `only` line, editor, refusal and notice; `editor`, the open editor's
+  committed input values, passphrase command arguments `redacted`; the open draft as its
+  `delivery.set` config, redacted the same way; the preview's items and problems;
+  `rendered`). Drive it with `ui.prefs_section` (scroll), and in test mode
+  `ui.press_delivery_toggle`, `ui.press_delivery_button` (Edit/Save/Cancel, add/remove an
+  entry, the command's Replace/Clear/Keep) and `ui.type_delivery_field`, which type into
+  and press the REAL controls: wait for `editor.values` to show what was typed before
+  pressing Save. A stored passphrase command is never shown: `delivery.settings` says
+  `"set"`, and `delivery.set` takes `"set"` back as "unchanged". Each shed row has a delivery badge
+  (`dashboard.dump` rows' `delivery_badge`) and a detail opened by `ui.show_shed_delivery`,
+  read by `shed_delivery.dump`, pressed by `ui.press_deliver_again` (test mode).
+  `test_tauri_provisioning.py` launches its own app over the A6 module's throwaway home;
+  `SHED_DELIVERY_SHOTS=<dir>` keeps its screenshots. Two traps: a self-managed launch
+  must wait for `ui.current_pane` to be non-null before its first `ui.navigate`
+  (`frontend_not_ready` otherwise; `await_hermetic` does not wait for it), and the
+  Preferences window re-reads `delivery.toml` only when it is shown again (a `prefs-shown`
+  from `ui.show_preferences`), so a cell that rewrites the file shows the window again.
 - **Launch at login is on by default** (plan 037 §3.1.4): every hermetic first launch turns
   it on, so the session app reads on (`test_loginitem_probe`). On Linux `auto-launch` writes
   `$HOME/.config/autostart/*.desktop` and ignores `XDG_CONFIG_HOME`, so it lands under the

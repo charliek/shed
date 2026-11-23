@@ -9,13 +9,23 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/charliek/shed/internal/audit"
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/redact"
 )
 
 // SetAuditLog attaches the audit log (<state>/audit.jsonl). shed-server opens
-// it when auth.clients is set or audit.enabled is true; nil (the default)
-// records nothing.
-func (s *Server) SetAuditLog(l *audit.Log) { s.audit = l }
+// it when auth.clients is set, when audit.enabled is true, and by default in
+// mtls mode; nil (the default) records nothing. It is handed on to the
+// access guard (the lifecycle events) and to the delivery service, if one is
+// set (each delivery's event), so one call wires every writer of the API's
+// side; GET /api/activity reads it back.
+func (s *Server) SetAuditLog(l *audit.Log) {
+	s.audit = l
+	if g := backend.Guarded(s.backend); g != nil {
+		g.SetAuditLog(l)
+	}
+	s.delivery.SetAuditLog(l)
+}
 
 // recordAudit appends one record, logging (never failing the request on) a
 // write error.

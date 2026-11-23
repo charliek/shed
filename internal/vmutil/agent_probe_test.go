@@ -42,7 +42,7 @@ func writeEnvelope(conn net.Conn, env *plugin.Envelope) {
 }
 
 func TestProbe(t *testing.T) {
-	newInfo := guest.AgentInfo{Version: "v0.9.2", Protocol: 1, Layout: 1}
+	newInfo := guest.AgentInfo{Version: "v0.9.2", Protocol: guest.AgentProtocol, Layout: 1}
 	newPayload, _ := json.Marshal(newInfo)
 	heartbeat := func() *plugin.Envelope {
 		hb, _ := json.Marshal(plugin.HeartbeatPayload{StartedAt: time.Now()})

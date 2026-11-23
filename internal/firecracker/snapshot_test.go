@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/systemprune"
 	"github.com/charliek/shed/internal/vmimage"
 )
@@ -141,6 +142,16 @@ func TestResetShedRecreatesUpper(t *testing.T) {
 	}
 	meta.UpperPath = upperPath
 	meta.RootfsPath = upperPath
+	// A delivered shed: its items go with the upper.
+	meta.Delivery = &delivery.Record{
+		Steps: &delivery.Steps{Stage1: delivery.Step{State: delivery.StepDone}, Clone: delivery.Step{State: delivery.StepDone},
+			Stage2: delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNoItems}, Install: delivery.Step{State: delivery.StepDone}},
+		Last: &delivery.Last{At: "2026-11-23T10:00:00Z", Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeAccepted,
+			Source: &delivery.SourceMachine{MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"}},
+		Items: []delivery.RecordItem{{Name: "k", Provider: "ssh-key", Stage: 1, Kind: delivery.KindFile, Base: delivery.BaseHome,
+			Target: ".ssh/id_ed25519", Fingerprint: "fp", WrittenAt: "2026-11-23T10:00:01Z", Result: delivery.ResultOK}},
+	}
+	meta.Delivery.State = delivery.DeriveState(meta.Delivery)
 	if err := meta.Save(instanceDir); err != nil {
 		t.Fatalf("save metadata: %v", err)
 	}
@@ -199,6 +210,21 @@ func TestResetShedRecreatesUpper(t *testing.T) {
 	}
 	if got.RootfsPath != upperPath {
 		t.Errorf("meta.RootfsPath = %q, want %q", got.RootfsPath, upperPath)
+	}
+	// The delivery record keeps no item, every step is owed, and the shed
+	// document names them (shed provision finishes them). No source was
+	// asked: the client has no delivery service at all.
+	if d := got.Delivery; d == nil || len(d.Items) != 0 || len(delivery.OwedSteps(d)) != 4 || d.Last == nil {
+		t.Errorf("record after reset = %+v", d)
+	}
+	if got.ResetGen != meta.ResetGen+1 {
+		t.Errorf("reset generation = %d, want %d: a delivery run under way must see the reset", got.ResetGen, meta.ResetGen+1)
+	}
+	if err := got.Delivery.Validate(); err != nil {
+		t.Errorf("record after reset: %v", err)
+	}
+	if d := shed.Delivery; d == nil || len(d.Owed) != 4 || len(d.Items) != 0 {
+		t.Errorf("reset's shed document delivery = %+v", d)
 	}
 }
 

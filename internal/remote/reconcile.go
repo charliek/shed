@@ -8,6 +8,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
@@ -605,17 +606,18 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 			NetworkProfile: spec.Network,
 			Arch:           inst.Arch,
 		},
-		Env:         id.Env,
-		Zone:        inst.Zone,
-		Ref:         inst.Ref,
-		Ready:       true,
-		Cloned:      true,
-		Provisioned: true,
-		HostKeyPin:  inst.HostKeyPin(),
-		Layout:      inst.Layout(),
-		Size:        spec.Size,
-		DiskGB:      inst.DiskGB,
-		MaxRun:      inst.MaxRun,
+		Env:   id.Env,
+		Zone:  inst.Zone,
+		Ref:   inst.Ref,
+		Ready: true,
+		// Its history is not known: nothing is marked done that the
+		// server did not see. Every step skipped, delivery none.
+		Delivery:   delivery.AdoptedRecord(),
+		HostKeyPin: inst.HostKeyPin(),
+		Layout:     inst.Layout(),
+		Size:       spec.Size,
+		DiskGB:     inst.DiskGB,
+		MaxRun:     inst.MaxRun,
 	}
 	if config.ValidUserName(id.User) {
 		rec.Shed.User = id.User

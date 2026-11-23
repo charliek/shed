@@ -182,11 +182,11 @@ func TestHealthRequestPayloadProbeWire(t *testing.T) {
 }
 
 func TestHealthResponsePayloadWire(t *testing.T) {
-	data, err := json.Marshal(HealthResponsePayload{Version: "v0.9.2", Protocol: 1, Layout: 1})
+	data, err := json.Marshal(HealthResponsePayload{Version: "v0.9.2", Protocol: 2, Layout: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"version":"v0.9.2","protocol":1,"layout":1}`; string(data) != want {
+	if want := `{"version":"v0.9.2","protocol":2,"layout":1}`; string(data) != want {
 		t.Errorf("marshal = %s, want %s", data, want)
 	}
 }

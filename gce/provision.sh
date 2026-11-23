@@ -14,7 +14,7 @@
 #
 # Carried over from firecracker/Dockerfile (base + extensions): the package
 # list, gh, the shed user (uid 1000, passwordless sudo, docker group) and its
-# home, tmux.conf, the prompt, strix/prox/roost-session/craze. Docker CE is in
+# home, tmux.conf, the prompt, strix/prox/parcel/envsecrets/roost-session/craze. Docker CE is in
 # every variant (the cloud has no `full`). Dropped: the kernel, network-setup,
 # the systemd unit wipe, the transient machine-id, the shed-extensions
 # credential brokers (no broker host on a cloud shed).
@@ -23,7 +23,7 @@
 #   provision.sh --agent PATH [--variant base|extensions] [--arch amd64|arm64]
 #                [--pins PATH]
 #     --agent    the linux shed-agent binary to install
-#     --variant  extensions (default) adds strix, prox, roost-session, craze
+#     --variant  extensions (default) adds strix, prox, parcel, envsecrets, roost-session, craze
 #     --arch     must equal the VM's dpkg architecture (default: the VM's)
 #     --pins     KEY=value file from scripts/read-guest-pins.sh; required for
 #                extensions. This script holds no pin of its own.
@@ -178,8 +178,8 @@ install -m 0755 -d /etc/docker
 install -m 0644 "${here}/daemon.json" /etc/docker/daemon.json
 
 if [ "${variant}" = extensions ]; then
-  log "installing strix and prox"
-  apt_get install -y --no-install-recommends strix prox
+  log "installing strix, prox, parcel and envsecrets"
+  apt_get install -y --no-install-recommends strix prox parcel envsecrets
 
   tmpd="$(mktemp -d)"
   trap 'rm -rf "${tmpd}"' EXIT

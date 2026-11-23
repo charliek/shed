@@ -35,6 +35,9 @@ var clientAllowedList = []string{
 	"POST /api/sheds/{name}/start",
 	"POST /api/sheds/{name}/stop",
 	"POST /api/sheds/{name}/exec",
+	// The activity feed: a client sees its own sheds' events (plan 039
+	// §3.9; TestActivityVisibility).
+	"GET /api/activity",
 }
 
 // clientForbiddenList is every other registered route, listed by hand. A
@@ -70,11 +73,15 @@ var clientForbiddenList = []string{
 	"GET /api/users/status",
 	"GET /api/sources",
 	"POST /api/sources/use",
+	"GET /api/delivery/requests",
+	"POST /api/delivery/requests/{id}",
 	"GET /api/plugins/listeners",
 	"GET /api/plugins/listeners/{namespace}/messages",
 	"POST /api/plugins/listeners/{namespace}/respond",
 	"GET /api/plugins/sheds",
 	"POST /api/sheds/{name}/reset",
+	// Nobody provisions a service client's shed (plan 039 §3.2).
+	"POST /api/sheds/{name}/provision",
 	"POST /api/sheds/{name}/assign",
 	"GET /api/sheds/{name}/sessions",
 	"DELETE /api/sheds/{name}/sessions/{session}",
@@ -358,7 +365,7 @@ func walkedRoutes(t *testing.T, router chi.Router) []string {
 
 // substitute fills a route pattern's placeholders.
 func substitute(pattern string) string {
-	r := strings.NewReplacer("{name}", "nocturn-x", "{namespace}", "ssh-agent", "{port}", "22", "{session}", "main")
+	r := strings.NewReplacer("{name}", "nocturn-x", "{namespace}", "ssh-agent", "{port}", "22", "{session}", "main", "{id}", "0123456789abcdef0123456789abcdef")
 	return r.Replace(pattern)
 }
 

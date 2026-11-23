@@ -23,6 +23,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
@@ -60,6 +61,15 @@ type Client struct {
 
 	credMgr *vmutil.CredentialManager
 
+	// deliverySvc asks a shed user's source for its credentials and writes
+	// them (nil: no delivery, every create's is not_applicable).
+	// provisioning holds one `shed provision` per shed.
+	deliverySvc  *delivery.Service
+	provisioning lockmap.NamedMutexMap
+	// halting is raised by a stop or a delete while it waits for the
+	// shed's lifecycle lock: a provision's next step gives way to it.
+	halting lockmap.Flags
+
 	// egressMgr drives the optional egress-control proxy. nil ⇒ egress
 	// disabled, in which case the ConfigureEgressProxy hook is a no-op.
 	egressMgr *egress.Manager
@@ -84,6 +94,10 @@ type Client struct {
 	// that window). See checkedDialer.
 	beforeVMDial func(name string)
 }
+
+// SetDelivery attaches the delivery service, called by shed-server at
+// startup. nil leaves every delivery not applicable.
+func (c *Client) SetDelivery(s *delivery.Service) { c.deliverySvc = s }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
 // shed-server at startup when egress is enabled. nil leaves egress off.
@@ -374,6 +388,26 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
+	// One delivery run per shed: the create holds the shed's provisioning
+	// slot until its delivery steps are done, so a provision meanwhile is
+	// refused (409). A provision holding it means the shed exists.
+	releaseBusy, ok := c.provisioning.TryAcquire(req.Name)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	}
+	defer releaseBusy()
+	_, pending, err := c.createLocked(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	// The delivery steps take the lifecycle lock one at a time, never
+	// across the wait for a source.
+	return pending.Run(ctx, c), nil
+}
+
+// createLocked runs the create up to its delivery steps under the shed's
+// lifecycle lock (and the source snapshot's lock), and returns them pending.
+func (c *Client) createLocked(ctx context.Context, req config.CreateShedRequest) (*config.Shed, *orchestrator.PendingDelivery, error) {
 	// Lock-order: snapshotLock(source) BEFORE createLock(new shed). This
 	// blocks DeleteSnapshot of the source between loadSnapshot and the
 	// reflink read, and matches CreateSnapshot's order so no AB-BA cycle.
@@ -387,14 +421,14 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	defer c.acquireCreateLock(req.Name)()
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
-		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+		return nil, nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	} else if !errors.Is(err, ErrInstanceNotFound) {
 		// Non-not-found errors (corrupt metadata, I/O, permission)
 		// must propagate — falling through here would sweep the
 		// existing upper and overwrite a possibly-real shed. The
 		// pre-orchestrator code silently fell through; CodeRabbit's
 		// review of PR #139 flagged this. Loud failure is correct.
-		return nil, fmt.Errorf("failed to read metadata for %s: %w", req.Name, err)
+		return nil, nil, fmt.Errorf("failed to read metadata for %s: %w", req.Name, err)
 	}
 
 	// Sweep an orphan upper from a previously crashed create. We're
@@ -407,7 +441,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if _, err := os.Stat(UpperPath(c.cfg.UppersDir, req.Name)); err == nil {
 		log.Printf("CreateShed %s: sweeping orphan upper from a prior crashed create", req.Name)
 		if err := DeleteUpper(c.cfg.UppersDir, req.Name); err != nil {
-			return nil, fmt.Errorf("failed to sweep orphan upper for %s: %w", req.Name, err)
+			return nil, nil, fmt.Errorf("failed to sweep orphan upper for %s: %w", req.Name, err)
 		}
 	}
 
@@ -559,6 +593,9 @@ func (c *Client) listSheds(ctx context.Context) ([]config.Shed, int, error) {
 
 // DeleteShed removes a shed.
 func (c *Client) DeleteShed(ctx context.Context, name string) error {
+	// A provision's step in hand finishes first, and its next step gives
+	// way to this one (halting).
+	defer c.halting.Raise(name)()
 	defer c.acquireCreateLock(name)()
 
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
@@ -648,6 +685,9 @@ const (
 
 // StopShed stops a running shed.
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
+	// A provision's step in hand finishes first, and its next step gives
+	// way to this one (halting).
+	defer c.halting.Raise(name)()
 	defer c.acquireCreateLock(name)()
 
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
@@ -853,6 +893,7 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	owner, user := config.ShedOwnership(meta.Owner, meta.User)
 	return &config.Shed{
 		Name:           meta.Name,
+		ID:             meta.ID,
 		Status:         meta.Status,
 		CreatedAt:      meta.CreatedAt,
 		Repo:           meta.Repo,
@@ -875,6 +916,7 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		User:           user,
 		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
 		NetworkProfile: config.EffectiveNetworkProfile(meta.NetworkProfile),
+		Delivery:       config.NewShedDelivery(meta.Delivery, time.Now()),
 	}
 }
 
@@ -998,6 +1040,11 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 	meta.UpperPath = upperPath
 	meta.RootfsPath = upperPath
 	meta.UpperSizeBytes = size
+	// The delivered items went with the disk: the record keeps none, and
+	// every step is owed until `shed provision` runs again. No source is
+	// asked.
+	meta.Delivery = delivery.ResetRecord(meta.Delivery)
+	meta.ResetGen++
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("failed to persist metadata after reset: %w", err)
 	}
