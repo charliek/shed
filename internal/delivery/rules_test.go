@@ -181,7 +181,7 @@ func TestRuleStatus(t *testing.T) {
 			t.Errorf("%s: %d, want %d", r, r.Status(), want)
 		}
 	}
-	if len(Rules) != 46 {
+	if len(Rules) != 47 {
 		t.Errorf("%d rules", len(Rules))
 	}
 }

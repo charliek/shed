@@ -239,6 +239,9 @@ func ParseAnswer(body []byte, req *Request) (*Answer, *Refusal) {
 	if r := checkAcross(a.Items, projectDir); r != nil {
 		return nil, r
 	}
+	if EnvFileSize(a.Items) > MaxEnvFileBytes {
+		return nil, refuse(RuleEnvTooLarge, "items")
+	}
 	for i, n := range problemNodes {
 		p, r := parseProblem(n, index("problems", i))
 		if r != nil {
@@ -420,6 +423,18 @@ func checkAcross(items []Item, projectDir string) *Refusal {
 		return refuse(RuleTotalTooLarge, "items")
 	}
 	return nil
+}
+
+// EnvFileSize is the size of the env file the env items among items are
+// written as: one VARIABLE=value line each, with its line feed.
+func EnvFileSize(items []Item) int {
+	n := 0
+	for _, it := range items {
+		if it.Kind == KindEnv {
+			n += len(it.Variable) + 1 + len(it.Value) + 1
+		}
+	}
+	return n
 }
 
 // HomeDir is the shed user's home directory, the base home.

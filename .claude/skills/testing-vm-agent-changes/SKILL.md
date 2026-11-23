@@ -40,6 +40,16 @@ docker run --rm -v "$PWD":/src -w /src -e GOFLAGS=-buildvcs=false \
   golang:1.27 go test -count=1 -race ./cmd/shed-agent/   # match the `go` line in go.mod
 ```
 
+The container runs the tests as **root**, so the two kinds of test that need
+the opposite are split: `TestApplyItemsPermission` (the writer's `permission`
+result: permission bits do not bind root) **skips** in Docker and runs under a
+plain `go test` as a normal user on a Linux host, and
+`TestRunApplyItemsStartChecks/root_is_refused` runs only as root (Docker). Run
+both places to cover both. `TestApplyItemsOtherFilesystem` needs a tmpfs mount
+under a directory on another file system (it finds `/dev/shm` under `/dev`,
+present both on a host and in a default container, so no `--privileged`); it
+skips, naming why, where there is none.
+
 Cross-compile + lint locally without running:
 
 ```bash

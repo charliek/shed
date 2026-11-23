@@ -27,6 +27,11 @@
 //     document, refusing under a rule name) and DeriveState.
 //   - The transport's names: the routes, the stream header, the error codes
 //     and the limits.
+//   - The writer's documents (writer.go), between the server and
+//     "shed-agent apply-items" in the shed, not part of the contract:
+//     WriterInput (one stage, with NewWriterInput, Marshal and the
+//     writer's own strict ParseWriterInput), WriterLine, the exit codes
+//     and the env file's name.
 //
 // It is pure: no HTTP handler, no pending-request table, no I/O.
 package delivery

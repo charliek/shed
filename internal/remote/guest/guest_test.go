@@ -72,7 +72,7 @@ func TestAgentInfoJSONShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"version":"dev","protocol":1,"layout":1}`; string(data) != want {
+	if want := `{"version":"dev","protocol":2,"layout":1}`; string(data) != want {
 		t.Errorf("JSON = %s, want %s", data, want)
 	}
 }
@@ -84,6 +84,7 @@ func TestCompatibility(t *testing.T) {
 		wantProto, wantLay bool
 	}{
 		{"current", AgentProtocol, Layout, true, true},
+		{"protocol 1, an image baked before the writer, still boots", 1, Layout, true, true},
 		{"agent with no reply and an image with no layout file", 0, 0, false, false},
 		{"newer than this server", AgentProtocol + 1, Layout + 1, false, false},
 	}

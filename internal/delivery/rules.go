@@ -56,6 +56,7 @@ const (
 	RuleDuplicateTarget   Rule = "duplicate_target"
 	RuleNestedTarget      Rule = "nested_target"
 	RuleTotalTooLarge     Rule = "total_too_large"
+	RuleEnvTooLarge       Rule = "env_too_large"
 	RuleBadProblemCode    Rule = "bad_problem_code"
 	RuleBadProblemMessage Rule = "bad_problem_message"
 )
@@ -74,7 +75,7 @@ var Rules = []Rule{
 	RuleBadVariable, RuleRefusedVariable, RuleValueEmpty, RuleValueTooLong,
 	RuleValueNotPrintable, RuleValueEdgeSpace,
 	RuleBadFingerprint, RuleBadTime,
-	RuleDuplicateName, RuleDuplicateTarget, RuleNestedTarget, RuleTotalTooLarge,
+	RuleDuplicateName, RuleDuplicateTarget, RuleNestedTarget, RuleTotalTooLarge, RuleEnvTooLarge,
 	RuleBadProblemCode, RuleBadProblemMessage,
 }
 

@@ -20,6 +20,11 @@ const (
 	// MaxTotalFileBytes is the most decoded content all of an answer's file
 	// items may hold together.
 	MaxTotalFileBytes = 4 << 20
+	// MaxEnvFileBytes is the most all of an answer's env items may take
+	// written as the env file: one VARIABLE=value line each, with its line
+	// feed. It is also the most the shed reads of one file of its user
+	// environment directory, so every accepted value is read back.
+	MaxEnvFileBytes = 256 << 10
 	// MaxValueBytes is the longest env value.
 	MaxValueBytes = 8192
 	// MaxPathBytes is the longest file path.

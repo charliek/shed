@@ -113,8 +113,8 @@ const (
 // Outcomes is every Outcome, in the contract's order.
 var Outcomes = []Outcome{OutcomeAccepted, OutcomeRefused, OutcomeNoAnswer, OutcomeNotRequested}
 
-// ItemResult is what became of one item in the shed. The first six are the
-// writer's (WriterResults); the last two are the record's own.
+// ItemResult is what became of one item in the shed. The first seven are
+// the writer's (WriterResults); the last two are the record's own.
 type ItemResult string
 
 const (
@@ -123,17 +123,18 @@ const (
 	ResultSymlink         ItemResult = "symlink"
 	ResultNotDirectory    ItemResult = "not_directory"
 	ResultPermission      ItemResult = "permission"
+	ResultOtherFilesystem ItemResult = "other_filesystem"
 	ResultIO              ItemResult = "io"
 	ResultNotWritten      ItemResult = "not_written"
 	ResultNotInLastAnswer ItemResult = "not_in_last_answer"
 )
 
 // WriterResults is the closed list the writer reports per item.
-var WriterResults = []ItemResult{ResultOK, ResultIsDirectory, ResultSymlink, ResultNotDirectory, ResultPermission, ResultIO}
+var WriterResults = []ItemResult{ResultOK, ResultIsDirectory, ResultSymlink, ResultNotDirectory, ResultPermission, ResultOtherFilesystem, ResultIO}
 
 // ItemResults is every ItemResult, in the contract's order.
 var ItemResults = []ItemResult{
-	ResultOK, ResultIsDirectory, ResultSymlink, ResultNotDirectory, ResultPermission, ResultIO,
+	ResultOK, ResultIsDirectory, ResultSymlink, ResultNotDirectory, ResultPermission, ResultOtherFilesystem, ResultIO,
 	ResultNotWritten, ResultNotInLastAnswer,
 }
 

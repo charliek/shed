@@ -345,6 +345,7 @@ judged on the whole document at once, the first in the text deciding.
 | `duplicate_target` | 422 | two items have one target |
 | `nested_target` | 422 | one file lands at a directory prefix of where another lands |
 | `total_too_large` | 422 | the files' contents are over 4 MiB together |
+| `env_too_large` | 422 | the env items, written one `VARIABLE=value` line each with a line feed after it, are over 256 KiB together |
 | `bad_problem_code` | 422 | a problem's `code` is not one of the problem codes |
 | `bad_problem_message` | 422 | a problem's `message` is over 256 bytes or holds a character that is not printable |
 
@@ -646,8 +647,8 @@ reasons** of `last.failure`, as the warning a person sees names them.
 
 ### Item results
 
-The first six are what the writer reports for each item it tries; the last
-two are the record's own.
+The first seven are what the writer reports for each item it tries; the
+last two are the record's own.
 
 | Result | Meaning |
 |---|---|
@@ -656,6 +657,7 @@ two are the record's own.
 | `symlink` | a symbolic link stands at the target or on its way |
 | `not_directory` | something that is not a directory stands where a directory is needed |
 | `permission` | refused by the file system's permissions |
+| `other_filesystem` | the target, or a directory on its way, is on another file system than the base's home (a host directory mounted into the shed): a delivered file must not land outside the shed |
 | `io` | any other failure, or a writer reply that could not be read |
 | `not_written` | in the accepted answer, but not tried: its stage stopped at an earlier failure, or was never reached |
 | `not_in_last_answer` | delivered before and absent from the last answer: it stays on disk (a delivery never deletes a file) |
@@ -669,6 +671,7 @@ two are the record's own.
 | Problems per answer | 16 |
 | One file's content | 1 MiB, decoded |
 | All files' content | 4 MiB, decoded |
+| All env items, as `VARIABLE=value` lines with a line feed each | 256 KiB |
 | Path | 255 bytes |
 | Variable | 128 characters |
 | Value | 1 to 8,192 bytes |
