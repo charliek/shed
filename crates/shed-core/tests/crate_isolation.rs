@@ -1,9 +1,10 @@
 //! Plan 038 D1 crate-isolation contract.
 //!
 //! Enforces the workspace dependency boundaries via `cargo metadata` and
-//! per-package `cargo tree` (which evaluates each crate with its own default
-//! features, without workspace-wide feature unification from sibling members
-//! like `shed-broker-harness`):
+//! per-package `cargo tree` over every target (each crate resolved alone, so
+//! sibling members like `shed-broker-harness` never unify features into it).
+//! Every rule holds under both the crate's default features and
+//! `--all-features`, except `shed-app`'s, which is default-features only:
 //! - `shed-lane` is a pure leaf (no `shed-core`, `shed-roost`, `shed-app`,
 //!   `shed-broker`, `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
 //! - `shed-core` is pure shed-server protocol (no `roost-ipc`, `shed-roost`,
@@ -54,12 +55,34 @@ fn no_deps_metadata() -> Value {
 }
 
 /// Every crate name in `pkg`'s resolved dependency graph for the given `-e`
-/// edge kinds (`normal,build` or `normal,build,dev`).
+/// edge kinds (`normal,build` or `normal,build,dev`), for EVERY target and
+/// for both `pkg`'s default features and `--all-features`: a rule here is
+/// unconditional, so a non-default feature or a target-specific dependency
+/// that reaches a forbidden crate must fail it too. (`shed-app`'s default-only
+/// rule uses [`resolved_default_deps`] instead, since `broker` is meant to be
+/// opt-in.)
 fn resolved_deps(pkg: &str, edges: &str) -> HashSet<String> {
+    let mut deps = cargo_tree(pkg, edges, false);
+    deps.extend(cargo_tree(pkg, edges, true));
+    deps
+}
+
+/// `pkg`'s graph under its default features only, for every target.
+fn resolved_default_deps(pkg: &str, edges: &str) -> HashSet<String> {
+    cargo_tree(pkg, edges, false)
+}
+
+fn cargo_tree(pkg: &str, edges: &str, all_features: bool) -> HashSet<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let out = Command::new(cargo)
+    let mut cmd = Command::new(cargo);
+    cmd.arg("tree");
+    if all_features {
+        cmd.arg("--all-features");
+    }
+    let out = cmd
         .args([
-            "tree",
+            "--target",
+            "all",
             "--manifest-path",
             crates_dir()
                 .join("Cargo.toml")
@@ -78,7 +101,7 @@ fn resolved_deps(pkg: &str, edges: &str) -> HashSet<String> {
         .expect("run cargo tree");
     assert!(
         out.status.success(),
-        "cargo tree -p {pkg} -e {edges} failed: {}",
+        "cargo tree -p {pkg} -e {edges} (all_features={all_features}) failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 cargo tree output");
@@ -196,7 +219,7 @@ fn crate_isolation_invariants() {
             }
         }
     }
-    let app_deps = resolved_normal_deps("shed-app");
+    let app_deps = resolved_default_deps("shed-app", "normal,build");
     for forbidden in [
         "shed-roost",
         "shed-craze",

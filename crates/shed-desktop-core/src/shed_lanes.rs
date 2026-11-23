@@ -322,6 +322,12 @@ impl Life {
 }
 
 struct LaneCore {
+    /// Orders this lane's emits to match its state transitions: held across
+    /// a transition AND its emit, so no event can reach [`LaneEvents`] after
+    /// the terminal `Down` that followed it. Taken before `state`, and never
+    /// while holding `ShedLanes::inner` or `state` — callbacks still run with
+    /// neither held, so they may re-enter (`messages`, `snapshot`).
+    emitting: Mutex<()>,
     state: Mutex<Life>,
     view: Mutex<LaneView>,
     finished: tokio::sync::Notify,
@@ -331,6 +337,7 @@ struct LaneCore {
 impl LaneCore {
     fn new(client: Option<Arc<dyn AgentLane>>) -> Arc<LaneCore> {
         Arc::new(LaneCore {
+            emitting: Mutex::new(()),
             state: Mutex::new(Life {
                 state: EntryState::Live,
                 closing: false,
@@ -364,6 +371,7 @@ impl LaneCore {
     }
 
     fn apply(&self, events: &Arc<dyn LaneEvents>, key: &Key, event: &LaneEvent) -> bool {
+        let _order = lock(&self.emitting);
         {
             let life = lock(&self.state);
             if !life.admits() {
@@ -376,6 +384,7 @@ impl LaneCore {
     }
 
     fn finish(&self, events: &Arc<dyn LaneEvents>, key: &Key, reason: &str) -> bool {
+        let _order = lock(&self.emitting);
         let down = {
             let mut life = lock(&self.state);
             if !life.admits() {
@@ -403,6 +412,7 @@ impl LaneCore {
     }
 
     fn expire(&self, events: &Arc<dyn LaneEvents>, key: &Key, token: u64) -> bool {
+        let _order = lock(&self.emitting);
         let down = {
             let mut life = lock(&self.state);
             let cause = match life.state {
@@ -992,7 +1002,12 @@ impl ShedLanes {
         };
         for (key, entry, down) in ended {
             if let Some(down) = down {
-                emit(&self.events, &key, &down);
+                // `inner` is released: wait out any emit in flight so the Down
+                // is the last event this lane publishes.
+                {
+                    let _order = lock(&entry.core.emitting);
+                    emit(&self.events, &key, &down);
+                }
                 entry.core.finished.notify_waiters();
             }
             entry.cancel_grace();
@@ -2119,6 +2134,69 @@ mod tests {
         assert!(!core.apply(&events_rec, &k, &LaneEvent::Ready { generation: 2 }));
         assert_eq!(recorded.downs(), ["session_closed"]);
         drop(events);
+    }
+
+    /// A terminal `Down` is never published ahead of an event whose state
+    /// transition came first: a `finish` racing an `apply` whose callback is
+    /// still running waits for it, so consumers see `Ready` then `Down`.
+    #[test]
+    fn terminal_down_is_never_emitted_ahead_of_an_inflight_event() {
+        use std::sync::mpsc;
+
+        struct GatedEvents {
+            events: Mutex<Vec<LaneUiEvent>>,
+            entered: Mutex<Option<mpsc::Sender<()>>>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl LaneEvents for GatedEvents {
+            fn on_lane_event(&self, event: LaneUiEvent) {
+                if matches!(event.event, LaneEvent::Ready { .. }) {
+                    if let Some(tx) = lock(&self.entered).take() {
+                        let _ = tx.send(());
+                        if let Some(rx) = lock(&self.release).take() {
+                            let _ = rx.recv();
+                        }
+                    }
+                }
+                lock(&self.events).push(event);
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gated = Arc::new(GatedEvents {
+            events: Mutex::new(Vec::new()),
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let events: Arc<dyn LaneEvents> = gated.clone();
+        let core = LaneCore::new(None);
+        let k = key(&shed("s1"), GHOST);
+
+        let pump = {
+            let (core, events, k) = (Arc::clone(&core), Arc::clone(&events), k.clone());
+            std::thread::spawn(move || core.apply(&events, &k, &LaneEvent::Ready { generation: 1 }))
+        };
+        entered_rx.recv().expect("Ready callback entered");
+        let ender = {
+            let (core, events, k) = (Arc::clone(&core), Arc::clone(&events), k.clone());
+            std::thread::spawn(move || core.finish(&events, &k, "session_closed"))
+        };
+        // Give the ender every chance to (wrongly) publish its Down first.
+        std::thread::sleep(Duration::from_millis(100));
+        release_tx.send(()).expect("release Ready");
+        assert!(pump.join().unwrap());
+        assert!(ender.join().unwrap());
+
+        let order: Vec<&'static str> = lock(&gated.events)
+            .iter()
+            .map(|e| match e.event {
+                LaneEvent::Ready { .. } => "ready",
+                LaneEvent::Down { .. } => "down",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(order, ["ready", "down"]);
     }
 
     /// **Fix 7**: `begin_closing` immediately blocks new RPCs (`send`, `set`,
