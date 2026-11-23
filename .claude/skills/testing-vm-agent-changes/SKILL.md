@@ -444,3 +444,46 @@ Add it here. This file exists because the agent-in-image split has non-obvious
 traps; capturing each one saves the next session an hour. (The stale-ref-index
 and BuildKit-cache traps that used to live in step 3 were fixed in **#227** —
 the rebuild now busts the install layer and writes the ref-index on its own.)
+
+## Rough edges from the delivery live run (plan 039, VZ, 2026-11)
+
+A scratch HOME (`HOME=<scratch>/home`) on the Mac, the rootfs rebuilt into a
+scratch image store, the suite run over `ssh <mac> bash -s < script`:
+
+- **A scratch HOME has no `~/.docker`, so the docker CLI finds no buildx
+  plugin**: the build dies at the initramfs step with `unknown flag:
+  --platform`. Give the scratch HOME its own `~/.docker/config.json` naming
+  Docker Desktop's plugin directory,
+  `{"cliPluginsExtraDirs": ["/Applications/Docker.app/Contents/Resources/cli-plugins"]}`;
+  the daemon is still reached through `/var/run/docker.sock`. Do not point
+  `DOCKER_CONFIG` at the developer's own `~/.docker`.
+- **Rebuild all three variants**, not only `base`: the users and delivery
+  cases boot `base`, `test_delivery_image_baked` boots `full`, and the dev
+  configs' `default_image` is the `full` alias. One `SHED_SOURCE_REF` per
+  variant (`image_aliases.<variant>`). From a cold builder: base about 100 s,
+  extensions about 45 s, full about 6 min.
+- **Docker Desktop's disk can live on an external volume.** Its growth from
+  the builds (about 13 GiB for the three) is not given back when the scratch
+  store is removed; check where it lives before reading `df` after clean-up.
+- **`shed exec` inside a `bash -s` script reads the rest of the script** from
+  stdin (ssh forwards it), and the script silently ends there. Give every
+  `shed exec` (and `shed create`) `</dev/null`. Never `exec </dev/null` at
+  the top: that stops `bash -s` from reading the script too.
+- **An old agent has no `version` subcommand**: `shed-agent version` on a
+  pre-0.9 image starts a second agent daemon (`shed-agent starting...`).
+  Use the step-4 `version` check only on a rebuilt image (it prints
+  `"protocol":2` since plan 039).
+- **`test_delivery.py`'s `image_too_old` case needs an alias that still boots
+  a published image** once every alias is rebuilt (users may name only
+  aliases). Add one to the scratch config (for example `published:` naming a
+  published `full` ref already in the store) and run the case with
+  `SHED_DELIVERY_OLD_IMAGE=published`.
+- **Three `test_ssh_auth.py` cases replace `auth.ssh.authorized_keys`.** With
+  the scratch key listed there, the readiness bootstrap after their restart
+  fails `Permission denied (publickey)`. Run that module separately with the
+  key in `auth.ssh.authorized_keys_file`, started without
+  `SHED_DEV_USERS=itest` (the itest render refuses `authorized_keys_file`).
+- **The create timing line has a `delivery=` phase** since plan 039 (about
+  35 to 60 ms with no source or an instant one; the source's wait when it
+  answers late). `agent=` is unchanged by delivery.
+
