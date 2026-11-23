@@ -1817,23 +1817,7 @@ impl Handler {
 
     /// The roost host a shed-addressed op is about: `roost:<server>/<shed>`.
     ///
-    /// `host` resolves through `Backend` exactly as it did when these ops went
-    /// to the hub — an alias, a bare server name and an omitted host all land
-    /// where they always did — and only the last step, turning a resolved server
-    /// plus a shed name into a host token, is new.
-    /// The shed an inject addresses: `host` resolves through `Backend`, then
-    /// the pair is a [`ShedId`].
-    fn shed_id(&self, params: &Value) -> Result<ShedId, (String, String)> {
-        let shed = req_str(params, "shed")?;
-        let server = self
-            .backend
-            .resolve_rc_target(params.get("host").and_then(Value::as_str))
-            .map_err(|e| err("bad_request", e.to_string()))?
-            .server_name;
-        ShedId::new(&server, shed).map_err(|message| err("bad_request", message))
-    }
-
-    /// `rc.inject_test {shed, slug, host?, kind?, display_name?, workdir?,
+    /// `rc.inject_test {target, slug, kind?, display_name?, workdir?,
     /// lifecycle?, attention?}` → put a row into the shed's roost snapshot
     /// (test-only, guarded like `policy.set`).
     ///
@@ -1845,11 +1829,7 @@ impl Handler {
         if !self.env.test_mode {
             return Err(err("not_enabled", "rc.inject_test requires test mode"));
         }
-        let target = if let Some(t) = params.get("target").and_then(Value::as_str) {
-            parse_shed(t)?
-        } else {
-            self.shed_id(params)?
-        };
+        let target = parse_shed(req_str(params, "target")?)?;
         let row = self.build_inject_row(params)?;
         self.runtime
             .hosts()

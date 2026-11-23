@@ -28,15 +28,17 @@ impl ShedId {
     pub fn new(server: impl Into<String>, shed: impl Into<String>) -> Result<Self, String> {
         let server = server.into();
         let shed = shed.into();
-        validate_part("server", &server)?;
-        validate_part("shed", &shed)?;
+        validate_server(&server)?;
+        validate_shed(&shed)?;
         Ok(Self { server, shed })
     }
 
     /// Parse a shed target token (`roost:<server>/<shed>`).
     ///
-    /// Rejects empty input, a missing or extra `/`, and whitespace or control
-    /// characters in either component.
+    /// Rejects empty input, a missing or extra `/`, control characters,
+    /// leading/trailing whitespace on the server alias, and any whitespace in
+    /// the shed name. Internal spaces in server aliases (e.g. `Dev Lab`,
+    /// accepted by `shed server add --name`) are preserved.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -76,13 +78,28 @@ impl ShedId {
     }
 }
 
-fn validate_part(label: &str, value: &str) -> Result<(), String> {
+fn validate_server(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.contains('/')
+        || value
+            .chars()
+            .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
+    {
+        return Err(format!(
+            "invalid server name {value:?} (want non-empty name without '/', control chars, or surrounding whitespace)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shed(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.contains('/')
         || value.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(format!(
-            "invalid {label} name {value:?} (want non-empty name without '/' or whitespace)"
+            "invalid shed name {value:?} (want non-empty name without '/' or whitespace)"
         ));
     }
     Ok(())
@@ -133,6 +150,14 @@ mod tests {
             id_of("srv-1", "my_shed")
         );
 
+        // Server aliases with internal spaces (e.g. `shed server add --name "Dev Lab"`)
+        // are preserved cleanly.
+        let spaced = ShedId::parse("roost:Dev Lab/dev").expect("server alias with space");
+        assert_eq!(spaced.server(), "Dev Lab");
+        assert_eq!(spaced.shed(), "dev");
+        assert_eq!(spaced.as_target(), "roost:Dev Lab/dev");
+        assert_eq!(ShedId::new("Dev Lab", "dev").unwrap(), spaced);
+
         // Serde round-trip as plain string.
         let json = serde_json::to_value(&id).unwrap();
         assert_eq!(json, serde_json::json!("roost:mini3/dev"));
@@ -154,7 +179,10 @@ mod tests {
             "roost:mini3/",
             "roost:/dev",
             "roost:mini3/a/b",
-            "roost:mini 3/dev",
+            "roost: mini3/dev",
+            "roost:mini3 /dev",
+            "roost:mini\t3/dev",
+            "roost:mini\n3/dev",
             "roost:mini3/d ev",
         ] {
             assert!(

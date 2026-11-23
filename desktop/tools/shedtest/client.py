@@ -232,17 +232,18 @@ class _RcOps:
             params["shed"] = shed
         return self.call("rc.list", params)["sessions"]
 
-    def rc_inject_test(self, shed: str, slug: str, *, host: str | None = None,
+    def rc_inject_test(self, target: str, slug: str, *,
                        kind: str = "claude-rc", display_name: str | None = None,
                        workdir: str | None = None, lifecycle: str | None = None,
                        attention: bool | None = None) -> None:
         """Put a row into the shed's ROOST snapshot — test mode only.
 
-        `slug` is the roost tab id, so it must parse as one: a row with an
-        invented slug is refused. `lifecycle` is roost's own
-        `agent_lifecycle` word (`working`, `waiting`, `finished`, …)."""
-        params: dict = {"shed": shed, "slug": slug, "kind": kind}
-        for k, v in (("host", host), ("display_name", display_name),
+        `target` is the shed target (`roost:<server>/<shed>`). `slug` is the
+        roost tab id, so it must parse as one: a row with an invented slug is
+        refused. `lifecycle` is roost's own `agent_lifecycle` word (`working`,
+        `waiting`, `finished`, …)."""
+        params: dict = {"target": target, "slug": slug, "kind": kind}
+        for k, v in (("display_name", display_name),
                      ("workdir", workdir), ("lifecycle", lifecycle),
                      ("attention", attention)):
             if v is not None:

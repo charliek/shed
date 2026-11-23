@@ -28,10 +28,10 @@ pub use model::{
 pub use paths::{local_session_socket, ResolvedSocket};
 pub use reach::{
     shed_reach_entry, tab_close, tab_dump, tab_open, tab_open_command_fenced, tab_open_fenced,
-    tab_set_title, BootstrapRunner, HooksRefresh, LabelledPort, LocalSession, OpenedTabInfo,
-    ReachError, ReachKind, RecordedReach, RoostPeek, RoostReach, RoostUpdate, RoostWatcher,
-    RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, TabFence,
-    TeardownSink, Tunnel, TunnelOpener, UnreachableReach,
+    tab_set_title, BootstrapRunner, DuplexChild, DuplexExit, HooksRefresh, LabelledPort,
+    LocalSession, OpenedTabInfo, ReachError, ReachKind, RecordedReach, RoostPeek, RoostReach,
+    RoostUpdate, RoostWatcher, RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec,
+    SystemSshTunnels, TabFence, TeardownSink, Tunnel, TunnelOpener, UnreachableReach,
 };
 pub use spawn_gate::{
     ChildExit, Drained, LateRegistrations, ShuttingDown, SlotClose, SlotsClosed, SpawnGate,

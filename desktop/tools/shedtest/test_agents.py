@@ -242,7 +242,7 @@ def test_inject_puts_a_row_into_the_roost_snapshot(app):
     """`rc.inject_test` lands in the ROOST snapshot — the only row source there
     is — so the injected row is stamped and keyed exactly like one a session
     reported."""
-    app.call("rc.inject_test", {"shed": SHED, "slug": "77", "kind": "claude-rc",
+    app.call("rc.inject_test", {"target": TARGET, "slug": "77", "kind": "claude-rc",
                                 "display_name": "injected", "workdir": "/home/shed/inj"})
     row = _rows(app)["77"]
     assert row["origin"] == TARGET
@@ -256,7 +256,7 @@ def test_inject_refuses_a_slug_that_is_not_a_tab_id(app):
     """A row whose slug is not a tab id could never be closed, so it is refused
     rather than injected."""
     with pytest.raises(ShedError) as exc:
-        app.call("rc.inject_test", {"shed": SHED, "slug": "legacy1"})
+        app.call("rc.inject_test", {"target": TARGET, "slug": "legacy1"})
     assert exc.value.code == "bad_request"
 
 
@@ -271,7 +271,7 @@ def test_inject_refuses_a_kind_roost_has_no_adapter_for(app, kind):
     and nothing lands.
     """
     with pytest.raises(ShedError) as exc:
-        app.call("rc.inject_test", {"shed": SHED, "slug": "79", "kind": kind})
+        app.call("rc.inject_test", {"target": TARGET, "slug": "79", "kind": kind})
     assert exc.value.code == "bad_request"
     assert "not a session row" in exc.value.message, exc.value.message
     assert "79" not in _rows(app), "a refused injection left a row behind"
@@ -284,7 +284,7 @@ def test_agents_pane_renders_an_injected_session(app):
     needs no display) + a window screenshot where the capture is available —
     macOS-tauri shells out to a Screen-Recording-TCC-gated tool, so the
     Linux/Xvfb render gate covers that pixel."""
-    app.call("rc.inject_test", {"shed": SHED, "slug": "78", "kind": "opencode",
+    app.call("rc.inject_test", {"target": TARGET, "slug": "78", "kind": "opencode",
                                 "display_name": "shot1"})
     app.navigate("agents")
     app.show_window()

@@ -272,10 +272,18 @@ struct Detached {
     was_offered: bool,
     craze: Option<CrazeHost>,
     craze_removed: Option<(u64, u64)>,
+    exec: Option<Arc<SshExec>>,
+}
+
+struct RemovedTeardown {
+    id: ShedId,
+    craze: Option<CrazeHost>,
+    exec: Option<Arc<SshExec>>,
 }
 
 struct RemovedEvents {
     craze_removed: Vec<(ShedId, u64, u64)>,
+    teardowns: Vec<RemovedTeardown>,
     hosts_changed: bool,
 }
 
@@ -615,11 +623,14 @@ pub struct ShedHosts {
     craze_reaches: CrazeReaches,
     craze_timings: CrazeTimings,
     observe_seq: AtomicU64,
-    last_observe_seq: AtomicU64,
-    observe_pass: tokio::sync::Mutex<()>,
+    /// Serializes inventory observation passes and tracks the latest
+    /// authoritative observation sequence per server so a partial fleet
+    /// refresh reaching only server B never discards an older refresh's
+    /// authoritative shed removal for server A.
+    observe_pass: tokio::sync::Mutex<BTreeMap<String, u64>>,
     probes: Mutex<tokio::task::JoinSet<()>>,
     admitted: Arc<Admitted>,
-    retired: Mutex<Retired>,
+    retired: Arc<Mutex<Retired>>,
     #[cfg(test)]
     pub(crate) remove_gap: Mutex<Option<TestGap>>,
     #[cfg(test)]
@@ -675,11 +686,10 @@ impl ShedHosts {
             craze_reaches,
             craze_timings,
             observe_seq: AtomicU64::new(1),
-            last_observe_seq: AtomicU64::new(0),
-            observe_pass: tokio::sync::Mutex::new(()),
+            observe_pass: tokio::sync::Mutex::new(BTreeMap::new()),
             probes: Mutex::new(tokio::task::JoinSet::new()),
             admitted: Arc::new(Admitted::default()),
-            retired: Mutex::new(Retired::default()),
+            retired: Arc::new(Mutex::new(Retired::default())),
             #[cfg(test)]
             remove_gap: Mutex::new(None),
             #[cfg(test)]
@@ -1247,23 +1257,41 @@ impl ShedHosts {
 
     async fn observe_sheds_admitted(&self, seq: u64, running: &[ShedId], authoritative: &[String]) {
         let (removed_events, craze_started) = {
-            let _pass = self.observe_pass.lock().await;
+            let mut last_seq_by_server = self.observe_pass.lock().await;
             if lock(&self.reg).closing {
                 return;
             }
-            if seq < self.last_observe_seq.load(Ordering::SeqCst) {
+            // Track authoritative freshness PER SERVER: a newer refresh that
+            // only reached server B advances B's high-water mark and never
+            // discards an older refresh's authoritative removal for server A.
+            // Filtered add-only observations (`authoritative` empty) do not
+            // advance any server's mark, and are ignored for servers that
+            // already have a strictly newer authoritative observation.
+            let all_authoritative: BTreeSet<&str> =
+                authoritative.iter().map(String::as_str).collect();
+            let mut answered: BTreeSet<&str> = BTreeSet::new();
+            for server in authoritative {
+                let prev = last_seq_by_server.get(server).copied().unwrap_or(0);
+                if seq >= prev {
+                    last_seq_by_server.insert(server.clone(), seq);
+                    answered.insert(server.as_str());
+                }
+            }
+            let live: BTreeSet<ShedId> = running
+                .iter()
+                .filter(|id| {
+                    if all_authoritative.contains(id.server()) {
+                        answered.contains(id.server())
+                    } else {
+                        let prev = last_seq_by_server.get(id.server()).copied().unwrap_or(0);
+                        seq >= prev
+                    }
+                })
+                .cloned()
+                .collect();
+            if answered.is_empty() && live.is_empty() {
                 return;
             }
-            // Only authoritative observations advance the high-water mark: a
-            // filtered (add-only) `rc.list` finishing ahead of an in-flight
-            // full refresh must never suppress that full refresh's removal of
-            // stopped sheds.
-            if !authoritative.is_empty() {
-                self.last_observe_seq.store(seq, Ordering::SeqCst);
-            }
-
-            let answered: BTreeSet<&str> = authoritative.iter().map(String::as_str).collect();
-            let live: BTreeSet<ShedId> = running.iter().cloned().collect();
 
             // Update the authorization set FIRST before any registration or probe.
             {
@@ -1299,7 +1327,9 @@ impl ShedHosts {
             }
             (removed_events, craze_started)
         };
-        // Dispatch every callback AFTER releasing `observe_pass` and all mutexes.
+        // Dispatch every callback AFTER releasing `observe_pass` and all mutexes,
+        // and BEFORE awaiting Craze source teardown so open lanes are fenced
+        // immediately and drop their dial holders right away.
         for (id, gen, news_seq) in removed_events.craze_removed {
             publish_craze(
                 &self.on_craze,
@@ -1313,6 +1343,37 @@ impl ShedHosts {
         }
         if removed_events.hosts_changed {
             self.events.on_hosts_changed();
+        }
+        // Schedule each removed host's teardown independently in the background
+        // so one host's held Craze dial neither stalls the fleet refresh nor
+        // blocks unrelated hosts' SSH shutdowns, and cancelling the refresh
+        // cannot orphan retired runners.
+        for teardown in removed_events.teardowns {
+            let retired = Arc::clone(&self.retired);
+            self.handle.spawn(async move {
+                if let Some(craze) = teardown.craze {
+                    if !craze.stop().await {
+                        tracing::warn!(
+                            target = %teardown.id,
+                            secs = CRAZE_STOP_WAIT.as_secs(),
+                            "craze source had not stopped after removal (a lane verb still holds it); its last holder releases it"
+                        );
+                    }
+                }
+                if let Some(exec) = teardown.exec {
+                    if exec.shutdown().await {
+                        // Prune ONLY once confirmed ended: an unconfirmed runner
+                        // stays in `retired.execs` so its scratch dir/socket is
+                        // not dropped prematurely and orderly quit accounts for it.
+                        lock(&retired).execs.retain(|e| !Arc::ptr_eq(e, &exec));
+                    } else {
+                        tracing::warn!(
+                            target = %exec.label(),
+                            "detached ssh master could not be confirmed ended after retried -O exit; kept for orderly shutdown accounting"
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -1540,36 +1601,33 @@ impl ShedHosts {
         for id in ids {
             removed.push(self.detach(id).await);
         }
-        let stops: Vec<_> = removed
-            .iter_mut()
-            .filter_map(|r| {
-                r.craze
-                    .take()
-                    .map(|craze| (r.id.clone(), self.handle.spawn(craze.stop())))
-            })
-            .collect();
-        for (id, stop) in stops {
-            if !stop.await.unwrap_or(false) {
-                tracing::warn!(
-                    target = %id,
-                    secs = CRAZE_STOP_WAIT.as_secs(),
-                    "craze source had not stopped after removal (a lane verb still holds it); its last holder releases it"
-                );
+        let mut teardowns = Vec::new();
+        let mut craze_removed = Vec::new();
+        let mut hosts_changed = false;
+        for r in removed {
+            if r.was_listed || r.was_offered {
+                hosts_changed = true;
+            }
+            if let Some((gen, seq)) = r.craze_removed {
+                craze_removed.push((r.id.clone(), gen, seq));
+            }
+            if r.craze.is_some() || r.exec.is_some() {
+                teardowns.push(RemovedTeardown {
+                    id: r.id,
+                    craze: r.craze,
+                    exec: r.exec,
+                });
             }
         }
-        let craze_removed = removed
-            .iter()
-            .filter_map(|r| r.craze_removed.map(|(gen, seq)| (r.id.clone(), gen, seq)))
-            .collect();
-        let hosts_changed = removed.iter().any(|r| r.was_listed || r.was_offered);
         RemovedEvents {
             craze_removed,
+            teardowns,
             hosts_changed,
         }
     }
 
     async fn detach(&self, id: &ShedId) -> Detached {
-        let (removed, craze, dropped) = {
+        let (removed, craze, exec_out, dropped) = {
             // Canonical lock order: `state` -> `armed` -> `reg` -> `execs` -> `retired`.
             // Clearing `armed` and removing `reg` atomically closes any race
             // with `arm_if_same_incarnation`.
@@ -1586,6 +1644,13 @@ impl ShedHosts {
             lock(&self.probed).remove(id);
             let mut execs = lock(&self.execs);
             let exec = execs.remove(id);
+            if let Some(exec) = &exec {
+                // Fence spawn admission synchronously on detach so no retained
+                // Craze dial (e.g. an in-flight `craze.create` retry) can open
+                // a fresh SSH connection while background teardown waits on
+                // `craze.stop()`.
+                exec.close_admission();
+            }
             {
                 let mut retired = lock(&self.retired);
                 retired.prune();
@@ -1593,7 +1658,7 @@ impl ShedHosts {
                     retired.reaches.push(Arc::downgrade(reach));
                 }
                 if let Some(exec) = &exec {
-                    // Retain a strong ref until orderly shutdown sweeps it.
+                    // Retain a strong ref until background teardown or orderly shutdown finishes.
                     if !retired.execs.iter().any(|e| Arc::ptr_eq(e, exec)) {
                         retired.execs.push(Arc::clone(exec));
                     }
@@ -1602,7 +1667,7 @@ impl ShedHosts {
             drop(execs);
             let mut removed = state.remove(id);
             let seq = removed.as_mut().map(|m| m.craze.mint_news());
-            (removed.zip(seq), craze, (watcher, reach, exec))
+            (removed.zip(seq), craze, exec, (watcher, reach))
         };
         #[cfg(test)]
         at_gap(&self.remove_gap).await;
@@ -1615,6 +1680,7 @@ impl ShedHosts {
             was_offered: removed.as_ref().is_some_and(HostState::in_shed_craze),
             craze,
             craze_removed,
+            exec: exec_out,
         }
     }
 
@@ -2132,7 +2198,7 @@ impl ShedHosts {
             execs.iter().cloned().map(|exec| {
                 let unconfirmed = Arc::clone(&unconfirmed);
                 async move {
-                    if !exec.shutdown().await {
+                    if !exec.shutdown_or_retry_unsettled().await {
                         unconfirmed.fetch_add(1, Ordering::SeqCst);
                         tracing::warn!(
                             target = %exec.label(),
@@ -3268,6 +3334,168 @@ mod tests {
         // Give the aborted task a tick to unwind and drop its `HostCrazeSink`.
         wait_for("ShedHosts & Registry drop with zero ref cycle", || {
             (weak_hosts.upgrade().is_none() && weak_reg.upgrade().is_none()).then_some(())
+        })
+        .await;
+    }
+
+    /// **Branch review High 1**: a partial fleet refresh reaching only server B
+    /// must never discard an older refresh's authoritative shed removal for
+    /// server A.
+    #[tokio::test]
+    async fn partial_fleet_refresh_does_not_discard_other_servers_removal() {
+        let mut cfg = server_config("srv-a", "");
+        cfg.servers.push(ShedServerEntry {
+            name: "srv-b".to_string(),
+            host: "127.0.0.1".to_string(),
+            http_port: 8081,
+            ssh_port: 2223,
+            ..Default::default()
+        });
+        let hosts = Arc::new(ShedHosts::start_with(
+            &tokio::runtime::Handle::current(),
+            &cfg,
+            ShedReachOptions {
+                test_mode: true,
+                ..Default::default()
+            },
+            false,
+            Arc::new(NoopHostEvents),
+            CrazeReaches::Fixed(Arc::new(|_| None)),
+            CrazeTimings::default(),
+        ));
+
+        let a1 = shed("srv-a", "a1");
+        let b1 = shed("srv-b", "b1");
+        let seq0 = hosts.next_observe_seq();
+        hosts
+            .observe_sheds_at(
+                seq0,
+                &[a1.clone(), b1.clone()],
+                &["srv-a".to_string(), "srv-b".to_string()],
+            )
+            .await;
+        assert!(lock(&hosts.listed_sheds).contains(&a1));
+        assert!(lock(&hosts.listed_sheds).contains(&b1));
+
+        // Refresh 1 (seq1) starts, then refresh 2 (seq2) finishes first having
+        // reached ONLY srv-b.
+        let seq1 = hosts.next_observe_seq();
+        let seq2 = hosts.next_observe_seq();
+        hosts
+            .observe_sheds_at(seq2, std::slice::from_ref(&b1), &["srv-b".to_string()])
+            .await;
+        assert!(lock(&hosts.listed_sheds).contains(&a1));
+        assert!(lock(&hosts.listed_sheds).contains(&b1));
+
+        // Refresh 1 (seq1) now finishes confirming srv-a's shed `a1` stopped.
+        // srv-b's stale portion in seq1 must be ignored while srv-a's removal
+        // MUST take effect.
+        hosts
+            .observe_sheds_at(seq1, &[], &["srv-a".to_string(), "srv-b".to_string()])
+            .await;
+        assert!(
+            !lock(&hosts.listed_sheds).contains(&a1),
+            "srv-a's authoritative removal at seq1 must not be discarded by srv-b's seq2"
+        );
+        assert!(
+            lock(&hosts.listed_sheds).contains(&b1),
+            "srv-b's newer observation at seq2 must not be rolled back by seq1"
+        );
+    }
+
+    /// **Branch review High 2**: host removal publishes `HostRemoved` BEFORE
+    /// awaiting `CrazeHost::stop()`, so an open Craze lane holding the source's
+    /// dial is fenced immediately (not kept writable for up to 2s) and drops
+    /// its dial holder so `stop()` finishes promptly.
+    #[tokio::test]
+    async fn host_removal_fences_open_craze_lane_before_awaiting_source_stop() {
+        let s1 = shed("srv", "s1");
+        let (dial, _conns) = shed_craze::testing::ScriptedDial::new();
+        let craze_reach = CrazeReach {
+            dial,
+            probe: None,
+            ensure: None,
+        };
+        let hosts = Arc::new(ShedHosts::start_with(
+            &tokio::runtime::Handle::current(),
+            &server_config("srv", ""),
+            ShedReachOptions {
+                test_mode: true,
+                ..Default::default()
+            },
+            false,
+            Arc::new(NoopHostEvents),
+            CrazeReaches::Fixed(Arc::new(move |id: &ShedId| {
+                (*id == s1).then(|| craze_reach.clone())
+            })),
+            CrazeTimings::default(),
+        ));
+
+        let s1_id = shed("srv", "s1");
+        hosts
+            .observe_sheds(std::slice::from_ref(&s1_id), &["srv".to_string()])
+            .await;
+
+        // Hold an extra dial clone just like an open Craze lane does, and drop
+        // it ONLY when HostRemoved arrives (proving HostRemoved is delivered
+        // BEFORE `craze.stop()` finishes waiting).
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let held_dial = Arc::new(Mutex::new(Some(
+            hosts.craze_source(&s1_id).expect("registered craze source"),
+        )));
+        let held_cb = Arc::clone(&held_dial);
+        hosts.set_craze_observer(Arc::new(move |_id, _gen, news| {
+            if matches!(news, CrazeNews::HostRemoved { .. }) {
+                lock(&held_cb).take();
+                let _ = held_tx.send(());
+            }
+        }));
+
+        let started = Instant::now();
+        hosts.observe_sheds(&[], &["srv".to_string()]).await;
+        assert!(
+            held_rx.try_recv().is_ok(),
+            "HostRemoved must fire during removal before stop finishes"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "removal should not stall for CRAZE_STOP_WAIT when HostRemoved releases holders (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// **Branch review Medium 1**: detaching a shed with an `SshExec` triggers
+    /// background verified shutdown and prunes it from `retired.execs` instead
+    /// of accumulating until app exit.
+    #[tokio::test]
+    async fn detached_ssh_exec_is_torn_down_and_pruned_from_retired_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ssh, _log) = write_recording_ssh(dir.path());
+        let hosts = Arc::new(ShedHosts::start_with(
+            &tokio::runtime::Handle::current(),
+            &server_config("srv", ""),
+            ShedReachOptions {
+                test_mode: true,
+                ssh_bin: Some(ssh),
+                ..Default::default()
+            },
+            false,
+            Arc::new(NoopHostEvents),
+            CrazeReaches::Fixed(Arc::new(|_| None)),
+            CrazeTimings::default(),
+        ));
+        let s1 = shed("srv", "s1");
+        hosts
+            .observe_sheds(std::slice::from_ref(&s1), &["srv".to_string()])
+            .await;
+        // Materialize an SshExec for s1 (no master ever opened -> ctl_lookup == Some(false) -> shutdown returns true immediately).
+        let _exec = hosts.exec_for(&s1).expect("exec for listed shed");
+        assert!(lock(&hosts.execs).contains_key(&s1));
+
+        // Removing the shed detaches the exec and prunes it once background shutdown confirms it.
+        hosts.observe_sheds(&[], &["srv".to_string()]).await;
+        wait_for("detached SshExec pruned from retired.execs", || {
+            lock(&hosts.retired).execs.is_empty().then_some(())
         })
         .await;
     }

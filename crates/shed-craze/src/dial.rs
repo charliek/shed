@@ -429,12 +429,13 @@ pub struct ExitWatch {
     pid: Option<u32>,
 }
 
-struct KillSwitch(Mutex<Option<oneshot::Sender<()>>>);
+struct KillSwitch(Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>);
 
 impl KillSwitch {
     fn pull(&self) {
-        if let Some(tx) = lock(&self.0).take() {
-            let _ = tx.send(());
+        let kill = lock(&self.0).take();
+        if let Some(kill) = kill {
+            kill();
         }
     }
 }
@@ -466,9 +467,25 @@ impl ExitWatch {
             };
             let _ = status_tx.send(Some(exit));
         });
+        Self::from_parts(pid, status, move || {
+            let _ = kill_tx.send(());
+        })
+    }
+
+    /// Build an [`ExitWatch`] backed by an external process watcher (for
+    /// instance a runner-tracked SSH duplex whose `Child` is owned inside the
+    /// runner's spawn gate).
+    pub fn from_parts<F>(
+        pid: Option<u32>,
+        status: watch::Receiver<Option<Exit>>,
+        on_kill: F,
+    ) -> ExitWatch
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
         ExitWatch {
             status,
-            switch: Arc::new(KillSwitch(Mutex::new(Some(kill_tx)))),
+            switch: Arc::new(KillSwitch(Mutex::new(Some(Box::new(on_kill))))),
             pid,
         }
     }

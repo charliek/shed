@@ -239,6 +239,11 @@ impl SpawnGate {
         })
     }
 
+    /// Whether `self` and `other` are handles to the same underlying gate.
+    pub fn same_gate(&self, other: &SpawnGate) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Whether [`Self::close`] has begun. A hint for a clean early refusal; the
     /// authority is [`Self::enter`].
     pub fn is_closed(&self) -> bool {
@@ -276,17 +281,24 @@ impl SpawnGate {
         }
     }
 
-    /// Close the gate — no section can be entered after this begins — and wait
-    /// at most `within` for every section in progress to end. Answers whether
-    /// they all did. Idempotent: a later call waits the same way and changes
-    /// nothing else.
-    pub async fn close(&self, within: Duration) -> bool {
+    /// Refuse every new spawn section immediately without waiting for active
+    /// sections to finish. Idempotent with [`Self::close`], which still waits
+    /// for any in-flight sections to drain.
+    pub fn close_now(&self) {
         {
             let mut state = lock(&self.inner.state);
             state.closed = true;
             state.closing_at.get_or_insert_with(Instant::now);
         }
         self.inner.closing.notify_waiters();
+    }
+
+    /// Close the gate — no section can be entered after this begins — and wait
+    /// at most `within` for every section in progress to end. Answers whether
+    /// they all did. Idempotent: a later call waits the same way and changes
+    /// nothing else.
+    pub async fn close(&self, within: Duration) -> bool {
+        self.close_now();
         let deadline = tokio::time::Instant::now() + within;
         loop {
             // Interest registered BEFORE the count is read, so a section ending
@@ -326,23 +338,47 @@ impl SpawnGate {
         section: &SpawnSection,
         child: Arc<dyn ChildExit>,
     ) -> Result<(), ShuttingDown> {
-        debug_assert!(Arc::ptr_eq(&section.inner, &self.inner));
-        {
-            let mut state = lock(&self.inner.state);
-            if !state.closed {
-                state.prune();
-                state.exits.push(child);
-                return Ok(());
+        Self::register_exit_many(&[(self, section)], child).await
+    }
+
+    /// Atomically record `child` across every `(gate, section)` pair BEFORE
+    /// awaiting any late-kill exit. If any gate is already closed, `child` is
+    /// already present in every gate's drain registry (so cancelling this
+    /// future cannot leave any gate blind to an unreaped child), killed once,
+    /// awaited for [`LATE_KILL_WAIT`], and refused with [`ShuttingDown`].
+    pub async fn register_exit_many(
+        gates: &[(&SpawnGate, &SpawnSection)],
+        child: Arc<dyn ChildExit>,
+    ) -> Result<(), ShuttingDown> {
+        let mut any_closed = false;
+        let mut closed_flags = Vec::with_capacity(gates.len());
+        for (gate, section) in gates {
+            debug_assert!(Arc::ptr_eq(&section.inner, &gate.inner));
+            let mut state = lock(&gate.inner.state);
+            state.prune();
+            state.exits.push(Arc::clone(&child));
+            closed_flags.push(state.closed);
+            if state.closed {
+                any_closed = true;
             }
+        }
+        if !any_closed {
+            return Ok(());
         }
         let pid = child.pid();
         child.kill();
         let seen = child.exited(LATE_KILL_WAIT).await;
-        {
-            let mut state = lock(&self.inner.state);
-            state.late.killed += 1;
-            if !seen {
-                state.late.unseen.push(pid);
+        let id = identity(&child);
+        for ((gate, _section), was_closed) in gates.iter().zip(closed_flags) {
+            let mut state = lock(&gate.inner.state);
+            if was_closed {
+                state.late.killed += 1;
+                if !seen {
+                    state.late.unseen.push(pid);
+                }
+            }
+            if seen {
+                state.exits.retain(|c| identity(c) != id);
             }
         }
         if !seen {
@@ -430,26 +466,39 @@ impl SpawnGate {
             let seen = futures_util::future::join_all(fresh.iter().map(|c| c.exited(left))).await;
             killed += fresh.len();
             exited += seen.into_iter().filter(|exited| *exited).count();
-            let drained = self.sections_ended(deadline).await;
-            let unswept = {
+            let _ = self.sections_ended(deadline).await;
+            let deadline_passed = tokio::time::Instant::now() >= deadline;
+            let (leftover, sections_open) = {
                 let mut state = lock(&self.inner.state);
                 state.prune();
-                state
+                let leftover: Vec<Arc<dyn ChildExit>> = state
                     .exits
                     .iter()
-                    .any(|child| !swept.contains(&identity(child)))
+                    .filter(|child| !swept.contains(&identity(child)))
+                    .cloned()
+                    .collect();
+                (leftover, state.sections)
             };
-            if !unswept && (drained || tokio::time::Instant::now() >= deadline) {
-                return self.drained_report(killed, exited);
+            if leftover.is_empty() && (sections_open == 0 || deadline_passed) {
+                return self.drained_report(killed, exited, sections_open);
             }
-            if tokio::time::Instant::now() >= deadline {
-                return self.drained_report(killed, exited);
+            if deadline_passed {
+                // Any live child still unswept at the deadline (for instance a
+                // late registration whose future was cancelled after the last
+                // sweep) is read under the same lock as `sections_open`, then
+                // signalled and counted as killed-not-exited so `exited ==
+                // killed && sections_open == 0` can never claim a clean drain
+                // while a child remains registered.
+                for child in &leftover {
+                    child.kill();
+                }
+                killed += leftover.len();
+                return self.drained_report(killed, exited, sections_open);
             }
         }
     }
 
-    fn drained_report(&self, killed: usize, exited: usize) -> Drained {
-        let sections_open = lock(&self.inner.state).sections;
+    fn drained_report(&self, killed: usize, exited: usize, sections_open: usize) -> Drained {
         if sections_open > 0 {
             tracing::warn!(
                 sections_open,
@@ -838,5 +887,35 @@ mod tests {
             .expect("the waiter");
         drop(_held);
         assert!(closing.await.expect("close"));
+    }
+
+    /// **A cancelled late registration stays in the drain registry**: if a
+    /// timeout or cancellation drops `register_exit` while it is awaiting a
+    /// late child's exit (releasing its `SpawnSection` early), `kill_exits`
+    /// still sees and accounts for that child instead of reporting a clean
+    /// empty drain.
+    #[tokio::test]
+    async fn a_cancelled_late_registration_stays_in_the_drain_registry() {
+        let gate = SpawnGate::new();
+        let section = gate.enter().expect("admitted before close");
+        assert!(!gate.close(Duration::from_millis(20)).await);
+        let stuck = Child::stuck(9001);
+        let reg = tokio::time::timeout(
+            Duration::from_millis(30),
+            gate.register_exit(&section, stuck.clone()),
+        )
+        .await;
+        assert!(reg.is_err(), "registration timed out and was cancelled");
+        drop(section);
+        let drained = gate.kill_exits(Duration::from_millis(80)).await;
+        assert_eq!(
+            drained,
+            Drained {
+                killed: 1,
+                exited: 0,
+                sections_open: 0,
+            },
+            "drain must still sweep a late child whose register_exit was cancelled"
+        );
     }
 }

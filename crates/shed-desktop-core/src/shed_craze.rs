@@ -31,9 +31,11 @@ use shed_lane::lane::{
 };
 use shed_lane::shell_quote::display_line;
 use shed_roost::bootstrap::{Outcome, Stdin};
+#[cfg(test)]
+use shed_roost::{ChildExit, SpawnSection};
 use shed_roost::{
-    ChildExit, LocalSession, RoostReach, ShuttingDown, SpawnGate, SpawnSection, SshBridge,
-    SshBridgeOptions, SshEndpoint, SshExec, TeardownSink, UnreachableReach,
+    DuplexChild, LocalSession, RoostReach, ShuttingDown, SpawnGate, SshBridge, SshBridgeOptions,
+    SshEndpoint, SshExec, TeardownSink, UnreachableReach,
 };
 
 use crate::shed_lanes::LaneFailure;
@@ -322,7 +324,7 @@ impl CrazeDial for SshCrazeDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         let exec = Arc::clone(&self.exec);
         let gate = self.gate.clone();
-        if gate.as_ref().is_some_and(SpawnGate::is_closed) {
+        if exec.is_closed() || gate.as_ref().is_some_and(SpawnGate::is_closed) {
             return Box::pin(async { Err(shutting_down_dial()) });
         }
         let (bridge, probe) = match (&self.no_start, self.mode()) {
@@ -345,20 +347,13 @@ impl CrazeDial for SshCrazeDial {
                     }
                 },
             }
-            let section = match &gate {
-                Some(gate) => Some(gate.enter().map_err(|_| shutting_down_dial())?),
-                None => None,
-            };
-            let child = exec.spawn_duplex(&bridge).map_err(|e| {
-                DialError::Unreachable(format!("{}: could not run ssh: {e}", exec.label()))
-            })?;
-            let stream = child_stream(child)?;
-            match (&gate, section.as_ref()) {
-                (Some(gate), Some(section)) => register_stream(gate, section, stream)
-                    .await
-                    .map_err(|_| shutting_down_dial()),
-                _ => Ok(stream),
-            }
+            let duplex = exec
+                .spawn_duplex_with_gate(&bridge, gate.as_ref())
+                .await
+                .map_err(|e| {
+                    DialError::Unreachable(format!("{}: could not run ssh: {e}", exec.label()))
+                })?;
+            Ok(duplex_stream(duplex))
         })
     }
 
@@ -441,7 +436,7 @@ impl CrazeDial for GatedDial {
                 proceed.notified().await;
             }
             let stream = inner.dial().await?;
-            register_stream(&gate, &section, stream)
+            register_stream(&[(&gate, &section)], stream)
                 .await
                 .map_err(|_| shutting_down_dial())
         })
@@ -452,18 +447,20 @@ impl CrazeDial for GatedDial {
     }
 }
 
-/// Register `stream`'s child ([`ExitWatch`]) with `gate` inside `section`.
+/// Register `stream`'s child ([`ExitWatch`]) with every `(gate, section)` pair.
+#[cfg(test)]
 async fn register_stream(
-    gate: &SpawnGate,
-    section: &SpawnSection,
+    gates: &[(&SpawnGate, &SpawnSection)],
     stream: CrazeStream,
 ) -> Result<CrazeStream, ShuttingDown> {
     let (reader, writer, tail, exit) = stream.into_parts();
     let Some(exit) = exit else {
         return Ok(CrazeStream::from_parts(reader, writer, tail, None));
     };
-    gate.register_exit(section, Arc::new(ExitKill(exit.clone())))
-        .await?;
+    for (gate, section) in gates {
+        gate.register_exit(section, Arc::new(ExitKill(exit.clone())))
+            .await?;
+    }
     Ok(CrazeStream::from_parts(
         reader,
         Box::new(RegisteredWrite {
@@ -475,8 +472,10 @@ async fn register_stream(
     ))
 }
 
+#[cfg(test)]
 struct ExitKill(ExitWatch);
 
+#[cfg(test)]
 impl ChildExit for ExitKill {
     fn kill(&self) {
         self.0.kill();
@@ -583,7 +582,41 @@ pub(crate) fn tethered(
     })
 }
 
+/// Wrap a runner-tracked [`DuplexChild`] as a [`CrazeStream`].
+fn duplex_stream(duplex: DuplexChild) -> CrazeStream {
+    let pid = duplex.exit.pid();
+    let mut code_rx = duplex.exit.subscribe();
+    let (status_tx, status_rx) = tokio::sync::watch::channel(
+        (*code_rx.borrow()).map(|code| shed_craze::dial::Exit { code }),
+    );
+    tokio::spawn(async move {
+        if status_tx.borrow().is_some() {
+            return;
+        }
+        while code_rx.changed().await.is_ok() {
+            if let Some(code) = *code_rx.borrow() {
+                let _ = status_tx.send(Some(shed_craze::dial::Exit { code }));
+                return;
+            }
+        }
+    });
+    let exit_handle = duplex.exit;
+    let exit = ExitWatch::from_parts(pid, status_rx, move || {
+        exit_handle.kill();
+    });
+    CrazeStream::from_parts(
+        Box::new(duplex.stdout),
+        Box::new(RegisteredWrite {
+            inner: Box::new(duplex.stdin),
+            exit: exit.clone(),
+        }),
+        Some(StderrTail::spawn(duplex.stderr)),
+        Some(exit),
+    )
+}
+
 /// Wrap a spawned bridge child as a [`CrazeStream`].
+#[cfg(test)]
 pub(crate) fn child_stream(mut child: tokio::process::Child) -> Result<CrazeStream, DialError> {
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())

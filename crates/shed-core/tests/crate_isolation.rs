@@ -95,14 +95,7 @@ fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
 }
 
 const RETIRED_ADAPTER: &str = concat!("shed-", "opencode");
-const TOOLKIT_FORBIDDEN: &[&str] = &[
-    "tauri",
-    "wry",
-    "tao",
-    "webkit2gtk",
-    "iced",
-    RETIRED_ADAPTER,
-];
+const TOOLKIT_FORBIDDEN: &[&str] = &["tauri", "wry", "tao", "webkit2gtk", "iced", RETIRED_ADAPTER];
 
 #[test]
 fn crate_isolation_invariants() {

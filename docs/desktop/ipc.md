@@ -412,9 +412,7 @@ A pane dump answers `null` off its pane; reporting copy nobody is reading would 
 assert a surface that isn't on screen. `sidebar.dump` is the exception because the sidebar
 is always mounted — which is precisely why it is where an unreachable server's reason
 lives now that the Sheds pane carries no error strip. Its `servers[].detail` is the host
-failure's `summary` (empty for a healthy host); its `machines[].note` is the clean word a
-person reads in the list (`offline`, `connecting`, `N sessions`), never the raw transport
-error, which stays on hover.
+failure's `summary` (empty for a healthy host).
 
 ## Approval ops
 

@@ -2614,9 +2614,24 @@ pub struct SshExec {
     /// it may establish — runs inside one of its sections, and a step's child
     /// is registered with it. `None` by default.
     gate: Option<SpawnGate>,
+    /// Per-runner spawn gate closed at the start of [`SshExec::shutdown`]:
+    /// once a detached runner begins shutting down, no caller holding a cloned
+    /// `Arc<SshExec>` (e.g. a previously admitted bootstrap or Craze dial) can
+    /// spawn another `ssh` child or re-open a `ControlMaster` afterward.
+    local_gate: SpawnGate,
+    /// Serializes concurrent [`SshExec::shutdown`] callers (e.g. background
+    /// host-removal cleanup racing orderly app quit) so only one teardown runs
+    /// and every caller observes the same confirmation result.
+    shutdown_lock: tokio::sync::Mutex<()>,
     /// Set once [`SshExec::shutdown`] has done its bounded work, so `Drop` does
     /// nothing more — whether or not the master was confirmed ended.
     exited: AtomicBool,
+    /// Set when the last [`SshExec::shutdown`] pass finished while local spawn
+    /// work was still unsettled (so a late child could still open a master
+    /// afterward). Orderly quit calls [`SshExec::shutdown_or_retry_unsettled`]
+    /// to make one fresh bounded attempt in that case without disturbing
+    /// `exited` (so `Drop` never blocks) or C3 round 4 repeat-`shutdown` caching.
+    unsettled: AtomicBool,
     /// Whether that shutdown CONFIRMED the master ended — what a repeat call
     /// answers (C3 round 4). Meaningful once `exited` is set.
     confirmed: AtomicBool,
@@ -2698,7 +2713,10 @@ impl SshExec {
             dir,
             _pin_dir: pinned.dir,
             gate: options.spawn_gate.clone(),
+            local_gate: SpawnGate::new(),
+            shutdown_lock: tokio::sync::Mutex::new(()),
             exited: AtomicBool::new(false),
+            unsettled: AtomicBool::new(false),
             confirmed: AtomicBool::new(false),
             entry: entry.clone(),
             #[cfg(test)]
@@ -2709,6 +2727,13 @@ impl SshExec {
     /// The reach's name in the target grammar.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Close this runner's local spawn gate immediately without waiting for
+    /// in-flight sections to finish, so no caller holding a cloned
+    /// `Arc<SshExec>` can start another SSH child after the host is detached.
+    pub fn close_admission(&self) {
+        self.local_gate.close_now();
     }
 
     /// The full argv for one exec, argv[0] excluded (it is [`Self::ssh_bin`]).
@@ -2763,6 +2788,17 @@ impl SshExec {
         &self.ssh_bin
     }
 
+    /// Whether this runner was constructed with the same app-wide spawn gate as
+    /// `gate`.
+    pub fn has_spawn_gate(&self, gate: &SpawnGate) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.same_gate(gate))
+    }
+
+    /// Whether spawn admission on this runner has closed (detached or shutting down).
+    pub fn is_closed(&self) -> bool {
+        self.local_gate.is_closed()
+    }
+
     /// Run one [`Step::Exec`] and answer with its [`Outcome`].
     ///
     /// ## `exit: None` is only ever a real timeout here
@@ -2815,7 +2851,7 @@ impl SshExec {
         use tokio::io::AsyncReadExt as _;
         use tokio::io::AsyncWriteExt as _;
 
-        let (mut child, section) = match self.spawn_child(command) {
+        let (mut child, section, local_section) = match self.spawn_child(command) {
             Ok(spawned) => spawned,
             Err(e) => {
                 return Outcome::Exec {
@@ -2835,21 +2871,24 @@ impl SshExec {
         // guard below and STILL reaped and seen, not merely asked to die.
         let watched = RunChild::spawn(child);
         let _kill_if_dropped = KillOnDrop(Arc::clone(&watched));
-        // **Registered with the gate, inside the spawn's section**: the drain
-        // can end this step whoever is awaiting it — a bootstrap in flight when
-        // the app quits, say. On a gate that has already closed, the
-        // registration kills it at once and this step answers `shutting_down`.
+        // **Registered atomically with the runner's local gate and the app
+        // gate, inside their spawn sections**: either a detached-host teardown
+        // or an app quit can end this step whoever is awaiting it, and neither
+        // gate can miss the child if the other closed mid-spawn.
+        let mut gates: Vec<(&SpawnGate, &SpawnSection)> = vec![(&self.local_gate, &local_section)];
         if let (Some(gate), Some(section)) = (&self.gate, section.as_ref()) {
-            let handle: Arc<dyn ChildExit> = Arc::clone(&watched) as Arc<RunChild>;
-            if gate.register_exit(section, handle).await.is_err() {
-                return Outcome::Exec {
-                    exit: None,
-                    stdout: Vec::new(),
-                    stderr_tail: format!("{}: {ShuttingDown}", self.label),
-                };
-            }
+            gates.push((gate, section));
+        }
+        let handle: Arc<dyn ChildExit> = Arc::clone(&watched) as Arc<RunChild>;
+        if SpawnGate::register_exit_many(&gates, handle).await.is_err() {
+            return Outcome::Exec {
+                exit: None,
+                stdout: Vec::new(),
+                stderr_tail: format!("{}: {ShuttingDown}", self.label),
+            };
         }
         drop(section);
+        drop(local_section);
 
         // **All three bands concurrently.** A stream step feeds tens of
         // megabytes into a pipe whose reader is the far side's `tee`; writing it
@@ -2930,20 +2969,104 @@ impl SshExec {
     /// connection that is let go never leaves its bridge running. Nothing here
     /// bounds the child's life; a duplex lives as long as its caller holds it.
     ///
-    /// **Gated** (plan 026 §3.3): once the app's spawn gate has closed it
-    /// refuses with [`ShuttingDown`] and spawns nothing. Registering the child
-    /// is the caller's — it owns the child's kill handle — and a caller with a
-    /// gate holds a section of its own across this call and the registration.
-    pub fn spawn_duplex(&self, command: &str) -> std::io::Result<tokio::process::Child> {
-        self.spawn_child(command).map(|(child, _section)| child)
+    /// **Gated** (plan 026 §3.3): once this runner's local gate or the app's
+    /// spawn gate has closed it refuses with [`ShuttingDown`] and spawns
+    /// nothing. The spawned `Child` is owned by an internal watcher and
+    /// registered on BOTH this runner's local gate and the app's spawn gate
+    /// BEFORE this method returns [`DuplexChild`], so no caller can ever leak
+    /// an untracked SSH child while `shutdown()` inspects the control socket.
+    pub async fn spawn_duplex(&self, command: &str) -> std::io::Result<DuplexChild> {
+        self.spawn_duplex_with_gate(command, None).await
     }
 
-    /// Spawn one exec inside a section of the gate, if there is one — and hand
-    /// the section back, so the caller can register the child before it ends.
+    /// Like [`Self::spawn_duplex`], additionally admitting and registering the
+    /// spawned child atomically on `extra_gate` (when distinct from this
+    /// runner's own gates) in the same [`SpawnGate::register_exit_many`] call.
+    pub async fn spawn_duplex_with_gate(
+        &self,
+        command: &str,
+        extra_gate: Option<&SpawnGate>,
+    ) -> std::io::Result<DuplexChild> {
+        let extra = extra_gate.filter(|g| !self.has_spawn_gate(g) && !self.local_gate.same_gate(g));
+        let (mut child, section, local_section, extra_section) =
+            self.spawn_child_with_gate(command, extra)?;
+        let stdin = child
+            .stdin
+            .take()
+            .expect("the duplex child's stdin is piped");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("the duplex child's stdout is piped");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("the duplex child's stderr is piped");
+        let watched = RunChild::spawn(child);
+        // Build the drop-kill owner BEFORE registration so cancellation or
+        // refusal drops it and kills the child without leaking a reference.
+        let exit = DuplexExit(Arc::new(DuplexExitInner(Arc::clone(&watched))));
+        let mut gates: Vec<(&SpawnGate, &SpawnSection)> = vec![(&self.local_gate, &local_section)];
+        if let (Some(gate), Some(section)) = (&self.gate, section.as_ref()) {
+            gates.push((gate, section));
+        }
+        if let (Some(gate), Some(section)) = (extra, extra_section.as_ref()) {
+            gates.push((gate, section));
+        }
+        let handle: Arc<dyn ChildExit> = watched as Arc<RunChild>;
+        if SpawnGate::register_exit_many(&gates, handle).await.is_err() {
+            return Err(std::io::Error::other(ShuttingDown.to_string()));
+        }
+        Ok(DuplexChild {
+            stdin,
+            stdout,
+            stderr,
+            exit,
+        })
+    }
+
+    /// Spawn one exec inside sections of both this runner's local gate and the
+    /// app gate (if any), handing both sections back so the caller can register
+    /// the child before they end.
     fn spawn_child(
         &self,
         command: &str,
-    ) -> std::io::Result<(tokio::process::Child, Option<SpawnSection>)> {
+    ) -> std::io::Result<(tokio::process::Child, Option<SpawnSection>, SpawnSection)> {
+        let (child, section, local_section, _extra) = self.spawn_child_with_gate(command, None)?;
+        Ok((child, section, local_section))
+    }
+
+    fn spawn_child_with_gate(
+        &self,
+        command: &str,
+        extra_gate: Option<&SpawnGate>,
+    ) -> std::io::Result<(
+        tokio::process::Child,
+        Option<SpawnSection>,
+        SpawnSection,
+        Option<SpawnSection>,
+    )> {
+        // Fast-refuse if any gate has already closed so shutdown always
+        // reports `ShuttingDown` rather than a filesystem/identity-key error,
+        // then check identity file & build argv BEFORE entering the spawn
+        // sections so filesystem I/O cannot hold a section open past a
+        // shutdown wait. `enter()` below remains the authoritative admission
+        // check.
+        if self.local_gate.is_closed()
+            || self.gate.as_ref().is_some_and(SpawnGate::is_closed)
+            || extra_gate.is_some_and(SpawnGate::is_closed)
+        {
+            return Err(std::io::Error::other(ShuttingDown.to_string()));
+        }
+        // An identity file that cannot be used is the refusal itself, carried
+        // typed inside the `io::Error` (`shed_core::identityfile::refusal_in`
+        // finds it) and shown as its own text, which already names the entry,
+        // escaped: no raw label in front of it.
+        let argv = self.argv(command).map_err(std::io::Error::other)?;
+        let local_section = self
+            .local_gate
+            .enter()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let section = match &self.gate {
             Some(gate) => Some(
                 gate.enter()
@@ -2951,11 +3074,13 @@ impl SshExec {
             ),
             None => None,
         };
-        // An identity file that cannot be used is the refusal itself, carried
-        // typed inside the `io::Error` (`shed_core::identityfile::refusal_in`
-        // finds it) and shown as its own text, which already names the entry,
-        // escaped: no raw label in front of it.
-        let argv = self.argv(command).map_err(std::io::Error::other)?;
+        let extra_section = match extra_gate {
+            Some(gate) => Some(
+                gate.enter()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            ),
+            None => None,
+        };
         let child = tokio::process::Command::new(&self.ssh_bin)
             .args(argv)
             // **`LC_ALL=C`.** Failures on this path are classified by English
@@ -2969,7 +3094,7 @@ impl SshExec {
             // What makes the budget in `run` a kill and not merely a give-up.
             .kill_on_drop(true)
             .spawn()?;
-        Ok((child, section))
+        Ok((child, section, local_section, extra_section))
     }
 
     /// **End the `ControlMaster`, bounded** (plan 026 §3.3) — the app's
@@ -3000,23 +3125,75 @@ impl SshExec {
     /// it, so it is safe to run beside other masters' shutdowns without an
     /// outer timeout: N of them in parallel take one bound.
     pub async fn shutdown(&self) -> bool {
-        // A repeat call answers what the first one CONFIRMED (C3 round 4) —
-        // `exited` alone only says the work is done.
-        if self.exited.load(Ordering::SeqCst) {
+        self.shutdown_inner(false).await
+    }
+
+    /// Like [`Self::shutdown`], but if an earlier teardown pass ended with
+    /// local spawn work still unsettled (so a late child could still have
+    /// opened a master afterward), performs one fresh bounded attempt instead
+    /// of returning the stale `false`. Used by orderly app quit.
+    pub async fn shutdown_or_retry_unsettled(&self) -> bool {
+        self.shutdown_inner(true).await
+    }
+
+    async fn shutdown_inner(&self, retry_if_unsettled: bool) -> bool {
+        // Capture the caller's deadline BEFORE awaiting `shutdown_lock` so an
+        // orderly-quit retry that waited behind an overlapping unsettled pass
+        // stays inside the caller's single `MASTER_SHUTDOWN_BOUND` budget
+        // (while a retry after an already-finished pass gets the full 5 s).
+        let caller_deadline = tokio::time::Instant::now() + MASTER_SHUTDOWN_BOUND;
+        let _guard = self.shutdown_lock.lock().await;
+        // A repeat call (including a concurrent caller that just waited on
+        // `shutdown_lock`) answers what the first pass CONFIRMED (C3 round 4),
+        // unless orderly quit asked to retry an earlier unsettled pass.
+        let retrying_unsettled = self.exited.load(Ordering::SeqCst);
+        if retrying_unsettled && !(retry_if_unsettled && self.unsettled.load(Ordering::SeqCst)) {
             return self.confirmed.load(Ordering::SeqCst);
         }
-        // Only a socket that is reliably NOT THERE means no master was ever
-        // opened; a lookup that failed goes the normal way (C3 round 6).
-        if self.ctl_lookup() == Some(false) {
+        // An overlapping retry shares the caller's `MASTER_SHUTDOWN_BOUND`; a
+        // fresh first pass (or a waiter whose predecessor was cancelled before
+        // setting `exited`) gets a full `MASTER_SHUTDOWN_BOUND` from now.
+        let deadline = if retrying_unsettled {
+            caller_deadline
+        } else {
+            tokio::time::Instant::now() + MASTER_SHUTDOWN_BOUND
+        };
+        // Close this runner's local spawn gate and drain any in-flight child
+        // (both `run` steps and Craze duplex SSH bridges registered on
+        // `local_gate`) BEFORE checking/exiting the control master: no caller
+        // holding a cloned `Arc<SshExec>` can spawn another `ssh` or open a new
+        // master after shutdown starts.
+        let local_close_budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_millis(250));
+        let _ = self.local_gate.close(local_close_budget).await;
+        let local_drain_budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_millis(250));
+        let local_drained = self.local_gate.kill_exits(local_drain_budget).await;
+        // Admission is closed before `kill_exits` runs, so if every section
+        // closed during the drain (even if `close()` hit its shorter wait) and
+        // every registered child exited, local spawn work is settled.
+        let local_settled = local_drained.sections_open == 0
+            && local_drained.exited == local_drained.killed
+            && self.local_gate.registered_exits() == 0;
+        // Only a socket that is reliably NOT THERE *after* every local section
+        // and child settled means no master was ever opened (C3 round 6).
+        if local_settled && self.ctl_lookup() == Some(false) {
+            self.unsettled.store(false, Ordering::SeqCst);
             self.confirmed.store(true, Ordering::SeqCst);
             self.exited.store(true, Ordering::SeqCst);
             return true;
         }
-        let deadline = tokio::time::Instant::now() + MASTER_SHUTDOWN_BOUND;
         // The fallback's own deadline: the retry's budget is kept back first.
         let fallback = deadline
             .checked_sub(MASTER_RETRY_RESERVE)
             .unwrap_or(deadline);
+        if retrying_unsettled
+            && fallback.saturating_duration_since(tokio::time::Instant::now()) < MASTER_EXIT_WAIT
+        {
+            return false;
+        }
         let _ = run_bounded(self.control_command(self.exit_argv()), MASTER_EXIT_WAIT).await;
         let mut check = self.check_master(fallback).await;
         if matches!(check, MasterCheck::Uncertain) {
@@ -3077,7 +3254,12 @@ impl SshExec {
         // has had its bounded attempts by now, so `Drop` does nothing more —
         // and the answer, now and on any later call, says whether the master
         // was CONFIRMED ended.
-        let confirmed = unconfirmed.is_none();
+        // Destructor suppression, kept apart from confirmation: every path
+        // has had its bounded attempts by now, so `Drop` does nothing more
+        // (preserving R2-1's non-blocking drop on orderly quit), and any repeat
+        // call answers whether this pass CONFIRMED the master ended (C3 round 4).
+        let confirmed = local_settled && unconfirmed.is_none();
+        self.unsettled.store(!local_settled, Ordering::SeqCst);
         self.confirmed.store(confirmed, Ordering::SeqCst);
         self.exited.store(true, Ordering::SeqCst);
         confirmed
@@ -3319,6 +3501,71 @@ impl Drop for SshExec {
     }
 }
 
+/// A spawned duplex SSH child's stdio pipes and tracked exit handle, returned
+/// by [`SshExec::spawn_duplex`] AFTER the child has been registered on this
+/// runner's local spawn gate (and on the app's spawn gate when configured).
+pub struct DuplexChild {
+    pub stdin: tokio::process::ChildStdin,
+    pub stdout: tokio::process::ChildStdout,
+    pub stderr: tokio::process::ChildStderr,
+    pub exit: DuplexExit,
+}
+
+impl std::fmt::Debug for DuplexChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuplexChild")
+            .field("pid", &self.exit.pid())
+            .finish()
+    }
+}
+
+/// Handle to a runner-tracked duplex SSH child. Dropping the last clone kills
+/// the child (via its internal watcher, which reaps it).
+#[derive(Clone)]
+pub struct DuplexExit(Arc<DuplexExitInner>);
+
+struct DuplexExitInner(Arc<RunChild>);
+
+impl Drop for DuplexExitInner {
+    fn drop(&mut self) {
+        self.0.kill();
+    }
+}
+
+impl DuplexExit {
+    /// The child's pid, taken at spawn.
+    pub fn pid(&self) -> Option<u32> {
+        self.0 .0.pid
+    }
+
+    /// Kill the child now.
+    pub fn kill(&self) {
+        self.0 .0.kill();
+    }
+
+    /// Whether the child has been seen to exit.
+    pub fn done(&self) -> bool {
+        self.0 .0.done()
+    }
+
+    /// Subscribe to the child's exit code (`None` until exited, then
+    /// `Some(code)` where `code` is `None` for a signal or unknown wait).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<Option<i32>>> {
+        self.0 .0.code.clone()
+    }
+
+    /// Wait at most `within` for the child to exit.
+    pub async fn wait_exited(&self, within: Duration) -> bool {
+        self.0 .0.exited(within).await
+    }
+
+    /// The underlying [`ChildExit`] handle, for registering with an additional
+    /// spawn gate if needed.
+    pub fn as_child_exit(&self) -> Arc<dyn ChildExit> {
+        Arc::clone(&self.0 .0) as Arc<RunChild>
+    }
+}
+
 /// One [`SshExec::run`] step's child, OWNED until it is reaped (plan 026 §3.3,
 /// F8): a task of its own holds the `Child`, waits for it — or kills it, on
 /// [`ChildExit::kill`] or once every handle is gone — and publishes the exit.
@@ -3329,6 +3576,8 @@ struct RunChild {
     pid: Option<u32>,
     /// `None` until the watcher is done with the child; then how it ended.
     status: tokio::sync::watch::Receiver<Option<RunExit>>,
+    /// Same exit published as `Option<Option<i32>>` for [`DuplexExit::subscribe`].
+    code: tokio::sync::watch::Receiver<Option<Option<i32>>>,
     kill: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -3346,6 +3595,7 @@ impl RunChild {
     fn spawn(mut child: tokio::process::Child) -> Arc<RunChild> {
         let pid = child.id();
         let (status_tx, status) = tokio::sync::watch::channel(None);
+        let (code_tx, code) = tokio::sync::watch::channel(None);
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let done = tokio::select! {
@@ -3367,11 +3617,17 @@ impl RunChild {
                     RunExit::Unknown
                 }
             };
+            let exit_code = match exit {
+                RunExit::Reaped(code) => code,
+                RunExit::Unknown => None,
+            };
+            let _ = code_tx.send(Some(exit_code));
             let _ = status_tx.send(Some(exit));
         });
         Arc::new(RunChild {
             pid,
             status,
+            code,
             kill: std::sync::Mutex::new(Some(kill_tx)),
         })
     }
@@ -6729,10 +6985,11 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
 
         // `cat` answers each line only once it has READ it, so a reply proves
         // the duplex is live, not a buffered one-shot.
-        let mut child = exec.spawn_duplex("cat").expect("spawn");
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        assert!(child.stderr.is_some(), "stderr is the caller's to read");
+        let duplex = exec.spawn_duplex("cat").await.expect("spawn");
+        let mut stdin = duplex.stdin;
+        let stdout = duplex.stdout;
+        let _stderr = duplex.stderr;
+        let exit = duplex.exit;
         let mut lines = tokio::io::BufReader::new(stdout).lines();
         for word in ["hello", "again"] {
             stdin
@@ -6747,14 +7004,11 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
                 .expect("a line");
             assert_eq!(line, word);
         }
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "still running"
-        );
-        let pid = child.id().expect("a pid");
+        assert!(!exit.done(), "still running");
+        let pid = exit.pid().expect("a pid");
         drop(stdin);
         drop(lines);
-        drop(child);
+        drop(exit);
         // Killed with its last handle — `kill(pid, 0)` failing (or the pid
         // being a zombie reaped by tokio's orphan queue) is what "gone" means
         // here; give the reaper a moment.
@@ -7140,8 +7394,8 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
     /// The refusal is kept typed inside the `io::Error` (a missing ssh binary is
     /// not mistaken for it), and its text is the refusal's own: the entry's name
     /// escaped, with no raw label (a newline, a terminal sequence) in front.
-    #[test]
-    fn an_exec_whose_key_is_gone_spawns_nothing() {
+    #[tokio::test]
+    async fn an_exec_whose_key_is_gone_spawns_nothing() {
         const NAME: &str = "roost:pop\nos\u{1b}[31m/p019-a";
         let dir = tempfile::tempdir().unwrap();
         let key = identity_file_in(dir.path());
@@ -7168,7 +7422,7 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
         );
         assert!(exec.argv("true").is_ok());
         // With the key there, the spawn fails for the missing ssh: no refusal.
-        let no_ssh = exec.spawn_duplex("true").unwrap_err();
+        let no_ssh = exec.spawn_duplex("true").await.unwrap_err();
         assert_eq!(
             shed_core::identityfile::refusal_in(&no_ssh),
             None,
@@ -7181,7 +7435,7 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
              the file does not exist"
         );
         assert_eq!(exec.argv("true").unwrap_err().to_string(), want);
-        let refused = exec.spawn_duplex("true").unwrap_err();
+        let refused = exec.spawn_duplex("true").await.unwrap_err();
         assert_eq!(
             refused.to_string(),
             want,
@@ -8312,6 +8566,7 @@ exit 0
         }
         let err = exec
             .spawn_duplex("craze bridge --hub")
+            .await
             .expect_err("a closed gate spawns no duplex");
         assert!(
             err.to_string().contains(crate::spawn_gate::SHUTTING_DOWN),
@@ -8578,7 +8833,10 @@ for arg in "$@"; do
     prev="$arg"
 done
 case "$op" in
-  exit) exec sleep 30 ;;
+  exit)
+    printf 'exit\n' >> "$ctl.exits"
+    exec sleep 30
+    ;;
   check)
     printf 'Master running (pid=%s)\r\n' "$(cat "$ctl.pid")" >&2
     exit 0
@@ -9013,6 +9271,139 @@ exit 0
         assert!(idle.shutdown().await);
     }
 
+    /// **Concurrent `shutdown` calls serialize and share one teardown**:
+    /// host-removal cleanup racing orderly app quit never runs overlapping
+    /// control commands, waits for the active pass instead of returning early,
+    /// and observes the finished pass's exact confirmation result.
+    #[tokio::test]
+    async fn concurrent_shutdown_calls_share_one_teardown_and_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 1. Confirmed slow `-O exit`: second caller arrives mid-teardown,
+        //    waits on `shutdown_lock`, runs zero extra `-O exit` commands, and
+        //    both observe `true`.
+        let log = dir.path().join("slow-exit.log");
+        let slow_ssh = write_staged_script(
+            dir.path(),
+            "slow-confirm-ssh",
+            format!(
+                r#"#!/bin/sh
+ctl=""
+op=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -S) ctl="$a" ;;
+    -O) op="$a" ;;
+  esac
+  prev="$a"
+done
+if [ -n "$op" ]; then
+  printf '%s\n' "$op" >> "{log}"
+  if [ "$op" = "exit" ]; then
+    sleep 0.3
+    rm -f "$ctl"
+    exit 0
+  fi
+  if [ "$op" = "check" ]; then
+    if [ -e "$ctl" ]; then
+      echo "Master running (pid=12345)" >&2
+      exit 0
+    fi
+    echo "Control socket connect($ctl): No such file or directory" >&2
+    exit 255
+  fi
+fi
+touch "$ctl"
+exit 0
+"#,
+                log = log.display()
+            ),
+        );
+        settle_exec(&slow_ssh, &["-O", "check"]);
+        let _ = std::fs::remove_file(&log);
+
+        let confirming = Arc::new(
+            SshExec::new(&entry("concurrent-confirm"), &exec_options(slow_ssh)).expect("exec"),
+        );
+        let outcome = first_exec(&confirming).await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        let first = tokio::spawn({
+            let exec = Arc::clone(&confirming);
+            async move { exec.shutdown().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !first.is_finished(),
+            "first shutdown must still hold the lock during slow -O exit"
+        );
+        let wait_started = std::time::Instant::now();
+        let second = confirming.shutdown().await;
+        let wait_elapsed = wait_started.elapsed();
+        let first = first.await.expect("first shutdown task");
+        assert!(first && second, "both callers must observe confirmed=true");
+        assert!(
+            wait_elapsed >= Duration::from_millis(150),
+            "second caller must wait for active pass rather than returning early (took {wait_elapsed:?})"
+        );
+        let ops: Vec<String> = std::fs::read_to_string(&log)
+            .expect("log")
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            ops.iter().filter(|op| op.as_str() == "exit").count(),
+            1,
+            "concurrent shutdowns must run exactly one -O exit, got {ops:?}"
+        );
+
+        // 2. Unconfirmed decoy: second caller arrives mid-teardown, waits for
+        //    the active pass to finish (does not return an early `false`), and
+        //    both observe `false`.
+        let ssh = write_decoy_ssh(dir.path());
+        let decoys = FakeMasters::default();
+        let exec = Arc::new(
+            SshExec::new(&entry("concurrent-shutdown"), &exec_options(ssh)).expect("exec"),
+        );
+        let _kept = decoys.arm(&exec);
+        let outcome = first_exec(&exec).await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        let first = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move { exec.shutdown().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !first.is_finished(),
+            "decoy shutdown must still be running when waiter arrives"
+        );
+        let wait_started = std::time::Instant::now();
+        let second = exec.shutdown().await;
+        let wait_elapsed = wait_started.elapsed();
+        let first = first.await.expect("first decoy shutdown task");
+        assert!(
+            !first && !second,
+            "both callers must observe the same unconfirmed result"
+        );
+        assert!(exec.exited.load(Ordering::SeqCst));
+        assert!(
+            wait_elapsed >= Duration::from_millis(500),
+            "second caller must wait for active decoy pass rather than timing out early (took {wait_elapsed:?})"
+        );
+        let decoy_exits = std::fs::read_to_string(format!("{}.exits", exec.ctl_path.display()))
+            .expect("decoy exits log");
+        assert_eq!(
+            decoy_exits.lines().count(),
+            2,
+            "one teardown (initial -O exit + retry) should run, never a second teardown: {decoy_exits:?}"
+        );
+    }
+
     /// **Only ssh's own "no master" answer is Gone; a check killed before it
     /// answers is UNCERTAIN, and the retry runs** (C3 round 5). The
     /// classification, over fake checks, then the shutdown path: a check that
@@ -9140,9 +9531,11 @@ exit 0
     #[tokio::test]
     async fn a_steps_exit_counts_only_once_published() {
         let (report, status) = tokio::sync::watch::channel(None);
+        let (_code_tx, code) = tokio::sync::watch::channel(None);
         let child = RunChild {
             pid: None,
             status,
+            code,
             kill: std::sync::Mutex::new(None),
         };
         drop(report);
@@ -9160,9 +9553,11 @@ exit 0
     #[tokio::test]
     async fn a_failed_wait_is_an_unknown_exit_not_a_seen_one() {
         let (report, status) = tokio::sync::watch::channel(None);
+        let (_code_tx, code) = tokio::sync::watch::channel(None);
         let child = RunChild {
             pid: Some(4242),
             status,
+            code,
             kill: std::sync::Mutex::new(None),
         };
         report.send(Some(RunExit::Unknown)).expect("a receiver");
@@ -9229,6 +9624,62 @@ exit 0
         assert!(
             !pid_exists(pid),
             "the cancelled step's child {pid} survived"
+        );
+    }
+
+    /// **Medium 1 teardown barrier**: once [`SshExec::shutdown`] has run on a
+    /// detached runner, a surviving `Arc<SshExec>` holder can no longer spawn
+    /// `ssh` via either `spawn_duplex` or `run` (cannot reopen a master after
+    /// cleanup confirmed).
+    #[tokio::test]
+    async fn an_ssh_exec_refuses_new_spawns_after_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("ssh.log");
+        let ssh = dir.path().join("recording-ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf 'ran\\n' >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .expect("write recording ssh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod recording ssh");
+        }
+        let exec =
+            Arc::new(SshExec::new(&entry("post-shutdown"), &exec_options(ssh)).expect("exec"));
+        assert!(exec.shutdown().await, "idle exec shutdown confirms");
+
+        let duplex_err = exec
+            .spawn_duplex("true")
+            .await
+            .expect_err("spawn_duplex must be refused after shutdown");
+        assert!(
+            duplex_err.to_string().contains("shutting_down"),
+            "unexpected duplex error: {duplex_err}"
+        );
+        let outcome = exec
+            .run("true", Stdin::Empty, Duration::from_secs(5), 1024, false)
+            .await;
+        match outcome {
+            Outcome::Exec {
+                exit, stderr_tail, ..
+            } => {
+                assert!(exit.is_none(), "no ssh child should run after shutdown");
+                assert!(
+                    stderr_tail.contains("shutting_down"),
+                    "unexpected run error: {stderr_tail}"
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert!(
+            !log.exists(),
+            "zero ssh processes may spawn after SshExec::shutdown"
         );
     }
 }
