@@ -259,13 +259,15 @@ func (r *Registry) notBoundLocked(user string) error {
 }
 
 // boundMachine is user's bound machine as the store remembers it (zero when
-// the user has no binding; only the id when the record is gone).
+// the user has no binding). The binding and the machine are read at one
+// moment (Bindings.Bound): a caller without the user's gate may race an
+// unbind, and must never see a binding without its machine.
 func boundMachine(b source.Bindings, user string) source.Machine {
-	bd, ok := b.Get(user)
+	_, m, ok := b.Bound(user)
 	if !ok {
 		return source.Machine{}
 	}
-	return knownMachine(b, user, bd.MachineID())
+	return m
 }
 
 // wouldWrite reports whether admitting m for user writes the store: the user
@@ -563,6 +565,64 @@ func (r *Registry) Move(ctx context.Context, user, machineID, by string) (MoveRe
 			forUser(user), mv.From.ID, mv.From.Name, mv.To.ID, mv.To.Name, by, closed, dropped)
 	}
 	return MoveResult{Move: mv, View: r.view(b, user)}, nil
+}
+
+// UnbindResult is what Unbind did.
+type UnbindResult struct {
+	// Unbound is false when the user had no binding: nothing changed.
+	Unbound bool
+	// Previous is the machine that was bound (zero when none was).
+	Previous source.Machine
+	// Forgotten is how many remembered machines went with the binding.
+	Forgotten int
+	// Closed and Dropped count the user's streams closed and requests
+	// dropped.
+	Closed, Dropped int
+}
+
+// Unbind clears user's binding (`shed source unbind`): the store forgets the
+// user's binding and the machines it remembers for the user (Bindings.Drop:
+// the store keeps no machines for a user without a binding), and then, still
+// under the user's gate, every listener and the delivery stream of the user
+// are closed and every request of the user is dropped, as a move closes the
+// old machine's. None of them is current any more, and a stale listener left
+// registered would hold its namespace against the next machine's subscribe.
+// A user with no binding changes nothing. by is the mover, logged.
+//
+// The user then has no source: a create asks none (delivery is
+// not_applicable) and the first machine of the user to connect next is bound,
+// as on a first start. A machine that was connected reconnects on its next
+// retry, so unless it has stopped it becomes the source again. ctx bounds the
+// wait for the gate. ErrNotPinned with no source bindings.
+func (r *Registry) Unbind(ctx context.Context, user, by string) (UnbindResult, error) {
+	b := r.pin()
+	if b == nil {
+		return UnbindResult{}, ErrNotPinned
+	}
+	g := r.gate(user)
+	if err := g.lock(ctx); err != nil {
+		return UnbindResult{}, err
+	}
+	defer g.unlock()
+
+	var res UnbindResult
+	if _, ok := b.Get(user); ok {
+		res.Previous = boundMachine(b, user)
+		res.Forgotten = len(b.Machines(user))
+	}
+	dropped, err := b.Drop(user)
+	if err != nil {
+		return UnbindResult{}, err
+	}
+	res.Unbound = dropped
+	if !dropped {
+		return UnbindResult{}, nil
+	}
+	res.Closed, res.Dropped = r.retainOnly(user, "", 0)
+	g.refused = nil
+	log.Printf("credential bus: the credential source%s (machine %s, %q) was cleared by %q; forgot %d machine(s), closed %d stream(s) and dropped %d request(s); the next machine to connect becomes the source",
+		forUser(user), res.Previous.ID, res.Previous.Name, by, res.Forgotten, res.Closed, res.Dropped)
+	return res, nil
 }
 
 // retainOnly closes every listener and the delivery stream of user not

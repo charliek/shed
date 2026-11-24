@@ -79,10 +79,10 @@ The server keeps one pin per user. It is set in one of two ways:
 - **On purpose, by moving it.** **Use this machine** in the app's Preferences, under
   **Provisioning**, or `shed source use` (the app's IPC op is `source.use`).
 
-**There is no unbind command.** A pin is moved to another of your machines; it is never
-cleared. The one way to discard every pin is for the operator to delete the server's
-`source-bindings.json` (below), after which the next machine to connect for each user is
-bound again.
+A pin can also be **cleared** with `shed source unbind` (see [Clearing the
+source](#clearing-the-source)); the next machine to connect is then bound, as the first one
+was. An operator can discard every user's pin at once by deleting the server's
+`source-bindings.json` (below).
 
 After that the server answers each connection as follows:
 
@@ -181,19 +181,48 @@ credential:
 | `500` | `INTERNAL_ERROR` | the move could not be confirmed; check `shed source ls` before retrying |
 | `503` | `SOURCE_BUSY` | (read only) the user's records were being changed or saved; carries `Retry-After` |
 
+## Clearing the source
+
+```bash
+shed source unbind                 # clear your source on the default server
+shed -s devbox source unbind --user bob   # an admin clears another user's
+```
+
+What an unbind does:
+
+1. The server forgets your pin **and every machine it remembers for you** (the store keeps no
+   machines for a user without a pin), so `shed source ls` is empty until a machine connects
+   again.
+2. It closes your machines' streams and fails every delivery request it had sent, as a move
+   does.
+3. Until a machine is bound again, you have no source: a create asks nothing and warns about
+   nothing, and its install hook runs as it would with no delivery (an offline pin, by
+   contrast, holds the hook back until `shed provision`).
+4. **The first of your machines to connect next becomes the source** (`first-connect`). A
+   desktop app that is still running reconnects within about 30 seconds, so its machine is
+   bound again. To leave no source, quit the app on your machines first; to choose another
+   machine, use `shed source use` instead.
+
+With no pin, nothing changes and the command says so. The route is `POST /api/sources/unbind`
+with `{}` (an admin may add `"user"`); it answers `200` with `unbound` (false when there was
+nothing to clear), the `previous` machine and `forgotten_machines`. It needs a control-scope
+credential, refuses a script key and a service client with `403`, and answers `500
+INTERNAL_ERROR` when the change could not be saved (check `shed source status` before
+retrying). A server older than v0.11 does not have it.
+
 ## Who may be or move a source
 
-- A user may move their own source from any of their keys that is not a script key; an
-  admin may also move another configured user's.
-- A **script key** cannot be a source or move one: its certificate is refused on a stream
-  and on both source routes, with `403 FORBIDDEN`.
+- A user may move or clear their own source from any of their keys that is not a script
+  key; an admin may also move or clear another configured user's.
+- A **script key** cannot be a source, move one or clear one: its certificate is refused on a
+  stream and on every source route, with `403 FORBIDDEN`.
 - A shed owned by a service client gets nothing from any source: no delivery request is made
   for it, and the bus is off.
 - With no bound machine, a create asks nothing and warns about nothing.
 
 ## Nothing fails over by itself
 
-The pin changes only when someone moves it. If the source is asleep, off the network or not
+The pin changes only when someone moves or clears it. If the source is asleep, off the network or not
 running the app, the server has no stream for that user: a create ends with the delivery
 failed as `source_offline` and the fixed warning, and the shed starts regardless. Another of
 the user's machines keeps reporting `not_bound` and does not take over. Move the source with

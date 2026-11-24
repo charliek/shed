@@ -24,7 +24,7 @@ var sourceUserFlag string
 
 var sourceCmd = &cobra.Command{
 	Use:   "source",
-	Short: "Show and move the machine that answers your credential requests",
+	Short: "Show, move and clear the machine that answers your credential requests",
 	Long: `A shed server sends your sheds' credential requests (SSH agent, Docker and
 AWS helpers) to one of your machines only: your credential source on that
 server. The first of your machines to connect becomes it; the others are
@@ -33,6 +33,7 @@ refused and keep retrying, naming the source.
   shed source status           Which machine is the source, and is it connected
   shed source ls               Every machine that has presented itself for you
   shed source use <machine>    Make another of your machines the source
+  shed source unbind           Clear the source: the next machine to connect becomes it
 
 Use -s/--server to pick the server. An admin can name another user with
 --user.`,
@@ -67,6 +68,28 @@ its desktop app next connects, within about 30 seconds
 	RunE: runSourceUse,
 }
 
+var sourceUnbindCmd = &cobra.Command{
+	Use:   "unbind",
+	Short: "Clear your credential source on this server",
+	Long: `Clear your credential source on this server, so that no machine is it.
+
+The server forgets the source and every machine it remembers for you, and
+closes your machines' credential streams. Until a machine is the source
+again, a create asks no machine for credentials and runs its install hook
+as it would with no source (a source that is offline holds the hook back
+until 'shed provision').
+
+The first of your machines to connect afterwards becomes the source, as on
+a first start. A desktop app that is running reconnects within about 30
+seconds, so its machine becomes the source again: quit the app on that
+machine first, or use 'shed source use' to pick another machine. Nothing
+changes when you have no source.`,
+	Example: `  shed source unbind
+  shed -s myserver source unbind --user bob`,
+	Args: cobra.NoArgs,
+	RunE: runSourceUnbind,
+}
+
 var sourceStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show which machine is the credential source, and whether it is connected",
@@ -77,7 +100,7 @@ var sourceStatusCmd = &cobra.Command{
 func init() {
 	sourceCmd.PersistentFlags().StringVar(&sourceUserFlag, "user", "", "Another user's credential source (admin)")
 	sourceCmd.SetFlagErrorFunc(sourceFlagError)
-	sourceCmd.AddCommand(sourceLsCmd, sourceUseCmd, sourceStatusCmd)
+	sourceCmd.AddCommand(sourceLsCmd, sourceUseCmd, sourceUnbindCmd, sourceStatusCmd)
 	rootCmd.AddCommand(sourceCmd)
 }
 
@@ -221,6 +244,49 @@ func runSourceUse(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintln(w, "The new source answers once its desktop app next connects, within about 30 s.")
 	return nil
+}
+
+func runSourceUnbind(cmd *cobra.Command, args []string) error {
+	client, server, err := sourceClient()
+	if err != nil {
+		return err
+	}
+	resp, err := client.UnbindSource(sourceUserFlag)
+	if err != nil {
+		if errors.Is(err, errSourcesUnsupported) {
+			return fmt.Errorf("server %s does not support clearing a credential source (it needs shed-server 0.11.0 or newer)", server)
+		}
+		return sourceError("clear the credential source", server, err)
+	}
+	if jsonFlag {
+		return writeTermJSON(cmd.OutOrStdout(), resp)
+	}
+	renderSourceUnbind(cmd.OutOrStdout(), server, *resp)
+	return nil
+}
+
+// renderSourceUnbind says what an unbind did, and what happens next.
+func renderSourceUnbind(w io.Writer, server string, resp config.SourceUnbindResponse) {
+	if !resp.Unbound {
+		fmt.Fprintf(w, "No credential source for %s on %s: nothing changed.\n", sourceWho(), server)
+		return
+	}
+	prev := config.SourceMachine{}
+	if resp.Previous != nil {
+		prev = config.SourceMachine{ID: resp.Previous.ID, Name: resp.Previous.Name}
+	}
+	fmt.Fprintf(w, "Cleared the credential source for %s on %s (it was machine %s).\n", sourceWho(), server, sourceMachineLabel(prev))
+	switch n := resp.ForgottenMachines; {
+	case n == 1:
+		fmt.Fprintln(w, "Forgot 1 machine; it is listed again when it next connects.")
+	case n > 1:
+		fmt.Fprintf(w, "Forgot %d machines; each is listed again when it next connects.\n", n)
+	}
+	whose := "your"
+	if sourceUserFlag != "" {
+		whose = "user " + sourceUserFlag + "'s"
+	}
+	fmt.Fprintf(w, "The first of %s machines to connect next becomes the source: a desktop app that is still running reconnects within about 30 s, and its machine becomes the source again.\n", whose)
 }
 
 // sourceMatch is a machine arg matched, and every way it matched.
@@ -376,10 +442,15 @@ func renderSourceStatus(w io.Writer, server string, resp config.SourcesResponse)
 	if !ok {
 		m = config.SourceMachine{ID: id}
 	}
-	if m.Connected {
+	switch {
+	case m.Connected && len(m.Namespaces) == 0:
+		// Connected with its delivery stream only: no bus namespaces.
+		fmt.Fprintf(w, "Credential source for %s on %s: %s, connected.\n",
+			sourceWho(), server, sourceMachineLabel(m))
+	case m.Connected:
 		fmt.Fprintf(w, "Credential source for %s on %s: %s, connected (%s).\n",
 			sourceWho(), server, sourceMachineLabel(m), termSafe(strings.Join(m.Namespaces, ", ")))
-	} else {
+	default:
 		fmt.Fprintf(w, "Credential source for %s on %s: %s, not connected: credential requests get no answer until it reconnects.\n",
 			sourceWho(), server, sourceMachineLabel(m))
 	}

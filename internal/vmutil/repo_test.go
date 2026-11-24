@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/charliek/shed/internal/agentproto"
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -175,5 +176,45 @@ func TestCloneRepoKeepsNoOutput(t *testing.T) {
 	if after > before.HeapAlloc && after-before.HeapAlloc > allowed {
 		t.Fatalf("the heap grew by %d MiB while the guest printed %d MiB; want under %d MiB",
 			(after-before.HeapAlloc)>>20, (chunk*chunks)>>20, allowed>>20)
+	}
+}
+
+// TestCloneStepShowsOneStatusLine: a clone step as every backend runs it
+// (its own "Cloning repository..." and then CloneStep over CloneRepo) shows
+// that line once: CloneRepo adds no status of its own.
+func TestCloneStepShowsOneStatusLine(t *testing.T) {
+	dialer := &pipeDialer{handler: func(conn net.Conn) {
+		defer conn.Close()
+		msgType, data, err := agentproto.ReadMessage(conn)
+		if err != nil || msgType != agentproto.MsgTypeExecRequest {
+			return
+		}
+		var req agentproto.ExecRequest
+		_ = json.Unmarshal(data, &req)
+		_, _, _ = agentproto.ReadMessage(conn) // stdin EOF
+		// The probe of the project directory finds nothing there; the
+		// clone succeeds.
+		_ = agentproto.WriteExitCode(conn, 0)
+	}}
+	agent := NewAgentClient(dialer, 1024, 1026)
+	var messages []string
+	ctx := backend.ContextWithProgress(context.Background(), func(ev backend.ProgressEvent) {
+		if ev.Message != "" {
+			messages = append(messages, ev.Message)
+		}
+	})
+	repo := "https://github.com/example/repo.git"
+	backend.Status(ctx, "Cloning repository...")
+	CloneStepWith(ctx, func(context.Context) (WorkTree, error) { return WorkTreeAbsent, nil }, repo, func(ctx context.Context) error {
+		return CloneRepo(ctx, agent, &config.ServerConfig{}, repo, true, nil)
+	})
+	n := 0
+	for _, m := range messages {
+		if m == "Cloning repository..." {
+			n++
+		}
+	}
+	if n != 1 || !slices.Contains(messages, "Repository cloned") {
+		t.Fatalf("status lines = %q, want \"Cloning repository...\" once, then \"Repository cloned\"", messages)
 	}
 }

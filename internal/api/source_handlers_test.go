@@ -22,7 +22,8 @@ import (
 	"github.com/charliek/shed/internal/users/userstest"
 )
 
-// The credential source routes, GET /api/sources and POST /api/sources/use,
+// The credential source routes, GET /api/sources, POST /api/sources/use and
+// POST /api/sources/unbind,
 // driven with the users of userLookup (alice and bob, and root, an admin),
 // plus two more keys of alice's: a labelled one and a script key.
 
@@ -56,6 +57,32 @@ func getSources(h http.Handler, fp, query string) apiResp {
 // useSource is POST /api/sources/use as fp with body.
 func useSource(h http.Handler, fp, body string) apiResp {
 	return doAs(h, fp, http.MethodPost, "/api/sources/use", body)
+}
+
+// unbindSource is POST /api/sources/unbind as fp with body.
+func unbindSource(h http.Handler, fp, body string) apiResp {
+	return doAs(h, fp, http.MethodPost, "/api/sources/unbind", body)
+}
+
+// unbindBody is an unbind body, for user when named.
+func unbindBody(user string) string {
+	if user == "" {
+		return "{}"
+	}
+	return fmt.Sprintf(`{"user":%q}`, user)
+}
+
+// unbound decodes an unbind's answer; it fails the test on anything but 200.
+func unbound(t *testing.T, what string, r apiResp) config.SourceUnbindResponse {
+	t.Helper()
+	if r.code != http.StatusOK {
+		t.Fatalf("%s = %d %s, want 200", what, r.code, r.body)
+	}
+	var resp config.SourceUnbindResponse
+	if err := json.Unmarshal(r.body, &resp); err != nil {
+		t.Fatalf("%s: %v: %s", what, err, r.body)
+	}
+	return resp
 }
 
 // useBody is a move body to id, for user when named.
@@ -477,6 +504,10 @@ func TestSourcesScriptKeyRefused(t *testing.T) {
 		useSource(router, rootScriptFP, useBody(aliceB.ID, "")),
 		useSource(router, rootScriptFP, useBody(aliceB.ID, "root")),
 		useSource(router, rootScriptFP, useBody(aliceB.ID, "alice")),
+		unbindSource(router, aliceScriptFP, unbindBody("")),
+		unbindSource(router, aliceScriptFP, unbindBody("alice")),
+		unbindSource(router, rootScriptFP, unbindBody("")),
+		unbindSource(router, rootScriptFP, unbindBody("alice")),
 	} {
 		if r.code != http.StatusForbidden || r.errCode(t) != config.ErrForbidden || !strings.Contains(r.errMessage(t), "script key") {
 			t.Fatalf("script key = %d %s, want 403 naming the script key", r.code, r.body)
@@ -506,7 +537,8 @@ func TestSourcesNeedTheControlScope(t *testing.T) {
 		for _, named := range sourceTargets {
 			rs = append(rs,
 				do(router, credsAs(fp), http.MethodGet, "/api/sources?user="+url.QueryEscape(named), ""),
-				do(router, credsAs(fp), http.MethodPost, "/api/sources/use", useBody(aliceB.ID, named)))
+				do(router, credsAs(fp), http.MethodPost, "/api/sources/use", useBody(aliceB.ID, named)),
+				do(router, credsAs(fp), http.MethodPost, "/api/sources/unbind", unbindBody(named)))
 		}
 	}
 	for _, r := range rs {
@@ -546,6 +578,7 @@ func TestSourcesRefuseCallersThatAreNotUsers(t *testing.T) {
 			}{
 				{http.MethodGet, "/api/sources?user=" + url.QueryEscape(named), "", s.handleListSources},
 				{http.MethodPost, "/api/sources/use", useBody(aliceB.ID, named), s.handleUseSource},
+				{http.MethodPost, "/api/sources/unbind", unbindBody(named), s.handleUnbindSource},
 			} {
 				req := httptest.NewRequest(h.method, h.target, strings.NewReader(h.body)).WithContext(ctx)
 				rec := httptest.NewRecorder()
@@ -560,6 +593,7 @@ func TestSourcesRefuseCallersThatAreNotUsers(t *testing.T) {
 		for _, r := range []apiResp{
 			do(router, serviceLeaf(testClientName), http.MethodGet, "/api/sources?user="+url.QueryEscape(named), ""),
 			do(router, serviceLeaf(testClientName), http.MethodPost, "/api/sources/use", useBody(aliceB.ID, named)),
+			do(router, serviceLeaf(testClientName), http.MethodPost, "/api/sources/unbind", unbindBody(named)),
 		} {
 			if r.code != http.StatusForbidden || strings.Contains(string(r.body), aliceA.ID) {
 				t.Errorf("service client through the router naming %q = %d %s, want 403 and nothing of alice's", named, r.code, r.body)
@@ -631,10 +665,132 @@ func TestSourcesNoBindings(t *testing.T) {
 	for _, r := range []apiResp{
 		do(s.Router(), nil, http.MethodGet, "/api/sources", ""),
 		do(s.Router(), nil, http.MethodPost, "/api/sources/use", useBody(aliceA.ID, "")),
+		do(s.Router(), nil, http.MethodPost, "/api/sources/unbind", ""),
 	} {
 		if r.code != http.StatusServiceUnavailable {
 			t.Fatalf("no bindings = %d %s, want 503", r.code, r.body)
 		}
+	}
+}
+
+// TestSourcesUnbind: a user clears their own credential source. The store
+// forgets the binding and the remembered machines, the user's streams are
+// closed, and the next machine to connect is bound (first-connect). A second
+// unbind is answered that nothing changed. Another user's binding is
+// untouched.
+func TestSourcesUnbind(t *testing.T) {
+	s, router, _ := sourcesServer(t)
+	l := subscribeAs(t, s, "alice", "ssh-agent", aliceA)
+	present(t, s, "alice", aliceB)
+	bobM := testMachineFor(bobFP)
+	bobL := subscribeAs(t, s, "bob", "ssh-agent", bobM)
+
+	resp := unbound(t, "alice's unbind", unbindSource(router, aliceFP, unbindBody("")))
+	if resp.User != "alice" || !resp.Unbound || resp.Previous == nil || resp.Previous.ID != aliceA.ID || resp.Previous.Name != aliceA.Name || resp.ForgottenMachines != 2 {
+		t.Fatalf("unbind = %+v", resp)
+	}
+	if _, ok := s.plugins.Bindings().Get("alice"); ok {
+		t.Fatal("the unbind left alice's binding")
+	}
+	if !closed(l.Done) {
+		t.Fatal("the unbind left the old source's stream open")
+	}
+	if view := sources(t, "after the unbind", getSources(router, aliceFP, "")); view.Binding != nil || len(view.Machines) != 0 {
+		t.Fatalf("sources after the unbind = %+v", view)
+	}
+	if _, ok := s.plugins.DeliveryBound("alice"); ok {
+		t.Fatal("delivery still finds a bound machine: a create would ask an offline source")
+	}
+	if closed(bobL.Done) || mustBinding(t, s, "bob").MachineID() != bobM.ID {
+		t.Fatal("alice's unbind touched bob's source")
+	}
+
+	// Idempotent: nothing to clear is a success that says so. No body at
+	// all is the caller's own.
+	again := unbound(t, "a second unbind", unbindSource(router, aliceFP, ""))
+	if again.Unbound || again.Previous != nil || again.ForgottenMachines != 0 {
+		t.Fatalf("second unbind = %+v", again)
+	}
+	if !strings.Contains(string(unbindSource(router, aliceFP, "{}").body), `"previous":null`) {
+		t.Fatal("an unbind with nothing to clear does not answer previous: null")
+	}
+
+	// The next machine to connect is bound, by first connect, whichever it is.
+	subscribeAs(t, s, "alice", "ssh-agent", aliceB)
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceB.ID || bd.BoundBy != source.BoundByFirstConnect {
+		t.Fatalf("binding after the next connect = %+v", bd)
+	}
+}
+
+// TestSourcesUnbindRefusals: a malformed body is 400 and changes nothing; a
+// user naming another is 403; an admin naming a user who is not configured
+// is 400; an admin naming alice clears hers, recorded as the admin's.
+func TestSourcesUnbindRefusals(t *testing.T) {
+	s, router, _ := sourcesServer(t)
+	subscribeAs(t, s, "alice", "ssh-agent", aliceA)
+	for _, body := range []string{
+		`[]`, `"alice"`, `{"user":"alice","user":"alice"}`, `{"User":"alice"}`, `{"machine_id":"x"}`,
+		`{"user":1}`, `{} {}`, `{`,
+	} {
+		r := unbindSource(router, aliceFP, body)
+		if r.code != http.StatusBadRequest || r.errCode(t) != config.ErrInvalidRequest {
+			t.Errorf("body %s = %d %s, want 400", body, r.code, r.body)
+		}
+	}
+	for _, named := range []string{"alice", "ghost"} {
+		if r := unbindSource(router, bobFP, unbindBody(named)); r.code != http.StatusForbidden || r.errCode(t) != config.ErrForbidden {
+			t.Errorf("bob naming %s = %d %s, want 403", named, r.code, r.body)
+		}
+	}
+	if r := unbindSource(router, rootFP, unbindBody("ghost")); r.code != http.StatusBadRequest || r.errCode(t) != config.ErrInvalidRequest {
+		t.Errorf("admin naming ghost = %d %s, want 400", r.code, r.body)
+	}
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceA.ID {
+		t.Fatalf("a refused unbind changed alice's binding: %+v", bd)
+	}
+	resp := unbound(t, "the admin's unbind of alice", unbindSource(router, rootFP, unbindBody("alice")))
+	if resp.User != "alice" || !resp.Unbound || resp.Previous == nil || resp.Previous.ID != aliceA.ID {
+		t.Fatalf("admin unbind = %+v", resp)
+	}
+	if _, ok := s.plugins.Bindings().Get("alice"); ok {
+		t.Fatal("the admin's unbind left alice's binding")
+	}
+}
+
+// TestSourcesUnbindStoreFailure: an unbind whose save fails is 500, clears
+// nothing and closes nothing.
+func TestSourcesUnbindStoreFailure(t *testing.T) {
+	s, router, b := sourcesServer(t)
+	l := subscribeAs(t, s, "alice", "ssh-agent", aliceA)
+	b.FailWrites(errors.New("disk full"))
+	r := unbindSource(router, aliceFP, unbindBody(""))
+	if r.code != http.StatusInternalServerError || r.errCode(t) != config.ErrInternalError || !strings.Contains(r.errMessage(t), "not confirmed") {
+		t.Fatalf("unbind with a failing store = %d %s, want 500", r.code, r.body)
+	}
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceA.ID {
+		t.Fatalf("a failed unbind changed the binding: %+v", bd)
+	}
+	if closed(l.Done) {
+		t.Fatal("a failed unbind closed the bound machine's stream")
+	}
+	b.FailWrites(nil)
+	if !unbound(t, "the unbind once saves work", unbindSource(router, aliceFP, unbindBody(""))).Unbound {
+		t.Fatal("the unbind did not clear the binding once saves worked")
+	}
+}
+
+// TestSourcesUnbindImplicitUser: on a server with no user list the implicit
+// user clears its own binding; there is no other user to name.
+func TestSourcesUnbindImplicitUser(t *testing.T) {
+	s := newTestServerWithPlugins()
+	router := s.Router()
+	subscribeAs(t, s, "", "ssh-agent", testMachineFor(""))
+	if r := do(router, nil, http.MethodPost, "/api/sources/unbind", unbindBody("alice")); r.code != http.StatusBadRequest {
+		t.Fatalf("implicit user naming alice = %d %s, want 400 (no user list)", r.code, r.body)
+	}
+	resp := unbound(t, "implicit unbind", do(router, nil, http.MethodPost, "/api/sources/unbind", ""))
+	if resp.User != "" || !resp.Unbound || resp.Previous == nil || resp.Previous.ID != testMachineFor("").ID {
+		t.Fatalf("implicit unbind = %+v", resp)
 	}
 }
 

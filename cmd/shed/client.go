@@ -1826,6 +1826,18 @@ func (c *APIClient) UseSource(machineID, user string) (*config.SourcesResponse, 
 	return &resp, nil
 }
 
+// UnbindSource clears the credential source of the caller, or of user when
+// user is set (admin only) (POST /api/sources/unbind). A user with no source
+// is answered with Unbound false.
+func (c *APIClient) UnbindSource(user string) (*config.SourceUnbindResponse, error) {
+	var resp config.SourceUnbindResponse
+	req := config.SourceUnbindRequest{User: user}
+	if err := c.doSourcesRequest(http.MethodPost, "/api/sources/unbind", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // doSourcesRequest is doRequest for the credential source routes, which also
 // tells a server without them (errSourcesUnsupported) from a 404 the routes
 // answer themselves (SOURCE_MACHINE_NOT_FOUND).

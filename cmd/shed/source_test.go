@@ -18,7 +18,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// `shed source ls|use|status` against an httptest server, driven through
+// `shed source ls|use|unbind|status` against an httptest server, driven through
 // cobra's own argument parsing (rootCmd.Execute), as a shell would.
 
 var (
@@ -52,6 +52,7 @@ type fakeSourcesServer struct {
 	useErr    config.APIError
 	queries   []string
 	uses      []map[string]any
+	unbinds   []map[string]any
 	// beforeUse, when set, runs as a POST arrives, before it moves (with the
 	// fake's lock held): another client's move that lands between the CLI's
 	// list and its move.
@@ -104,6 +105,23 @@ func (f *fakeSourcesServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.resp.Binding.BoundBy = "user alice with key SHA256:x"
 		}
 		_ = json.NewEncoder(w).Encode(f.resp)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/sources/unbind":
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.unbinds = append(f.unbinds, body)
+		// As the server does: the binding and the machines go; nothing to
+		// clear is answered unbound false.
+		resp := config.SourceUnbindResponse{User: f.resp.User}
+		if u, _ := body["user"].(string); u != "" {
+			resp.User = u
+		}
+		if id := f.resp.Binding.MachineID(); id != "" {
+			resp.Unbound, resp.ForgottenMachines = true, len(f.resp.Machines)
+			prev, _ := findSourceMachine(f.resp.Machines, id)
+			resp.Previous = &config.SourceMachineRef{ID: id, Name: prev.Name}
+			f.resp.Binding, f.resp.Machines = nil, []config.SourceMachine{}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	default:
 		http.NotFound(w, r)
 	}
@@ -113,6 +131,12 @@ func (f *fakeSourcesServer) usesSnapshot() []map[string]any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]map[string]any(nil), f.uses...)
+}
+
+func (f *fakeSourcesServer) unbindsSnapshot() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.unbinds...)
 }
 
 func (f *fakeSourcesServer) queriesSnapshot() []string {
@@ -308,6 +332,15 @@ func TestSourceStatus(t *testing.T) {
 		t.Fatalf("disconnected status = %q, %v", out, err)
 	}
 
+	// Connected with no bus namespaces (its delivery stream only): no empty
+	// parentheses.
+	f.resp.Machines[1].Connected = true
+	out, err = runShed(t, "source", "status")
+	if err != nil || !strings.Contains(out, "\"Zo\u00eb\u2019s desk\" (b1b1b1b1), connected.\n") || strings.Contains(out, "()") {
+		t.Fatalf("connected status with no namespaces = %q, %v", out, err)
+	}
+	f.resp.Machines[1].Connected = false
+
 	f.resp.Binding = nil
 	out, err = runShed(t, "source", "status")
 	if err != nil {
@@ -377,6 +410,72 @@ func TestSourceOlderServer(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "server srv does not support credential sources") {
 			t.Errorf("%v against an older server = %v", args, err)
 		}
+	}
+	if _, err := runShed(t, "source", "unbind"); err == nil || !strings.Contains(err.Error(), "server srv does not support clearing a credential source (it needs shed-server 0.11.0 or newer)") {
+		t.Errorf("unbind against an older server = %v", err)
+	}
+}
+
+// TestSourceUnbind: the unbind says what it cleared and what happens next;
+// a second one says nothing changed; --json prints the answer; --user is
+// sent in the body.
+func TestSourceUnbind(t *testing.T) {
+	f := sourcesRig(t, srcLaptop, srcDesk)
+	f.resp.Binding = srcBinding(srcLaptop.ID)
+
+	out, err := runShed(t, "source", "unbind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`Cleared the credential source for you on srv (it was machine "laptop" (9a60b039)).`,
+		"Forgot 2 machines; each is listed again when it next connects.",
+		"The first of your machines to connect next becomes the source",
+		"reconnects within about 30 s, and its machine becomes the source again.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("unbind output lacks %q:\n%s", want, out)
+		}
+	}
+	if u := f.unbindsSnapshot(); len(u) != 1 || len(u[0]) != 0 {
+		t.Fatalf("unbind posted %v, want an empty object", u)
+	}
+
+	out, err = runShed(t, "source", "unbind")
+	if err != nil || out != "No credential source for you on srv: nothing changed.\n" {
+		t.Fatalf("second unbind = %q, %v", out, err)
+	}
+
+	f.resp.Binding, f.resp.Machines = srcBinding(srcDesk.ID), []config.SourceMachine{srcDesk}
+	out, err = runShed(t, "source", "unbind", "--user", "bob", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got config.SourceUnbindResponse
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--json is not JSON: %v\n%s", err, out)
+	}
+	if got.User != "bob" || !got.Unbound || got.Previous == nil || got.Previous.ID != srcDesk.ID || got.Previous.Name != srcDesk.Name || got.ForgottenMachines != 1 {
+		t.Fatalf("--json = %+v", got)
+	}
+	if u := f.unbindsSnapshot(); len(u) != 3 || u[2]["user"] != "bob" {
+		t.Fatalf("unbind --user posted %v", u)
+	}
+
+	f.resp.Binding, f.resp.Machines = srcBinding(srcDesk.ID), []config.SourceMachine{srcDesk}
+	if out, err = runShed(t, "source", "unbind", "--user", "bob"); err != nil ||
+		!strings.Contains(out, "Cleared the credential source for user bob on srv") || !strings.Contains(out, "Forgot 1 machine; it is listed again") ||
+		!strings.Contains(out, "The first of user bob's machines to connect next") {
+		t.Fatalf("unbind --user = %q, %v", out, err)
+	}
+
+	if _, err := runShed(t, "source", "unbind", "extra"); err == nil {
+		t.Fatal("unbind took an argument")
+	}
+	f.refuseStatus = http.StatusForbidden
+	f.refuse = config.NewAPIError(config.ErrForbidden, "only an admin can see or move another user's credential source")
+	if _, err := runShed(t, "source", "unbind", "--user", "bob"); err == nil || err.Error() != "clear the credential source on srv: FORBIDDEN: only an admin can see or move another user's credential source" {
+		t.Fatalf("403 = %v", err)
 	}
 }
 

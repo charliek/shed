@@ -191,6 +191,21 @@ func (s *Store) Get(user string) (Binding, bool) {
 	return u.binding.clone(), true
 }
 
+// Bound implements Bindings: the binding and the bound machine from one
+// snapshot. The bound machine is never evicted, so a valid store always
+// remembers it; were it missing the user is reported as not bound.
+func (s *Store) Bound(user string) (Binding, Machine, bool) {
+	u := s.cur.Load().users[user]
+	if u == nil || u.binding == nil {
+		return Binding{}, Machine{}, false
+	}
+	m, ok := u.machines[u.binding.MachineID()]
+	if !ok {
+		return Binding{}, Machine{}, false
+	}
+	return u.binding.clone(), m, true
+}
+
 // Machines implements Bindings.
 func (s *Store) Machines(user string) []Machine {
 	u := s.cur.Load().users[user]

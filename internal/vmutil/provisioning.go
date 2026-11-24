@@ -27,8 +27,11 @@ type Provisioner struct {
 	shedName string
 	workDir  string
 	addDirs  []string
-	output   io.Writer
-	errOut   io.Writer
+	// noMountLag: the landing directory is never a host mount that may not
+	// be serving yet (SetNoMountLag), so LoadConfig does not wait for one.
+	noMountLag bool
+	output     io.Writer
+	errOut     io.Writer
 }
 
 // NewProvisioner creates a new Provisioner. The working directory defaults to
@@ -57,6 +60,15 @@ func (p *Provisioner) SetWorkDir(dir string) {
 // see them via SHED_ADD_DIRS (colon-separated), matching the session env.
 func (p *Provisioner) SetAddDirs(dirs []string) {
 	p.addDirs = dirs
+}
+
+// SetNoMountLag says the shed's landing directory is never a host mount
+// that may not be serving yet (the remote backend: the project directory is
+// on the VM's own disk). LoadConfig then takes a missing or empty
+// .shed/provision.yaml as no config at once, instead of retrying it as a
+// mount that has not settled; an agent error is still retried.
+func (p *Provisioner) SetNoMountLag() {
+	p.noMountLag = true
 }
 
 // SetOutput sets the output writers for streaming hook output.
@@ -111,6 +123,10 @@ func configParseError(err error) error {
 	return fmt.Errorf("%w, at line %d", ErrProvisionConfigInvalid, line)
 }
 
+// errNoMountToWait marks a probe that found the landing directory empty or
+// unreadable on a shed with no mount to wait for: not retried.
+var errNoMountToWait = errors.New("the landing directory is empty or unreadable")
+
 // errProvisionConfigNotReady marks a read that succeeded but returned no content
 // on a project mount — treated as coherence lag and retried.
 var errProvisionConfigNotReady = errors.New("provision config not ready (empty read on project mount)")
@@ -140,15 +156,19 @@ const loadConfigProbe = `if out=$(cat "$1" 2>/dev/null); then printf '%s' "$out"
 // is terminal, so sheds without provisioning pay no latency. A project landing
 // dir (--local-dir / --repo) keeps retrying a "no config" result, since it may
 // be a mount that hasn't settled; if it stays absent the retries drain and we
-// conclude there genuinely is no config.
+// conclude there genuinely is no config. A shed whose landing dir is never a
+// mount (SetNoMountLag: the remote backend) does not wait for one: there a
+// "no config" is terminal on a project dir too, and only an agent error is
+// retried.
 func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error) {
 	configPath := filepath.Join(p.workDir, provision.ShedProvisionYAML)
-	projectDir := p.workDir != config.HomePath
+	// projectDir: the landing dir may be a mount that has not settled.
+	projectDir := p.workDir != config.HomePath && !p.noMountLag
 
 	var content string
 	lastCode := -1
 	retryable := func(err error) bool {
-		return !errors.Is(err, errGuestReadTooLarge) && retry.DefaultIsRetryable(err)
+		return !errors.Is(err, errGuestReadTooLarge) && !errors.Is(err, errNoMountToWait) && retry.DefaultIsRetryable(err)
 	}
 	readErr := retry.Do(ctx, "read provision config", provisionReadBackoffs, retryable, func() error {
 		// Bounded: the guest decides what the config path holds, and a read
@@ -191,6 +211,10 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 		// fast. On a project landing dir it may be an unsettled mount, so retry.
 		if lastCode == 66 && !projectDir {
 			return nil
+		}
+		// With no mount to wait for, an empty landing dir stays empty.
+		if lastCode == 75 && p.noMountLag {
+			return fmt.Errorf("%w: %w", errNoMountToWait, err)
 		}
 		return err
 	})

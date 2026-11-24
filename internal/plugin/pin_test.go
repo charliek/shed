@@ -9,9 +9,11 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/source/fake"
 )
@@ -1330,5 +1332,183 @@ func TestPinSourcesWaitEndsWithItsContext(t *testing.T) {
 	}
 	if _, err := NewRegistry().Sources(context.Background(), "alice"); !errors.Is(err, ErrNotPinned) {
 		t.Fatalf("Sources with no bindings = %v", err)
+	}
+}
+
+// TestPinUnbind: Unbind drops the user's records, closes every stream of the
+// user (listeners and the delivery stream) and drops their requests, and
+// leaves another user's alone. The next machine to subscribe is bound, at a
+// generation that never was the user's, so nothing stamped before the
+// unbind can be answered. A user with no binding changes nothing.
+func TestPinUnbind(t *testing.T) {
+	reg, br, b := pinned(t)
+	var written []*Envelope
+	var mu sync.Mutex
+	boxGen := boxShed(br, "box", "alice", &written, &mu)
+	bobsGen := boxShed(br, "bobs", "bob", &written, &mu)
+	aliceL := sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+	aliceD := subD(t, reg, "alice", mach(1))
+	bobL := sub(t, reg, uk("bob", "ssh-agent"), mach(9))
+	if _, err := reg.Subscribe(context.Background(), uk("alice", "ssh-agent"), mach(2)); err == nil {
+		t.Fatal("test set-up")
+	}
+	oldGen := mustGet(t, b, "alice").Generation
+	req := publish(t, br, "box", boxGen, "")
+	recv(t, aliceL)
+	publish(t, br, "bobs", bobsGen, "")
+	recv(t, bobL)
+
+	res, err := reg.Unbind(context.Background(), "alice", "SHA256:mover")
+	if err != nil || !res.Unbound || res.Previous.ID != mach(1).ID || res.Previous.Name != mach(1).Name || res.Forgotten != 2 || res.Closed != 2 || res.Dropped != 1 {
+		t.Fatalf("Unbind = %+v, %v", res, err)
+	}
+	if _, ok := b.Get("alice"); ok || len(b.Machines("alice")) != 0 {
+		t.Fatal("the unbind left alice's records")
+	}
+	if !isClosed(aliceL) || !dClosed(aliceD) {
+		t.Fatal("the unbind left alice's streams open")
+	}
+	if _, ok := reg.Get(uk("alice", "ssh-agent")); ok {
+		t.Fatal("the old listener is still registered")
+	}
+	if pendingOf(reg, "alice") != 0 {
+		t.Fatal("alice's requests were kept")
+	}
+	if _, ok := reg.DeliveryBound("alice"); ok {
+		t.Fatal("delivery still finds a bound machine")
+	}
+	if isClosed(bobL) || pendingOf(reg, "bob") != 1 {
+		t.Fatal("alice's unbind touched bob's listener or requests")
+	}
+
+	// Nothing to clear: no change, no error.
+	if res, err := reg.Unbind(context.Background(), "alice", "me"); err != nil || res.Unbound || res.Previous.ID != "" {
+		t.Fatalf("second Unbind = %+v, %v", res, err)
+	}
+
+	// The next machine to connect is bound, the old one's request is not
+	// answerable from it.
+	l := sub(t, reg, uk("alice", "ssh-agent"), mach(2))
+	bd := mustGet(t, b, "alice")
+	if bd.MachineID() != mach(2).ID || bd.BoundBy != source.BoundByFirstConnect || bd.Generation <= oldGen {
+		t.Fatalf("binding after the next connect = %+v (was generation %d)", bd, oldGen)
+	}
+	if err := respondFrom(br, "alice", mach(2).ID, answer("ssh-agent", "box", req.ID)); err == nil {
+		t.Fatal("a request from before the unbind was answered")
+	}
+	if isClosed(l) {
+		t.Fatal("test: the new listener closed")
+	}
+}
+
+// TestPinUnbindStoreFailureChangesNothing: an unbind whose save fails keeps
+// the binding and every stream.
+func TestPinUnbindStoreFailureChangesNothing(t *testing.T) {
+	reg, _, b := pinned(t)
+	l := sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+	b.FailWrites(errors.New("disk full"))
+	if _, err := reg.Unbind(context.Background(), "alice", "me"); err == nil {
+		t.Fatal("an unbind whose store write failed succeeded")
+	}
+	b.FailWrites(nil)
+	if bd := mustGet(t, b, "alice"); bd.MachineID() != mach(1).ID || isClosed(l) {
+		t.Fatalf("a failed unbind changed the binding or closed the stream: %+v", bd)
+	}
+	if _, err := NewRegistry().Unbind(context.Background(), "alice", "me"); !errors.Is(err, ErrNotPinned) {
+		t.Fatalf("Unbind with no bindings = %v, want ErrNotPinned", err)
+	}
+}
+
+// mustGet is user's binding in b (fails without one).
+func mustGet(t *testing.T, b source.Bindings, user string) source.Binding {
+	t.Helper()
+	bd, ok := b.Get(user)
+	if !ok {
+		t.Fatalf("%s has no binding", user)
+	}
+	return bd
+}
+
+// dropAfterRead is a store whose user's records are dropped (as an unbind
+// does) right after the first read once armed: an unbind landing between
+// two reads of a reader that does not hold the user's gate.
+type dropAfterRead struct {
+	*fake.Bindings
+	user  string
+	armed atomic.Bool
+}
+
+func (d *dropAfterRead) after() {
+	if d.armed.CompareAndSwap(true, false) {
+		if _, err := d.Drop(d.user); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (d *dropAfterRead) Get(user string) (source.Binding, bool) {
+	bd, ok := d.Bindings.Get(user)
+	d.after()
+	return bd, ok
+}
+
+func (d *dropAfterRead) Machines(user string) []source.Machine {
+	ms := d.Bindings.Machines(user)
+	d.after()
+	return ms
+}
+
+func (d *dropAfterRead) Bound(user string) (source.Binding, source.Machine, bool) {
+	bd, m, ok := d.Bindings.Bound(user)
+	d.after()
+	return bd, m, ok
+}
+
+// TestPinDeliveryBoundIsOneMomentsState: delivery's lookup of the bound
+// machine (DeliveryBound, which takes no gate) reads the binding and the
+// machine at one moment, so an unbind landing between reads leaves it either
+// bound to the whole machine (its id and name) or not bound, never bound to
+// a machine with no id; and a refusal names the machine the same way.
+func TestPinDeliveryBoundIsOneMomentsState(t *testing.T) {
+	reg := NewRegistry()
+	b := &dropAfterRead{Bindings: fake.New(source.Options{}), user: "alice"}
+	reg.SetBindings(b)
+	sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+
+	b.armed.Store(true)
+	m, ok := reg.DeliveryBound("alice")
+	if ok && (m.MachineID != mach(1).ID || m.MachineName != mach(1).Name) {
+		t.Fatalf("DeliveryBound with an unbind between its reads = %+v, bound; want the whole machine or not bound", m)
+	}
+	if _, ok := reg.DeliveryBound("alice"); ok {
+		t.Fatal("DeliveryBound after the unbind still finds a machine")
+	}
+
+	// Through a create's delivery: an unbind at its first read gives a
+	// whole machine (offline) or no request, never a machine with no id.
+	// (The test drops the records without closing streams, as Unbind would,
+	// so each bind here takes a namespace not held yet.)
+	sub(t, reg, uk("alice", "git"), mach(1))
+	b.armed.Store(true)
+	svc := delivery.NewService(reg, time.Second)
+	res, err := svc.Request(context.Background(), delivery.Params{Reason: delivery.ReasonCreate, User: "alice",
+		Shed: delivery.RequestShed{Name: "box", ID: "idbox", Backend: delivery.BackendFirecracker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case res.Reason == delivery.ReasonNotApplicable:
+	case res.Reason == delivery.ReasonSourceOffline && res.Source != nil && res.Source.MachineID == mach(1).ID && res.Source.MachineName == mach(1).Name:
+	default:
+		t.Fatalf("a create's delivery with an unbind between its reads = %+v (source %+v)", res, res.Source)
+	}
+
+	sub(t, reg, uk("alice", "docker"), mach(1))
+	b.armed.Store(true)
+	var nb *NotBoundError
+	if err := reg.DeliveryAnswerFrom("alice", mach(2).ID); !errors.As(err, &nb) {
+		t.Fatalf("DeliveryAnswerFrom = %v", err)
+	} else if nb.Bound.ID != "" && (nb.Bound.ID != mach(1).ID || nb.Bound.Name != mach(1).Name) {
+		t.Fatalf("a refusal with an unbind between its reads names %+v", nb.Bound)
 	}
 }

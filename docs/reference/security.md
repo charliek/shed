@@ -1003,8 +1003,9 @@ upgrade machines before servers.
   configured are removed.
 
 `GET /api/info` lists the feature `source_binding` on a server that pins. The
-routes are [`GET /api/sources`](api.md#get-apisources) and [`POST
-/api/sources/use`](api.md#post-apisourcesuse) (control scope).
+routes are [`GET /api/sources`](api.md#get-apisources), [`POST
+/api/sources/use`](api.md#post-apisourcesuse) and [`POST
+/api/sources/unbind`](api.md#post-apisourcesunbind) (control scope).
 
 ### Refusals on the bus
 

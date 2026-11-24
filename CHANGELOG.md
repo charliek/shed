@@ -98,11 +98,29 @@ All notable changes to this project will be documented in this file.
     shows its delivery and its egress profile and recent blocks; egress profiles are listed in
     System. The app mints its control certificate through `shed-source`, keeping the machine
     identity and certificate store paths. The source rows moved to Preferences → Provisioning;
-    there is no unbind, a pin is only moved.
+    the app has no unbind (`shed source unbind`, below, clears a pin).
   - **Docs.** New `docs/guides/credentials-in-a-shed.md` (the five providers, AWS and registry
     sign-in inside a shed, and the trade stated plainly: a usable credential is inside the shed
     while it runs); the source-binding, extensions and architecture pages are rewritten for
     delivery and the bus alone.
+- **`shed source unbind` clears a credential source.** A pin could only be moved; now
+  `shed source unbind` (`POST /api/sources/unbind`; an admin can add `--user`) clears it. The
+  server forgets the pin and the machines it remembered for that user and closes their
+  streams. Until a machine is bound again, a create asks no source and runs its install hook
+  (an offline pin holds the hook back). The first of the user's machines to connect next is
+  bound, so a desktop app that is still running takes the source back within about 30 s. With
+  no pin it changes nothing and says so. The Rust client has the matching `source_unbind`.
+- **`shed source status` no longer prints `connected ()`** for a source connected only by its
+  delivery stream; it prints `connected.`.
+- **A `--repo` create prints `Cloning repository...` once**, not twice, on every backend
+  (create and `shed provision` alike).
+- **A cloud `--repo` create with no `.shed/provision.yaml` no longer waits about 3.75 s** for
+  the config: the retries for a host mount that has not settled (VZ, `--local-dir`) are skipped
+  on the remote backend, whose project directory is on the VM's own disk.
+- **`shed-server directory enroll` run several times at once no longer fails with `openat
+  enrol.lock: no such file or directory`** on macOS: the lock file is created exclusively and
+  opened on its own, so two runs racing to create it each get the lock or "another enrolment
+  is running".
 
 ## v0.10.1 — 2026-11-20
 
