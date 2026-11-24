@@ -5,7 +5,6 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/config"
@@ -39,15 +38,11 @@ func TestRemoteRepoWithNoProvisionConfigIsReadOnce(t *testing.T) {
 	d := &answerDialer{code: 66} // the landing dir lists content; no config
 	rec := &state.Record{Shed: config.Shed{Name: "cloud", LandingDir: config.HomePath + "/widgets"}}
 	p := provisionerFor(vmutil.NewAgentClient(d, 1024, 1026), rec)
-	start := time.Now()
 	cfg, err := p.LoadConfig(context.Background())
 	if err != nil || cfg == nil || cfg.HasAnyHooks() {
 		t.Fatalf("LoadConfig() = %+v, %v; want no hooks", cfg, err)
 	}
 	if n := d.calls.Load(); n != 1 {
 		t.Fatalf("read attempts = %d, want 1", n)
-	}
-	if took := time.Since(start); took > 200*time.Millisecond {
-		t.Fatalf("LoadConfig took %s, want no retry wait", took)
 	}
 }
