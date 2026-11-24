@@ -6,8 +6,10 @@ the listener was dispatched — is dropped at the registry even with a valid
 credentials certificate. The per-route scope gate is covered by
 test_http_auth.py; this is the below-the-handler ownership defense
 (response-injection / listener-squat). It runs against either dev server
-(`shed_server_dev`), which it reads and does not change, over the pinned mtls
-listener. (It replaces the bearer-token form that ran against the removed
+(`shed_server_dev`) and, on `[remote]`, against the remote-backend dev server
+(`SHED_REMOTE_SERVER`; skipped when unset), which it reads and does not change,
+over the pinned mtls listener. It creates no shed, so `[remote]` starts no
+cloud VM. (It replaces the bearer-token form that ran against the removed
 token mode.)
 
 The second test asserts the config shapes shed-server no longer loads — the
@@ -15,7 +17,8 @@ removed `public_exposure` / `auth.http.tokens` keys, the removed bearer-token
 mode under both its spellings, `allow_insecure_exposure`, and an open server
 bound beyond loopback — each refuse to start with a message naming the fix, and
 never come up open. The third does the same for a user list (`auth.users`)
-outside mtls or beside `auth.ssh` key sources. The ownership logic is
+outside mtls or beside `auth.ssh` key sources. Those two run a throwaway
+server process on this host, so they stay `[vz]` only. The ownership logic is
 backend-agnostic Go covered by
 internal/plugin + internal/api unit tests, and every refused shape has a Go
 config-load test in internal/config.
@@ -33,8 +36,19 @@ from fixtures.busclient import machine_headers
 from fixtures.tlsclient import pinned_request
 
 
-def test_cred_bus_forged_respond_dropped(shed_server_dev, tmp_path):
-    server = shed_server_dev
+@pytest.fixture(params=["vz", "fc", "remote"])
+def bus_server(request):
+    """A dev server whose credential bus the forged answer is sent to: the
+    vz or fc dev server, or the remote-backend dev server (`remote_server`,
+    which skips unless `SHED_REMOTE_SERVER` is set). Lazily instantiated, so
+    each backend skips only when it would have run."""
+    if request.param == "remote":
+        return request.getfixturevalue("remote_server")
+    return request.getfixturevalue(f"{request.param}_server_dev")
+
+
+def test_cred_bus_forged_respond_dropped(bus_server, tmp_path):
+    server = bus_server
     entry = resolve_server_entry(server.name)
     assert entry is not None, f"{server.name!r} not found in ~/.shed/config.yaml"
     creds = bootstrap_cert(server.name, "credentials", tmp_path)

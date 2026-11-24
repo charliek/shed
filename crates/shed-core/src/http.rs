@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::models::{
     CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo, SessionsResponse, Shed,
-    ShedImage, ShedList, SourceDocument, SystemDiskUsage,
+    ShedImage, ShedList, SourceDocument, SourceUnbound, SystemDiskUsage,
 };
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
@@ -47,8 +47,8 @@ pub enum ShedError {
     Config(String),
 }
 
-/// Why a credential-source call (`GET /api/sources`, `POST /api/sources/use`) did not
-/// answer with the source document (plan 035 §3.4). Its own type, not new [`ShedError`]
+/// Why a credential-source call (`GET /api/sources`, `POST /api/sources/use`,
+/// `POST /api/sources/unbind`) did not answer with its document (plan 035 §3.4). Its own type, not new [`ShedError`]
 /// variants, so no existing match over `ShedError` (here, in the desktop, in
 /// shed-mobile) has to learn a case it never sees.
 #[derive(Debug, Error)]
@@ -142,7 +142,7 @@ fn source_api_error(body: &[u8]) -> Option<(String, String)> {
 }
 
 /// Classify an answer to a source call (see [`Client::source_status`]).
-fn source_answer(answer: SourceAnswer) -> Result<SourceDocument, SourceError> {
+fn source_answer<T: serde::de::DeserializeOwned>(answer: SourceAnswer) -> Result<T, SourceError> {
     let SourceAnswer {
         status,
         retry_after,
@@ -1204,6 +1204,28 @@ impl Client {
         source_answer(answer)
     }
 
+    /// `POST /api/sources/unbind` with `{}` — clear the caller's credential source on
+    /// this server. The server forgets the binding and the machines it remembered for the
+    /// user and closes the user's streams; the first of the user's machines to connect
+    /// next becomes the source (so a running app's machine is bound again on its next
+    /// retry). Nothing to clear is a success with `unbound: false`. A server older than
+    /// the route answers a plain 404: [`SourceError::Unsupported`].
+    pub async fn source_unbind(&self) -> Result<SourceUnbound, SourceError> {
+        let url = self.build_url(&["api", "sources", "unbind"], &[])?;
+        let body = serde_json::json!({});
+        let answer = self
+            .request_with_status(
+                reqwest::Method::POST,
+                &url,
+                WRITE_TIMEOUT,
+                Some(&body),
+                SOURCE_DOCUMENT_MAX,
+                SOURCE_ERROR_BODY_MAX,
+            )
+            .await?;
+        source_answer(answer)
+    }
+
     // Path-building note: every method below hands `shed`/`session`/`slug`
     // values to `build_url`, which percent-encodes each as exactly ONE path
     // segment and rejects ""/"."/"..". The values are server-vended
@@ -1920,6 +1942,53 @@ mod tests {
             }
             e => panic!("want Api, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn source_unbind_sends_an_empty_object_and_decodes_the_answer() {
+        let server = MockServer::start_async().await;
+        let cleared = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sources/unbind")
+                    .json_body(serde_json::json!({}));
+                t.status(200).body(format!(
+                    r#"{{"user":"ada","unbound":true,"previous":{{"id":"{THIS_ID}","name":"desk"}},"forgotten_machines":2}}"#
+                ));
+            })
+            .await;
+        let got = client(&server).source_unbind().await.unwrap();
+        cleared.assert_async().await;
+        assert!(got.unbound);
+        assert_eq!(got.previous.as_ref().map(|m| m.id.as_str()), Some(THIS_ID));
+        assert_eq!(got.forgotten_machines, 2);
+    }
+
+    #[tokio::test]
+    async fn source_unbind_with_nothing_to_clear_and_on_an_older_server() {
+        let server = MockServer::start_async().await;
+        let none = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sources/unbind");
+                t.status(200).body(
+                    r#"{"user":"ada","unbound":false,"previous":null,"forgotten_machines":0}"#,
+                );
+            })
+            .await;
+        let got = client(&server).source_unbind().await.unwrap();
+        assert!(!got.unbound);
+        assert!(got.previous.is_none());
+        none.delete_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sources/unbind");
+                t.status(404).body("404 page not found");
+            })
+            .await;
+        assert!(matches!(
+            client(&server).source_unbind().await.unwrap_err(),
+            SourceError::Unsupported
+        ));
     }
 
     /// A malformed id is refused before anything is sent.

@@ -52,8 +52,9 @@ steps.
     arrive by [delivery](delivery.md)), and so was the variant: `--image extensions` is an
     unknown alias, and the `extensions` images are no longer built. See the [v0.10 to v0.11 upgrade guide](../upgrades/v0.10-to-v0.11.md).
 
-!!! note "Docker is only in `full`"
-    The Docker daemon ships **only** in the `full` variant. Provisioning hooks that use `docker` / `docker compose`
+!!! note "Docker is only in `full` (Firecracker and VZ)"
+    On Firecracker and VZ the Docker daemon ships **only** in the `full` variant. The cloud image
+    installs Docker CE in both of its variants. On Firecracker and VZ, provisioning hooks that use `docker` / `docker compose`
     (Testcontainers, service stacks) therefore require the `full` image.
     `full` does **not** ship a system Node.js or Python — install language
     runtimes per-project (e.g. `uv` provisions Python, `bun` is built in).

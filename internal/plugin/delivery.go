@@ -221,10 +221,13 @@ func (r *Registry) DeliveryBound(user string) (delivery.SourceMachine, bool) {
 	if b == nil {
 		return delivery.SourceMachine{}, false
 	}
-	if _, ok := b.Get(user); !ok {
+	// One read: an unbind (which this does not wait for) between a read of
+	// the binding and one of its machine would leave a binding with no
+	// machine.
+	_, m, ok := b.Bound(user)
+	if !ok {
 		return delivery.SourceMachine{}, false
 	}
-	m := boundMachine(b, user)
 	return delivery.SourceMachine{MachineID: m.ID, MachineName: m.Name}, true
 }
 
@@ -262,8 +265,12 @@ func (r *Registry) DeliveryAnswerFrom(user, machineID string) error {
 	if b == nil {
 		return ErrNotPinned
 	}
-	if bd, ok := b.Get(user); ok && bd.MachineID() == machineID {
+	bd, m, ok := b.Bound(user)
+	if ok && bd.MachineID() == machineID {
 		return nil
 	}
-	return &NotBoundError{User: user, Bound: boundMachine(b, user)}
+	if !ok {
+		m = source.Machine{}
+	}
+	return &NotBoundError{User: user, Bound: m}
 }

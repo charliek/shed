@@ -146,6 +146,7 @@ the route's own `403`, `400` or `501` never appears.
 | GET | `/api/users/status` | Where the server's users come from, and the directory's state (admin) |
 | GET | `/api/sources` | A user's credential source and machines |
 | POST | `/api/sources/use` | Move a user's credential source |
+| POST | `/api/sources/unbind` | Clear a user's credential source |
 | GET | `/api/plugins/listeners` | List active extension listeners |
 | GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
 | POST | `/api/plugins/listeners/{ns}/respond` | Respond to a plugin message |
@@ -1612,6 +1613,44 @@ machine already bound changes nothing (the `generation` is unchanged).
 | 403 | `FORBIDDEN` | As for `GET /api/sources` |
 | 404 | `SOURCE_MACHINE_NOT_FOUND` | No machine with that id has presented itself for the user |
 | 500 | `INTERNAL_ERROR` | The move was not confirmed: the store could not save it. The current source stays in use for now, but the move may take effect when the server restarts; check with `GET /api/sources` before retrying |
+| 503 | `PLUGINS_DISABLED` | The server has no credential bus |
+
+### POST /api/sources/unbind
+
+Clears the user's credential source. The body is `{}` (or empty) and, for an
+admin, optionally `{"user": "<name>"}`; any other field, a field given twice,
+or trailing data is refused.
+
+**Response (200 OK):**
+
+```json
+{
+  "user": "alice",
+  "unbound": true,
+  "previous": {"id": "fedcba9876543210fedcba9876543210", "name": "desktop"},
+  "forgotten_machines": 2
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `unbound` | `false` when the user had no source: nothing changed (`previous` is then `null`) |
+| `previous` | The machine that was the source |
+| `forgotten_machines` | How many remembered machines were forgotten with the pin |
+
+The server forgets the pin and the machines it remembers for the user, closes
+the user's streams and drops the requests sent on them. The first of the
+user's machines to connect next is bound (`first-connect`), so a machine whose
+app is still running reconnects and becomes the source again. Until then a
+create asks no source (delivery is `not_applicable`).
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | The body, or an admin naming a user who is not configured |
+| 403 | `FORBIDDEN` | As for `GET /api/sources` |
+| 500 | `INTERNAL_ERROR` | The change was not confirmed: the store could not save it. The current source stays in use for now, but the change may take effect when the server restarts; check with `GET /api/sources` before retrying |
 | 503 | `PLUGINS_DISABLED` | The server has no credential bus |
 
 ## Extensions

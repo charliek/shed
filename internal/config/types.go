@@ -937,6 +937,35 @@ type SourceUseRequest struct {
 	User      string `json:"user,omitempty"`
 }
 
+// SourceUnbindRequest is the body of POST /api/sources/unbind: clear the
+// user's credential source. User names another user; only an admin may. An
+// empty body ({}) is the caller's own.
+type SourceUnbindRequest struct {
+	User string `json:"user,omitempty"`
+}
+
+// SourceUnbindResponse is returned by POST /api/sources/unbind (`shed source
+// unbind`).
+type SourceUnbindResponse struct {
+	// User is the user the response is for ("" for the implicit user).
+	User string `json:"user"`
+	// Unbound is false when the user had no credential source: nothing
+	// changed.
+	Unbound bool `json:"unbound"`
+	// Previous is the machine that was the source; null when there was none.
+	// Its name comes from the machine: show it escaped.
+	Previous *SourceMachineRef `json:"previous"`
+	// ForgottenMachines is how many remembered machines were forgotten with
+	// the binding (each is remembered again when it next connects).
+	ForgottenMachines int `json:"forgotten_machines"`
+}
+
+// SourceMachineRef names a machine: its id and its own display name.
+type SourceMachineRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 // SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
 type SessionsResponse struct {
 	Sessions []Session `json:"sessions"`

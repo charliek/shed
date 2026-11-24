@@ -116,7 +116,7 @@
 //   - Drop, AdoptImplicit and RetainUsers change bindings like a move does,
 //     but return no generation to compare. They run either at start-up,
 //     before any listener can register, or under the caller's per-user lock
-//     for every user they touch.
+//     for every user they touch (`shed source unbind` is a Drop under it).
 //
 // # The file
 //
@@ -351,6 +351,11 @@ type Bindings interface {
 	Get(user string) (Binding, bool)
 	// Machines returns the machines remembered for user, oldest first.
 	Machines(user string) []Machine
+	// Bound returns user's binding and its bound machine as one moment of
+	// the store holds them; false when the user has no binding. A reader
+	// that does not hold the user's gate uses it rather than Get and then
+	// Machines, between which a Drop (an unbind) may land.
+	Bound(user string) (Binding, Machine, bool)
 	// Current reports whether user's binding is still to machineID at
 	// generation.
 	Current(user, machineID string, generation uint64) bool

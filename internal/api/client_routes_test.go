@@ -73,6 +73,7 @@ var clientForbiddenList = []string{
 	"GET /api/users/status",
 	"GET /api/sources",
 	"POST /api/sources/use",
+	"POST /api/sources/unbind",
 	"GET /api/delivery/requests",
 	"POST /api/delivery/requests/{id}",
 	"GET /api/plugins/listeners",

@@ -410,6 +410,7 @@ var userRouteClasses = map[string]string{
 	"GET /api/users/status":                           "admin",
 	"GET /api/sources":                                "pin:list",
 	"POST /api/sources/use":                           "pin:use",
+	"POST /api/sources/unbind":                        "pin:unbind",
 	"GET /api/delivery/requests":                      "delivery:stream",
 	"POST /api/delivery/requests/{id}":                "delivery:answer",
 	"GET /api/plugins/listeners":                      "bus:list",
@@ -506,6 +507,7 @@ var userRouteAllowed = map[string]int{
 	"GET /api/users/status":                           http.StatusOK,
 	"GET /api/sources":                                http.StatusOK,
 	"POST /api/sources/use":                           http.StatusOK,
+	"POST /api/sources/unbind":                        http.StatusOK,
 	"GET /api/delivery/requests":                      http.StatusOK,
 	"POST /api/delivery/requests/{id}":                http.StatusNoContent,
 	"GET /api/plugins/listeners":                      http.StatusOK,
@@ -593,6 +595,10 @@ func TestUserRouteWalk(t *testing.T) {
 		kind, action, _ := strings.Cut(class, ":")
 		if kind == "bus" {
 			walkBusRoute(t, s, router, be, route, action, box, boxGen)
+			continue
+		}
+		if kind == "pin" && action == "unbind" {
+			walkUnbindRoute(t, s, router, be)
 			continue
 		}
 		if kind == "pin" {
@@ -777,6 +783,97 @@ func walkPinRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBack
 	}
 	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceM.ID || bd.Generation != gen {
 		t.Errorf("the walk of %s changed alice's binding: %+v", route, bd)
+	}
+}
+
+// walkUnbindRoute checks POST /api/sources/unbind for bob, root and alice,
+// with alice's machine bound: it reaches no shed through the backend; bob
+// and the admin clear only their own (whatever the walk left bound for
+// them), never telling of alice's machine; bob naming alice is refused with
+// 403 and changes nothing; the admin naming alice clears hers, and alice's
+// own unbind then changes nothing. Alice's machine is bound again afterwards
+// (first connect), so the rest of the walk finds her as it did; bob's and
+// the admin's machines are bound again by their next connect too.
+func walkUnbindRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBackend) {
+	t.Helper()
+	aliceM := testMachineFor(aliceFP)
+	l, err := s.plugins.Subscribe(context.Background(), plugin.ListenerKey{User: "alice", Namespace: "x-walk-pin"}, aliceM)
+	if err != nil {
+		t.Fatalf("binding alice's machine: %v", err)
+	}
+	defer s.plugins.Unregister(l.Key(), l.Token)
+	for _, c := range []struct {
+		who, fp, named string
+		want           int
+		wantCode       string
+		target         string
+	}{
+		{"bob", bobFP, "", http.StatusOK, "", "bob"},
+		{"bob", bobFP, "alice", http.StatusForbidden, config.ErrForbidden, ""},
+		{"admin", rootFP, "", http.StatusOK, "", "root"},
+		{"admin", rootFP, "alice", http.StatusOK, "", "alice"},
+		{"alice", aliceFP, "", http.StatusOK, "", "alice"},
+	} {
+		be.reset()
+		had := false
+		if c.target != "" {
+			_, had = s.plugins.Bindings().Get(c.target)
+		}
+		body := "{}"
+		if c.named != "" {
+			body = fmt.Sprintf(`{"user":%q}`, c.named)
+		}
+		r := doAs(router, c.fp, http.MethodPost, "/api/sources/unbind", body)
+		if got := be.actedSnapshot(); len(got) != 0 {
+			t.Errorf("%s unbind reached the backend: %v", c.who, got)
+		}
+		if r.code != c.want || (c.wantCode != "" && r.errCode(t) != c.wantCode) {
+			t.Errorf("%s unbind (naming %q) = %d %s, want %d %s", c.who, c.named, r.code, r.body, c.want, c.wantCode)
+			continue
+		}
+		if r.code != http.StatusOK {
+			if _, ok := s.plugins.Bindings().Get("alice"); !ok && c.named == "alice" {
+				t.Errorf("%s's refused unbind cleared alice's binding", c.who)
+			}
+			continue
+		}
+		var resp config.SourceUnbindResponse
+		if err := json.Unmarshal(r.body, &resp); err != nil {
+			t.Fatalf("%s unbind: %v: %s", c.who, err, r.body)
+		}
+		if resp.User != c.target || resp.Unbound != had {
+			t.Errorf("%s unbind (naming %q) = %s, want %s's, unbound %v", c.who, c.named, r.body, c.target, had)
+		}
+		if _, still := s.plugins.Bindings().Get(c.target); still {
+			t.Errorf("%s unbind (naming %q) left %s's binding", c.who, c.named, c.target)
+		}
+		if c.target != "alice" && strings.Contains(string(r.body), aliceM.ID) {
+			t.Errorf("%s unbind mentions alice's machine: %s", c.who, r.body)
+		}
+	}
+	if _, ok := s.plugins.Bindings().Get("alice"); ok {
+		t.Error("the admin's unbind left alice's binding")
+	}
+	if !isListenerClosed(l) {
+		t.Error("the unbind left alice's stream open")
+	}
+	// Bound again by her machine's next connect.
+	l2, err := s.plugins.Subscribe(context.Background(), plugin.ListenerKey{User: "alice", Namespace: "x-walk-pin"}, aliceM)
+	if err != nil {
+		t.Fatalf("binding alice's machine again: %v", err)
+	}
+	s.plugins.Unregister(l2.Key(), l2.Token)
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceM.ID || bd.BoundBy != source.BoundByFirstConnect {
+		t.Errorf("alice's binding after her machine connected again = %+v", bd)
+	}
+}
+
+func isListenerClosed(l *plugin.Listener) bool {
+	select {
+	case <-l.Done:
+		return true
+	default:
+		return false
 	}
 }
 

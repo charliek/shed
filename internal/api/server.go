@@ -268,10 +268,11 @@ func (s *Server) Router() chi.Router {
 		r.Get("/activity", s.handleActivity)
 
 		// Credential sources: which of a user's machines answers their
-		// credential requests, and moving that (control scope: outside
+		// credential requests, moving and clearing that (control scope: outside
 		// /api/plugins, so a credentials certificate cannot reach them).
 		r.Get("/sources", s.handleListSources)
 		r.Post("/sources/use", s.handleUseSource)
+		r.Post("/sources/unbind", s.handleUnbindSource)
 
 		// Plugins / Extensions (the credential bus)
 		// Provisioning by delivery: a person's source holds its delivery

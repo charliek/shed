@@ -316,7 +316,7 @@ The check covers VPC firewall rules. It does not read hierarchical or network fi
 
 ## Credential delivery
 
-A cloud shed gets [credential delivery](delivery.md) like any other: the user's bound source is asked at create, and `shed provision` delivers again. The create answers `201 starting`, so the outcome is read from the shed document, polled as for any other field. A job never retries a delivery step recorded `failed`, a provision is refused (`409`) while a job for that shed is in flight, and a shed adopted at start-up is recorded with every step skipped and delivery `none`. The cloud image has two variants like the others: `base` (with roost-session and craze) and `full` (plus `strix`, `prox`, `parcel` and `envsecrets`), `full` the default, in the family `shed-<variant>-<arch>`. The delivered files are on the shed's boot disk, so a stopped cloud shed holds them.
+A cloud shed gets [credential delivery](delivery.md) like any other: the user's bound source is asked at create, and `shed provision` delivers again. The create answers `201 starting`, so the outcome is read from the shed document, polled as for any other field. A job never retries a delivery step recorded `failed`, a provision is refused (`409`) while a job for that shed is in flight, and a shed adopted at start-up is recorded with every step skipped and delivery `none`. The cloud image has two variants like the others: `base` (with roost-session, craze and, unlike the Firecracker and VZ `base`, Docker CE) and `full` (plus `strix`, `prox`, `parcel` and `envsecrets`), `full` the default, in the family `shed-<variant>-<arch>`. The delivered files are on the shed's boot disk, so a stopped cloud shed holds them.
 
 ## Server restarts
 

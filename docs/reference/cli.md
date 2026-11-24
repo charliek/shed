@@ -622,6 +622,7 @@ answers for each user](security.md#one-machine-answers-for-each-user).
 shed source status           # which machine is the source, and is it connected
 shed source ls               # every machine that has presented itself for you
 shed source use <machine>    # make another of your machines the source
+shed source unbind           # clear the source: the next machine to connect becomes it
 ```
 
 | Flag | Description |
@@ -638,6 +639,17 @@ answering at once; the new one starts when its desktop app
 next connects, within about 30 s (at once from the desktop app's "Use this
 machine"). Nothing fails over on its own.
 
+`shed source unbind` clears your source on the server. The server forgets
+the source and every machine it remembers for you, and closes your machines'
+streams. Until a machine is the source again, a create asks no machine and
+runs its install hook as with no delivery. The first of your machines to
+connect next becomes the source: a desktop app that is still running
+reconnects within about 30 s, and its machine is bound again, so quit the app
+on every machine of yours first to leave none, or use `shed source use` to pick another. With `--user`, an admin
+clears another user's source; that user's running apps take it back the same
+way unless they quit them. With no source
+it changes nothing and says so. It needs shed-server v0.11.0 or newer.
+
 ```text
 $ shed source ls
 MACHINE  ID        KEY         BOUND  CONNECTED  FIRST SEEN
@@ -649,9 +661,18 @@ Machine "desktop" (fedcba98) is now the credential source for you on my-server.
 Machine "laptop" (01234567) no longer answers. The new source answers once its desktop app next connects, within about 30 s.
 
 $ shed source status
-Credential source for you on my-server: "desktop" (fedcba98), connected (ssh-agent).
+Credential source for you on my-server: "desktop" (fedcba98), connected.
 Bound 1 min ago by user alice with key "laptop" (SHA256:...).
+
+$ shed source unbind
+Cleared the credential source for you on my-server (it was machine "desktop" (fedcba98)).
+Forgot 2 machines; each is listed again when it next connects.
+The first of your machines to connect next becomes the source: a desktop app that is still running reconnects within about 30 s, and its machine becomes the source again.
 ```
+
+`shed source status` lists in parentheses the bus namespaces the source holds,
+when it holds any (`connected (ssh-agent)`); a source connected by its
+delivery stream only prints `connected.`.
 
 A script key cannot use these commands. Machine names come from the machines,
 so every output is escaped for the terminal. Against a server older than

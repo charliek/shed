@@ -2,6 +2,7 @@ package vmutil
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -156,4 +157,72 @@ func TestLoadConfigProjectDirEmptyReadRetries(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Errorf("read attempts = %d, want 3 (2 empty reads then content)", got)
 	}
+}
+
+// TestLoadConfigNoMountLag: on a shed whose landing dir is never a mount
+// (SetNoMountLag, the remote backend), a project dir with no config (66), an
+// empty config (0) and an empty landing dir (75) are each read once: there
+// is no mount to wait for. An agent error is still retried.
+func TestLoadConfigNoMountLag(t *testing.T) {
+	orig := provisionReadBackoffs
+	defer func() { provisionReadBackoffs = orig }()
+
+	for _, tc := range []struct {
+		name    string
+		code    byte
+		wantErr error
+	}{
+		{"no config file", 66, nil},
+		{"an empty config file", 0, nil},
+		{"an empty landing dir", 75, ErrProvisionConfigUnreadable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Long backoffs: a retry would hang the test.
+			provisionReadBackoffs = []time.Duration{time.Hour, time.Hour}
+			var calls int32
+			dialer := &pipeDialer{handler: func(conn net.Conn) {
+				defer conn.Close()
+				agentproto.ReadMessage(conn) // exec request
+				agentproto.ReadMessage(conn) // stdin EOF
+				atomic.AddInt32(&calls, 1)
+				agentproto.WriteExitCode(conn, int(tc.code))
+			}}
+			p := NewProvisioner(NewAgentClient(dialer, 1024, 1026), "test")
+			p.SetWorkDir("/home/shed/proj") // a --repo landing dir
+			p.SetNoMountLag()
+			cfg, err := p.LoadConfig(context.Background())
+			if !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && (cfg == nil || cfg.HasAnyHooks())) {
+				t.Fatalf("LoadConfig() = %+v, %v; want no hooks, %v", cfg, err, tc.wantErr)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Errorf("read attempts = %d, want 1", got)
+			}
+		})
+	}
+
+	t.Run("an agent error is retried", func(t *testing.T) {
+		provisionReadBackoffs = []time.Duration{time.Millisecond, time.Millisecond}
+		const yaml = "hooks:\n  install: .shed/scripts/install.sh\n"
+		var calls int32
+		dialer := &pipeDialer{handler: func(conn net.Conn) {
+			defer conn.Close()
+			if atomic.AddInt32(&calls, 1) < 2 {
+				return // the connection drops before an answer
+			}
+			agentproto.ReadMessage(conn) // exec request
+			agentproto.ReadMessage(conn) // stdin EOF
+			agentproto.WriteData(conn, []byte(yaml))
+			agentproto.WriteExitCode(conn, 0)
+		}}
+		p := NewProvisioner(NewAgentClient(dialer, 1024, 1026), "test")
+		p.SetWorkDir("/home/shed/proj")
+		p.SetNoMountLag()
+		cfg, err := p.LoadConfig(context.Background())
+		if err != nil || cfg == nil || !cfg.HasInstallHook() {
+			t.Fatalf("LoadConfig() = %+v, %v; want the hooks after a retry", cfg, err)
+		}
+		if got := atomic.LoadInt32(&calls); got != 2 {
+			t.Errorf("read attempts = %d, want 2", got)
+		}
+	})
 }

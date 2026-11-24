@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -635,5 +636,89 @@ func TestStateDirLock(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("taking %s as a lock did not return", name)
 		}
+	}
+}
+
+// TestStateDirLockTakenTogether: takers started together on a lock file
+// that does not exist yet each get the lock or ErrLocked, never another
+// error (on macOS one open with O_CREAT can fail with ENOENT when another
+// creates the same name at once; openLockFile does not), and exactly one
+// holds it at a time.
+func TestStateDirLockTakenTogether(t *testing.T) {
+	for round := range 50 {
+		dir := stateDir(t)
+		const n = 8
+		var wg sync.WaitGroup
+		var held atomic.Int32
+		start := make(chan struct{})
+		errs := make(chan error, n)
+		for range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d, err := OpenStateDir(dir)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer d.Close()
+				<-start
+				unlock, err := d.Lock("together.lock")
+				if errors.Is(err, ErrLocked) {
+					return
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+				if held.Add(1) != 1 {
+					errs <- errors.New("two takers held the lock at once")
+				}
+				held.Add(-1)
+				unlock()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+}
+
+// TestStateDirLockRefusesASymlinkInTheDirectory: a lock name that is a
+// symbolic link to a regular file in the same directory (which os.Root
+// follows, staying inside it) is refused, and the file it names is not
+// locked by the refusal.
+func TestStateDirLockRefusesASymlinkInTheDirectory(t *testing.T) {
+	dir := stateDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "target"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", filepath.Join(dir, "rel.lock")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := OpenStateDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	unlock, err := d.Lock("rel.lock")
+	if err == nil {
+		unlock()
+		t.Fatal("a symbolic link in the directory was taken as a lock")
+	}
+	var fce *FileCheckError
+	if !errors.As(err, &fce) {
+		t.Errorf("refusal = %v, want a FileCheckError", err)
+	}
+	other, err := d.Lock("target")
+	if err != nil {
+		t.Fatalf("the link's target after the refusal: %v", err)
+	}
+	other()
+	if fi, err := os.Lstat(filepath.Join(dir, "rel.lock")); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+		t.Errorf("the link was changed: %v, %v", fi, err)
 	}
 }

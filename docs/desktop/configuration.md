@@ -62,8 +62,8 @@ confirmation, one request that is not retried. It always sends this machine's ow
 succeeds the row shows the server's answer; when the server refuses it the row returns to the
 last confirmed source and shows why. Moving the source here fails any delivery request still
 waiting on the other machine. If the server has never seen this machine (its delivery stream has not reached that
-server yet), the app says so and does not retry. There is no command to unbind: a pin is only
-moved.
+server yet), the app says so and does not retry. The app has no unbind: `shed source unbind` clears
+a pin, and this machine, while the app runs, is bound again when it next connects.
 
 The app reopens this server's delivery stream at once, so it connects without waiting for
 its next retry. Nothing fails over by itself: if the source is off, nothing

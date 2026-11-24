@@ -774,6 +774,9 @@ func provisionerFor(agent *vmutil.AgentClient, rec *state.Record) *vmutil.Provis
 	}
 	provisioner := vmutil.NewProvisioner(agent, rec.Shed.Name)
 	provisioner.SetWorkDir(workDir)
+	// The project directory is on the VM's own disk: no mount to wait for,
+	// so a repository with no .shed/provision.yaml costs no retries.
+	provisioner.SetNoMountLag()
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	return provisioner
 }

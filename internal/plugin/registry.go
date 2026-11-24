@@ -94,6 +94,11 @@ package plugin
 //     binding's and drops the user's requests stamped otherwise. It also
 //     closes the user's delivery stream when it is not the new binding's,
 //     which fails every delivery request it carried (delivery.go).
+//   - Unbind: Unbind asks the store to drop the user's records
+//     (Bindings.Drop) and then, under the same hold of the gate, closes
+//     every listener and the delivery stream of the user and drops the
+//     user's requests: none is current any more. The next machine of the
+//     user to subscribe is bound, as the first one was.
 //
 // The user's gate (pin.go: userGate, one per user) is the per-user critical
 // section: admission and registration (Subscribe), a move with its clean-up

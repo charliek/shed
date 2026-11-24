@@ -774,6 +774,32 @@ pub struct SourceDocument {
     pub machines: Vec<SourceMachine>,
 }
 
+/// The body of a successful `POST /api/sources/unbind`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceUnbound {
+    #[serde(default, deserialize_with = "lenient")]
+    pub user: String,
+    /// `false` when the user had no source: nothing changed.
+    #[serde(default, deserialize_with = "lenient")]
+    pub unbound: bool,
+    /// The machine that was the source; `None` when there was none. Its name is
+    /// untrusted text: see [`display_source_text`].
+    #[serde(default, deserialize_with = "lenient")]
+    pub previous: Option<SourceMachineRef>,
+    /// How many remembered machines were forgotten with the binding.
+    #[serde(default, deserialize_with = "lenient")]
+    pub forgotten_machines: u64,
+}
+
+/// A machine named by its id and its own display name.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceMachineRef {
+    #[serde(default, deserialize_with = "lenient")]
+    pub id: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub name: String,
+}
+
 impl SourceDocument {
     /// The id of the machine that answers: the FIRST signing slot, when that slot is a
     /// well-formed machine reference; when it is not (another kind, no id, an entry that

@@ -26,6 +26,10 @@ var errInvalidRepoURL = errors.New("invalid repository URL")
 // extraEnv (e.g. egress proxy variables) is appended to the git environment so
 // the clone is routed through (and audited by) anything those vars configure.
 //
+// It shows no status line: the clone step that calls it (every backend's,
+// at create and under provision) says "Cloning repository..." once, before
+// it probes the project directory.
+//
 // owned is true for a shed a service client owns: its clone gets only
 // extraEnv, never the server's env_file variables (BuildEnvForGit), which
 // hold the server's own credentials (model API keys, GITHUB_TOKEN). A
@@ -33,7 +37,6 @@ var errInvalidRepoURL = errors.New("invalid repository URL")
 // process's environment.
 func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error {
 	backend.Phase(ctx, "clone")
-	backend.Status(ctx, "Cloning repository...")
 
 	dirName, err := config.RepoDirName(repo)
 	if err != nil {

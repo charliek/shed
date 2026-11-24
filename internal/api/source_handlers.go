@@ -1,23 +1,24 @@
 package api
 
-// The credential source routes (`shed source ls|use|status`): a user reads
-// which of their machines answers their credential requests on this server,
-// and moves that to another machine of theirs. The pin itself, its rules and
-// its locks are the bus's (internal/plugin/pin.go and the note at the top of
-// internal/plugin/registry.go); these routes only decide who may read and
-// move whose binding, and call Registry.Sources for the read and
-// Registry.Move for the move (both under the user's gate, so each answer is
-// one moment's state).
+// The credential source routes (`shed source ls|use|unbind|status`): a user
+// reads which of their machines answers their credential requests on this
+// server, moves that to another machine of theirs, or clears it. The pin
+// itself, its rules and its locks are the bus's (internal/plugin/pin.go and
+// the note at the top of internal/plugin/registry.go); these routes only
+// decide who may read, move and clear whose binding, and call
+// Registry.Sources for the read, Registry.Move for the move and
+// Registry.Unbind for the clearing (each under the user's gate, so each
+// answer is one moment's state).
 //
 // Who may:
-//   - A user reads and moves their own binding, from any of their keys that
-//     is not a script key.
+//   - A user reads, moves and clears their own binding, from any of their
+//     keys that is not a script key.
 //   - An admin may also name another configured user (?user= on the read,
-//     "user" in the body of the move), and can then only choose among the
-//     machines that user's own keys have presented: machine records are kept
-//     per user.
-//   - A script key is refused both routes. It may not become or move a
-//     source, and the read is refused too: the bound machine's id is the
+//     "user" in the body of the move and of the unbind), and can then only
+//     choose among the machines that user's own keys have presented: machine
+//     records are kept per user.
+//   - A script key is refused every route. It may not become, move or clear
+//     a source, and the read is refused too: the bound machine's id is the
 //     whole of what admission matches on, so the routes hand it to nobody
 //     who may not hold the source.
 //   - A service client is refused (the routes are not on its allowlist, and
@@ -26,9 +27,9 @@ package api
 //   - A user who is not an admin naming anyone but themselves gets the same
 //     403 whether or not that user exists.
 //
-// Both routes are outside /api/plugins, so they need the control scope: a
-// credentials certificate (what a machine's broker holds) can neither read
-// nor move a binding.
+// The routes are outside /api/plugins, so they need the control scope: a
+// credentials certificate (what a machine's broker holds) can neither read,
+// move nor clear a binding.
 
 import (
 	"context"
@@ -289,52 +290,124 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sourcesResponse(res.View))
 }
 
+// handleUnbindSource is POST /api/sources/unbind (`shed source unbind`):
+// clear the user's credential source. Body {} (or none) and, for an admin,
+// "user", under the rules of POST /api/sources/use. The unbind is
+// Registry.Unbind: the store forgets the user's binding and remembered
+// machines, then, under the user's gate, the user's streams are closed and
+// their requests dropped. Idempotent: a user with no binding is answered 200
+// with "unbound": false. The first of the user's machines to connect next is
+// bound (first-connect), so a machine still running reconnects and becomes
+// the source again.
+//
+//	400 INVALID_REQUEST   the body, or an admin naming a user who is not
+//	                      configured
+//	403 FORBIDDEN         as for GET /api/sources
+//	500 INTERNAL_ERROR    the store could not save it: the source in use is
+//	                      unchanged for now, but a save that failed late may
+//	                      still take effect when the server restarts
+//	503 PLUGINS_DISABLED  the server has no credential bus
+func (s *Server) handleUnbindSource(w http.ResponseWriter, r *http.Request) {
+	own, admin, ok := sourceCaller(w, r)
+	if !ok {
+		return
+	}
+	req, err := decodeSourceUnbind(http.MaxBytesReader(w, r.Body, sourcesBodyLimit))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, `the body must be {} or {"user":"<name>"}: `+err.Error())
+		return
+	}
+	user, ok := s.sourceTarget(w, own, admin, req.User)
+	if !ok {
+		return
+	}
+	if s.sourceBindings(w) == nil {
+		return
+	}
+	by := moverFor(callerFrom(r.Context()), user != own)
+	res, err := s.plugins.Unbind(r.Context(), user, by)
+	if err != nil {
+		switch {
+		case errors.Is(err, plugin.ErrNotPinned):
+			writeError(w, http.StatusServiceUnavailable, "PLUGINS_DISABLED", "credential source bindings not initialized")
+		case r.Context().Err() != nil && errors.Is(err, r.Context().Err()):
+			// The client went away while waiting for the user's gate:
+			// nothing changed.
+		default:
+			log.Printf("credential source%s: clearing it by %q was not confirmed (the current source stays in use; the saved file may hold the change after a restart): %v", forBusUser(user), by, err)
+			writeError(w, http.StatusInternalServerError, config.ErrInternalError,
+				"the unbind was not confirmed: the server could not save it. The current credential source stays in use for now, but the change may still take effect when the server restarts; check with 'shed source status' before retrying")
+		}
+		return
+	}
+	resp := config.SourceUnbindResponse{User: user, Unbound: res.Unbound, ForgottenMachines: res.Forgotten}
+	if res.Unbound {
+		resp.Previous = &config.SourceMachineRef{ID: res.Previous.ID, Name: res.Previous.Name}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // decodeSourceUse reads the body of POST /api/sources/use strictly: one JSON
-// object, its fields only "machine_id" and "user", each at most once and
-// spelled exactly (the standard decoder matches field names without regard
-// to case and lets the last of two equal names win), each a string or null,
-// and nothing after the object but white space.
+// object, its fields only "machine_id" and "user" (decodeSourceFields).
 func decodeSourceUse(body io.Reader) (config.SourceUseRequest, error) {
 	var req config.SourceUseRequest
+	err := decodeSourceFields(body, false, map[string]*string{"machine_id": &req.MachineID, "user": &req.User})
+	return req, err
+}
+
+// decodeSourceUnbind reads the body of POST /api/sources/unbind strictly:
+// one JSON object whose only field is "user", or no body at all (the
+// caller's own).
+func decodeSourceUnbind(body io.Reader) (config.SourceUnbindRequest, error) {
+	var req config.SourceUnbindRequest
+	err := decodeSourceFields(body, true, map[string]*string{"user": &req.User})
+	return req, err
+}
+
+// decodeSourceFields reads a source route's body strictly: one JSON object,
+// its fields only those named in fields, each at most once and spelled
+// exactly (the standard decoder matches field names without regard to case
+// and lets the last of two equal names win), each a string or null (taken as
+// absent), and nothing after the object but white space. With emptyOK, a
+// body with nothing in it but white space is an empty object.
+func decodeSourceFields(body io.Reader, emptyOK bool, fields map[string]*string) error {
 	dec := json.NewDecoder(body)
 	tok, err := dec.Token()
+	if emptyOK && errors.Is(err, io.EOF) {
+		return nil
+	}
 	if err != nil {
-		return req, err
+		return err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return req, errors.New("it is not a JSON object")
+		return errors.New("it is not a JSON object")
 	}
 	seen := map[string]bool{}
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return req, err
+			return err
 		}
 		key, _ := tok.(string)
-		var dst *string
-		switch key {
-		case "machine_id":
-			dst = &req.MachineID
-		case "user":
-			dst = &req.User
-		default:
-			return req, fmt.Errorf("unknown field %q", key)
+		dst, ok := fields[key]
+		if !ok {
+			return fmt.Errorf("unknown field %q", key)
 		}
 		if seen[key] {
-			return req, fmt.Errorf("field %q given twice", key)
+			return fmt.Errorf("field %q given twice", key)
 		}
 		seen[key] = true
 		if err := dec.Decode(dst); err != nil {
-			return req, fmt.Errorf("field %q: %v", key, err)
+			return fmt.Errorf("field %q: %v", key, err)
 		}
 	}
 	if _, err := dec.Token(); err != nil { // the closing '}'
-		return req, err
+		return err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return req, errors.New("data after the JSON object")
+		return errors.New("data after the JSON object")
 	}
-	return req, nil
+	return nil
 }
 
 // whoseSources names the user a source route acted on, in a message.

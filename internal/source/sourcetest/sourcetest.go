@@ -212,6 +212,31 @@ func Run(t *testing.T, h Harness) {
 		}
 	})
 
+	t.Run("bound reads the binding and its machine together", func(t *testing.T) {
+		in, _ := newInst(t)
+		if _, _, ok := in.Bindings.Bound("alice"); ok {
+			t.Fatal("Bound with no binding reports one")
+		}
+		first := admit(t, in.Bindings, "alice", M(1))
+		admit(t, in.Bindings, "alice", M(2))
+		bd, m, ok := in.Bindings.Bound("alice")
+		if !ok || bd.Generation != first.Binding.Generation || m.ID != ID(1) || m.Name != "machine-1" || m.KeyFingerprint != "SHA256:key1" {
+			t.Fatalf("Bound = %+v, %+v, %v", bd, m, ok)
+		}
+		if _, err := in.Bindings.Use("alice", ID(2), "me"); err != nil {
+			t.Fatal(err)
+		}
+		if bd, m, ok := in.Bindings.Bound("alice"); !ok || bd.MachineID() != ID(2) || m.ID != ID(2) || m.Name != "machine-2" {
+			t.Fatalf("Bound after a move = %+v, %+v, %v", bd, m, ok)
+		}
+		if _, err := in.Bindings.Drop("alice"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, ok := in.Bindings.Bound("alice"); ok {
+			t.Fatal("Bound after Drop reports a binding")
+		}
+	})
+
 	t.Run("use moves both slots", func(t *testing.T) {
 		in, clk := newInst(t)
 		first := admit(t, in.Bindings, "alice", M(1))

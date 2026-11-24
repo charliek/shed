@@ -197,11 +197,13 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		{"egress stream POST, control cert", "POST", "/api/egress/stream", ctl, 200},
 		{"create, control cert", "POST", "/api/sheds", ctl, 200},
 		// The credential source routes need control: a machine's broker
-		// holds credentials and must not read or move a binding.
+		// holds credentials and must not read, move or clear a binding.
 		{"sources, control cert", "GET", "/api/sources", ctl, 200},
 		{"sources, credentials cert forbidden", "GET", "/api/sources", cred, 403},
 		{"sources use, control cert", "POST", "/api/sources/use", ctl, 200},
 		{"sources use, credentials cert forbidden", "POST", "/api/sources/use", cred, 403},
+		{"sources unbind, control cert", "POST", "/api/sources/unbind", ctl, 200},
+		{"sources unbind, credentials cert forbidden", "POST", "/api/sources/unbind", cred, 403},
 		// The delivery transport is a source's, as the bus is: credentials
 		// only, at every path under it.
 		{"delivery stream, credentials cert", "GET", "/api/delivery/requests", cred, 200},

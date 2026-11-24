@@ -72,6 +72,7 @@ var notRecordRoutes = []string{
 	"GET /api/users/status",
 	"GET /api/sources",
 	"POST /api/sources/use",
+	"POST /api/sources/unbind",
 	"GET /api/plugins/listeners",
 	"GET /api/plugins/listeners/{namespace}/messages",
 	"POST /api/plugins/listeners/{namespace}/respond",

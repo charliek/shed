@@ -377,7 +377,7 @@ func (d *StateDir) Names() ([]string, error) {
 // blocking when it is a FIFO). The returned function releases the lock.
 func (d *StateDir) Lock(name string) (unlock func(), err error) {
 	path := d.Join(name)
-	f, err := d.root.OpenFile(name, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, stateFileMode)
+	f, err := d.openLockFile(name)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +387,9 @@ func (d *StateDir) Lock(name string) (unlock func(), err error) {
 	case !fi.Mode().IsRegular():
 		err = &FileCheckError{path, "is not a regular file"}
 	default:
+		err = d.sameLeaf(name, path, fi)
+	}
+	if err == nil {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			err = fmt.Errorf("%s: %w", path, ErrLocked)
@@ -400,6 +403,54 @@ func (d *StateDir) Lock(name string) (unlock func(), err error) {
 	}
 	// Closing the file releases the lock.
 	return func() { _ = f.Close() }, nil
+}
+
+// sameLeaf checks that name in the directory is, itself, the regular file
+// opened (fi, its Stat): not a symbolic link, and the same device and inode.
+// os.Root follows a symbolic link whose target stays inside the root, even
+// with O_NOFOLLOW, so a link named name to another file in the directory
+// would otherwise be opened (and locked) in its place.
+func (d *StateDir) sameLeaf(name, path string, fi fs.FileInfo) error {
+	leaf, err := d.root.Lstat(name)
+	switch {
+	case err != nil:
+		return err
+	case leaf.Mode()&fs.ModeSymlink != 0:
+		return &FileCheckError{path, "is a symbolic link"}
+	case !leaf.Mode().IsRegular():
+		return &FileCheckError{path, "is not a regular file"}
+	case !os.SameFile(leaf, fi):
+		return &FileCheckError{path, "changed while it was opened"}
+	}
+	return nil
+}
+
+// lockOpenAttempts bounds openLockFile's rounds of create-or-open.
+const lockOpenAttempts = 8
+
+// openLockFile opens the lock file name, creating it (mode 0600) when it is
+// absent. Several processes may do this at once, so it is not one open with
+// O_CREAT: on macOS such an open can fail with ENOENT when another process
+// creates the same name at that moment (seen as "openat enrol.lock: no such
+// file or directory" from enrolments started together). Instead each round
+// creates the file exclusively and, when it exists, opens it without
+// creating; a lock file is never removed, so a round that loses both ways
+// is that race and is tried again, a bounded number of times. An exclusive
+// create refuses a symbolic link at name as existing, but the plain open
+// follows one whose target is inside the directory (os.Root does, even with
+// O_NOFOLLOW): Lock refuses that afterwards (sameLeaf).
+func (d *StateDir) openLockFile(name string) (*os.File, error) {
+	const flags = os.O_RDWR | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+	for attempt := 1; ; attempt++ {
+		f, err := d.root.OpenFile(name, flags|os.O_CREATE|os.O_EXCL, stateFileMode)
+		if !errors.Is(err, fs.ErrExist) {
+			return f, err
+		}
+		f, err = d.root.OpenFile(name, flags, 0)
+		if !errors.Is(err, fs.ErrNotExist) || attempt == lockOpenAttempts {
+			return f, err
+		}
+	}
 }
 
 // tempSuffixBytes is the random part of a temporary file's name, in bytes
