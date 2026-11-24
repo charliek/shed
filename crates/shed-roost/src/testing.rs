@@ -186,10 +186,9 @@ pub(crate) fn write_exec(path: &Path, body: &str) {
     // assertion because the sibling rung is *designed* to fall through when its
     // local `identify` fails, so an exec error reads as "no sibling here".
     //
-    // Closing it properly means not exec'ing a file this process wrote while
-    // other threads are forking — a rig-level change (exec from a
-    // pre-populated, read-only fixture directory) rather than a one-line fix,
-    // and out of scope for the commit that noticed it.
+    // What closes it is `settle_first_exec` below (Linux): one traced exec
+    // that runs nothing, retried while the file is busy, before any test
+    // execs the script for real.
     let staging = path.with_file_name(format!(
         ".{}.{}.{:?}.staging",
         path.file_name()
@@ -206,6 +205,101 @@ pub(crate) fn write_exec(path: &Path, body: &str) {
         let _ = std::fs::remove_file(&staging);
         panic!("renaming into {}: {error}", path.display())
     });
+    #[cfg(target_os = "linux")]
+    settle_first_exec(path);
+}
+
+/// Exec `path` once, so the `ETXTBSY` race described in [`write_exec`] is
+/// over before the code under test execs it — without running a line of it.
+///
+/// The child asks to be traced before its `execve`; a successful `execve` then
+/// stops it on `SIGTRAP` before the new image (the script's interpreter) runs
+/// anything, and it is killed there. `spawn` returning `Ok` means the `execve`
+/// succeeded, which means no descriptor held the file open for writing at
+/// that moment — and none can appear later, since this process has closed its
+/// own. An `ETXTBSY` from `spawn` is the race itself, so it waits and tries
+/// again. Linux only: `ETXTBSY` on exec is a Linux behaviour, and macOS does
+/// not let a child trace a platform binary such as `/bin/sh`.
+#[cfg(all(test, target_os = "linux"))]
+fn settle_first_exec(path: &Path) {
+    use std::os::unix::process::CommandExt as _;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut command = std::process::Command::new(path);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: the closure runs in the forked child before `execve` and
+        // makes one async-signal-safe system call.
+        unsafe {
+            command.pre_exec(|| {
+                // The stop after `execve` is a SIGTRAP, which a blocked mask
+                // inherited from the parent thread would hold back while the
+                // interpreter runs: unblock it first.
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTRAP);
+                let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                if rc != 0 {
+                    // No allocation after fork: the error number as it is.
+                    return Err(std::io::Error::from_raw_os_error(rc));
+                }
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id() as libc::pid_t;
+                // SAFETY: plain system calls on our own child's pid. The child
+                // is reaped here, not through `child`, because a traced child's
+                // stop is reported by `waitpid` and `Child::wait` would take
+                // that stop for its end.
+                unsafe {
+                    if libc::kill(pid, libc::SIGKILL) == -1 {
+                        panic!(
+                            "killing the settle exec of {}: {}",
+                            path.display(),
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    loop {
+                        let mut status = 0;
+                        if libc::waitpid(pid, &mut status, 0) == -1 {
+                            let error = std::io::Error::last_os_error();
+                            match error.raw_os_error() {
+                                Some(libc::EINTR) => continue,
+                                // Already reaped: nothing is left to wait for.
+                                Some(libc::ECHILD) => break,
+                                _ => {
+                                    panic!("reaping the settle exec of {}: {error}", path.display())
+                                }
+                            }
+                        }
+                        // A stop report (the SIGTRAP) is not the end: wait on.
+                        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                            break;
+                        }
+                    }
+                }
+                drop(child);
+                return;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} stayed busy for 10 s",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("settling {}: {error}", path.display()),
+        }
+    }
 }
 
 /// A one-shot seam that runs under the state lock just before a `tab.list`
