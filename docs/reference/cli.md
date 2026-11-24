@@ -645,7 +645,9 @@ streams. Until a machine is the source again, a create asks no machine and
 runs its install hook as with no delivery. The first of your machines to
 connect next becomes the source: a desktop app that is still running
 reconnects within about 30 s, and its machine is bound again, so quit the app
-on every machine of yours first to leave none, or use `shed source use` to pick another. With no source
+on every machine of yours first to leave none, or use `shed source use` to pick another. With `--user`, an admin
+clears another user's source; that user's running apps take it back the same
+way unless they quit them. With no source
 it changes nothing and says so. It needs shed-server v0.11.0 or newer.
 
 ```text
