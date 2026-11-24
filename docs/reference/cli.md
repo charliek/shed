@@ -8,7 +8,7 @@ Complete reference for the `shed` command-line interface.
     - `shed image build --from <ref>` — use [`shed image pull`](#shed-image-pull) instead. Pulls are now registry-direct via `go-containerregistry` and don't require a Docker daemon.
     - `shed image install` — host-side blob install. The same effect is now produced by `shed image build`, `shed image pull`, or `shed image load`.
 
-    The variant lineup also changed. The old `default`, `devtools`, and `experimental` variants are replaced by `base`, `extensions`, and `full`. See [Images](images.md) for the new lineup.
+    The variant lineup also changed. The old `default`, `devtools`, and `experimental` variants are replaced by `base` and `full` (a third variant, `extensions`, existed for a time and was removed in v0.11). See [Images](images.md) for the new lineup.
 
 ## Global Flags
 
@@ -657,7 +657,7 @@ A script key cannot use these commands. Machine names come from the machines,
 so every output is escaped for the terminal. Against a server older than
 v0.10.0 the commands say the server does not support credential sources.
 `shed source status` reads the server; it does not say whether the machine you
-run it on is the source (the desktop app's Preferences and `broker.status` do).
+run it on is the source (the desktop app's Preferences and the `source.status` IPC op do).
 
 ## Egress Control
 
@@ -878,7 +878,6 @@ shed image ls
 ```text
 IMAGE                                       DIGEST          SOURCE    SIZE     IN USE
 ghcr.io/charliek/shed-vz-base:v0.6.0        sha256:abc123…  config    2.1 GB   yes
-ghcr.io/charliek/shed-vz-extensions:v0.6.0  sha256:7c2e5d…  config    2.3 GB   no
 ghcr.io/charliek/shed-vz-full:v0.6.0        sha256:def456…  config    3.8 GB   no
 ghcr.io/test/legacy:v1                      sha256:ff8800…  dangling  2.0 GB   no
 ```
@@ -916,8 +915,8 @@ LAYER  DIGEST                                                                   
 ```
 
 The big shared layers — `ubuntu:24.04` (ordinal 1) and `apt-get install`
-(ordinal 2) — appear with the same digest in `base`, `extensions`, and
-`full`, so on disk they cost once across all three variants.
+(ordinal 2) — appear with the same digest in `base` and
+`full`, so on disk they cost once across both variants.
 
 ### shed image inspect
 
@@ -954,7 +953,7 @@ shed image pull <ref> [-t <tag>] [--platform <os/arch>] [--with-layers]
 
 If `--tag` is omitted, the tag is derived from the last path segment of
 the ref minus the `shed-{vz,fc}-` prefix and the version suffix (e.g.
-`ghcr.io/charliek/shed-vz-extensions:v0.5.1` → `extensions`).
+`ghcr.io/charliek/shed-vz-full:v0.11.0` → `full`).
 
 #### Boot-only by default
 

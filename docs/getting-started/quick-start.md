@@ -10,7 +10,7 @@ day-to-day commands.
 config, create a shed:
 
 - **[macOS Quickstart](macos-quickstart.md)** — Homebrew + the shed-desktop
-  approval app; runs VMs via Apple's Virtualization.framework (VZ backend).
+  app, your credential source; runs VMs via Apple's Virtualization.framework (VZ backend).
 - **[Linux Quickstart](linux-quickstart.md)** — the `shed-server` deb running
   Firecracker microVMs (the tested remote-host path).
 
@@ -165,7 +165,7 @@ shed tunnels start myproj -t 3000:3000 -d
 
 - [CLI Reference](../reference/cli.md) — all available commands
 - [Configuration](../reference/configuration.md) — client and server config options
-- [Extensions](../reference/extensions.md) — credential brokering by the desktop app
+- [Credentials in a shed](../guides/credentials-in-a-shed.md) — delivering keys and tokens from the desktop app
 - [Tunnels](../reference/tunnels.md) — port forwarding configuration
 - [Provisioning](../reference/provisioning.md) — `.shed/` install/startup hooks
 - [Security Configuration](../guides/security-configuration.md) — server postures and hardening sheds

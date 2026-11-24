@@ -60,10 +60,10 @@ through `charliek/apt-charliek`:
 apt install shed-desktop
 ```
 
-The binary installs to `/usr/bin/shed-desktop`, with a headless `shedctl` and the polkit
-action alongside. The `.deb` declares its WebKitGTK runtime dependencies
+The binary installs to `/usr/bin/shed-desktop`, with a headless `shedctl`
+alongside. The `.deb` declares its WebKitGTK runtime dependencies
 (`libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libayatana-appindicator3-1`, `librsvg2-2`,
-`libsoup-3.0-0`) and recommends `polkitd`. See the
+`libsoup-3.0-0`). See the
 [shed apt repo](https://github.com/charliek/apt-charliek) for the repository setup.
 
 ## Build from source
@@ -107,30 +107,28 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
   as a degraded state, never a hard failure.
 
 **Nothing else.** `brew install shed` (or `apt install shed-server` on a Linux host) plus the
-desktop app is a complete install — its credential broker handles credential approvals (SSH
-sign, AWS, Docker) itself, with nothing else to install.
+desktop app is a complete install — the app delivers your credentials into new sheds itself, with nothing else to install.
 
-## Credential broker
+## Credential source
 
-The app's headline feature — SSH-sign approvals, AWS/Docker credential gating, and the
-Activity audit feed — needs a **credential broker** in the loop. The app is that broker: it
-runs it in its own process, on both macOS and Linux, with nothing extra to install and no
-mode to choose. A machine without the app (a server, or a box with no desktop session) has no
-broker.
+The app's headline feature, delivering your credentials into new sheds, needs a **credential
+source** on your side: the machine a server asks for them. The app is that source, on both
+macOS and Linux, with nothing extra to install and no mode to choose. A machine without the
+app (a server, or a box with no desktop session) is not a source.
 
-Credential requests are answered only while the app is running. To keep it running, the app
+Credentials are delivered only while the app is running. To keep it running, the app
 turns on **launch at login** once, at its first launch (an upgraded install included), and
 records that in its preferences. It never turns it on again, so if you switch it off in
 Preferences it stays off. A debug build does not register itself.
 
 If you installed the separate credential daemon from Homebrew with an earlier release, it is
-removed from the tap with this release and does nothing now: uninstall it with `brew uninstall` (see
+removed from the tap and does nothing now: uninstall it with `brew uninstall` (see
 [Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
-upgrade guide for this release).
+v0.10 upgrade guide).
 
-The active SSH backend and per-server connection state are visible in Preferences → Credential
-broker and over IPC (`broker.status`). The app and the servers see one machine identity, and
+Per-server connection state is visible in Preferences → Provisioning and over IPC
+(`delivery.status`, `source.status`). The app and the servers see one machine identity, and
 Preferences shows which of your machines is the [credential source](../extensions/source-binding.md)
-on each server. Full mechanics — `extensions.yaml` handling, the synthesized fresh-install
-default, and the fail-closed behaviors — are in
-[Architecture → The credential broker](architecture.md#the-credential-broker).
+on each server. Full mechanics are in
+[Architecture → The credential source for delivery](architecture.md#the-credential-source-for-delivery)
+and [Provisioning](provisioning.md).

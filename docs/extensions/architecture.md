@@ -1,188 +1,93 @@
 # Extensions Architecture
 
-The credential extensions broker all signing and secret resolution through the
-user's own machine over shed's [plugin message bus](../reference/extensions.md). This
-page traces the component layout, the per-namespace message flows, and how the
-guest binaries are built and shipped.
+Shed's plugin message bus lets a process in a shed talk to a process on the user's own
+machine, routed by the shed server. This page traces the component layout, the message flow,
+and where the pieces live in the repository. The bus is generic: shed ships no extension of
+its own on it. (Credentials used to run on it; since v0.11 they reach a shed by
+[credential delivery](../reference/delivery.md) instead.)
 
 ## Component Overview
 
 ```mermaid
 graph TB
     subgraph "shed microVM"
-        SSH[SSH client / git] --> SSA[shed-ext-ssh-agent<br/>Unix socket]
-        AWS[AWS SDK] --> AWP[shed-ext-aws-credentials<br/>HTTP :499]
-        DCK[Docker CLI] --> DCS[docker-credential-shed<br/>one-shot CLI]
-        SSA --> BUS[shed-agent<br/>127.0.0.1:498]
-        AWP --> BUS
-        DCS --> BUS
+        P[Extension process<br/>from your image] --> BUS[shed-agent<br/>127.0.0.1:498]
     end
     BUS -->|vsock| SRV[shed-server<br/>Plugin message bus<br/>routed by user]
-    SRV -->|SSE, to the user's<br/>credential source only| HA[credential broker<br/>in the shed desktop app]
-    subgraph "The user's machine (macOS or Linux)"
-        HA --> SC[Signing check]
-        SC --> AG[Approval gate<br/>policy / Touch ID / shed-desktop]
-        AG --> BE[SSH Backend<br/>agent-forward / local-keys]
-        HA --> STS[AWS STS<br/>AssumeRole + cache]
-        HA --> DCB[Docker Backend<br/>credential helpers + config]
-        HA --> AL[Audit log]
-    end
+    SRV -->|SSE, to the user's<br/>credential source only| L[Host listener<br/>on the user's machine]
 ```
 
 ## Message Flow
 
-### SSH Sign Request
-
-1. SSH client connects to `shed-ext-ssh-agent` via `SSH_AUTH_SOCK`
-2. `shed-ext-ssh-agent` translates the SSH agent protocol `Sign()` call into a JSON envelope
-3. Envelope is POSTed to `http://127.0.0.1:498/v1/publish` (shed-agent's HTTP endpoint)
-4. shed-agent sends the message over vsock to shed-server
-5. shed-server stamps the envelope with its own record of the shed, replaces the guest's
-   request id with one it mints, and routes it to the `ssh-agent` listener of the **shed's
+1. A process in the shed POSTs a JSON envelope to `http://127.0.0.1:498/v1/publish`, the
+   shed-agent's HTTP endpoint.
+2. shed-agent sends the message over vsock to shed-server.
+3. shed-server stamps the envelope with its own record of the shed, replaces the guest's
+   request id with one it mints, and routes it to the namespace's listener of the **shed's
    user**. That listener exists only on the user's [credential source](source-binding.md);
-   with no listener the request is dropped and logged
-6. The broker (in the shed desktop app) decodes the request
-   and runs the [signing check](ssh-agent.md#what-the-machine-signs). A refused request is
-   audited and answered at once, with no prompt
-7. A request that passes goes to the approval gate, then to the SSH backend, which signs
-   exactly the checked bytes
-8. Response envelope flows back: broker -> shed-server (accepted only from the bound machine,
-   for a request it was sent) -> shed-agent -> shed-ext-ssh-agent
-9. `shed-ext-ssh-agent` returns the signature to the SSH client
+   with no listener the request is dropped and logged.
+4. The listener processes the request and POSTs a response to
+   `/api/plugins/listeners/{namespace}/respond`, carrying the minted id in `in_reply_to`.
+5. shed-server accepts the response only from the bound machine, for a request it sent that
+   machine, and passes it back over vsock to shed-agent, which answers the publish call.
 
-### AWS Credential Request
-
-1. AWS SDK calls `GET http://127.0.0.1:499/credentials` (via `AWS_CONTAINER_CREDENTIALS_FULL_URI`)
-2. `shed-ext-aws-credentials` translates the HTTP request into a JSON envelope
-3. Envelope is POSTed to the shed-agent publish endpoint
-4. shed-server routes the message to the `aws-credentials` listener of the shed's user (its credential source) via SSE
-5. The broker receives the envelope, applies the AWS approval policy, and checks its credential cache
-6. If cached credentials are still valid (>5 min remaining), return immediately
-7. If stale, call `sts:AssumeRole` with the configured role and cache the result — or, in passthrough mode, re-read and vend the source profile's session credentials directly (no AssumeRole, no caching)
-8. Response flows back to `shed-ext-aws-credentials`, which returns the AWS SDK-expected format
-9. The SDK caches the credential in memory and manages its own refresh
-
-```mermaid
-sequenceDiagram
-    participant SDK as AWS SDK
-    participant Proxy as shed-ext-aws-credentials
-    participant Bus as Message Bus
-    participant Host as credential broker (desktop app)
-    participant STS as AWS STS
-
-    SDK->>Proxy: GET /credentials
-    Proxy->>Bus: publish(aws-credentials)
-    Bus->>Host: SSE event
-    alt passthrough mode
-        Host->>Host: re-read source profile session creds
-        Host-->>Bus: session credentials (no AssumeRole, no cache)
-    else assume-role, cache hit
-        Host-->>Bus: cached credentials
-    else assume-role, cache miss
-        Host->>STS: AssumeRole
-        STS-->>Host: temp credentials
-        Host-->>Bus: fresh credentials
-    end
-    Bus-->>Proxy: response
-    Proxy-->>SDK: {AccessKeyId, SecretAccessKey, Token, Expiration}
-```
-
-### Docker Credential Request
-
-1. Docker CLI execs `docker-credential-shed get` with the registry hostname on stdin
-2. `docker-credential-shed` translates the request into a JSON envelope and POSTs to the shed-agent publish endpoint
-3. shed-server routes the message to the `docker-credentials` listener of the shed's user (its credential source) via SSE
-4. The broker applies the Docker approval policy, checks the registry allowlist, reads `~/.docker/config.json`, and shells out to the appropriate credential helper (gcloud, osxkeychain, ecr-login, etc.)
-5. Response flows back to `docker-credential-shed`, which writes credentials to stdout and exits
+The wire format, the headers a listener sends and every refusal code are in the
+[Extensions reference](../reference/extensions.md).
 
 ## Package Structure
 
-All extension code lives in the shed monorepo. The guest binaries are Go and share the
-`internal/ext/` packages and the `github.com/charliek/shed/sdk` module. The host side, the
-credential broker, is the Rust crate `crates/shed-broker`, which the shed desktop app embeds
-and runs in its own process. It ports the same wire protocol — it talks to shed-server over
-the identical `sdk.HostClient`-shaped SSE subscribe/respond endpoints, so guest and host still
-agree on the wire even though they no longer share Go source. The desktop app is the only
-credential broker: there is no separate daemon to install.
+All bus code lives in the shed monorepo.
 
-### Guest-Side
+### Server and guest
 
-- **`internal/ext/sshagent/`** — Implements `golang.org/x/crypto/ssh/agent.Agent`. Each method marshals a request, POSTs to the publish endpoint, and unmarshals the response.
-- **`internal/ext/awsproxy/`** — HTTP handler for the AWS container credential endpoint. Translates `GET /credentials` into message bus requests. Returns the PascalCase JSON format the AWS SDK expects.
-- **`internal/ext/dockercred/`** — Docker credential helper bus client. Translates Docker credential helper protocol operations (`get`, `list`) into message bus requests. One-shot usage (not a daemon).
-- **`cmd/shed-ext-ssh-agent/`** — Unix socket listener. Creates a new agent instance per connection. Handles startup health check and graceful shutdown.
-- **`cmd/shed-ext-aws-credentials/`** — HTTP server on port 499. Routes `/credentials` to the proxy handler.
-- **`cmd/docker-credential-shed/`** — One-shot CLI binary. Docker execs this binary per credential operation. Reads stdin, publishes to bus, writes stdout, exits.
+- **`internal/plugin/`**: the bus. It holds listeners per user and namespace, admits a
+  machine only if it is the user's credential source, and matches each response to the
+  request it answers. It backs the `/api/plugins` routes.
+- **`cmd/shed-agent/`**: the in-VM agent. It runs the local publish proxy on
+  `127.0.0.1:498`, forwards messages over vsock, reads the manifests in
+  `/etc/shed-extensions.d/` and activates the enabled extensions' systemd units, and reports
+  each extension's health in its heartbeat.
+- **Credentials scope**: the bus routes need a credentials-scope certificate (see
+  [Security](../reference/security.md)); a script key's certificate is refused.
 
-### Host-Side
+### SDK
 
-- **`crates/shed-broker/`** — the broker core, embedded in the desktop app. It
-  subscribes to namespaces via a Rust port of the `sdk.HostClient` SSE
-  subscribe/respond protocol (handles subscription, reconnection, and response
-  delivery), dispatches requests to the SSH, AWS, and Docker handlers concurrently, and
-  hosts the approval gates. The `biometrics`/`biometrics-or-password` policies use a
-  native macOS Touch ID / LocalAuthentication gate built on `objc2` — it links the
-  LocalAuthentication framework directly, so the binary needs no CGO on darwin. The
-  `shed-desktop` policy instead delegates the approval decision to the app's own approval
-  gate (see [Credential approvals](../desktop/approvals.md)).
-
-### Shared
-
-- **`sdk/envelope.go`** — The envelope (`sdk.Envelope`, `sdk.ShedInfo`) and message types.
+- **`sdk/envelope.go`**: the envelope (`sdk.Envelope`, `sdk.ShedInfo`) and the message types.
   `internal/plugin` uses the same types as aliases, so the server and the guest share one
   definition.
-- **`internal/ext/protocol/`** — Per-namespace payload types (`ssh.go`, `aws.go`,
-  `docker.go`): namespaces, operations, error codes and request/response field names.
+- **`sdk.BusClient`**: the guest-side HTTP publisher to shed-agent.
+- **`sdk.HostClient`**: the host-side SSE subscriber to shed-server, with machine identity,
+  reconnect and the credential-source refusals (`*sdk.SourceError`).
 
-## SSH Backend Selection
+The desktop app's Rust crate `crates/shed-source` has its own client of the same endpoints
+for its delivery stream; it does not subscribe to any bus namespace.
 
-```mermaid
-graph TD
-    A[Start] --> B{config.ssh.mode set?}
-    B -->|Yes| C[Use configured mode]
-    B -->|No| D{SSH_AUTH_SOCK exists?}
-    D -->|Yes| E[agent-forward mode]
-    D -->|No| F[local-keys mode]
-```
+## The health frame
 
-**Agent-forward**: Proxies to the developer's existing SSH agent (Secretive, 1Password, ssh-agent, yubikey-agent). Zero disruption to existing key management.
-
-**Local-keys**: Reads keys directly from `~/.ssh/`. Fallback when no agent is running.
-
-## AWS Credential Caching
-
-The caching strategy is asymmetric:
-
-- **Guest proxy**: Pure passthrough, no caching. Every SDK request goes to the bus.
-- **Host handler (assume-role mode)**: Caches STS credentials per shed, keyed by server/shed.
-- **Host handler (passthrough mode)**: No caching — the shared credentials file is re-read on every request so a fresh SSO/SAML login is picked up immediately.
-
-This avoids cache coherence complexity. Each request makes a round trip from the shed to its server and on to the user's machine, but the SDK only fetches credentials when its in-memory cache is stale (~once per hour).
+The first message of an agent's connection is `system:health`. The server answers with the
+list of enabled extensions from its config, and the agent reads that list to decide which
+manifest units to enable. After that the agent's heartbeat carries each enabled
+extension's `guest` state (is the unit active) and `host` state (does a bus ping reach a
+listener).
 
 ## Distribution
 
-Extension artifacts ship from the shed release pipeline, split by where they run:
+| Component | Channel |
+|-----------|---------|
+| `shed-server` (the bus) | The server package (brew, apt) |
+| `shed-agent` | Baked into the rootfs images (`base`, `full`) and the cloud image |
+| `sdk` | The Go module `github.com/charliek/shed/sdk` |
 
-| Component | Channel | How it is built |
-|-----------|---------|-----------------|
-| Credential broker (`shed-broker`) | The shed desktop app (macOS DMG, Linux `.deb`) | Built into the desktop app; there is no separate broker binary or Homebrew formula. The retired `shed-machine-rc`'s brew/apt artifacts stay frozen at their last release, v0.8.2 |
-| Guest binaries + systemd units + env config | Baked into the `extensions` / `full` rootfs images | Cross-compiled from `cmd/` and staged into the image build context by `scripts/stage-guest-binaries.sh`, alongside the `guest/extensions/etc/` overlay |
-
-The guest binaries (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`,
-`docker-credential-shed`) are compiled in-tree — there is no
-separate published image to `COPY --from`. The same `stage-guest-binaries.sh`
-script feeds the local `scripts/build-{vz,firecracker}-rootfs.sh` flows and the
-`publish-images.yaml` CI jobs, so a local dev build and a released image carry
-byte-identical staging logic. See
-[Testing](../development/testing.md) for the rootfs-rebuild loop.
+The images carry no extension manifest and no extension unit. To add one, build your own
+image from `base` or `full` (see [Build Your Own Image](../tutorials/build-your-own-image.md)),
+install its binary, unit and a manifest in `/etc/shed-extensions.d/`, and name its namespace
+in `extensions.enabled`.
 
 ## Security Boundaries
 
-| Boundary | What crosses | What doesn't |
-|----------|-------------|--------------|
-| VM -> Host (SSH sign) | Data to sign, public key reference (signed only if it is a login as an allowed username or a `git` signature) | Private keys |
-| Host -> VM (SSH response) | Signature blob | Private keys |
-| VM -> Host (AWS request) | Operation type only | Role ARN, source credentials |
-| Host -> VM (AWS response) | Short-lived STS token (1h) | Long-lived AWS credentials |
-| VM -> Host (Docker get) | Registry hostname | Docker config.json contents |
-| Host -> VM (Docker response) | Registry credentials (tokens or passwords) | Host Docker config, other registries' credentials |
+| Boundary | Rule |
+|----------|------|
+| Guest to server | Anything in the shed can publish on the bus. The server replaces the envelope's `shed` object and id, so a guest cannot claim to be another shed. |
+| Server to listener | Only the shed's user's credential source receives the message. Another of the user's machines is refused and keeps retrying. |
+| Listener to server | A response is accepted only from the machine that was sent the request, under the current binding. |
+| Service clients and script keys | A shed owned by a service client has the bus off. A script key's certificate cannot subscribe or respond. |

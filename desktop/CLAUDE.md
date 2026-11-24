@@ -51,7 +51,7 @@ it. There is no `shed-gtk` crate.
 sparkle-updater crate's `build.rs` panics without it. The mac bundle uses the identity
 `ai.stridelabs.ShedDesktop` (mac-only overlay `tauri.macos.conf.json`), so the mac dev config
 dir is `~/Library/Application Support/ai.stridelabs.ShedDesktop`; the **Linux** identity
-`ai.stridelabs.shed-desktop` (polkit/D-Bus/nfpm) is different. **Never change the mac bundle
+`ai.stridelabs.shed-desktop` (D-Bus/nfpm) is different. **Never change the mac bundle
 id, `SUFeedURL` or `SUPublicEDKey`** (`tauri/src-tauri/Info.plist`) — every installed copy
 updates against them, and CI's bundle smoke pins the key. See `desktop/RELEASING.md` for the
 release flow.
@@ -92,7 +92,7 @@ full loops.
 make tauri-run           # build + launch the Tauri client natively
 make e2e-tauri           # the hermetic pytest harness (needs a display, Xvfb on Linux)
 make tauri-build-linux   # the WebKitGTK render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 (Docker, Xvfb)
-make tauri-test-linux    # the Tauri crate's Linux-only approval-seam tests (polkit gate; Docker)
+make tauri-test-linux    # the Tauri crate's clippy + cargo test on Linux (its Linux cfg; Docker)
 make core-linux          # shared-crate cargo test/clippy on Linux (Docker)
 make deb / make deb-validate   # build the .deb / build + install-validate in a clean ubuntu:24.04 container
 ```

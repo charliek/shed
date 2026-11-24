@@ -56,7 +56,7 @@ channel**:
    }
    ```
 
-`shed server add` performs this exchange automatically; the desktop app's credential broker enrolls
+`shed server add` performs this exchange automatically; the desktop app enrolls
 its own `credentials` certificate the same way. The certificate lives
 `auth.token_ttl` (default 24h) and is **re-validated on every request**: its
 expiry, its key against the live key set (with a user list, also the key's
@@ -1410,7 +1410,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 **Consumers:**
 
 - `shed tunnels` CLI uses Connect API for port forwarding
-- The proxy extension (`shed-ext-proxy`) uses Connect API for reverse proxying
+- A proxy extension built on the bus can use the Connect API for reverse proxying
 - SSH port forwarding (`ssh -L`) uses `DialService` internally via `handleDirectTCPIP`
 
 ## Users
@@ -1576,7 +1576,7 @@ read as one moment's state.
 | `binding` | `null` when no machine is the source yet (the first to connect becomes it). `delivery` (where requests are sent) and `signing` (whose answers are accepted) each name exactly one machine, the same one. |
 | `binding.bound_by` | `first-connect`, or who moved it last: `user <name> with key "<label>" (<fingerprint>)` for a key listed with a label, `user <name> with key <fingerprint>` otherwise, `admin <name> ...` when an admin moved another user's, `the implicit user ...` on a server with no user list |
 | `binding.generation` | Increases on every bind and move |
-| `machines` | Up to 32 machines remembered for the user, oldest first. A machine is known only once its broker has tried to connect. |
+| `machines` | Up to 32 machines remembered for the user, oldest first. A machine is known only once its app has tried to connect. |
 | `machines[].key_fingerprint` | The key the machine's certificate was enrolled with (empty in open mode) |
 | `machines[].connected`, `namespaces` | Whether it holds a subscription now, and for which request types |
 
@@ -1601,7 +1601,7 @@ left it.
 
 The move takes effect at once: the old machine's streams end, the requests
 sent to it are dropped, and its answers are refused. The new machine is not
-called; it starts answering when its broker next connects. Moving to the
+called; it starts answering when its app next connects. Moving to the
 machine already bound changes nothing (the `generation` is unchanged).
 
 **Errors:**
@@ -1616,8 +1616,8 @@ machine already bound changes nothing (the `generation` is unchanged).
 
 ## Extensions
 
-Extension endpoints carry the credential bus between sheds and the machines
-that answer for their users. See [Extensions](extensions.md) for the full guide
+Extension endpoints carry the message bus between sheds and the machines
+that answer for their users. Shed ships no extension on it since v0.11; credentials travel by [delivery](delivery.md). See [Extensions](extensions.md) for the full guide
 and [Security › Credential bus](security.md#credential-bus) for the routing,
 the pin and its limits. Every route here needs the `credentials` scope in mtls
 mode, and refuses a service client (`403 FORBIDDEN`, `the credential bus is for
@@ -1660,7 +1660,7 @@ taken within 15 s closes it.
 | `FORBIDDEN` | 403 | A service client, or a script key |
 | `NAMESPACE_RESERVED` | 403 | `system:*` namespaces cannot be registered |
 | `INVALID_NAMESPACE` | 400 | The namespace is malformed |
-| `SOURCE_MACHINE_ID_REQUIRED` | 403 | The machine headers are missing or invalid (a broker released before v0.10.0); the message names the minimum versions |
+| `SOURCE_MACHINE_ID_REQUIRED` | 403 | The machine headers are missing or invalid (a client released before v0.10.0); the message names the minimum versions |
 | `SOURCE_RATE_LIMITED` | 429 | Too many new or changed machines for this user lately; with `Retry-After` in seconds |
 | `SOURCE_NOT_BOUND` | 403 | Another machine is the user's source; the body's `source` names it (`machine_id`, `machine_name`) |
 | `SOURCE_DUPLICATE_STREAM` | 409 | The source machine already holds this namespace. Retryable: nothing is replaced, and a dead stream is closed by its write deadline |

@@ -118,7 +118,7 @@ the [upgrade cookbook](../reference/images.md#cookbook-upgrading-image-versions)
 
 ## 4. Configure
 
-Edit `/etc/shed/server.yaml` to configure mounts and extensions. The package never overwrites
+Edit `/etc/shed/server.yaml` to configure mounts. The package never overwrites
 this file: an upgrade keeps your edits and does not prompt. New defaults appear in the
 reference copy, so compare after an upgrade with
 `diff /usr/share/shed/server.yaml.default /etc/shed/server.yaml`.
@@ -144,17 +144,9 @@ mounts:
 # Environment variables passed to the in-VM git clone of --repo (not to sessions or hooks)
 env_file: /root/.shed/env
 
-# Extensions provide credential brokering from host to VM.
-# Credentials are brokered by the shed desktop app, which must be running on your machine.
-# extensions:
-#   enabled:
-#     - ssh-agent
-#     - aws-credentials
-#     - docker-credentials
-
 firecracker:
   # default_image / image_aliases omitted -> resolved from the server
-  # version: ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z. A
+  # version: ghcr.io/charliek/shed-fc-{base,full}:vX.Y.Z. A
   # released (deb) shed-server fills these in automatically; pin them
   # explicitly only on an ahead-of-tag/dirty source build or to use a
   # custom registry (see "Set Up Images" below).
@@ -232,7 +224,7 @@ shed create myproject --backend=firecracker
 shed create myproject --backend=firecracker --cpus=4 --memory=8192
 
 # Or with a specific variant
-shed create myproject --backend=firecracker --image extensions
+shed create myproject --backend=firecracker --image base
 ```
 
 ## Upgrading from v0.4.x
@@ -335,7 +327,6 @@ firecracker:
   default_image: ghcr.io/charliek/shed-fc-full:v0.6.2
   image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v0.6.2
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.6.2
     full: ghcr.io/charliek/shed-fc-full:v0.6.2
   pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
@@ -356,15 +347,14 @@ script runs (the script compiles `shed-agent` and `shed-firstboot`).
 
 # Build a specific variant
 ./scripts/build-firecracker-rootfs.sh --variant base
-./scripts/build-firecracker-rootfs.sh --variant extensions
 
-# Build all variants (base, extensions, full)
+# Build all variants (base, full)
 ./scripts/build-firecracker-rootfs.sh --all
 ```
 
 The script writes directly into the local blob store at
-`/var/lib/shed/firecracker/images/blobs/` and advances the `base`,
-`extensions`, and `full` tags. Confirm with `shed image ls`.
+`/var/lib/shed/firecracker/images/blobs/` and advances the `base`
+and `full` tags. Confirm with `shed image ls`.
 
 ##### Configure server for local builds
 

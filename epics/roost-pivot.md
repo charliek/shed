@@ -40,7 +40,7 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | S4m | [shed-mobile#19](https://github.com/charliek/shed-mobile/issues/19) | RP/M3 | the phone mirrors the lane DTOs through FRB and forwards `server_url` over dartssh2 — opencode AND gx (the gx half retired in plan 025; the phone's craze half is shed-mobile#33–#35) |
 | S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | **landed (plan 019)** — the `shed` roost provider script, the kickoff path that replaced `sx` |
 | S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | **landed (plan 019)** — `roost-session` inside sheds and on machines, via roost's bootstrap ladder; the payoff is **demonstrated live** — a real shed's codex row carries roost-sourced `activity` with `source: "roost"` |
-| S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle — **after S5** |
+| S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, the guest RC helper, Go engine, rc-parity oracle — **after S5** |
 | S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | ✅ **done (plan 016)** — `sx` sunset entirely: crate, release wiring and the rc-parity one-shot family deleted |
 
 S3's mobile twin is **S3m** in `shed-mobile`

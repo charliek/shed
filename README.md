@@ -26,7 +26,7 @@ Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon
 
 Follow the packaged quickstart for your platform:
 
-- **[macOS Quickstart](https://charliek.github.io/shed/getting-started/macos-quickstart/)** — Homebrew + the shed-desktop approval app.
+- **[macOS Quickstart](https://charliek.github.io/shed/getting-started/macos-quickstart/)** — Homebrew + the shed-desktop app.
 - **[Linux Quickstart](https://charliek.github.io/shed/getting-started/linux-quickstart/)** — the `shed-server` deb running Firecracker.
 
 Building from source or customizing images? See
@@ -41,7 +41,7 @@ Two binaries and a desktop app:
 
 - **`shed`** — the CLI on your developer machine.
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
-- **shed desktop app** — the credential broker on your machine (macOS and Linux), with the approval prompts: the [shed-desktop](https://charliek.github.io/shed/desktop/) app, in this monorepo under `desktop/` with its shared Rust client core under `crates/`. It ships separately from these binaries.
+- **shed desktop app** — your credential source on your machine (macOS and Linux), delivering keys and tokens into new sheds: the [shed-desktop](https://charliek.github.io/shed/desktop/) app, in this monorepo under `desktop/` with its shared Rust client core under `crates/`. It ships separately from these binaries.
 
 ```text
 Developer Machine                Remote Server / Local Mac
@@ -53,7 +53,7 @@ Developer Machine                Remote Server / Local Mac
                               └──────────────────────────────┘
 ```
 
-Both backends boot from layered OCI images (`base` / `extensions` / `full`)
+Both backends boot from layered OCI images (`base` / `full`)
 pulled registry-direct from `ghcr.io`. See
 [Images](https://charliek.github.io/shed/reference/images/).
 
@@ -66,7 +66,8 @@ pulled registry-direct from `ghcr.io`. See
 - [Security](https://charliek.github.io/shed/reference/security/) — the model: postures, service clients, mount selection, network profiles
 - [Orchestrated Sheds](https://charliek.github.io/shed/guides/orchestrated-sheds/) — driving sheds from CI or an agent runner
 - [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
-- [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
+- [Credentials in a shed](https://charliek.github.io/shed/guides/credentials-in-a-shed/) — what to deliver, AWS and registry sign-in, and the trade
+- [Extensions](https://charliek.github.io/shed/reference/extensions/) — the plugin message bus
 - [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
 - [Credential delivery](https://charliek.github.io/shed/reference/delivery/) — a person's SSH key, GitHub token, API keys and envsecrets login written into a shed at create and by `shed provision`
 - [Desktop app](https://charliek.github.io/shed/desktop/) — the Tauri desktop app for macOS (menu bar) and Linux (`desktop/`, on the shared Rust core in `crates/`)

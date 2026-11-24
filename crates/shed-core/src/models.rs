@@ -373,7 +373,7 @@ fn raw_str(v: Option<&Value>) -> &str {
 /// adapter's merge of the derived slug/tmux/outer-created_at with the `rc`
 /// block). Ported field-for-field from mobile's `RcSession.fromJson`
 /// (`rc_models.dart:245-273`) — deliberately NOT the strict [`crate::rc::RcSessionDto`]
-/// serde path (that is the `shed-ext-rc` stdout contract): a server-enriched
+/// serde path (that is the retired guest RC helper's stdout contract): a server-enriched
 /// row must decode per-field so a future/unknown enum value or a missing field
 /// degrades that FIELD, never vanishes the session (forward-compat: an old
 /// client still renders a session a newer server enriches). Tolerances:
@@ -585,8 +585,8 @@ impl OverviewShed {
     /// `None` to skip it. Only rc-enriched tmux rows carry an `rc` block; a
     /// plain tmux session (e.g. "default"), an un-enriched rc-* row on a
     /// degraded shed, or a non-map element has none — skipped, so the sessions
-    /// list holds exactly the RC sessions (parity with the old `shed-ext-rc
-    /// list` fan-out). Mirrors `shed_dtos.dart:263-269`.
+    /// list holds exactly the RC sessions (parity with the old guest RC helper's
+    /// `list` fan-out). Mirrors `shed_dtos.dart:263-269`.
     fn session_from_row(row: &Value, shed_name: &str) -> Option<RcSession> {
         let row = row.as_object()?;
         let rc = row.get("rc").and_then(Value::as_object)?;

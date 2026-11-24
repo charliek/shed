@@ -1,6 +1,6 @@
 # shed-machine-rc (retired)
 
-`shed-machine-rc` was the host-side sibling of the now-retired [`shed-ext-rc`](rc-helper.md):
+`shed-machine-rc` was the host-side sibling of the now-retired [the guest RC helper](rc-helper.md):
 the same RC Session Convention v2 engine, shipped as a CLI for **native machines** — a
 laptop, workstation, or tailnet host — instead of baked into a shed image. It created and
 drove `rc-<slug>` `tmux` sessions, and its `serve` verb ran the machine's RC activity hub.
@@ -10,7 +10,7 @@ drove `rc-<slug>` `tmux` sessions, and its `serve` verb ran the machine's RC act
 | What it did | What happened to it |
 |---|---|
 | the one-shot verbs (`create`, `list`, `probe`, `prompt`, `kill`, …) | Plan 010 ported this half to Rust and shipped it as `sx`; `sx` was itself [sunset unreleased in plan 016](sx.md) before it ever shipped. Machine kickoff moved to [roost's own palette](roost-provider.md) (S4), with [`roost-session` bootstrapped onto the machine first](roost-session-hosts.md) (S5) when it doesn't already have one. |
-| `serve` — the machine RC activity hub on `127.0.0.1:1029` | Plan 010 ported this half into `shed-host-agent` (`shed-broker`'s `rc_hub` module) as a supervised resident role. Plan 022 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) then retired the hub itself — machine session activity now comes from [roost](roost-session-hosts.md), the same way it does for a shed. `shed-host-agent rc-hub` is now a tombstone: it exits naming the retirement instead of starting a hub. |
+| `serve` — the machine RC activity hub on `127.0.0.1:1029` | Plan 010 ported this half into `shed-host-agent` (the broker's `rc_hub` module) as a supervised resident role. Plan 022 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) then retired the hub itself — machine session activity now comes from [roost](roost-session-hosts.md), the same way it does for a shed. `shed-host-agent rc-hub` is now a tombstone: it exits naming the retirement instead of starting a hub. |
 
 The `tests/rc-parity` differential suite that once proved the Rust hub port wire-identical
 to this binary's engine (its Go oracle relocated to `tests/rc-parity/oracle/` at the plan
@@ -25,7 +25,7 @@ either side of the wire to diff.
     from them and they receive no fixes.
 
 The Go RC engine this binary was built from (`internal/ext/rc`, `internal/ext/clirc`) is
-also gone — it was deleted along with the guest binary `shed-ext-rc` in the same S6
+also gone — it was deleted along with the guest RC helper binary in the same S6
 retirement, not kept on as a guest-side survivor.
 
 ## Migrating a machine

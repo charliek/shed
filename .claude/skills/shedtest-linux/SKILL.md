@@ -1,6 +1,6 @@
 ---
 name: shedtest-linux
-description: Validate the shed desktop app's Tauri Linux client from a Mac (or Linux) dev machine — the WebKitGTK render gate, the Linux-only approval-seam crate tests, the nfpm .deb build + clean-container install validation, and driving the app headlessly over its IPC socket. Use when asked to test the Tauri/Linux client, verify a shared/Linux desktop change, debug a WebKitGTK render or .deb failure, or run the Docker legs. The app lives under `desktop/`; the shared Rust core is the sibling `crates/` workspace. The macOS app loop is the shedtest-mac skill.
+description: Validate the shed desktop app's Tauri Linux client from a Mac (or Linux) dev machine — the WebKitGTK render gate, the Tauri crate's Linux clippy and tests, the nfpm .deb build + clean-container install validation, and driving the app headlessly over its IPC socket. Use when asked to test the Tauri/Linux client, verify a shared/Linux desktop change, debug a WebKitGTK render or .deb failure, or run the Docker legs. The app lives under `desktop/`; the shared Rust core is the sibling `crates/` workspace. The macOS app loop is the shedtest-mac skill.
 ---
 
 # Tauri Linux client end-to-end (from a Mac dev box)
@@ -16,7 +16,7 @@ running.
 ## The fast path
 
 ```bash
-make -C desktop tauri-test-linux    # Tauri crate's Linux-only approval-seam tests (polkit gate; Docker, no display)
+make -C desktop tauri-test-linux    # the Tauri crate's clippy + cargo test on Linux (its Linux cfg; Docker, no display)
 make -C desktop tauri-build-linux   # the render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 under Xvfb (Docker)
 make -C desktop core-linux          # shared crates: test + clippy on Linux (Docker)
 ```
@@ -26,8 +26,9 @@ make -C desktop core-linux          # shared crates: test + clippy on Linux (Doc
   WebView** (WebKitGTK 2.44) under Xvfb — the render smoke *is* the CSS gate (2.44 supports
   oklch/color-mix/`:has()`/`@container`, so a static denylist would be miscalibrated). The macOS
   WKWebView e2e alone can miss Linux-only breaks.
-- **`tauri-test-linux`** compiles the Tauri crate on Linux (where the polkit `AuthGate` +
-  libnotify `Notifier` compile) and asserts the gate is fail-closed. No display needed.
+- **`tauri-test-linux`** runs the Tauri crate's clippy and unit tests on Linux, so the
+  `cfg(target_os = "linux")` code compiles and is linted there. No display needed. (The polkit
+  approval gate and its seam tests were removed in plan 039 with the approvals.)
 - Both reuse the `shed-tauri-linux` image (built from `desktop/Dockerfile.tauri-linux`).
 
 ### The native inner loop (a Linux host with the WebKitGTK dev stack)
@@ -76,8 +77,8 @@ make -C desktop deb DEB_VERSION=0.8.0     # override the version stamped into th
 ```
 
 `deb` builds the Tauri binary via nfpm (`desktop/linux/scripts/build-deb.sh`, bin
-`shed-desktop-tauri` → `/usr/bin/shed-desktop`), with a headless `shedctl` and the polkit
-action bundled; `deb-validate` installs it in a fresh container and runs
+`shed-desktop-tauri` → `/usr/bin/shed-desktop`), with a headless `shedctl`
+bundled; `deb-validate` installs it in a fresh container and runs
 `linux/scripts/validate-deb.sh` against the newest `out/*.deb`.
 
 ## Driving the Tauri app over IPC
@@ -106,42 +107,40 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   `{visible, title, prefs}` (the window's UI truth — `visible`/`title` are Rust-side native
   window state, `prefs` is the React-reported `{sections, values, mode}` snapshot keyed under
   the **`preferences`** window label); `prefs.close` (hide, close-hides contract);
-  `prefs.provider_modes` / `prefs.set_provider` (AWS/Docker Allow|Deny, ungated); and
-  `prefs.remove_shed_rule {server, shed}` (the per-shed override row's remove button). Note
+  Note
   `ui.modal` now only ever reports `create` | `launch` | `null` — Preferences is never a
   modal value.
-- **Credential sources (plan 035 §3.4).** `source.status` → `{rows, this_machine,
-  this_machine_error}` (one row per configured server: `host`, `supported`,
-  `source {id,name}|null`, `this_machine`, `connected`, `error`) and `source.use {host}` (makes
-  THIS machine the source; `{row, woke_broker}`; refusals come back as `bad_request`,
-  `machine_identity_unavailable`, `source_machine_not_found`, `forbidden`, `unsupported`,
-  `action_failed`). The Preferences rows live INSIDE the "Credential broker" section (no new
-  section id: `prefs.dump`'s `values.sources` / `this_machine_name` / `this_machine_error`
-  carry them). The button is pressed through `ui.press_source_use {host}` (test mode only): the
-  open window clicks its OWN `button[data-source-use="<host>"]`, so a disabled button takes no
-  press — the dump's `can_use` and the DOM's `disabled` come from one rule. The mock is
-  UNARMED by default (`/api/sources` answers chi's plain 404 = an older server; subscribes
-  unchanged); `MockShedServer.arm_source(...)` (or `_broker_app(source={...})`) makes it
-  pin: another machine's subscribe gets 403 SOURCE_NOT_BOUND naming the bound machine, a
-  move needs a machine the mock has SEEN (a subscribe, or `know_machine` for a machine that
-  never subscribes), and `source_use_script([403, 500])` scripts refusals. Like the
-  real server, a move (`POST /api/sources/use` or `mock.move_source(id, name)`, another
-  machine taking it) releases every slot the old machine holds and ends its streams, and the
-  old machine's later responds get 403 SOURCE_NOT_BOUND. More knobs: `source_busy(n,
-  retry_after)` (next n reads 503 SOURCE_BUSY — the core asks 3 times per read),
-  `source_reads_late(secs)` (a read that takes its document on arrival and answers late —
-  an overtaken read), `delay_source_use(secs)` (two moves in flight at once). The mock's own
-  contract is pinned without the app in `test_mockserver_sources.py`. The cells are
-  `test_tauri_broker.py`'s "(d1b)" block; the "connected at once" cell waits for four
-  refusals (next backoff 8 s, no jitter) and asserts the accepted subscribe came within
-  `_WAKE_BUDGET_S` of the last one (`mock.subscribe_times`): 6 s at scale 1, scaled with
-  `SHED_TAURI_TEST_TIMEOUT_SCALE` but capped 0.5 s under the backoff — without the wake it
+- **Credential sources (plan 035 §3.4, re-hosted on the delivery stream in plan 039 PR B).**
+  `source.status` → `{rows, this_machine, this_machine_error}` (one row per configured
+  server: `host`, `supported`, `source {id,name}|null`, `this_machine`, `connected`, `error`)
+  and `source.use {host}` (makes THIS machine the source; `{row, woke_source}`; refusals come
+  back as `bad_request`, `machine_identity_unavailable`, `source_machine_not_found`,
+  `forbidden`, `unsupported`, `action_failed`). The Preferences rows live INSIDE the
+  Provisioning section (`prefs.dump`'s `values.sources` / `this_machine_name` /
+  `this_machine_error` carry them). The button is pressed through `ui.press_source_use
+  {host}` (test mode only): the open window clicks its OWN `button[data-source-use="<host>"]`,
+  so a disabled button takes no press — the dump's `can_use` and the DOM's `disabled` come
+  from one rule. The mock is UNARMED by default (`/api/sources` answers chi's plain 404 = an
+  older server); `MockShedServer.arm_source(...)` (or `_source_app(source={...})` in
+  `test_tauri_source.py`) makes it pin: another machine's delivery stream gets 403
+  SOURCE_NOT_BOUND naming the bound machine, a move needs a machine the mock has SEEN (a
+  stream, or `know_machine` for a machine that never connects), and
+  `source_use_script([403, 500])` scripts refusals. Like the real server, a move
+  (`POST /api/sources/use` or `mock.move_source(id, name)`, another machine taking it) ends
+  the old machine's streams, and the old machine's later answers get 403 SOURCE_NOT_BOUND.
+  More knobs: `source_busy(n, retry_after)` (next n reads 503 SOURCE_BUSY — the core asks 3
+  times per read), `source_reads_late(secs)` (a read that takes its document on arrival and
+  answers late — an overtaken read), `delay_source_use(secs)` (two moves in flight at once).
+  The mock's own contract is pinned without the app in `test_mockserver_sources.py`. The cells
+  are `test_tauri_source.py`'s; the "connected at once" cell waits for four refusals (next
+  backoff 8 s, no jitter) and asserts the accepted stream came within `_WAKE_BUDGET_S` of the
+  last one (`mock.subscribe_times`): 6 s at scale 1, scaled with
+  `SHED_TAURI_TEST_TIMEOUT_SCALE` but capped 0.5 s under the backoff — without the reopen it
   lands at exactly +8 s. Preferences re-reads the rows when a hidden window is shown again
   (the native `prefs-shown` event, plus the DOM `focus`/`visibilitychange`, throttled to
   one read per 5 s); under Xvfb either path alone refreshes a reopen.
 - **Provisioning (plan 039 A7).** Preferences → Provisioning holds the five providers'
-  switches and editors, the source rows (moved there from the broker section; same
-  `data-source-*` nodes, same `values.sources`), and a Preview. Read it back from
+  switches and editors, the source rows (`data-source-*` nodes, `values.sources`), and a Preview. Read it back from
   `prefs.dump`'s `values.provisioning` (built off the rendered nodes: each provider's
   switch state, `only` line, editor, refusal and notice; `editor`, the open editor's
   committed input values, passphrase command arguments `redacted`; the open draft as its
@@ -165,23 +164,22 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   `$HOME/.config/autostart/*.desktop` and ignores `XDG_CONFIG_HOME`, so it lands under the
   throwaway HOME (`ui.linux_autostart_dir`), never yours; `prefs.json` is under
   `XDG_CONFIG_HOME` (`ui.app_config_dir`). `test_login_item_default_once` relaunches over the
-  same runtime dir (`_broker_app(runtime_dir=...)`, caller-owned); the unwritable cell makes
+  same runtime dir (a self-managed app with `runtime_dir=...`, caller-owned); the unwritable cell makes
   `prefs.json` a DIRECTORY because the Docker gate runs as root, which a read-only directory
   does not stop. A debug build outside the harness never applies the default.
-- **The app's credential broker is the harness's own** (`broker_env.py`). The app brokers in
-  process, so every launch gets a hermetic broker in its runtime dir: `ssh.mode: local-keys`
-  over a throwaway key, every namespace delegated to the app, a server file naming only
-  loopback mocks, AWS/Docker credentials of constants, no `SSH_AUTH_SOCK` and no proxy
-  variables (`NO_PROXY=*`). The server file must be byte for byte what `render_server_file`
-  makes for the launch's mocks; hand-written YAML, however valid, is refused.
-  `broker_env.validate` runs inside `ui.subproc_env` before every spawn; the session app is
-  also held to its two mock URLs after launch (`check_running`). The session broker serves
-  the session mock as `mini3` and a bus-only second mock as `studio`; a self-managed launch
-  gets a broker that serves no server unless it passes `broker=` with a PRIVATE mock.
-  Approvals are real requests on a mock's bus (`bus_stimulus.py`: `emit_sign`,
-  `emit_docker`, `emit_aws`, `new_approval`), and outcomes are read from the bus answer
-  (`verdict`) and the broker's audit file (`audit_line`: `decided_by`, `scope`, `ttl`,
-  `server`). The negative controls for the guards are `test_broker_env.py`.
+- **The launch environment is the harness's own** (`hermetic.py`). The app is a credential
+  source in process, so every launch is made hermetic: HOME, every `XDG_*_HOME`,
+  `XDG_RUNTIME_DIR` and `SHED_BROKER_STATE_DIR` inside the runtime dir, no `SSH_AUTH_SOCK`,
+  no `AWS_*` file overrides or `DOCKER_CONFIG`, no proxy variables (`NO_PROXY=*`), and every
+  mock URL `http://127.0.0.1:<port>`. `hermetic.validate` runs inside `ui.subproc_env`
+  before every spawn. There is no broker to configure and no approval to decide: delivery is
+  driven by the mock's `/api/delivery/requests` stream (`push_delivery_request`), and a cell
+  reads the answer off `delivery.status`. `hermetic.generate_key` makes a throwaway ed25519
+  key for a cell that needs one, so the render-gate image installs `openssh-client`.
+- **The server views** (`test_tauri_server_views.py`) run over private mocks with
+  `hermetic.mock_url(base, per_server)` naming each server's URL, and cover the four sidebar
+  entries, Activity merged across servers, a shed's delivery and egress detail and the
+  System pane's egress profiles.
 - **Updater ops on Linux report `linux_apt`.** `updater.status` → `{os, enabled, reason,
   instantiated}` and `updater.check` exist on both targets (the Sparkle updater is macOS-only;
   Linux ships via apt). On the Linux render gate `updater.status` is
@@ -554,7 +552,7 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
 `make tauri-test-linux` runs `cargo clippy --locked --all-targets -- -D warnings` in its
 container before the crate's `cargo test` (plan 030, FU3), and `make -C desktop tauri-lint` is
 clean on Linux too — the three Linux-only findings that used to sit in `src/tray.rs` and the
-`zbus::proxy` macro in `src/approval.rs` are fixed. So a Linux lint is a real failure now: it
+`zbus::proxy` macro in the old approval code were fixed (that code is gone). So a Linux lint is a real failure now: it
 fails CI's `tauri-linux` job before a test runs, and there is no baseline to discount.
 
 What Linux clippy still cannot see is code under `#[cfg(target_os = "macos")]`, which only the
@@ -736,15 +734,14 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
 The driver is a Python script that:
 
 - adds `/work/desktop/tools/shedtest` to `sys.path` and imports `ui`, `client`,
-  `mockserver`, `broker_env`, `bus_stimulus`;
+  `mockserver`, `hermetic`;
 - launches the mock + the app hermetically via the harness's own `ui.launch`
   (throwaway HOME/XDG under `/work` or `/tmp`), passing
-  `broker=broker_env.write_hermetic_broker(state_dir, {"mini3": mock.base_url})` when
-  the shots need credential activity (without it the app's broker serves no server);
+  `hermetic.overrides(runtime_dir)` for the launch environment;
 - seeds fixtures — `rc.inject_test` rows for the Agents pane (since S6 it injects into
   the shed's ROOST snapshot, so `slug` must parse as a roost tab id and the shed has to
-  have been listed by `sheds.list` first), real requests for Activity/Approvals
-  (`bus_stimulus.emit_sign`/`emit_aws` on the mock), and for the Egress activity a mock
+  have been listed by `sheds.list` first), events for Activity
+  (the mock's `/api/activity` rows), and for a shed's egress detail a mock
   built with `MockShedServer(egress_events=[{...}])`, whose egress route streams those
   decisions instead of answering 501 (`test_tauri.py::test_egress_activity_filters_ns`
   is the mixed-ns pattern) — `navigate`s to the pane, drives sub-state
@@ -805,7 +802,7 @@ sessions is asserted. `launch.dump` and `machines.dump` answer `unknown_op`.
   a full `cargo build` there only works in Docker.
 - **`cargo fmt --check` is not a gate on the Tauri crate, but your own files still are** —
   unlike `crates/`, `desktop/tauri/src-tauri` is NOT rustfmt-clean at `origin/main` (about
-  twenty-odd hunks across `approval.rs`, `broker.rs`, `lib.rs`,
+  twenty-odd hunks across `lib.rs`,
   `screenshot.rs`, `termctl.rs`, `tray.rs`, `updater.rs`), so a whole-crate `cargo fmt --check`
   is red before you touch anything and a whole-crate `cargo fmt -- --emit files` would bury your
   diff in unrelated reflows. Check only the files you edited, against their own baseline:
@@ -838,24 +835,6 @@ sessions is asserted. `launch.dump` and `machines.dump` answer `unknown_op`.
   fixture is first resolved, so it can pass in a full run and fail when the file is run alone.
   Name a per-module double something else (`fake_roost`, `roost`, `egress_mock`, …). (`fake`
   is free since the session stopped using a fake daemon.)
-- **The app's broker answers ONE request per namespace and server at a time** → its bus loop
-  awaits each request's gate before it reads the next (`serve_namespace` in
-  `crates/shed-broker/src/bus.rs`). A cell that emits a second sign on the same mock while
-  the first is still pending never sees the second approval: it waits behind the first
-  until that is decided or times out (`approval_timeout`, 25 s by default). Emit one request,
-  take its approval (`bus_stimulus.new_approval`), decide it, then emit the next; two pending
-  at once needs two servers (`mock` and `studio`). For the same reason a pending approval
-  left by a failed cell would stall the next cell's request, so `_reset_policy` denies any
-  leftover before each test.
-- **Every harness launch needs `ssh-keygen`** → `broker_env.write_hermetic_broker` makes a
-  throwaway ed25519 key for the app's broker on every launch (the session's and each
-  self-managed one), so the render-gate image installs `openssh-client`. A missing
-  `ssh-keygen` fails every launch with "the hermetic broker needs ssh-keygen".
-- **A launch that fails `broker_env.validate` never spawns** → `ui.subproc_env` raises
-  `HermeticityError` naming the leak (an inherited `SSH_AUTH_SOCK`, a dir outside the runtime
-  dir, a server URL that is not one of the launch's mocks). Do not work around it by
-  editing the env after `subproc_env`: fix what the launch passes (`broker=` for the
-  servers, the runtime dir for the paths).
 - **`FakeRoost.stop()` is roost's `session.stopping`, not the teardown** (plan 014, mirroring the
   Rust fake) → it tells every stream why, hangs up, and latches the fake *unavailable* until
   `restart()`. Tearing the fake down — stop listening, remove the socket file, produce the
@@ -870,24 +849,16 @@ sessions is asserted. `launch.dump` and `machines.dump` answer `unknown_op`.
   error** (`ipc.rs::build_inject_session`), so a fixture with a typo'd/invented state renders
   Ready and you chase a phantom. Send the exact wire value.
 - **WebKitGTK renders a raw `<select>` illegibly in dark mode** → its native button text
-  stays dark-on-dark. In the Preferences window every dropdown (terminal preset, SSH policy)
+  stays dark-on-dark. In the Preferences window every dropdown (terminal preset)
   uses the dialog kit's `Select` (`components/dialog`, `appearance-none` + its own caret), NOT
   a bare `<select>`. Reach for `Select` when adding any picker to the Tauri UI, or the dark
   screenshot is unreadable (`PreferencesWindow.tsx`).
-- **`policy.set` resets the ENGINE but not the coordinator's `extra_rules`** → the harness's
-  per-test `policy.set` reset replaces the policy *engine's* rules, but the coordinator's
-  persisted per-shed `extra_rules` survive it and get recomposed into the engine on the next
-  `rebuild_policy` (a persisted approval decision from an earlier test resurrects there). So
-  the absolute shed-rule count is NOT yours to pin — write per-shed-rule assertions
-  **engine-relative** (`prefs.dump`'s `shed_rules_count` == `len(policy.list scope=="shed")`,
-  and filter `policy.list` to YOUR shed), never against a fixed number. `test_preferences_shed_rules`
-  is the pattern.
 - **No per-window screenshot capture exists** → `app.screenshot` grabs the whole X display
   (`screenshot.rs::capture`, `grim`→`scrot`→`import`), not a chosen window, and the Preferences
   window is fixed-size (520×640, not resizable). Its below-the-fold content can't be
   photographed, so don't try to prove a lower section by pixels — trim the fixture so the
-  section you care about sits above the fold (e.g. an `always-deny` SSH policy hides both the
-  Duration and Method rows — `usesDuration`/`prompts` are false — collapsing the SSH card), and
+  section you care about sits above the fold (e.g. leave a provider off so its editor stays
+  collapsed), and
   rely on `prefs.dump`'s reported `sections`/`values` for the logical assertions. Pixels are the
   eyeball; `prefs.dump` is the truth.
 

@@ -25,7 +25,7 @@ The `SHED_WORKSPACE` environment variable equals this landing directory.
 ### Create Sequence
 
 !!! note "Credential delivery"
-    On a shed whose user has a bound credential source, create also delivers credentials: a stage 1 write before the clone and a stage 2 write after it. The steps below show where. See [Credential delivery](delivery.md).
+    On a shed whose user has a bound credential source, create also delivers credentials: a stage 1 write before the clone and a stage 2 write after it. The steps below show where. See [Credential delivery](delivery.md) and [Credentials in a shed](../guides/credentials-in-a-shed.md).
 
 When you run `shed create`, the following steps execute in order:
 
@@ -247,7 +247,7 @@ docker compose down || true
 ```
 
 !!! warning "Docker requires the `full` image"
-    Only the `full` variant ships the Docker daemon. With `base`/`extensions`,
+    Only the `full` variant ships the Docker daemon. With `base`,
     `docker` is absent and these hooks will warn and continue.
 
 !!! note "Docker networking"
@@ -261,7 +261,7 @@ docker compose down || true
 
 For most projects, run Postgres from your `compose.yaml` (above) rather than
 installing it into the image. The example below is the **no-Docker alternative**
-— installing the service directly — kept for `base`/`extensions` images.
+— installing the service directly — kept for the `base` image.
 
 **`.shed/provision.yaml`:**
 
@@ -363,13 +363,7 @@ The shed agent loads environment variables from `/etc/environment.d/*.conf` file
 
 Files are read in alphabetical order — later files can override values from earlier ones. Each file contains one `KEY=VALUE` pair per line. Blank lines and lines starting with `#` are ignored.
 
-The `full` image uses this mechanism to configure the credential extensions:
-
-```dotenv
-# /etc/environment.d/shed-extensions.conf
-SSH_AUTH_SOCK=/run/shed-extensions/ssh-agent.sock
-AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:499/credentials
-```
+The agent also reads `~/.config/environment.d/*.conf`, where [credential delivery](delivery.md#where-values-go) writes the environment values it delivers.
 
 To add your own environment variables, create a `.conf` file in your image Dockerfile or via a provisioning install hook:
 
@@ -417,7 +411,7 @@ env:
 
 ## Credential delivery and `shed provision`
 
-If you have bound a credential source (`shed source use`), create asks it for files and environment values and writes them around the clone. The same four tracked steps (stage 1, clone, stage 2, install hook) are run by `shed provision <name>`, which finishes whatever a create left owed and delivers again. Delivered environment values land in `~/.config/environment.d/50-shed-delivery.conf` and reach commands started afterwards, so an install hook can use them. See [Credential delivery](delivery.md).
+If you have bound a credential source (`shed source use`), create asks it for files and environment values and writes them around the clone. The same four tracked steps (stage 1, clone, stage 2, install hook) are run by `shed provision <name>`, which finishes whatever a create left owed and delivers again. Delivered environment values land in `~/.config/environment.d/50-shed-delivery.conf` and reach commands started afterwards, so an install hook can use them. See [Credential delivery](delivery.md) and [Credentials in a shed](../guides/credentials-in-a-shed.md).
 
 ## Skipping Provisioning
 

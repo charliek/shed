@@ -11,12 +11,12 @@ window and it returns to menu-bar-only, the icon staying put.
 
 **Linux:** launch `shed-desktop` (installed at `/usr/bin/shed-desktop`) from your launcher
 or a terminal. It lives in the system tray; clicking the tray icon opens a native menu with
-**Open Dashboard**, **Approvals**, **Preferences** and **Quit** (Tauri emits no tray click
+**Open Dashboard**, **Preferences** and **Quit** (Tauri emits no tray click
 events on Linux, so there is no popover).
 
 ## The dashboard
 
-The sidebar selects a pane:
+The sidebar has four entries, **Sheds**, **Agents**, **Activity** and **System**, and a **Shed servers** section that lists each configured server with a reachability dot:
 
 - **Sheds** — every shed across all configured hosts, grouped by host, with status, image
   (the ref/alias label plus a short `sha256:` digest, matching `shed list -vv`), backend,
@@ -25,41 +25,41 @@ The sidebar selects a pane:
   the server's configured aliases, defaulting to its `default_image`) + backend, and
   CPU/memory, then streams creation progress live (SSE). The list is kept current by polling
   each `shed-server`.
-- **Approvals** — pending credential-approval requests, with Approve / Deny (optionally
-  confirmed with Touch ID on macOS or a polkit password prompt on Linux). They come from
-  the app's own credential broker — see [Credential approvals](approvals.md).
 - **Agents** — agent sessions on each shed: read-only roost rows with activity,
   and craze sessions with a live transcript, approvals and **New craze session**.
   See [Agent lanes](agent-lanes.md).
-- **Activity** — the merged audit feed (the broker's credentials + the app's decisions), with
-  a "Reveal log" button.
-- **Egress** — per-host egress profiles (allow/deny rules, by source) plus an activity
-  sub-tab filtered to the `egress` namespace.
-- **System** — per-host disk usage (images / sheds / snapshots / orphans).
-- **Hosts** (sidebar footer) — each configured server with a reachability dot.
+- **Activity** — each configured server's own activity feed (`GET /api/activity`), merged
+  newest first across servers, with a **Load older** button. You see only your own sheds'
+  events, including for a deleted shed whose name someone else has since reused.
+- **System** — per-host disk usage (images / sheds / snapshots / orphans) and each server's
+  egress profiles (allow/deny rules, by source).
+
+A shed's own detail shows its delivery state and **Deliver again**, and its egress profile
+with its recent blocks (the last 50 per shed, kept in memory), keyed by the shed's creation
+time so a reused name starts empty.
 
 ## The menu bar
 
-**macOS.** The status item shows the running-shed count and a pending-approval badge. Its
-popover lists pending approvals (inline Approve/Deny) and running sheds, plus **Open
+**macOS.** The status item shows the running-shed count. Its
+popover lists running sheds, plus **Open
 dashboard**, **Preferences…**, **Check for Updates…** (Sparkle), and **Quit**.
 
-**Linux.** The tray icon opens a native menu: **Open Dashboard**, **Approvals**,
+**Linux.** The tray icon opens a native menu: **Open Dashboard**,
 **Preferences** and **Quit**. There is no popover and no Sparkle item; the `.deb` updates
 through apt.
 
 ## Preferences
 
-**Preferences…** (in the menu) covers launch-at-login, the terminal, the credential broker
-and which of your machines is the credential source on each server (with
-**Use this machine**), and the approval policy (SSH policy and method, AWS/Docker modes, per-shed overrides). The full set of
+**Preferences…** (in the menu) covers launch-at-login, the terminal, and **Provisioning**:
+which of your machines is the credential source on each server (with
+**Use this machine**), the five providers and their `only` rules, and a preview. The full set of
 settings — and the environment-variable overrides — is in
 [Configuration](configuration.md).
 
 ## Credentials need the app running
 
-The app is the credential broker: it answers your sheds' SSH, AWS and Docker credential
-requests only while it is running. So at its first launch it turns on **Launch at login**,
+The app is your credential source: it delivers credentials into your sheds, at create and
+on `shed provision`, only while it is running. So at its first launch it turns on **Launch at login**,
 once, and runs whenever you are logged in. Switch it off in **Preferences › General** if you
 do not want that; the app never turns it on again.
 

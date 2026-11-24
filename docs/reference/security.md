@@ -623,7 +623,7 @@ internal CA and returns a bundle the CLI persists:
 | Scope | Grants |
 |-------|--------|
 | `control` | The control plane (lifecycle, images, sessions, snapshots, users, credential sources), the Connect tunnel for `shed forward`, and the egress audit stream. |
-| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the desktop app's broker and egress subscriber). |
+| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the desktop app's delivery stream and egress feed). |
 
 The bus requires `credentials`, so a leaked `control` certificate cannot reach
 the live-secret bus, and a `credentials` certificate cannot manage the fleet
@@ -662,7 +662,7 @@ TTL is invisible in normal use:
 - **CLI**: re-enrolls when the stored certificate is near expiry, and on an
   auth failure retries the request once after re-enrolling. The expiry is kept
   in the client config as `client_cert_expires_at`.
-- **desktop app's broker**: enrolls its **own** `credentials` certificate over the same
+- **desktop app**: enrolls its **own** `credentials` certificate over the same
   SSH channel with its identity key.
 - **background tunnels** (`shed tunnels start -d`): the detached daemon
   re-enrolls the same way, **in memory only**, so a multi-day daemon never
@@ -701,7 +701,7 @@ client cannot request an identity it doesn't hold:
 
 - **CN** = the SSH key fingerprint (`SHA256:...`).
 - **OU** = scope (`control` or `credentials`), one scope per certificate.
-- **O** = client kind (`cli`, `broker`, `desktop`, `mobile`).
+- **O** = client kind (`cli`, `broker`, `desktop`, `mobile`; `broker` is the name the desktop app's own certificate kept from when it embedded the credential broker).
 - **userId** (RFC 4519 `uid`) = the user the key belonged to at enrolment
   (`!implicit` for the implicit user of a server with no user list).
 - TTL = `auth.token_ttl` (default 24h), extended-key-usage `ClientAuth` only.
@@ -818,8 +818,8 @@ single pinned-TLS (`https_port`) listener in mtls mode, with **no plain-HTTP
 listener at all**. The credential bus (`/api/plugins/*`) and the Connect
 tunnel (`/api/sheds/*/connect/*`) ride that same listener; in mtls mode the
 bus needs the `credentials` scope while the Connect tunnel accepts `control`
-or `credentials`, and both travel over TLS. The desktop app's broker reaches
-the bus over `https://` with the pinned cert and its own
+or `credentials`, and both travel over TLS. The desktop app reaches
+the bus and its delivery stream over `https://` with the pinned cert and its own
 `credentials` certificate. These knobs shape what is reachable where:
 
 | Field | Effect |
@@ -915,9 +915,9 @@ over pinned TLS or pinned-host-key SSH.
 
 ## Credential delivery
 
-[Credential delivery](delivery.md) puts a person's credentials into their shed when it is created and when they run `shed provision`: an SSH key, a GitHub token, API keys, an envsecrets login, named files. This is a different trade from the credential bus below, and it is stated plainly here.
+[Credential delivery](delivery.md) puts a person's credentials into their shed when it is created and when they run `shed provision`: an SSH key, a GitHub token, API keys, an envsecrets login, named files. Earlier releases asked the person's machine for each use (a signing check and an approval prompt); v0.11 removed that. The trade is stated plainly here, and the [Credentials in a shed](../guides/credentials-in-a-shed.md) guide says what to deliver.
 
-- **A usable credential is inside the shed while it runs.** Anything in the shed can read it: the shed user, every process running as it, and the coding agents in the image. The bus decides per use, on the person's own machine; a delivered credential has no per-use check once it is in the shed. Deliver only what you would let that shed use.
+- **A usable credential is inside the shed while it runs.** Anything in the shed can read it: the shed user, every process running as it, and the coding agents in the image. There is no per-use check and no signing check once it is in the shed. Deliver only what you would let that shed use.
 - **The server sees values in transit.** An answer passes through shed-server on its way to the shed's agent. The server holds it in memory for the create or provision, never stores it, and never logs or returns it, but a compromised server can see it. A compromised server can also ask a connected source for a bundle for a shed that does not exist, and the source answers without a prompt. What limits this is less than it may seem. Only the user's **bound** machine is asked, but the first machine that connects for a user is bound automatically, and the desktop app opens a delivery stream to every server in its shed config. Of a provider's `only` rules, only `only.servers` is judged on the person's machine (the server the request came in on); `only.backends` and `only.repos` are matched against the request the server wrote, so a dishonest server can satisfy them. With a provider enabled and no `only.servers`, any configured server can draw that provider's items with no prompt. **Give every enabled provider an `only.servers` list** ([What limits a source's answers](delivery.md#what-limits-a-sources-answers)).
 - **The files are plain files** (`0600`, or `0400` where asked) in the shed's home or project directory. They are in snapshots and on a stopped cloud shed's disk.
 - **A shed assigned to a person may hold what someone else put there.** `shed assign` gives an unassigned shed to a user; a provision of such a shed writes the new user's credentials into a filesystem they did not build. Assigning is rare and admin-only.
@@ -928,11 +928,13 @@ over pinned TLS or pinned-host-key SSH.
 
 ## Credential bus
 
-The credential bus carries live secrets (SSH signatures, AWS and Docker
-credentials) between a shed and a machine's desktop app, whose broker
-subscribes to it with a `credentials` certificate. What the machine will sign
-is decided on the machine: see the [SSH agent](../extensions/ssh-agent.md)
-extension.
+The credential bus carries messages between a shed and a listener on a machine
+of the shed's user, which subscribes with a `credentials` certificate. Shed
+ships no extension on it since v0.11: credentials reach a shed by
+[delivery](delivery.md) (see [Credential delivery](#credential-delivery)
+above), not by the bus. The bus is generic and stays for extensions you build;
+see [Extensions](extensions.md). Its routing and pin rules, below, are the same
+ones delivery uses to decide which machine is asked.
 
 ### Routed by user
 
@@ -972,7 +974,7 @@ A machine names itself on every subscribe and respond with two headers:
 | `X-Shed-Machine-Id` | 32 lowercase hex digits, the machine's stable id |
 | `X-Shed-Machine-Name` | its display name, percent-encoded UTF-8; 1 to 63 bytes decoded, no control characters |
 
-The desktop app 0.10.0 or newer sends them. A broker
+The desktop app 0.10.0 or newer sends them. A client
 released earlier sends neither and is refused, with a message ending "install the current
 shed desktop app", until it is upgraded, so
 upgrade machines before servers.
@@ -980,10 +982,10 @@ upgrade machines before servers.
 - **Who may move it.** A user moves their own source from any of their keys
   that is not a script key. An admin may name another configured user
   (`--user`) and choose among that user's own machines. A machine is known to
-  the server only after its broker has tried to connect.
+  the server only after its app has tried to connect.
 - **What a move does.** It takes effect at once: the old machine's streams
   end, its requests in flight are dropped, and its answers are refused
-  (`SOURCE_NOT_BOUND`). The new machine starts answering when its broker next
+  (`SOURCE_NOT_BOUND`). The new machine starts answering when its app next
   connects (within about 30 s, or at once from the desktop app's button).
   Nothing fails over: if the source is off or asleep, its user's credential
   requests get no answer until it reconnects or the source is moved.
@@ -1012,7 +1014,7 @@ Subscribe (`GET /api/plugins/listeners/{ns}/messages`) and respond (`POST
 | Status | `error.code` | When |
 |---|---|---|
 | `403` | `FORBIDDEN` | A service client, or a script key (subscribe and respond); on respond, also an answer that matches no pending request |
-| `403` | `SOURCE_MACHINE_ID_REQUIRED` | The machine headers are missing or invalid (a broker released before v0.10.0). The message names the minimum versions |
+| `403` | `SOURCE_MACHINE_ID_REQUIRED` | The machine headers are missing or invalid (a client released before v0.10.0). The message names the minimum versions |
 | `403` | `SOURCE_NOT_BOUND` | Another machine is this user's source. The body also carries `source.machine_id` and `source.machine_name` |
 | `409` | `SOURCE_DUPLICATE_STREAM` | The source machine already holds this request type (a second process with the same machine id, or a stream that has not ended yet). Retryable; nothing is replaced |
 | `429` | `SOURCE_RATE_LIMITED` | Too many new or changed machines for this user lately (8 at once, then one every 15 s). With `Retry-After` |

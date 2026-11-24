@@ -22,7 +22,7 @@ moved:
 |---|---|
 | Kickoff (`agent`, `plan`) | Roost's own palette, via the [`shed` dynamic-provider script](roost-provider.md) (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)). |
 | Observe (`ls`, `watch`, `attach`, `kill`) | The desktop and mobile clients, reading roost directly. |
-| Engine-compat (`sx rc <subcommand>`) | Gone with the RC hub itself, retired in S6 ([`charliek/shed#328`](https://github.com/charliek/shed/issues/328), plan 022) — see [`shed-ext-rc` (retired)](rc-helper.md). There is no engine-compat surface any more, `sx` or otherwise. |
+| Engine-compat (`sx rc <subcommand>`) | Gone with the RC hub itself, retired in S6 ([`charliek/shed#328`](https://github.com/charliek/shed/issues/328), plan 022) — see [RC helper (retired)](rc-helper.md). There is no engine-compat surface any more, `sx` or otherwise. |
 
 !!! note "The S7 → S6 window has closed"
     Until S6 landed, `machines[].rc_bin` still defaulted to `sx` and the desktop's
@@ -35,7 +35,7 @@ moved:
 
 ## See also
 
-- [`shed-ext-rc` (retired)](rc-helper.md) — what replaced RC sessions end to end:
+- [RC helper (retired)](rc-helper.md) — what replaced RC sessions end to end:
   roost tabs, `shed attach`/`shed sessions`, and the roost provider/session-hosts
   mechanism.
 - [`shed-machine-rc`](shed-machine-rc.md) — the retired Go engine `sx` absorbed.

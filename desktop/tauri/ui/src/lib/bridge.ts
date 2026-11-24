@@ -925,7 +925,7 @@ const RC_KIND_TOOL: Record<string, string | undefined> = {
  *  capabilities say is installed.
  *
  *  **Absent capabilities offer NOTHING** (S6). They used to fall back to
- *  claude+shell, which was right for a shed whose `shed-ext-rc` was too old to
+ *  claude+shell, which was right for a shed whose guest RC helper was too old to
  *  advertise — it had always had both. There is no such binary any more: a host's
  *  contract is roost's synthesized one, present for every host in the payload, so
  *  absence means there is no roost-session to launch into and the fallback would

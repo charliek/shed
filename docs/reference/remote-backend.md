@@ -316,7 +316,7 @@ The check covers VPC firewall rules. It does not read hierarchical or network fi
 
 ## Credential delivery
 
-A cloud shed gets [credential delivery](delivery.md) like any other: the user's bound source is asked at create, and `shed provision` delivers again. The create answers `201 starting`, so the outcome is read from the shed document, polled as for any other field. A job never retries a delivery step recorded `failed`, a provision is refused (`409`) while a job for that shed is in flight, and a shed adopted at start-up is recorded with every step skipped and delivery `none`. The cloud image installs `parcel` and `envsecrets` beside `strix` and `prox`. The delivered files are on the shed's boot disk, so a stopped cloud shed holds them.
+A cloud shed gets [credential delivery](delivery.md) like any other: the user's bound source is asked at create, and `shed provision` delivers again. The create answers `201 starting`, so the outcome is read from the shed document, polled as for any other field. A job never retries a delivery step recorded `failed`, a provision is refused (`409`) while a job for that shed is in flight, and a shed adopted at start-up is recorded with every step skipped and delivery `none`. The cloud image has two variants like the others: `base` (with roost-session and craze) and `full` (plus `strix`, `prox`, `parcel` and `envsecrets`), `full` the default, in the family `shed-<variant>-<arch>`. The delivered files are on the shed's boot disk, so a stopped cloud shed holds them.
 
 ## Server restarts
 
@@ -360,10 +360,11 @@ and the user is kept in two places: the shed's record and the VM's
   never applies here.
 
 A remote server has no snapshots and refuses `env_file` at load, so neither
-part of Ownership applies to it. Its sheds make no credential-helper requests
-(`extensions.enabled` is refused with the remote backend), so a user's
-[credential source](security.md#one-machine-answers-for-each-user) is never
-asked on their behalf.
+part of Ownership applies to it. A user's
+[credential source](security.md#one-machine-answers-for-each-user) is asked
+for [delivery](delivery.md) when their shed is created or provisioned, and
+for nothing else (`extensions.enabled` is refused with the remote backend, so
+there is no bus traffic).
 
 ## Not supported yet
 

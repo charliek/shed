@@ -109,7 +109,7 @@ Keep the file mode `0600`. The server refuses to start, naming the variable, whe
 
 ## Baking an image
 
-A remote shed boots from an image baked by `scripts/build-gce-image.sh`. The bake boots a builder VM from stock Ubuntu 24.04, provisions and verifies it, saves its disk as an image in the family `shed-extensions-amd64`, and deletes the builder.
+A remote shed boots from an image baked by `scripts/build-gce-image.sh`. The bake boots a builder VM from stock Ubuntu 24.04, provisions and verifies it, saves its disk as an image in the family `shed-full-amd64` (or `shed-base-amd64` with `--variant base`), and deletes the builder.
 
 ```bash
 set -a; . ~/.config/shed/remote-dev/env; set +a
@@ -118,7 +118,7 @@ make gce-image                          # bake (the builder VM is billed while i
 make test-gce-image                     # offline checks of the image tooling
 ```
 
-The dev config boots the newest image of the family (`default_image: family/shed-extensions-amd64`, alias `cloud`). Rebake after any change to `cmd/shed-agent` or `gce/`: the server does not copy an agent into a VM (`agent_install` is not built), so a VM whose agent is incompatible fails its create with reason `layout`.
+The dev config boots the newest image of the family (`default_image: family/shed-full-amd64`, alias `cloud`). Rebake after any change to `cmd/shed-agent` or `gce/`: the server does not copy an agent into a VM (`agent_install` is not built), so a VM whose agent is incompatible fails its create with reason `layout`.
 
 ## Running the dev server
 

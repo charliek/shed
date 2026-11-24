@@ -141,11 +141,9 @@ that used to live here):
   references. A changed agent re-runs that layer — the build log prints
   `SHED_INSTALL_SHA=<hash>` and the step is **not** `CACHED` — while the expensive
   apt layer stays cached. An unchanged agent leaves the install layer `CACHED`.
-  Docker `ARG`s are **stage-scoped**, so the **extensions stage redeclares
-  `ARG SHED_INSTALL_SHA` and echoes it** in its install RUN too — that guards the
-  in-tree guest-binary install the same way (a changed `shed-ext-*` binary re-runs
-  the extensions install layer instead of reusing a stale BuildKit bind-mount
-  cache).
+  Docker `ARG`s are **stage-scoped**, so a later stage that installs from the build
+  context must redeclare `ARG SHED_INSTALL_SHA` and echo it in its own RUN to get the
+  same guard against a stale BuildKit bind-mount cache.
 - **The ref-index is written by the build.** `shed image build` records
   `refs/<sha256(source-ref)>.json` → the new manifest digest, so
   `shed create --image base` resolves your build immediately. `SHED_SOURCE_REF`
@@ -169,24 +167,13 @@ shed -s my-server-dev exec dbg -- bash -c \
 # that SHED_SOURCE_REF (step 2) matched the dev config's image_aliases.base.
 ```
 
-**The same verify applies to the guest extension binaries.** Since the monorepo
-import, the `extensions` / `full` variants bake the three guest binaries
-(`shed-ext-ssh-agent`, `shed-ext-aws-credentials`, `docker-credential-shed`)
-**in-tree** — cross-compiled from `cmd/shed-ext-*` and staged into
-the build context by `scripts/stage-guest-binaries.sh` (called by the rootfs
-scripts). There is no `ghcr.io/charliek/shed-extensions` image to `COPY --from`.
-(A fourth binary, `shed-ext-rc`, was baked the same way through v0.8.x; it was
-dropped from the image in plan 022's S6 retirement — see
-[`shed-ext-rc` (retired)](../../../docs/extensions/rc-helper.md) — and `strix` +
-`prox`, installed from the stridelabs apt repo rather than built in-tree, took
-its place.) If you changed a guest binary, build the `extensions` (or `full`)
-variant and confirm the VM runs **your** build — the dev-build convention is no
-ldflags, so the version is a dev string, not the last extensions release:
-
-```bash
-shed -s my-server-dev create dbg --image extensions
-shed -s my-server-dev exec dbg -- docker-credential-shed version   # must report a dev string
-```
+**What else the images bake.** There are two variants, `base` and `full`. `base` has
+`shed-agent`, `roost-session` and `craze`; `full` adds Docker, `strix`, `prox`, `parcel` and
+`envsecrets` (the last four from the stridelabs apt repo, so they need no rebuild loop of
+their own). The guest credential helpers (the SSH agent, the AWS credential endpoint and
+the Docker credential helper) and `scripts/stage-guest-binaries.sh` were removed in plan 039;
+credentials arrive by delivery. After a rebuild, confirm the VM runs **your** agent, as
+above, on `--image base` or `--image full`.
 
 To extract+inspect the agent from a manifest without booting a VM (useful to
 tell "build baked it" from "resolution is stale"):
@@ -214,53 +201,32 @@ Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → verify (step 
 integration (step 5). Comment-only edits don't change the binary, so they don't
 need a rebuild.
 
-## Guest extension binaries (`shed-ext-ssh-agent` and friends)
+## Fast loop: copy the agent into a running shed
 
-The surviving `cmd/shed-ext-*` binaries — `shed-ext-ssh-agent`, `shed-ext-aws-credentials`,
-`docker-credential-shed` — are baked into the `extensions`/`full` variants the same way
-`shed-agent` is baked into every variant, so the **full rebuild loop above applies
-unchanged**: edit `cmd/shed-ext-*` (or the `internal/ext/{sshagent,awsproxy,dockercred}`
-package behind it) → rebuild the `extensions` variant (step 2, `--variant extensions`) →
-verify (a `version` subcommand reports a dev string, step 4) → create a fresh shed.
-`internal/ext/*.go` is **not** `//go:build linux`, so its unit tests run under plain
-`make test` on macOS (no Docker needed, unlike the agent tests).
-
-> **A fourth guest binary, `shed-ext-rc`, and the RC activity hub it hosted (`serve`,
-> `internal/ext/rc`) were retired in plan 022's S6
-> ([`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) — deleted from the
-> tree, dropped from the `extensions`/`full` images, and replaced there by `strix` and
-> `prox` (installed from the stridelabs apt repo, not built in-tree, so they need no
-> rebuild loop at all). Everything this section used to say about rc sessions, the guest
-> hub, `tests/integration/test_rc_kickoff.py`/`test_rc_enrichment.py`/
-> `test_rc_hub_activity.py`, and the opencode-verb/cursor-hook smoke tests is gone with
-> it — none of those tests or binaries exist any more. Agent sessions are roost tabs now;
-> see [`shed-ext-rc` (retired)](../../../docs/extensions/rc-helper.md) if you land here
-> looking for where that went.
-
-### Fast loop: copy the binary into a running shed
-
-A full rootfs rebuild is minutes; for a tight edit→test loop on a guest binary you can
+A full rootfs rebuild is minutes; for a tight edit-to-test loop on a guest binary you can
 **cross-compile and drop it into a running shed**, skipping the image rebuild entirely:
 
 ```bash
 # VZ is arm64; FC is amd64. Match the shed's arch.
-GOOS=linux GOARCH=arm64 go build -o /tmp/docker-credential-shed ./cmd/docker-credential-shed
-shed -s my-server-dev cp /tmp/docker-credential-shed dbg:/tmp/docker-credential-shed   # or: pipe over `exec … tee`
-shed -s my-server-dev exec dbg -- sudo install -m0755 /tmp/docker-credential-shed /usr/local/bin/docker-credential-shed
-shed -s my-server-dev exec dbg -- docker-credential-shed version   # confirm the dev build
+GOOS=linux GOARCH=arm64 go build -o /tmp/shed-agent ./cmd/shed-agent
+shed -s my-server-dev exec dbg -- sudo tee /usr/local/bin/shed-agent.new >/dev/null < /tmp/shed-agent
+shed -s my-server-dev exec dbg -- sudo install -m0755 /usr/local/bin/shed-agent.new /usr/local/bin/shed-agent
+shed -s my-server-dev exec dbg -- sudo systemctl restart shed-agent   # the unit must restart for the new binary to run
 ```
 
-If `shed cp` is unavailable, stream it: `go build -o /dev/stdout … | shed -s … exec dbg
--- sudo tee /usr/local/bin/docker-credential-shed >/dev/null` then `chmod +x`.
+The restart drops the agent's vsock connection for a moment, so expect the exec to
+reconnect; if it does not, stop and start the shed.
 
 **One caveat:** a recreated shed reverts to the image binary. The copy lives only in that
-shed's writable upper — `shed create`/recreate (or a snapshot restore) boots the baked
+shed's writable upper, so `shed create`/recreate (or a snapshot restore) boots the baked
 image's binary again. Use the copy shortcut for iteration; use the full rootfs rebuild
 (step 2) for anything you'll assert on across a recreate, and for the final pre-PR
-verification. `shed-ext-ssh-agent` and `shed-ext-aws-credentials` run as systemd services
-rather than one-shot CLIs, so after installing a copy of either, restart its unit
-(`shed exec dbg -- sudo systemctl restart shed-ext-ssh-agent`, respectively
-`shed-ext-aws-credentials`) so the new binary actually takes over the running process.
+verification.
+
+> **Retired guest binaries.** The RC helper and its activity hub (plan 022, S6), and the
+> three credential helpers (plan 039) are gone from the tree and the images. The RC story is
+> in [the RC helper (retired)](../../../docs/extensions/rc-helper.md); credentials are in
+> [Credentials in a shed](../../../docs/guides/credentials-in-a-shed.md).
 
 ## Gremlin: FC remote rootfs build + mise + sudo
 
@@ -278,7 +244,7 @@ mise works):
 ssh mini3 'sudo chown -R $USER:$USER /var/lib/shed-dev/firecracker'
 ssh mini3 'cd ~/projects/shed && export PATH="$HOME/.local/share/mise/shims:$PATH" && \
   OUTPUT_DIR=/var/lib/shed-dev/firecracker/images \
-  ./scripts/build-firecracker-rootfs.sh --variant extensions --build-tools-version <ref>'
+  ./scripts/build-firecracker-rootfs.sh --variant full --build-tools-version <ref>'
 ```
 
 The root-run FC dev server (sudo nohup) still reads the user-owned blobs fine.
@@ -318,11 +284,6 @@ Three more from plan 024 (2026-09-28), driving the Mac mini from the Linux box:
   `pull_policy: missing`), and the suite's fixtures boot `base` by default. Build a current
   `base` into BOTH dev stores under the alias ref before `make test-integration-dev*`, or every
   `base`-booting cell runs an old in-VM agent (#373 and its FC twin).
-
-(Guest **extension** binaries — `extensions`/`full` variants — are now built
-in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
-shed-agent; verify `docker-credential-shed version` reports a non-release version
-in the booted shed, same as the shed-agent check.)
 
 ## Gremlin: `kill 0` (or any empty-pid kill) over tailscale ssh reaches OTHER sessions
 
@@ -429,12 +390,9 @@ proxy half-close). What bit, by backend:
   `~/.ssh/config` with `Match exec "sh ~/.ssh/env-probe.sh"` and a script that appends
   `env` names and `SSH_AUTH_SOCK=${SSH_AUTH_SOCK-unset}` to a file and exits 1 (so it
   never matches): every ssh the shed runs, the clone's included, records its environment.
-- **In PR A's `extensions`/`full` images every command has `SSH_AUTH_SOCK`.** The guest overlay's
-  `/etc/environment.d/shed-extensions.conf` sets it to `/run/shed-extensions/ssh-agent.sock`, and the
-  ssh-agent helper's unit runs whatever the server's `extensions.enabled` says (that list only shapes the
-  health handshake). A clone in such a shed asks the helper first, which asks the user's source over the
-  bus (the desktop app's Activity shows `ssh-agent list`). To show a clone used only delivered files, use
-  `--image base` until the helpers are removed.
+- **A new `base` or `full` shed has no `SSH_AUTH_SOCK`.** The image carries no SSH agent
+  helper, so a clone in a shed made from a v0.11 image uses only the delivered key; to
+  prove it, read the `env` probe above. A shed made from an older image still has the helper.
 - **A waiter that greps for the build's own script with `pgrep -f`** inside `bash -c`
   matches itself and never ends. Wait on the background job's notification instead.
 
@@ -457,13 +415,13 @@ scratch image store, the suite run over `ssh <mac> bash -s < script`:
   `{"cliPluginsExtraDirs": ["/Applications/Docker.app/Contents/Resources/cli-plugins"]}`;
   the daemon is still reached through `/var/run/docker.sock`. Do not point
   `DOCKER_CONFIG` at the developer's own `~/.docker`.
-- **Rebuild all three variants**, not only `base`: the users and delivery
+- **Rebuild both variants**, not only `base`: the users and delivery
   cases boot `base`, `test_delivery_image_baked` boots `full`, and the dev
   configs' `default_image` is the `full` alias. One `SHED_SOURCE_REF` per
   variant (`image_aliases.<variant>`). From a cold builder: base about 100 s,
-  extensions about 45 s, full about 6 min.
+  full about 6 min.
 - **Docker Desktop's disk can live on an external volume.** Its growth from
-  the builds (about 13 GiB for the three) is not given back when the scratch
+  the builds (about 13 GiB for the builds) is not given back when the scratch
   store is removed; check where it lives before reading `df` after clean-up.
 - **`shed exec` inside a `bash -s` script reads the rest of the script** from
   stdin (ssh forwards it), and the script silently ends there. Give every

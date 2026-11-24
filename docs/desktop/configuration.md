@@ -14,7 +14,7 @@ There are three places configuration lives, with deliberately little overlap:
    a normal user sets.
 
 The app intentionally exposes a *small* settings surface; most behavior is derived from the
-shed config and the credential broker's `extensions.yaml` rather than configured here.
+shed config and the delivery settings (`delivery.toml`) rather than configured here.
 
 ## Preferences (GUI)
 
@@ -23,34 +23,27 @@ persist to `prefs.json` in the app config directory — `~/Library/Application
 Support/ai.stridelabs.ShedDesktop/` on macOS, `${XDG_CONFIG_HOME:-~/.config}/ai.stridelabs.shed-desktop/`
 on Linux. A missing or unreadable file falls back to the defaults; it never blocks startup.
 
-The approval sections appear only for the providers the broker delegates to shed-desktop.
-
 | Section | Setting | Stored as | What it does |
 |---|---|---|---|
-| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json`; `login_item_defaulted` records only that the app turned it on once | Starts the app when you sign in. On by default: the app turns it on once, at its first launch, so the broker answers whenever you are logged in. Switch it off and it stays off. |
+| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json`; `login_item_defaulted` records only that the app turned it on once | Starts the app when you sign in. On by default: the app turns it on once, at its first launch, so credentials are delivered whenever you are logged in. Switch it off and it stays off. |
 | **Terminal** | Open sheds in: Ghostty / Roost / Custom | `terminal_preset`, `terminal_template` | Which terminal **Open in Terminal** launches. Custom takes a command template where `{cmd}` is the ssh command and `{shed}` the shed name, e.g. `ghostty -e {cmd}`; an empty template opens the platform's default terminal. |
-| **Credential broker** | Launch at login (the same switch as General, beside "Credentials are answered only while this app is running.") | the OS login item | The broker runs only while the app does. |
-| **Credential broker** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines answers credential requests on each server. See [Credential sources](#credential-sources) below. |
-| **SSH approvals** | Approval policy / Duration / Method | `ssh_policy`, `ssh_ttl`, `ssh_method` | Policy: Always Allow, Per Shed Allow, **Time Based Allow** (default), Always Ask, Always Deny. Duration (default `2h`) applies to Time Based Allow. Method, for the policies that prompt: Authenticate (`biometrics-or-password`, the default) or Prompt only (`prompt`). Changing any of these clears live SSH grants. |
-| **AWS / Docker credentials** | Allow / Deny | `provider_modes` | A live Allow/Deny toggle (default Deny). No prompt; takes effect immediately. |
-| **Per-shed overrides** | list of `(server, shed)` allow/deny rows | `extra_rules` | Per-`(server, shed)` *always-allow* / *always-deny* rules; remove one with the ✕. Shown only when there are any. |
+| **Provisioning** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines is asked for your credentials on each server. See [Credential sources](#credential-sources) below. |
+| **Provisioning** | The five providers, each with an on/off switch, its settings and its `only` rule; a preview | `~/.config/shed/delivery.toml` | What a shed gets. See [Provisioning](provisioning.md). |
 
-The full policy model is in [Credential approvals](approvals.md). Registries (Docker) and
-roles (AWS) are **not** configurable here — they live in `extensions.yaml`. Server hosts are
-managed with the `shed` CLI (no Preferences UI).
+Server hosts are managed with the `shed` CLI (no Preferences UI).
 
 ## Credential sources
 
-A shed server sends your sheds' credential requests to one of your machines only: your
+A shed server asks one of your machines only for your sheds' credentials: your
 [credential source](../extensions/source-binding.md) on that server. In
-Preferences → Credential broker:
+Preferences → Provisioning:
 
 - **This machine:** the name of the machine the app runs on, from the `machine.json` the
-  broker keeps. If the machine has no identity, the reason is shown and
+  app keeps. If the machine has no identity, the reason is shown and
   every **Use this machine** button is disabled.
 - One row per configured server that supports credential sources (a server older than that
   shows no row): the server's name, `Source: <machine>` (with `· not connected` when that
-  machine holds no subscription), or `No source yet — the first machine to connect becomes
+  machine holds no delivery stream), or `No source yet — the first machine to connect becomes
   it.`. A server that answered `503 SOURCE_BUSY` on every retry shows the last source it
   knew, or `Checking the source — the server is busy, retrying…`. A server that could not be
   reached (it is restarting, or the network is down) keeps the row it last showed, with
@@ -67,18 +60,19 @@ Preferences → Credential broker:
 **Use this machine** makes this machine the source on that server: one click, no
 confirmation, one request that is not retried. It always sends this machine's own id. When it
 succeeds the row shows the server's answer; when the server refuses it the row returns to the
-last confirmed source and shows why. Moving the source here drops any approval still waiting on
-the other machine. If the server has never seen this machine (its broker has not reached that
-server yet), the app says so and does not retry.
+last confirmed source and shows why. Moving the source here fails any delivery request still
+waiting on the other machine. If the server has never seen this machine (its delivery stream has not reached that
+server yet), the app says so and does not retry. There is no command to unbind: a pin is only
+moved.
 
-The app wakes the broker at once, so it connects without waiting for
+The app reopens this server's delivery stream at once, so it connects without waiting for
 its next retry. Nothing fails over by itself: if the source is off, nothing
 answers until you choose another.
 
 The window reads the sources when it opens and again whenever it is shown or focused, at most
 once every five seconds. After a move whose read-back shows this machine `· not connected`
-(its broker had not connected yet), it reads once more a few seconds later. The same reads and the move are available over IPC as
-[`source.status` and `source.use`](ipc.md#approval-ops).
+(its stream had not connected yet), it reads once more a few seconds later. The same reads and the move are available over IPC as
+[`source.status` and `source.use`](ipc.md#source-delivery-and-egress-ops).
 
 ## Host list (`~/.shed/config.yaml`)
 
@@ -101,15 +95,14 @@ A missing file degrades to an empty host list (no crash).
 ### The user an entry is held to
 
 On a server with a user list, every client certificate names the user it was issued to. The
-app (its control requests, and the credential broker's own certificate) uses a certificate only
+app (its control requests, and the delivery stream's own certificate) uses a certificate only
 when it names the entry's `user`, or the implicit user of a server with no user list. The `shed`
 CLI writes `user` when it enrols the entry; the app only reads it.
 
 - **A certificate for another user is refused.** When `ssh` can offer keys of two users and the
   server issues a certificate for the other one, the app does not use it: it keeps the
   certificate it holds and writes nothing. When the server then refuses the request, the host
-  error says why, and so does the credential broker's last error for that server (a
-  namespace's `last_error` in [`broker.status`](ipc.md); the broker log has it too):
+  error says why, and so does the delivery stream's last error for that server (`last_error` in [`delivery.status`](ipc.md); the app log has it too):
 
   ```text
   server "buildbox": the server issued a certificate for user "admin", but this entry is held
@@ -119,23 +112,23 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 
   While the server keeps issuing the other user's certificate, the app asks it for one again
   only after a wait: 1 second after the first refusal, then 2, 4, 8 and 16 seconds, then
-  every 30 seconds. The app's control requests and the credential broker each keep their own
-  wait on this schedule; the broker's holds for every credential request it answers and every
-  subscription it makes, however many arrive meanwhile. While the app still holds an earlier
+  every 30 seconds. The app's control requests and the delivery stream each keep their own
+  wait on this schedule; the stream's holds for every request it answers and every
+  reconnect it makes, however many arrive meanwhile. While the app still holds an earlier
   certificate for the entry's user that has not expired, it keeps using it. When it holds no
   usable certificate for that user (none, or only one that has since expired), a request is
   refused: it fails at once with the same message and is not sent. The entry stays held to
   its user all the same. When the server issues a certificate for the entry's user again
   (for example, the user's key is back in its list), each uses it at its first attempt once its
-  wait has passed, with no restart: the broker at its next credential request or subscription,
+  wait has passed, with no restart: the stream at its next request or reconnect,
   the control path when the dashboard next polls (every 5 seconds while the window is shown),
   so the gap seen in the dashboard is about 35 seconds at most.
 
   The wait starts again from 1 second when a certificate for the entry's user is used, or
-  when the app restarts. A change to `config.yaml` resets only the credential broker's wait,
-  and only for a server whose entry changed in a field the broker reads (such as its host,
-  ports, URL, TLS pin, `user` or `identity_file`): the broker then starts that server's credential
-  sources afresh. The app's control requests keep their wait, and their clients, until the
+  when the app restarts. A change to `config.yaml` resets only the delivery stream's wait,
+  and only for a server whose entry changed in a field it reads (such as its host,
+  ports, URL, TLS pin, `user` or `identity_file`): the stream then starts that server's
+  source afresh. The app's control requests keep their wait, and their clients, until the
   app restarts. After fixing the entry, restart the app; without a restart, the control
   path's next attempt comes within its wait.
 
@@ -149,15 +142,15 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 
 - **Restart the app after changing an entry's user** (`shed server update <name> --refetch`,
   with or without `--allow-user-change`). The app builds its control clients once, at start.
-  The broker picks up a changed `user` by itself.
+  The delivery stream picks up a changed `user` by itself.
 - **Record the user once with the CLI.** For an entry with no `user`, the app holds the first
   named user it is issued, in memory only, so after a restart it takes the first named user
-  again. The broker keeps its user across restarts through the certificate it stores. Run
+  again. The delivery stream keeps its user across restarts through the certificate it stores. Run
   `shed server update <name> --refetch` once, even for a server you use only from the app, so
   `config.yaml` records the user and both paths hold it.
-- A stored broker certificate that names no user, names another user than the entry's `user`,
-  or cannot be read is not presented: the broker logs why and enrols again.
-- For an entry with no `user`, the broker uses the certificate that sets the first user only
+- A stored certificate that names no user, names another user than the entry's `user`,
+  or cannot be read is not presented: the app logs why and enrols again.
+- For an entry with no `user`, the app uses the certificate that sets the first user only
   once it has stored it, so a restart cannot forget that user. If its state directory is not
   writable, it refuses that certificate with a message that says it could not be stored.
 - A `user` that is not a plain user name (a list or a map, a number, a value with a space)
@@ -175,16 +168,16 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 
 An entry the `shed` CLI added or updated with `--identity-file` names the SSH key it uses
 (`identity_file`; see the CLI's
-[One SSH key per entry](../reference/cli.md#one-ssh-key-per-entry)). The app and its credential
-broker read it with the CLI's value rule:
+[One SSH key per entry](../reference/cli.md#one-ssh-key-per-entry)). The app and its delivery
+stream read it with the CLI's value rule:
 
 - **Every `ssh` they run for the entry passes the key**: `-i <path> -o IdentitiesOnly=yes -o
-  ControlMaster=no -o ControlPath=none`, byte for byte as the CLI does (the broker's enrolment
+  ControlMaster=no -o ControlPath=none`, byte for byte as the CLI does (the enrolment
   over `_bootstrap`, the terminal command). A roost connection (a shed's session list, the
   bootstrap that installs roost, the craze hub) reads a generated ssh config whose stanza for
   the host carries the same four lines and comes before your own config; it keeps its own
   private connection, which its command line names.
-- **The file is checked each time the app or the broker builds an `ssh` command for the entry,
+- **The file is checked each time the app builds an `ssh` command for the entry,
   and each time it opens a tunnel or a command runner for it**, as the CLI checks it: it must
   still be a regular file. One that is missing, or a value the rule refuses, is a refusal that
   names the entry, and that `ssh` does not run: `entry "buildbox": identity_file
@@ -205,18 +198,18 @@ broker read it with the CLI's value rule:
   when each line in it is a plain key: value …; write its fields one per line, as key: value`.
   The app's own requests (the dashboard and its control requests) send nothing to its server.
   So is an entry whose `host` is null (`host: null`, `host: ~` or a bare `host:`); an entry
-  with no `host` at all still uses its name as the host. The credential broker reads entries
+  with no `host` at all still uses its name as the host. The delivery stream reads entries
   with another reader, and still serves some of these: see the limits under
   [How the app reads the file](#how-the-app-reads-the-file).
 
-What the app and broker do not do: they do not check that a certificate was made for the
+What the app does not do: they do not check that a certificate was made for the
 entry's key (the CLI does). If `ssh` authenticates with another key that your own ssh config
 names for the host (a `Host` or `Match` stanza, or `Host *`, can add its `IdentityFile` lines
 after the entry's), the app accepts the certificate when it names the entry's `user`, and
 refuses it when it names anyone else ([the user an entry is held to](#the-user-an-entry-is-held-to)).
 Keep no other `IdentityFile` for that host if the entry must use one key. Restart the app after
-changing an entry's `identity_file`: it builds its control clients once, at start (the broker
-picks the change up by itself).
+changing an entry's `identity_file`: it builds its control clients once, at start (the delivery
+stream picks the change up by itself).
 
 ### How the app reads the file
 
@@ -245,8 +238,7 @@ never to misread what the CLI wrote, not to defend against a hostile file.)
   escaped forms inside a double-quoted value are text); one with the key `servers:` twice; one
   whose `servers:` is written in flow form (`servers: {…}`), or with a tag or an anchor
   (`!!str servers:`, `servers: &s`), or whose first line under it is indented with a tab; and
-  one whose first `---` has content on its line. The
-  broker refuses the same line breaks, as an error reading the file.
+  one whose first `---` has content on its line.
 - **An entry the app does not read** (listed, and refused at every use the app makes of it, as
   above): any line in
   it that is not a plain `key: value`, a line in it indented with a tab, or a null `host`.
@@ -262,29 +254,11 @@ Limits, each refused rather than misread:
   Hosts named there are not shown; use the `roost` app for an interactive session on one.
 - An entry whose `host` is an empty string (`host: ""`) is read as an entry with an empty
   host, as before.
-- **The refusals above are the app's own.** An entry the app refuses sends nothing from the
-  app itself: not the dashboard's requests, not its control requests. The credential broker
-  (inside the app) reads the same file with a full YAML parser and
-  is not held to the line rule. An entry in a shape that parser reads as the CLI does (the
-  fields as a `{…}` mapping, an explicit `? key`, an anchored key, a block in a field other
-  than `user` and `identity_file`) is served like any other: the broker enrols with the entry's
-  key and sends that server its credential requests, though the app refuses the entry. It
-  never reads an entry as "no key" or "no user": an entry with a merge key `<<` or a key
-  written with a tag, and an `identity_file` or `user` written with a tag, an anchor or over
-  more than one line, are refused (no `ssh` runs with such an `identity_file`, and for such a
-  `user` no certificate that names a user is used: only one for the implicit user of a server
-  with no user list, as for any entry). Until the broker holds a certificate it may present
-  for the entry, its requests to that server carry none: a server that authenticates with
-  certificates refuses them, or, after a refusal for the entry's user, they are not sent. A
-  file with a repeated key, an alias, or a line indented with a tab is an error for the
-  broker: it logs it and keeps the servers it read before. An entry with a null `host` is one
-  the broker skips.
-
-## Credential broker (`extensions.yaml`)
-
-Whether the credential-approval gate is active is configured in the broker's
-`extensions.yaml` (`~/.config/shed/extensions.yaml`), not in this app — see [Credential
-approvals](approvals.md) and [Extensions → Configuration](../extensions/configuration.md).
+- **The refusals above apply to the delivery stream too.** An entry the app refuses sends
+  nothing from the app itself: not the dashboard's requests, not its control requests, and not
+  a delivery stream, because the source runtime finds its servers through the same
+  `shed-core` reader. (A source skips an entry with no SSH port rather than guess one, so
+  nothing is minted for it.)
 
 ## Environment variables
 
@@ -300,8 +274,7 @@ Normal use needs none of these. They exist for the test harness, packaging, and 
 | `SHED_TAURI_TEST_MODE` | `=1` → hermetic test mode: all HTTP clients hit the mock, `terminal.open` + Sparkle are disabled, the test-mode-only IPC ops are enabled, and `identify` echoes the flag. |
 | `SHED_TAURI_MOCK_BASE_URL` | Redirects every shed-server client at one in-process mock (test mode); echoed by `identify`. |
 | `SHED_TAURI_SHED_CONFIG` | Override the `~/.shed/config.yaml` path. In test mode an unset value loads an empty config. |
-| `SHED_TAURI_EXTENSIONS_CONFIG` | Override the `extensions.yaml` the broker loads. |
-| `SHED_BROKER_STATE_DIR` | Replace the broker's state directory (default: macOS `~/Library/Application Support/shed`, Linux `$XDG_DATA_HOME/shed` else `~/.local/share/shed`), which holds `broker/machine.json` and the broker's certificates. |
+| `SHED_BROKER_STATE_DIR` | Replace the app's state directory (default: macOS `~/Library/Application Support/shed`, Linux `$XDG_DATA_HOME/shed` else `~/.local/share/shed`), which holds `broker/machine.json` and the app's certificates. |
 | `SHED_TAURI_TEST_TIMEOUT_SCALE` | Multiply the harness's `wait_until` budgets (slow CI). Read by the harness, not the app. |
 
 The log file's location and rotation are in [Architecture](architecture.md#state-storage).

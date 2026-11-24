@@ -226,8 +226,8 @@ from under a running guest. To roll a shed onto new content,
 - **Byte-perfect push.** `shed image push <local-tag> <remote-ref>`
   produces a manifest at the destination whose digest matches the local
   manifest digest.
-- **Layer sharing across images.** The `base`, `extensions`, and `full`
-  images share base layers; pulling all three is barely more than pulling
+- **Layer sharing across images.** The `base` and `full`
+  images share base layers; pulling both is barely more than pulling
   `full`.
 - **Reachability-based GC.** Prune walks from the live shed and
   snapshot set, so unreferenced layers go away even if they were once

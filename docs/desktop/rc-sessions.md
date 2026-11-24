@@ -7,7 +7,7 @@ A roost row is what that shed's own
 [`roost-session`](../extensions/roost-session-hosts.md) reports. A shed with no
 `roost-session` running has no roost rows. Before v0.9.0 a shed's rows were the
 *union* of a guest RC hub's sessions and roost's; the guest binary
-(`shed-ext-rc`) and the hub are gone (S6,
+(the guest RC helper) and the hub are gone (S6,
 [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). A craze
 session comes from the craze hub on that shed — see
 [Craze sessions](#craze-sessions) below.

@@ -74,7 +74,7 @@ curl -s http://127.0.0.1:498/v1/publish -d '{
 }'
 ```
 
-The agent blocks until the host listener responds, for at most 30 seconds. The response envelope is returned as the HTTP body. (The credential helpers set their own, shorter client timeout: 3 seconds per request.)
+The agent blocks until the host listener responds, for at most 30 seconds. The response envelope is returned as the HTTP body.
 
 If the shed's user has no listener for the namespace (no machine connected, or the user's credential source is offline), the server drops the request and logs it; the publish then ends with `504 TIMEOUT`, or earlier at the caller's own timeout.
 
@@ -221,7 +221,7 @@ Registers the calling machine as its user's listener for the namespace and strea
 | 400 | `INVALID_NAMESPACE` | The namespace name is not valid |
 | 403 | `FORBIDDEN` | The caller is not a user (a service client), or the request was made with a script key |
 | 403 | `NAMESPACE_RESERVED` | `system:*` namespaces cannot be registered |
-| 403 | `SOURCE_MACHINE_ID_REQUIRED` | No valid machine headers (a broker older than credential sources) |
+| 403 | `SOURCE_MACHINE_ID_REQUIRED` | No valid machine headers |
 | 403 | `SOURCE_NOT_BOUND` | Another machine is the user's credential source; `source.machine_id` and `source.machine_name` name it |
 | 409 | `SOURCE_DUPLICATE_STREAM` | This machine already holds the namespace for this user; retry later |
 | 429 | `SOURCE_RATE_LIMITED` | Too many new or changed machines for the user lately; `Retry-After` says when to retry |
@@ -271,28 +271,30 @@ it is refused.
 
 ## Extension Management
 
-Extensions can be selectively enabled via server configuration. The agent reads extension manifests from the VM image and activates only the configured ones.
+Extensions can be selectively enabled via server configuration. The agent reads extension manifests from the VM image and activates only the configured ones. Shed ships no extension of its own: the images carry no manifest, so a namespace you enable must come from an image you built.
 
 ### Server Configuration
 
 ```yaml
 extensions:
   enabled:
-    - ssh-agent
-    - aws-credentials
+    - my-extension
 ```
 
 When `extensions` is omitted from the config, no extensions are activated.
+
+!!! warning "Three names are retired"
+    `ssh-agent`, `aws-credentials` and `docker-credentials` named the in-VM credential helpers, which were removed in v0.11. Naming one in `extensions.enabled` fails the config load. Credentials now reach a shed by [delivery](delivery.md), not through the bus. See the [v0.10 to v0.11 upgrade guide](../upgrades/v0.10-to-v0.11.md).
 
 ### Extension Manifests
 
 Each extension provides a manifest file in `/etc/shed-extensions.d/`:
 
 ```yaml
-# /etc/shed-extensions.d/ssh-agent.yaml
-namespace: ssh-agent
-systemd_unit: shed-ext-ssh-agent.service
-description: SSH agent forwarding via shed message bus
+# /etc/shed-extensions.d/my-extension.yaml
+namespace: my-extension
+systemd_unit: my-extension.service
+description: What the extension does
 ```
 
 | Field | Required | Description |
@@ -308,31 +310,21 @@ description: SSH agent forwarding via shed message bus
 3. Agent runs `systemctl enable --now` for each enabled extension
 4. Extensions not in the enabled list remain inactive
 
-Extensions are **enable-only** — they persist until VM restart. Runtime disabling is not supported.
+Extensions are **enable-only**: they persist until VM restart. Runtime disabling is not supported.
 
 ### Extension Health
 
 The agent periodically checks each enabled extension at two levels:
 
 - **guest**: Is the systemd service running? (`systemctl is-active`)
-- **host**: Can the extension reach the credential broker end-to-end? (bus ping round-trip)
+- **host**: Can the extension reach a host listener end-to-end? (bus ping round-trip)
 
 Health status is included in heartbeats and visible via `shed list -vv`:
 
 ```text
 Extensions:
-  aws-credentials:     guest=running  host=connected
-  ssh-agent:           guest=running  host=connected
+  my-extension:        guest=running  host=connected
 ```
-
-### Naming Convention
-
-| Component | Pattern | Example |
-|-----------|---------|---------|
-| Guest binary | `shed-ext-<namespace>` | `shed-ext-ssh-agent` |
-| Systemd unit | `shed-ext-<namespace>.service` | `shed-ext-ssh-agent.service` |
-| Manifest | `<namespace>.yaml` | `ssh-agent.yaml` |
-| Host binary | `shed-ext-<purpose>-host` | `shed-ext-credentials-host` |
 
 ### SDK
 
@@ -340,7 +332,7 @@ The `github.com/charliek/shed/sdk` Go module provides shared types and clients f
 
 - `sdk.Envelope` — Universal message format
 - `sdk.BusClient` — Guest-side HTTP publisher to shed-agent
-- `sdk.HostClient` — Host-side SSE subscriber to shed-server. The Rust broker in `crates/shed-broker` is the maintained host-side client
+- `sdk.HostClient` — Host-side SSE subscriber to shed-server. The Rust client in `crates/shed-source` is the maintained host-side one for the desktop app
 
 ```go
 import "github.com/charliek/shed/sdk"
@@ -361,7 +353,7 @@ for env := range ch {
 }
 ```
 
-`sdk.WithMachine(id, name)` gives the client its machine identity, sent on every subscribe and respond in `X-Shed-Machine-Id` and `X-Shed-Machine-Name` (the name percent-encoded the same way the Rust broker encodes it). The id is 32 lowercase hexadecimal characters and must stay the same for the machine: a new id is a new machine to the server, so store it rather than generating one per process. The name is 1 to 63 bytes of UTF-8 with no control characters. `sdk.ValidateMachine(id, name)` applies the server's rules. A client built with an identity that breaks them sends nothing: `Respond` returns an error wrapping `sdk.ErrInvalidMachine`, and the subscription stops with state `rejected`. Without `WithMachine` the client sends neither header, and a server with credential sources refuses it with `403 SOURCE_MACHINE_ID_REQUIRED`. The client never invents an identity, because the caller decides which machine answers for its user.
+`sdk.WithMachine(id, name)` gives the client its machine identity, sent on every subscribe and respond in `X-Shed-Machine-Id` and `X-Shed-Machine-Name` (the name percent-encoded the same way the desktop app encodes it). The id is 32 lowercase hexadecimal characters and must stay the same for the machine: a new id is a new machine to the server, so store it rather than generating one per process. The name is 1 to 63 bytes of UTF-8 with no control characters. `sdk.ValidateMachine(id, name)` applies the server's rules. A client built with an identity that breaks them sends nothing: `Respond` returns an error wrapping `sdk.ErrInvalidMachine`, and the subscription stops with state `rejected`. Without `WithMachine` the client sends neither header, and a server with credential sources refuses it with `403 SOURCE_MACHINE_ID_REQUIRED`. The client never invents an identity, because the caller decides which machine answers for its user.
 
 The server's credential-source refusals come back as `*sdk.SourceError`. `Respond` returns it, and a subscription reports it in `Status()` (field `Err`). Match each refusal with `errors.Is`, and read its fields with `errors.As`:
 
@@ -376,18 +368,13 @@ A refusal is recognised only from a complete body of at most 1024 bytes, that en
 
 The client follows a redirect only within the configured server's origin (the same scheme, host name and port, so never from `https` to `http`), at most three times, whatever the `CheckRedirect` of a client passed with `sdk.WithHTTPClient` allows. Any other redirect is reported as an `unexpected status` error, and nothing is sent to where it points.
 
-## Credential extensions
+## Nothing ships on the bus
 
-The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the shed desktop app, which is the credential broker, on your machine.
+Shed's own credential brokering (SSH agent forwarding, an AWS credential endpoint, a Docker credential helper) used to run on this bus. It was removed in v0.11: credentials now reach a shed as files and environment variables written by [credential delivery](delivery.md), and nothing in the shipped images uses the bus. The bus itself is unchanged and stays available for extensions you build:
 
-These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `internal/ext/` for the guest side; `crates/shed-broker` for the host-side broker). See the Extensions reference for setup and usage:
-
-- [Architecture](../extensions/architecture.md) — component layout and message flows
-- [Configuration](../extensions/configuration.md) — the broker's `extensions.yaml`
-- [SSH Agent](../extensions/ssh-agent.md), [AWS Credentials](../extensions/aws-credentials.md), [Docker Credentials](../extensions/docker-credentials.md)
-- [Credential Source](../extensions/source-binding.md) — which of a user's machines answers
-- [Credential approvals](../desktop/approvals.md) — deciding requests in the desktop app
-- [Security Posture](../extensions/security-posture.md)
+- [Architecture](../extensions/architecture.md): component layout and the message flow
+- [Credential Source](../extensions/source-binding.md): which of a user's machines answers, for the bus and for delivery
+- [Credentials in a shed](../guides/credentials-in-a-shed.md): what replaced the helpers
 
 ## Use Cases
 

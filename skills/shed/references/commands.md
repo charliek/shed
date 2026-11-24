@@ -31,7 +31,7 @@ Client (`shed`) commands only. Server operation (`shed-server setup/serve/instal
 | `--repo, -r <owner/repo\|url>` | Clone a repo into the shed |
 | `--local-dir <path>` | Mount a host directory as the workspace (mutually exclusive with `--repo`) |
 | `--from-snapshot <name>` | Spawn from a snapshot (mutually exclusive with `--repo`/`--image`) |
-| `--image, -i <base\|extensions\|full>` | Image variant (default: server default, usually `full`) |
+| `--image, -i <base\|full>` | Image variant (default: server default, usually `full`) |
 | `--backend <firecracker\|vz>` | Override backend (default: server default) |
 | `--cpus <n>` / `--memory <MB>` | Resource overrides |
 | `--upper-size <size>` | Size of the per-shed writable upper layer, e.g. `5G`, `20G` (default: server config) |
@@ -99,15 +99,17 @@ with nothing to run today.
 
 ## Credential sources
 
-A server sends your sheds' credential requests (SSH agent, Docker, AWS) to one
-of your machines only: your credential source. The first machine to connect
-becomes it; others are refused and keep retrying.
+A server asks one of your machines only for the credentials a new shed holds
+(an SSH key, a GitHub token, API keys, an envsecrets login): your credential
+source. The first machine to connect becomes it; others are refused and keep
+retrying. A pin is only moved, never unbound.
 
 | Command | Purpose |
 |---------|---------|
 | `shed source status [--json]` | Which machine is the source, and whether it is connected |
 | `shed source ls [--json]` | Every machine that has presented itself for you |
 | `shed source use [--] <machine>` | Make another machine the source (full id, 8+ hex id prefix, or exact name); the new one answers within about 30 s |
+| `shed provision <name> [--status]` | Deliver credentials into a running shed again, or finish what a create left owed; `--status` prints the delivery record |
 
 `--user <name>` (admin) acts on another user's source. A script key cannot use
 these commands.
@@ -161,7 +163,7 @@ A snapshot captures a **stopped** shed's rootfs as a named, immutable artifact; 
 
 ## Images
 
-Rootfs images are content-addressed OCI artifacts in variants `base` / `extensions` / `full`; tags point at digests, Docker-style. Most users never touch these — `shed create` pulls what it needs.
+Rootfs images are content-addressed OCI artifacts in variants `base` / `full`; tags point at digests, Docker-style. Most users never touch these — `shed create` pulls what it needs.
 
 | Command | Purpose |
 |---------|---------|

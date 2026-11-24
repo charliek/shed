@@ -7,7 +7,7 @@ by running the real app — not by a human clicking. Three layers cover it.
 
 Pure logic lives in the Rust crates and is unit-tested there: config parsing, model decoding
 against real API shapes (including `{"sheds": null}` and mixed timestamp formats), the SSE
-parser, the approval policy engine and coordinator, the lane adapters, and the Tauri crate's
+parser, the delivery providers and bundle builder, the lane adapters, and the Tauri crate's
 own IPC doors and seams. No running UI required.
 
 ```bash
@@ -23,13 +23,14 @@ The frontend's pure helpers have their own tests, run by `npm run build` in
 
 Drives the **real** app over the [IPC socket](ipc.md) and asserts on what it rendered via the
 UI-truth ops (`dashboard.dump`, `agents.dump`, `prefs.dump`, …) and on backend state
-(`sheds.list`, `approvals.list`, …). It is fully **hermetic**:
+(`sheds.list`, `delivery.status`, …). It is fully **hermetic**:
 
 1. A stdlib `ThreadingHTTPServer` (`mockserver.py`) stands in for `shed-server` on an
    ephemeral `127.0.0.1` port, serving fixture JSON the test can mutate directly. The app's
-   own credential broker runs hermetically (`broker_env.py`: a throwaway HOME, keys and
-   server list naming only the mocks, checked before every launch); approvals are pushed on
-   a mock's plugin bus (`bus_stimulus.py`). The app turns on launch at login at its first
+   credential source runs hermetically (`hermetic.py`: a throwaway HOME, every `XDG_*_HOME`
+   and `SHED_BROKER_STATE_DIR` inside the run, the developer's agent and credential files
+   unset, no proxy, a server list naming only the mocks, all checked before every launch); a
+   mock answers the delivery stream and the activity and egress routes. The app turns on launch at login at its first
    launch; under the harness that login item stays inside the throwaway HOME (Linux) or in
    memory (macOS).
 2. The harness launches the app in test mode (`SHED_TAURI_TEST_MODE=1`,
@@ -58,10 +59,23 @@ and `prefs` is the window's own reported `{sections, values, mode}` snapshot —
 test asserts (gated section visibility, persisted values, theme) instead of pixels, the same
 UI-truth pattern as `dashboard.dump`.
 
+### The source and server-view cells
+
+`test_tauri_source.py` drives this machine as a credential source through the real app: the
+delivery stream binds to a mock, a pinning mock refuses another machine's stream, and **Use
+this machine** (the `source.use` op, or the Preferences row's own button) moves the binding
+and reopens the stream at once. It also holds the app-level cells for the log file, the
+per-server credential mode and launch at login. `test_tauri_server_views.py` drives the views
+that read the servers themselves, over two private mocks and one that is down: the four
+sidebar entries, Activity merged across servers and paged with its cursor, a shed's detail
+(its delivery and its egress, keyed by the shed's creation time so a reused name starts
+empty) and the System pane's egress profiles. `hermetic.py` is the launch environment every
+cell runs under and its check.
+
 ### Simulating a down (unreachable) host
 
 The shared session redirects every configured server to the one in-process mock, so a
-per-host error row (an unreachable host in the Egress / System panes) can't appear there. To
+per-host error row (an unreachable host in the Activity / System panes) can't appear there. To
 exercise it, point a **dedicated** fixture config at an extra server and name it in
 `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (comma-separated server names, parsed only in test mode):
 the backend points those hosts at a closed port (`http://127.0.0.1:1`, a deterministic
@@ -78,7 +92,7 @@ The app's shipped Linux WebView is WebKitGTK, so a Linux-only render gate runs t
 
 ```bash
 make -C desktop tauri-build-linux   # render gate (WebKitGTK 2.44, Xvfb) — run for any shared/Linux change
-make -C desktop tauri-test-linux    # the Tauri crate's Linux-only approval-seam tests (polkit gate)
+make -C desktop tauri-test-linux    # the Tauri crate's clippy and cargo test on Linux (its Linux cfg)
 make -C desktop deb-validate        # build the .deb + install-validate in a clean container
 ```
 

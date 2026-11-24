@@ -2,7 +2,7 @@
 
 The opinionated, packaged path to a working shed on macOS, with the
 [shed-desktop](https://charliek.github.io/shed-desktop/) menu-bar app (Tauri, the shipped
-macOS client) handling credential approvals. Everything installs from Homebrew plus one DMG.
+macOS client) delivering your credentials into sheds. Everything installs from Homebrew plus one DMG.
 
 Building from source, custom images, or hacking on shed itself? See
 [macOS Developer Setup](vz-setup.md) instead.
@@ -11,10 +11,10 @@ Building from source, custom images, or hacking on shed itself? See
 
 - A local `shed-server` running VMs through Apple's Virtualization.framework (via
   `vfkit`, installed by Homebrew).
-- **shed-desktop**: a menu-bar app (Tauri) that lists/creates sheds, shows a Touch ID
-  approval prompt whenever a shed asks to use a credential, and is the credential broker:
-  it brokers your real credentials (SSH agent, Docker registry auth, optionally AWS) into
-  sheds — keys never leave your Mac.
+- **shed-desktop**: a menu-bar app (Tauri) that lists and creates sheds, and is your
+  credential source: when a shed is created, it answers the server with the credentials you
+  chose (an SSH key, a GitHub token, API keys, an envsecrets login) and the shed holds them
+  as ordinary files and environment variables.
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ clear the flag once:
 xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
 ```
 
-The app is the only credential broker; there is nothing else to install. (If you ran the
+The app is the only credential source; there is nothing else to install. (If you ran the
 separate credential daemon from an earlier release, it has been removed from Homebrew:
 uninstall it with `brew uninstall`; see
 [Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
@@ -56,8 +56,7 @@ launchd service.
 ## 2. Configure the server
 
 The server config lives at `/opt/homebrew/etc/shed/server.yaml`. A minimal setup
-shares a couple of host credential directories and enables the credential
-extensions:
+shares a couple of host credential directories:
 
 ```yaml
 # /opt/homebrew/etc/shed/server.yaml
@@ -82,95 +81,29 @@ mounts:
     target: /home/shed/.config/gh
     readonly: false
 
-# Credential brokering by the shed-desktop app (configured in step 3).
-extensions:
-  enabled:
-    - ssh-agent
-    - docker-credentials
-    # - aws-credentials
-
 # default_image / image_aliases are omitted, so they're synthesized from the
 # server version — upgrades move to the matching images with no config edit.
 ```
 
 Restart after editing: `brew services restart shed`.
 
-## 3. Configure credential brokering
-
-The credential broker runs inside shed-desktop. It holds your real keys and decides each
-request; its config is `~/.config/shed/extensions.yaml`. To route approvals to the app's
-approval prompt, set each provider's policy to `shed-desktop` (there is nothing to
-enable). With no file at all, the app uses a default that routes SSH approvals to the app.
-
-```yaml
-# ~/.config/shed/extensions.yaml
-# Full reference: https://charliek.github.io/shed/extensions/configuration/
-discovery:
-  servers: all            # broker for every server in ~/.shed/config.yaml
-  watch: fsnotify         # pick up `shed server add/remove` live
-
-# Optional: how long to wait for a shed-desktop decision before failing closed (default 25s)
-# approval_timeout: 25s
-
-ssh:
-  approval:
-    policy: shed-desktop  # SSH sign approvals decided in shed-desktop
-                          # no-GUI alternative: biometrics-or-password (native Touch ID)
-
-docker:
-  approval:
-    policy: shed-desktop  # live Allow/Deny toggle in shed-desktop
-  registries:             # registries the broker brokers creds for
-    - ghcr.io
-    - docker.io
-    # - registry.example.com   # add your private/org registries here
-  allow_all: false        # set true to broker for ANY registry (ignores the list)
-
-# AWS credential vending (inactive until you set a role)
-aws:
-  approval:
-    policy: shed-desktop  # or deny-all until a role is configured
-  source_profile: default
-  default_role: ""        # set an IAM role ARN to enable AWS vending
-  session_duration: 1h
-  cache_refresh_before: 5m
-  # Per-shed role overrides:
-  # sheds:
-  #   my-shed:
-  #     role: arn:aws:iam::123456789012:role/ShedRole
-
-logging:
-  enabled: true
-  path: ~/.local/share/shed/extensions-audit.log
-```
-
-Restart shed-desktop to apply the file, then verify in the app: **Preferences → Credential
-broker** shows that the broker started and lists each server with its credential source
-(`shedctl raw broker.status` prints the same details, including the config it loaded, as
-JSON). Policies, roles, and registries are off by default — see the
-[full reference](../extensions/configuration.md).
-
-## 4. Open shed-desktop
+## 3. Open shed-desktop and choose what a shed gets
 
 Launch it (it lives in the menu bar, no Dock icon). It reads your
-`~/.shed/config.yaml` host list and starts its credential broker. The first time it starts, it
-turns on **launch at login**, so credentials keep being answered whenever you are logged in
-(they are answered only while the app is running). Open
-**Preferences** from the menu-bar dropdown to set approval behavior:
+`~/.shed/config.yaml` host list and opens a delivery stream to each server. The first time it
+starts, it turns on **launch at login**, so credentials keep being delivered whenever you
+are logged in (they are delivered only while the app is running). The first of your
+machines to connect to a server becomes your credential source there. The app only knows servers in `~/.shed/config.yaml`, so run `shed server add` from the next step first if you have not.
 
-| Section | What |
-|---|---|
-| **SSH approvals** | Method (Touch ID or password / Touch ID / Prompt), default decision (Time Based Allow, etc.), and duration. |
-| **AWS / Docker credentials** | A live **Allow / Deny** toggle (default Deny). |
-| **Per-shed overrides** | Always-allow / always-deny rules keyed by `(server, shed)`. |
+Open **Preferences → Provisioning** from the menu-bar dropdown. Turn on the providers you want
+(`ssh-key`, `github`, `api-keys`, `envsecrets-login`, `files`) and give each an `only.servers`
+rule naming the servers you trust with it. The **Preview** shows what a shed would get, with
+sizes and fingerprints and never a value. Nothing is delivered until you turn a provider on.
+See [Desktop provisioning](../desktop/provisioning.md) and
+[Credentials in a shed](../guides/credentials-in-a-shed.md), including what it means that a
+usable credential is inside the shed while it runs.
 
-Credentials **fail closed**: when shed-desktop isn't running, delegated requests
-are denied. See the shed-desktop
-[installation](https://charliek.github.io/shed-desktop/getting-started/installation/)
-and [approvals](https://charliek.github.io/shed-desktop/reference/approvals/)
-docs for the full policy model.
-
-## 5. Register the server and create a shed
+## 4. Register the server and create a shed
 
 ```bash
 shed server add localhost --name my-mac   # registers the local server
@@ -180,41 +113,27 @@ shed console hello-world                  # drop into a shell inside it
 
 (You can also create from a repo or a local directory:
 `shed create demo --repo charliek/your-repo`, or
-`shed create demo --local-dir ~/projects/app`.)
+`shed create demo --local-dir ~/projects/app`.) A create with `--repo` asks your source for
+credentials before the clone, so a private repository clones with the delivered key. If the
+app is not running, the create still finishes and prints the command that finishes the delivery:
+`shed provision <name>`.
 
-## 6. Verify credential brokering
+## 5. Verify delivery
 
-Run these **inside the shed** — the `shed console hello-world` shell from step 5.
-The first SSH or Docker credential use raises a Touch ID approval in shed-desktop;
-approve it (pick a policy like *Time Based Allow* so you aren't asked again for a
-while).
-
-```bash
-# SSH — signs with your host key via the forwarded agent (-> approval in shed-desktop).
-# Success prints: Hi <you>! You've successfully authenticated...
-ssh -T git@github.com
-
-# Docker — pull a small public image (anonymous pulls work with credsStore=shed):
-docker pull postgres:16-alpine
-# ...and a private registry to exercise credential brokering (-> approval):
-# docker pull ghcr.io/your-org/your-image:tag
-
-# AWS — only if you set default_role + aws.approval.policy in step 3:
-aws sts get-caller-identity
-```
-
-Back on the **host**, check each shed's extension health and connection state:
+Check what the shed holds and what is owed:
 
 ```bash
-shed list -vv
+shed provision hello-world --status
+shed exec hello-world -- ls -l .ssh     # the delivered key, if ssh-key is on
 ```
 
+If the record shows steps owed, connect the source (open the app) and run `shed provision hello-world`.
 Remove the test shed when you're done: `shed delete hello-world`.
 
 ## Next steps
 
 - [Configuration](../reference/configuration.md) — every server-config field.
-- [Extensions](../reference/extensions.md) · [Extensions Architecture](../extensions/architecture.md) — the credential bus in full.
+- [Credential delivery](../reference/delivery.md) — what is delivered, when, and the record.
 - [shed-desktop docs](https://charliek.github.io/shed-desktop/) — the menu-bar app (Tauri) in full.
 - [macOS Developer Setup](vz-setup.md) — build from source, custom images.
 - Provisioning a project: [Gradle](../tutorials/gradle-provisioning.md) · [TypeScript](../tutorials/typescript-provisioning.md) · [Python](../tutorials/python-provisioning.md).

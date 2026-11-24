@@ -241,12 +241,13 @@ shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
 - **Use both.** On Firecracker, an `open` shed with no mounts can still reach
   another running shed's 9P port on the bridge, so leaving out mounts is not a
   boundary by itself.
-- **Neither flag turns off the credential bus.** While a machine of the shed's
-  user answers for this server, code in the shed can request SSH signatures
-  and the cloud and registry credentials configured for it, like any shed (see
-  [Credential isolation](../extensions/security-posture.md)). For untrusted
-  code, quit the desktop app on your machine while the shed runs, or have a [service
-  client](../reference/security.md#service-clients) own the shed: the bus is
+- **Neither flag turns off credential delivery.** While a machine of the shed's
+  user answers for this server, a create or `shed provision` writes that user's
+  delivered credentials into the shed, and code in the shed can read and use
+  them (see [Credentials in a shed](credentials-in-a-shed.md#the-trade)). For untrusted
+  code, turn off the providers you do not need, give each an `only.servers` rule,
+  quit the desktop app on your machine so no source is connected, or have a [service
+  client](../reference/security.md#service-clients) own the shed: delivery and the bus are
   always off for an owned shed.
 - **Neither flag stops the create's sync.** `shed create` still syncs your
   `default` [sync profile](../reference/sync.md#auto-sync-on-create) into the
@@ -314,7 +315,7 @@ moment is `shed server add` showing you the fingerprints to confirm (or pass
 [connection-flow table](../reference/security.md#connection-flow-whats-encrypted-where).
 
 The credential bus (`credentials` scope) and Connect tunnel (`control` or
-`credentials`) ride that same TLS listener, so a desktop app's broker reaches
+`credentials`) ride that same TLS listener, so a desktop app reaches
 them over `https://HOST:8443` with the pinned cert and its own client
 certificate. There is no plaintext channel, implicit or opt-in.
 

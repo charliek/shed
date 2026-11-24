@@ -1,8 +1,8 @@
 # Credential delivery
 
-When a shed is created, and when its user runs `shed provision`, shed-server asks that person's **credential source** (the shed desktop app on the machine they bound with `shed source use`) for the files and environment variables the shed should hold: an SSH key, a GitHub token, API keys, an envsecrets login, named files. The source answers, the server checks the answer, and the shed's agent writes it into the shed. The shed keeps working from those files afterwards; nothing is asked per use.
+When a shed is created, and when its user runs `shed provision`, shed-server asks that person's **credential source** (the shed desktop app on the machine they bound with **Use this machine** or `shed source use`) for the files and environment variables the shed should hold: an SSH key, a GitHub token, API keys, an envsecrets login, named files. The source answers, the server checks the answer, and the shed's agent writes it into the shed. The shed keeps working from those files afterwards; nothing is asked per use.
 
-The documents and the transport are specified in [The provision contract](provision-contract.md). This page says what the server does with them.
+The documents and the transport are specified in [The provision contract](provision-contract.md). This page says what the server does with them. For what to deliver and what that costs, see [Credentials in a shed](../guides/credentials-in-a-shed.md).
 
 ## When delivery runs
 
