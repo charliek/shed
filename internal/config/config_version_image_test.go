@@ -223,3 +223,46 @@ func TestRetiredExtensionsAliasIsUnknown(t *testing.T) {
 func containsToken(s string) bool {
 	return strings.Contains(s, shedVersionToken)
 }
+
+// A store upgraded from v0.10 keeps a tag label named "extensions" (every pull
+// writes one named after the image's repository). --image extensions must not
+// resolve through it to the old image with the retired helpers: it resolves as
+// an unknown word does, and the label is not offered as an available name. An
+// operator's own alias of that name still wins.
+func TestRetiredExtensionsLabelInAnUpgradedStoreIsIgnored(t *testing.T) {
+	setVersion(t, "0.6.2")
+	dir := t.TempDir()
+	installCachedBlob(t, dir, "extensions", "ghcr.io/charliek/shed-vz-extensions:v0.8.0")
+	installCachedBlob(t, dir, "mylabel", "ghcr.io/example/custom:v1")
+	cfg := &VZConfig{ImagesDir: dir}
+	cfg.applyDefaults()
+
+	got, err := cfg.ResolveImage("extensions")
+	if err != nil {
+		t.Fatalf("ResolveImage(extensions): %v", err)
+	}
+	unknown, err := cfg.ResolveImage("nosuchvariant")
+	if err != nil {
+		t.Fatalf("ResolveImage(nosuchvariant): %v", err)
+	}
+	if got.Path != "" {
+		t.Fatalf("ResolveImage(extensions).Path = %q: resolved through the old label", got.Path)
+	}
+	if want := strings.Replace(unknown.DockerRef, "nosuchvariant", "extensions", 1); got.DockerRef != want {
+		t.Errorf("ResolveImage(extensions).DockerRef = %q, want %q (as an unknown word resolves)", got.DockerRef, want)
+	}
+	// Another label still resolves.
+	if lbl, err := cfg.ResolveImage("mylabel"); err != nil || lbl.Path == "" {
+		t.Errorf("ResolveImage(mylabel) = %#v, %v; want the label's blob", lbl, err)
+	}
+	for _, name := range availableImageVariants(cfg.ImageAliases, dir) {
+		if name == "extensions" {
+			t.Errorf("available names %v offer the retired label", availableImageVariants(cfg.ImageAliases, dir))
+		}
+	}
+	// An operator's own alias of that name is theirs.
+	own := &VZConfig{ImagesDir: dir, ImageAliases: map[string]string{"extensions": "ghcr.io/example/mine:v1"}}
+	if r, err := own.ResolveImage("extensions"); err != nil || r.DockerRef != "ghcr.io/example/mine:v1" {
+		t.Errorf("ResolveImage(extensions) with an operator alias = %#v, %v", r, err)
+	}
+}

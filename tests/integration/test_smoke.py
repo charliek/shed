@@ -365,6 +365,9 @@ _STRIDELABS_APT_TOOLS = ("strix", "prox", "parcel", "envsecrets")
 # environment.d file, their manifests, the Docker credsStore) were removed in
 # plan 039; an allow-list proves their absence without naming each one.
 _USR_LOCAL_BIN = ("network-setup.sh", "shed-agent", "shed-firstboot")
+# `full` adds two of its apt tools there: the prox and envsecrets packages
+# install into /usr/local/bin (strix and parcel into /usr/bin).
+_USR_LOCAL_BIN_FULL = tuple(sorted(_USR_LOCAL_BIN + ("envsecrets", "prox")))
 _SHED_UNITS = ("shed-agent.service", "shed-firstboot.service")
 
 
@@ -441,9 +444,10 @@ def _variant_smoke(shed_server, test_shed_name, variant: str) -> None:
 
     r = shed_server.exec(test_shed_name, ["ls", "-A", "/usr/local/bin"])
     assert r.returncode == 0, f"ls /usr/local/bin: exit={r.returncode} stderr={r.stderr!r}"
-    assert tuple(sorted(r.stdout.split())) == _USR_LOCAL_BIN, (
+    want_local = _USR_LOCAL_BIN_FULL if variant == "full" else _USR_LOCAL_BIN
+    assert tuple(sorted(r.stdout.split())) == want_local, (
         f"/usr/local/bin in a `{variant}` shed holds {sorted(r.stdout.split())}, "
-        f"want exactly {list(_USR_LOCAL_BIN)}: the retired credential helpers "
+        f"want exactly {list(want_local)}: the retired credential helpers "
         f"(plan 039) must not come back."
     )
 

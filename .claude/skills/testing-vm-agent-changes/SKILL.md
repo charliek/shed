@@ -395,6 +395,15 @@ proxy half-close). What bit, by backend:
   prove it, read the `env` probe above. A shed made from an older image still has the helper.
 - **A waiter that greps for the build's own script with `pgrep -f`** inside `bash -c`
   matches itself and never ends. Wait on the background job's notification instead.
+- **A rootfs built from a `git bundle` clone reports the bare short sha.** A bundle of
+  `HEAD` carries no tags, so `shed-agent version` prints `{"version":"<sha>",...}`
+  (for example `"1e176afa"`), not `v…-g<sha>`. Compare the sha; `"protocol":2` is still
+  the check that the image is this branch's.
+- **`full` has two apt tools in `/usr/local/bin`.** The `prox` and `envsecrets` packages
+  install there (`dpkg -S /usr/local/bin/prox` names the package), `strix` and `parcel`
+  into `/usr/bin`. Anything that lists `/usr/local/bin` to prove the retired helpers are
+  gone must allow those two on `full` (plan 039 checkpoint B: `test_full_image_smoke`
+  did not, and failed on a correct image).
 
 ## When you hit a NEW rough edge
 
@@ -418,8 +427,9 @@ scratch image store, the suite run over `ssh <mac> bash -s < script`:
 - **Rebuild both variants**, not only `base`: the users and delivery
   cases boot `base`, `test_delivery_image_baked` boots `full`, and the dev
   configs' `default_image` is the `full` alias. One `SHED_SOURCE_REF` per
-  variant (`image_aliases.<variant>`). From a cold builder: base about 100 s,
-  full about 6 min.
+  variant (`image_aliases.<variant>`). From a cold builder: base about 100 to
+  140 s, full about 6 to 18 min (18 min in plan 039 B's run: the apt and
+  coding-agent downloads dominate, so allow for it in a background job).
 - **Docker Desktop's disk can live on an external volume.** Its growth from
   the builds (about 13 GiB for the builds) is not given back when the scratch
   store is removed; check where it lives before reading `df` after clean-up.
@@ -441,6 +451,18 @@ scratch image store, the suite run over `ssh <mac> bash -s < script`:
   fails `Permission denied (publickey)`. Run that module separately with the
   key in `auth.ssh.authorized_keys_file`, started without
   `SHED_DEV_USERS=itest` (the itest render refuses `authorized_keys_file`).
+- **A store from before v0.11 keeps an `extensions` tag label** (a pull writes
+  one named after the ref's repository). The server ignores that label for
+  `--image extensions` (plan 039 checkpoint B found it booting the old helper
+  image before the fix); look in `<images_dir>/tags/` when judging what an old
+  word resolves to.
+- **The dev server's log is emptied by every restart** (the users cases
+  restart it), so a suite run's `phasetimer-lines.txt` taken at the end misses
+  `test_create_agent_p50`'s lines. Take them from a `tail -F` follower of the
+  log started before the suite.
+- **Extra pytest arguments passed through `ssh ... bash -s -- ...` lose their
+  quoting**, so `-k "a and b"` reaches pytest as separate words. Pass a node
+  id (`test_delivery.py::<test>[vz]`) instead.
 - **The create timing line has a `delivery=` phase** since plan 039 (about
   35 to 60 ms with no source or an instant one; the source's wait when it
   answers late). `agent=` is unchanged by delivery.

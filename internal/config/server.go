@@ -1466,6 +1466,14 @@ type ResolvedImage struct {
 	PullPolicy string
 }
 
+// retiredImageVariant is the image variant removed in v0.11 (plan 039 §3.12).
+// A store upgraded from v0.10 can still hold a tag label of that name (every
+// pull writes one named after the image's repository), so the word is never
+// resolved through a label: unless an operator's own alias names it, it
+// resolves as any unknown word does, never to the old image with the retired
+// credential helpers.
+const retiredImageVariant = "extensions"
+
 // resolveImageRef classifies an image selector into a ResolvedImage. It is a
 // thin classifier — all cache-vs-pull logic (the ref-index lookup and
 // pull_policy enforcement) lives in vmimage.EnsureImage, so this returns
@@ -1489,7 +1497,7 @@ func resolveImageRef(defaultImage string, aliases map[string]string, pullPolicy,
 	default:
 		if aliased, ok := aliases[ref]; ok {
 			ref = aliased
-		} else if imagesDir != "" {
+		} else if imagesDir != "" && selector != retiredImageVariant {
 			// A raw selector may be a cosmetic tag label set via
 			// `shed image pull/build -t`. Resolve that first — a bare
 			// word like "mylabel" otherwise parses as a Docker ref
@@ -1532,7 +1540,7 @@ func availableImageVariants(aliases map[string]string, imagesDir string) []strin
 		tags, err := vmimage.ListTags(imagesDir)
 		if err == nil {
 			for _, name := range tags {
-				if name != "" {
+				if name != "" && name != retiredImageVariant {
 					seen[name] = true
 				}
 			}

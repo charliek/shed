@@ -25,6 +25,10 @@ use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
 
 use crate::auth_modes::AuthModeRegistry;
 
+/// A per-host egress profiles row's error when the server's egress control is off
+/// (its `/api/egress/profiles` answers 501).
+pub const EGRESS_OFF: &str = "egress control is off on this server";
+
 pub struct Backend {
     /// (server_name, client) — shed-core stamps each shed's `host` with the name.
     clients: Vec<(String, Client)>,
@@ -468,7 +472,7 @@ impl Backend {
             .collect()
     }
 
-    /// Per-host egress profiles (`GET /api/egress/profiles`) for the Egress pane.
+    /// Per-host egress profiles (`GET /api/egress/profiles`) for the System pane.
     /// Like [`system_df`](Self::system_df), a per-host failure is KEPT as an error
     /// row (that host is unreachable or has egress disabled) rather than failing
     /// the call. Concurrent.
@@ -481,6 +485,13 @@ impl Backend {
                     host,
                     profiles,
                     error: None,
+                },
+                // The server answers 501 when its egress control is off: said as
+                // that, not as a bare status.
+                Err(ShedError::BadStatus(501)) => HostEgressProfiles {
+                    host,
+                    profiles: Vec::new(),
+                    error: Some(EGRESS_OFF.to_string()),
                 },
                 Err(e) => HostEgressProfiles {
                     host,
@@ -1546,6 +1557,24 @@ mod tests {
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.profiles.is_empty());
         assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn egress_profiles_says_when_egress_control_is_off() {
+        let off = MockServer::start_async().await;
+        off.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(501).body(
+                r#"{"error":{"code":"BACKEND_ERROR","message":"egress control is not enabled"}}"#,
+            );
+        })
+        .await;
+        let rows = backend_with(vec![client_at("off", off.base_url())])
+            .egress_profiles()
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].profiles.is_empty());
+        assert_eq!(rows[0].error.as_deref(), Some(EGRESS_OFF));
     }
 
     const THIS_ID: &str = "0123456789abcdef0123456789abcdef";

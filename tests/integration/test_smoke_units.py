@@ -215,7 +215,10 @@ class _RecordingServer:
         self.backend = "vz"
         self.name = "unit-dev"
         self.variant = variant
-        self.usr_local_bin = usr_local_bin or "network-setup.sh\nshed-agent\nshed-firstboot\n"
+        default = "network-setup.sh\nshed-agent\nshed-firstboot\n"
+        if variant == "full":
+            default += "prox\nenvsecrets\n"
+        self.usr_local_bin = usr_local_bin or default
         self.execs = []
 
     def create(self, name, image=None, **kwargs):
@@ -247,8 +250,21 @@ def test_variant_smoke_body_passes_a_good_image(monkeypatch, variant):
     assert tools == list(test_smoke._STRIDELABS_APT_TOOLS)
 
 
-def test_variant_smoke_body_fails_on_a_stray_binary(monkeypatch):
+@pytest.mark.parametrize("variant", ["base", "full"])
+def test_variant_smoke_body_fails_on_a_stray_binary(monkeypatch, variant):
+    # Everything the variant may hold is there, so only the stray one fails it.
     monkeypatch.setenv("SHED_IMAGE_HAS_DELIVERY", "vz")
-    server = _RecordingServer("full", "network-setup.sh\nshed-agent\nshed-firstboot\nstray-helper\n")
+    good = "network-setup.sh\nshed-agent\nshed-firstboot\n"
+    if variant == "full":
+        good += "prox\nenvsecrets\n"
+    server = _RecordingServer(variant, good + "stray-helper\n")
     with pytest.raises(AssertionError, match="/usr/local/bin"):
-        test_smoke._variant_smoke(server, "unit-shed", "full")
+        test_smoke._variant_smoke(server, "unit-shed", variant)
+
+
+def test_variant_smoke_body_refuses_full_tools_in_base(monkeypatch):
+    # prox and envsecrets are allowed in /usr/local/bin on `full` only.
+    monkeypatch.setenv("SHED_IMAGE_HAS_DELIVERY", "vz")
+    server = _RecordingServer("base", "network-setup.sh\nshed-agent\nshed-firstboot\nprox\n")
+    with pytest.raises(AssertionError, match="/usr/local/bin"):
+        test_smoke._variant_smoke(server, "unit-shed", "base")
