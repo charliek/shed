@@ -283,6 +283,18 @@ fn craze_create_door(
 /// ITS OWN "Use this machine" button for `host` (`[data-source-use]`) and clicks it, so
 /// the press runs the button's handler and honours its disabled state exactly as a
 /// pointer would; a host with no enabled button is a press that lands nowhere.
+/// The gate on plan 039 PR B's harness ops — `activity.dump`, `shed_egress.dump`,
+/// `ui.press_activity_older`, `ui.scroll_to`, `ui.scrolled`: **TEST-MODE ONLY**, the
+/// `ui.report_history` rule. They exist so the harness can read what the Activity pane
+/// and a shed's egress section rendered, and drive what a pointer does; a shipped app
+/// answers `not_enabled`.
+fn test_mode_door(env: &Env, op: &str) -> Result<(), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    Ok(())
+}
+
 fn press_source_use_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
     if !env.test_mode {
         return Err(err("not_enabled", "ui.press_source_use requires test mode"));
@@ -956,7 +968,22 @@ impl Handler {
             "system.df" => Ok(json!({ "usage": self.backend.system_df().await })),
             "hosts.auth" => Ok(self.hosts_auth()),
             "egress.profiles" => Ok(self.egress_dump()),
-            "egress.show" => self.egress_show(params),
+            // A shed's egress lives on its detail (plan 039 B4): `egress.show` opens
+            // that detail exactly as `ui.show_shed_delivery` does, and
+            // `shed_egress.dump` reads what its egress section rendered.
+            "egress.show" => {
+                let (event, payload, _) =
+                    crate::delivery::ui_door(self.env.test_mode, "ui.show_shed_delivery", params)?;
+                present_main_window(&self.app);
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
+            "shed_egress.dump" => {
+                test_mode_door(&self.env, op)?;
+                Ok(json!({
+                    "detail": self.ui_get("shed_egress").unwrap_or(Value::Null),
+                }))
+            }
             // -- the egress decision feed (plan 039 PR B; `crate::egress`) --
             "egress.recent" => {
                 let feed = self.egress_feed()?;
@@ -1104,6 +1131,52 @@ impl Handler {
                 let _ = self.app.emit(event, payload);
                 Ok(json!({}))
             }
+            // Bring the element `[data-scroll-anchor=<anchor>]` into view — TEST-MODE
+            // ONLY: a screenshot's way to what is below the fold. Answers the token the
+            // dashboard reports back through `ui.scrolled` once it has scrolled.
+            "ui.scroll_to" => {
+                test_mode_door(&self.env, op)?;
+                let anchor = req_str(params, "anchor")?;
+                if anchor.is_empty() || anchor.len() > 256 {
+                    return Err(err("bad_request", "'anchor' names a section"));
+                }
+                static SCROLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let token = SCROLLS.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = self
+                    .app
+                    .emit("scroll-to", json!({ "anchor": anchor, "token": token }));
+                Ok(json!({ "token": token }))
+            }
+            // The last `ui.scroll_to` the dashboard carried out: `{anchor, token,
+            // found}`, or null before one.
+            "ui.scrolled" => {
+                test_mode_door(&self.env, op)?;
+                Ok(json!({
+                    "scrolled": self.ui_get("scrolled").unwrap_or(Value::Null),
+                }))
+            }
+            // What the Activity pane rendered (plan 039 PR B): `null` off the pane.
+            "activity.dump" => {
+                test_mode_door(&self.env, op)?;
+                let on_pane = self
+                    .ui_get("pane")
+                    .and_then(|p| p.as_str().map(|s| s == "activity"))
+                    .unwrap_or(false);
+                let activity = if on_pane {
+                    self.ui_get("activity").unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                Ok(json!({ "activity": activity }))
+            }
+            // The Activity pane's "Load older" press — TEST-MODE ONLY, the
+            // `ui.press_source_use` rule: the pane clicks its own button, so a
+            // hidden or disabled one takes no press.
+            "ui.press_activity_older" => {
+                test_mode_door(&self.env, op)?;
+                let _ = self.app.emit("press-activity-older", json!({}));
+                Ok(json!({}))
+            }
             // What the open shed delivery detail rendered (plan 039 A7), or null.
             "shed_delivery.dump" => Ok(json!({
                 "detail": self.ui_get("shed_delivery").unwrap_or(Value::Null),
@@ -1222,10 +1295,7 @@ impl Handler {
     /// always acks so the harness can drive navigation.
     fn navigate(&self, params: &Value) -> Result<Value, (String, String)> {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
-        if !matches!(
-            pane,
-            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
-        ) {
+        if !matches!(pane, "sheds" | "agents" | "activity" | "system") {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
         // The frontend's `navigate` listener attaches asynchronously; the snapshot
@@ -1958,67 +2028,22 @@ impl Handler {
         json!({ "sessions": sessions, "empty": empty })
     }
 
-    // -- egress (mac parity) — the pane's UI truth + its sub-tab driver --------
+    // -- egress profiles: the System pane's UI truth --------------------------
 
-    /// `egress.profiles` → the egress state the frontend reported (UI truth, like
-    /// `agents.dump` reads the rendered sessions): `{tab, profiles, errors,
-    /// selected, activity_count}`. The Egress pane reports only while mounted, so
-    /// off-pane this returns `null` rather than a stale snapshot.
+    /// `egress.profiles` → the server-wide egress profiles the System pane rendered
+    /// (UI truth, like `agents.dump`): `{profiles, errors}`. The pane reports them only
+    /// while mounted, so off System this answers `null` rather than a stale snapshot.
     fn egress_dump(&self) -> Value {
-        let on_egress = self
+        let on_system = self
             .ui_get("pane")
-            .and_then(|p| p.as_str().map(|s| s == "egress"))
+            .and_then(|p| p.as_str().map(|s| s == "system"))
             .unwrap_or(false);
-        let egress = if on_egress {
+        let egress = if on_system {
             self.ui_get("egress").unwrap_or(Value::Null)
         } else {
             Value::Null
         };
         json!({ "egress": egress })
-    }
-
-    /// `egress.show {tab?, profile?, host?}` → drive the Egress pane's sub-tab
-    /// and/or selected profile (an `egress-show` event the pane listens for), so the
-    /// harness can render the Profiles list→detail deterministically (the
-    /// `set-appearance` pattern). Validates the tab; the pane resolves `profile` by
-    /// (host, name) when `host` is given, else by name (first match) — so a name
-    /// that collides across hosts (e.g. `default` on every server) is selectable
-    /// deterministically.
-    ///
-    /// Readiness (mirrors `ui.navigate`'s `frontend_not_ready` gate): the pane's
-    /// `egress-show` LISTENER attaches asynchronously after mount, and — like
-    /// `useUiBridge` — the pane publishes its egress snapshot only AFTER that
-    /// listener is live. So a non-null reported `egress` snapshot proves the
-    /// listener is attached; a null/absent one means an emit would be lost to the
-    /// attach race, so fail fast and let the caller retry.
-    fn egress_show(&self, params: &Value) -> Result<Value, (String, String)> {
-        let tab = params.get("tab").and_then(Value::as_str);
-        if let Some(t) = tab {
-            if !matches!(t, "activity" | "profiles") {
-                return Err(err("bad_request", format!("unknown tab: {t:?}")));
-            }
-        }
-        // snapshot non-null ⟹ the pane mounted AND its egress-show listener attached
-        // (see the pane's effect ordering), so the emit below is heard. Null/absent
-        // ⟹ not yet reported → fail fast so the caller retries (the harness waits).
-        if self.ui_get("egress").is_none_or(|v| v.is_null()) {
-            return Err(err(
-                "frontend_not_ready",
-                "egress pane has not reported yet; retry",
-            ));
-        }
-        let mut payload = serde_json::Map::new();
-        if let Some(t) = tab {
-            payload.insert("tab".into(), json!(t));
-        }
-        if let Some(p) = params.get("profile").and_then(Value::as_str) {
-            payload.insert("profile".into(), json!(p));
-        }
-        if let Some(h) = params.get("host").and_then(Value::as_str) {
-            payload.insert("host".into(), json!(h));
-        }
-        let _ = self.app.emit("egress-show", Value::Object(payload));
-        Ok(json!({}))
     }
 
     /// `loginitem.set {enabled}` → enable/disable launch-at-login (the Preferences
@@ -2998,6 +3023,28 @@ mod tests {
                 "bad_request",
                 "{bad}"
             );
+        }
+    }
+
+    /// **Plan 039 PR B's harness ops are test-mode only**: outside test mode each
+    /// answers `not_enabled` naming itself; in test mode each passes the gate.
+    #[test]
+    fn the_activity_and_egress_harness_ops_are_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let test = env(None);
+        for op in [
+            "activity.dump",
+            "shed_egress.dump",
+            "ui.press_activity_older",
+            "ui.scroll_to",
+            "ui.scrolled",
+        ] {
+            let (code, message) = test_mode_door(&prod, op)
+                .expect_err("a harness op must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "{message}");
+            assert!(test_mode_door(&test, op).is_ok(), "{op} in test mode");
         }
     }
 

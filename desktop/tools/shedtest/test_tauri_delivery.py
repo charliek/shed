@@ -5,15 +5,14 @@ and answers each request it is sent with what `delivery.toml`'s providers read f
 this machine. These cells launch their OWN app (one per module) over a throwaway
 HOME that holds every input the five providers read, all made here at test time:
 
-* a throwaway ed25519 key (`ssh-keygen`, by `broker_env`), never a committed one;
+* a throwaway ed25519 key (`ssh-keygen`, by `hermetic`), never a committed one;
 * a fake `gh` that prints a sentinel token and login;
 * a craze `providers.toml` and an API-key env file (`0600`);
 * an envsecrets config, and its passphrase in a file (or a slow command);
 * two plain files for the `files` provider, one of them stage 2.
 
 It is pointed at a PRIVATE mock (`SHED_TAURI_MOCK_BASE_URL`, plain HTTP: nothing is
-minted over SSH), with a broker that serves no server, so nothing here touches the
-session app or its mocks, and nothing reads the developer's own `~/.ssh`,
+minted over SSH), so nothing here touches the session app or its mock, and nothing reads the developer's own `~/.ssh`,
 `~/.config/gh`, `~/.craze` or `~/.envsecrets`. The settings file is the launch's own
 (`SHED_TAURI_DELIVERY_CONFIG`, inside the runtime dir).
 
@@ -38,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-import broker_env
+import hermetic
 import ui
 from client import ShedError, TauriClient
 from mockserver import DELIVERED_RECORD, MockShedServer
@@ -130,8 +129,8 @@ def ctx():
     home = Path(tempfile.mkdtemp(prefix="shed-dlv-"))
     proc = None
     try:
-        # The broker serves no server; its files (and the throwaway key) live in `home`.
-        broker = broker_env.write_hermetic_broker(home, {})
+        # Every input the providers read (the throwaway key included) lives in `home`.
+        hermetic.generate_key(home / ".ssh")
         _script(home / "bin" / "gh", f"""case "$1 $2" in
   "auth token") echo {GH_TOKEN} ;;
   "api user") echo octo-test ;;
@@ -152,7 +151,7 @@ esac""")
         key_lines = [l for l in key_text.splitlines() if l and not l.startswith("-----")]
 
         env = ui.subproc_env(cfg, runtime_dir=home, mock_base_url=mock.base_url,
-                             config_path=CONFIG, broker=broker, delivery_config=settings)
+                             config_path=CONFIG, delivery_config=settings)
         sock = home / cfg.sock_rel
         log = home / "delivery-ui.log"
         log_fh = open(log, "wb")

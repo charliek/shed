@@ -108,8 +108,8 @@ def roost():
     """A fake roost-session with one agent-owned tab, torn down after the test.
 
     **Never named after a session fixture.** `conftest.py` owns the SESSION-scoped
-    `mock` and `studio` fixtures that the autouse `_app_session` requests by name,
-    so a module-level fixture of either name shadows it and the whole session dies
+    `mock` fixture that the autouse `_app_session` requests by name, so a
+    module-level fixture of that name shadows it and the whole session dies
     with a `ScopeMismatch` — but only when this module happens to be collected
     first, which makes it an intermittent landmine rather than an obvious break.
 

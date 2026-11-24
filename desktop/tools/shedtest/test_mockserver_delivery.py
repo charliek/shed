@@ -202,6 +202,24 @@ def test_provision_activity_and_the_document(dmock):
     c.close()
 
 
+def test_an_activity_page_can_end_empty_with_a_cursor(dmock):
+    """The server scans at most a budget of events per page; events this user may not
+    see are scanned but not sent, so a page can be EMPTY and still carry a cursor."""
+    dmock.activity_events = [{"id": f"e{n}", "at": f"2026-11-23T10:{n:02d}:00Z",
+                              "kind": "shed.start", "shed": {"name": "w"},
+                              "actor": {"kind": "user"}} for n in range(9, -1, -1)]
+    dmock.activity_hidden = {"e9", "e8", "e7"}
+    dmock.activity_scan_budget = 3
+    c = _conn(dmock)
+    c.request("GET", "/api/activity?limit=50")
+    page = json.loads(c.getresponse().read())
+    assert page == {"events": [], "next": "e7"}, page
+    c.request("GET", "/api/activity?limit=50&since=e7")
+    page = json.loads(c.getresponse().read())
+    assert [e["id"] for e in page["events"]] == ["e6", "e5", "e4"] and page["next"] == "e4", page
+    c.close()
+
+
 @pytest.mark.skipif(not CONTRACT.is_dir(), reason="the provision contract is not in this tree")
 def test_shapes_are_the_contracts_own():
     records = CONTRACT / "fixtures" / "records" / "accept"

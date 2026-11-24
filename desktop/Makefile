@@ -136,7 +136,7 @@ tauri-lint: tauri-ui-build  ## clippy the Tauri client (its own standalone works
 	# which fails closed if tauri.conf.json's frontendDist (../ui/dist) is absent.
 	cd tauri/src-tauri && cargo clippy --all-targets -- -D warnings
 
-tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalone workspace; the cross-platform dbus_notify race tests etc. — Linux-only approval-seam tests run under tauri-test-linux)
+tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalone workspace; tauri-test-linux runs it on Linux in Docker)
 	cd tauri/src-tauri && cargo test
 
 # The render gate: build the Tauri Rust app + run the hermetic e2e on
@@ -188,13 +188,12 @@ tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + W
 	    xvfb-run -a --server-args="-screen 0 1400x900x24" \
 	      uv run --group test pytest tools/shedtest -q -p no:cacheprovider'
 
-# The Tauri Rust crate's unit tests on Linux (the platform where the polkit
-# AuthGate + libnotify Notifier are compiled): asserts the gate is fail-closed
-# (never Approved without a real polkit auth; biometrics-only → Unavailable). Uses
-# the same image as the render gate; no display needed. Joins the tauri CI leg.
-# It lints that cfg first (`cargo clippy -D warnings`) — `tauri-lint` only runs on
-# the Mac leg, so nothing else would catch a Linux-only lint.
-tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Linux-only approval-seam tests)
+# The Tauri Rust crate's clippy and unit tests on Linux, where its Linux-only code
+# (the autostart login item, the scrot screenshot) is compiled. Uses the same image
+# as the render gate; no display needed. Joins the tauri CI leg. It lints that cfg
+# first (`cargo clippy -D warnings`) — `tauri-lint` only runs on the Mac leg, so
+# nothing else would catch a Linux-only lint.
+tauri-test-linux: tauri-ui-build  ## Tauri crate clippy + cargo test on ubuntu:24.04 (its Linux cfg)
 	# tauri-ui-build first: `cargo test` compiles the crate, whose generate_context!
 	# fails closed without the frontendDist bundle (tarred into the container below).
 	docker build -t shed-tauri-linux:latest - < Dockerfile.tauri-linux

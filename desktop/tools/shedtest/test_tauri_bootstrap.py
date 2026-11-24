@@ -37,10 +37,9 @@ assert reached the host cannot pass against a shape roost does not publish.
 
 **The app instance is self-managed and INDEPENDENT** (the down-host suite's
 pattern): its own throwaway `HOME`/`XDG_RUNTIME_DIR`, its own IPC socket, its own
-broker (which serves no server), and it never touches `ui._state`. The session-scoped instance
-keeps running beside it, which is what keeps the autouse `_reset_policy` /
-`_reset_mock` fixtures — which reconnect to the session socket before every test
-— working for the modules that come after this one.
+machine identity, and it never touches `ui._state`. The session-scoped instance
+keeps running beside it, which is what keeps the autouse `_reset_mock` fixture —
+which reconnects to the session socket before every test — working for the modules that come after this one.
 
 **Every cell owns its own sheds.** A bootstrap writes to the far side, so a shed
 shared between two cells would make the second one depend on the first having
@@ -555,7 +554,7 @@ def _boot_app(
     asset_base: str | None = None,
 ):
     """Launch an INDEPENDENT tauri instance pointed at `rig` — its own throwaway
-    `HOME`/`XDG_RUNTIME_DIR`, its own socket, its own broker — and yield
+    `HOME`/`XDG_RUNTIME_DIR`, its own socket, its own machine identity — and yield
     a ready client.
 
     Independent, never `ui.launch`, for the down-host suite's reason: a

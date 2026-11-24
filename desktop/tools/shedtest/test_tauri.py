@@ -1,61 +1,22 @@
 """Tauri E2E: the app runtime — the single-instance hand-off, the UI ops
 (navigate / show_window / activate), the tray, preferences, terminal presets,
-the System and Egress panes, and the dialogs.
+the System pane (with the servers' egress profiles), and the dialogs.
 """
 
 from __future__ import annotations
 
 import platform
-import shutil
 import subprocess
-import tempfile
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-import broker_env
+import hermetic
 import ui
-from bus_stimulus import DOCKER, SSH, audit_line, emit_docker, emit_sign, new_approval, pending_ids, verdict
-from client import ShedError, TauriClient, scaled_timeout
-from mockserver import MockShedServer
+from client import ShedError, scaled_timeout
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-
-
-@contextmanager
-def _own_app(mock_base_url: str, broker_for):
-    """A self-managed app (its own HOME/XDG_RUNTIME_DIR, socket and broker), the
-    session app untouched. `broker_for(runtime_dir)` returns its broker setup;
-    yields `(client, info)` once the frontend is up and the broker serves exactly
-    what it was given."""
-    cfg = ui._SUBPROC["tauri"]
-    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-own-"))
-    try:
-        broker = broker_for(runtime_dir)
-        env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
-                             config_path=FIXTURES / "config.yaml", broker=broker)
-        log = runtime_dir / "own-ui.log"
-        with open(log, "wb") as log_fh:
-            proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh,
-                                    stderr=subprocess.STDOUT)
-            try:
-                sock = runtime_dir / cfg.sock_rel
-                ui.await_hermetic("tauri", sock=sock, mock_base_url=mock_base_url,
-                                  proc=proc, log=log)
-                client = TauriClient(sock)
-                try:
-                    client.wait_until(lambda: client.current_pane() is not None,
-                                      timeout=30, what="frontend ready")
-                    broker_env.check_running(client, broker[1])
-                    yield client, broker[1]
-                finally:
-                    client.close()
-            finally:
-                ui.terminate(proc)
-    finally:
-        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 def test_ui_ops_ack(tauri):
@@ -96,8 +57,9 @@ def test_tray_dump(tauri):
     # menu ids are always reported; the tray *installs* on macOS (a status-bar host
     # is always present), while a headless / no-SNI Linux box may be window-only.
     dump = tauri.call("tray.dump")
-    # B1: the menu opens the dashboard, its Approvals/Preferences panes, or quits.
-    assert dump["items"] == ["open", "approvals", "preferences", "quit"]
+    # The menu opens the dashboard or Preferences, or quits (no Approvals item: the
+    # broker and its approvals are gone, plan 039 PR B).
+    assert dump["items"] == ["open", "preferences", "quit"]
     if platform.system() == "Darwin":
         assert dump["present"] is True
 
@@ -113,17 +75,18 @@ def test_tray_popover_drivable(tauri):
         pytest.skip("the tray popover is macOS-only (Linux tray has no click events)")
 
     # The popover reports its rows on mount (even hidden), so tray.dump's popover
-    # block carries the broker + running-sheds state regardless of visibility.
+    # block carries the running sheds regardless of visibility. No approvals and no
+    # broker dot: both went with the broker (plan 039 PR B).
     tauri.wait_until(lambda: tauri.tray_dump().get("popover") is not None,
                      timeout=20, what="popover reported its rows")
     pop = tauri.tray_dump()["popover"]
-    assert set(pop) >= {"connected", "running_sheds", "pending_approvals"}
-    assert isinstance(pop["running_sheds"], list) and isinstance(pop["pending_approvals"], list)
+    assert set(pop) == {"running_sheds"}, pop
+    assert isinstance(pop["running_sheds"], list)
 
     # The window-keyed report did NOT clobber the dashboard's `main` snapshot:
     # current_pane still reflects the shell (B1b.1's per-window keying).
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    assert tauri.current_pane() in {"sheds", "approvals", "agents", "activity", "egress", "system"}
+    assert tauri.current_pane() in {"sheds", "agents", "activity", "system"}
 
     # Drive the show path (the tray-icon-click analog) → the popover becomes visible;
     # hide → invisible. This is the hermetic stand-in for the (non-drivable) OS click.
@@ -176,9 +139,10 @@ def test_updater_status_and_check_disabled(tauri):
 
 def test_navigate_rejects_unknown_pane(tauri):
     # An unknown pane is a bad_request, not blindly emitted — a bogus pane would
-    # otherwise blank the UI (PANES[pane] undefined). `machines` is not a pane.
+    # otherwise blank the UI (PANES[pane] undefined). `machines` is not a pane, and
+    # neither are `approvals` and `egress` any more (plan 039 PR B).
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    for pane in ("bogus", "machines"):
+    for pane in ("bogus", "machines", "approvals", "egress"):
         with pytest.raises(ShedError) as e:
             tauri.navigate(pane)
         assert e.value.code == "bad_request"
@@ -195,6 +159,24 @@ def test_navigate_reports_rendered_pane(tauri):
     tauri.wait_until(lambda: tauri.current_pane() == "system", timeout=15, what="pane=system")
     tauri.navigate("agents")
     tauri.wait_until(lambda: tauri.current_pane() == "agents", timeout=15, what="pane=agents")
+    tauri.navigate("activity")
+    tauri.wait_until(lambda: tauri.current_pane() == "activity", timeout=15, what="pane=activity")
+    tauri.navigate("sheds")
+    tauri.wait_until(lambda: tauri.current_pane() == "sheds", timeout=15, what="pane=sheds")
+
+
+def test_sidebar_has_four_entries(tauri):
+    # The sidebar is Sheds, Agents, Activity, System (plan 039 §3.10). Each entry
+    # navigates and is reported as the rendered pane; the badges carry no approval
+    # count.
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    for pane in ("sheds", "agents", "activity", "system"):
+        tauri.navigate(pane)
+        tauri.wait_until(lambda: tauri.current_pane() == pane, timeout=15, what=f"pane={pane}")
+    tauri.navigate("sheds")
+    tauri.wait_until(lambda: tauri.current_pane() == "sheds", timeout=15, what="pane=sheds")
+    tauri.wait_until(lambda: tauri.badges() is not None, timeout=15, what="badges reported")
+    assert set(tauri.badges()) == {"sheds", "agents", "hosts"}, tauri.badges()
 
 
 def _norm(color: str) -> str:
@@ -245,17 +227,17 @@ def test_set_appearance_drives_dark_and_light(tauri):
 def test_sidebar_badges_match_fixture(tauri):
     # The sidebar nav badge counts are UI truth, reported over IPC (ui.badges), so
     # they're asserted as logical content, not pixels. The default fixture has 2
-    # sheds on 1 configured server, no RC sessions, no pending approvals. `hosts`
+    # sheds on 1 configured server and no RC sessions. `hosts`
     # counts CONFIGURED servers (from system_df, an async fetch), so wait on the full
     # snapshot rather than `sheds` alone — the host count lands independently.
-    want = {"sheds": 2, "agents": 0, "hosts": 1, "pending": 0}
+    want = {"sheds": 2, "agents": 0, "hosts": 1}
     tauri.wait_until(lambda: (tauri.badges() or {}) == want,
                      timeout=15, what="sidebar badges reported")
     b = tauri.badges()
     assert b == want, f"unexpected badges: {b}"
 
 
-def test_second_launch_hands_off(tauri, broker):
+def test_second_launch_hands_off(tauri):
     # A second shed-desktop-tauri against the same runtime must detect the running
     # instance (the single-instance plugin), hand off by raising it, and exit —
     # never bind a second socket or leave a process behind.
@@ -265,8 +247,8 @@ def test_second_launch_hands_off(tauri, broker):
     # The session instance's log is where the harness put it.
     env = ui.launch_env("tauri")
     # The same guard as every launch: the copied session env must still pass the
-    # session broker's pre-spawn check before a second binary sees it.
-    broker_env.validate(env, broker)
+    # pre-spawn check before a second binary sees it.
+    hermetic.validate(env, Path(env["HOME"]))
     log_path = tauri.identify()["log_path"]
     assert log_path == str(ui.app_log_path(Path(env["HOME"]))), log_path
     before = Path(log_path).read_text(errors="replace")
@@ -383,64 +365,6 @@ def test_terminal_pref_persists_and_drives_preview(tauri):
     assert tauri.prefs_get()["terminal_preset"] == "ghostty"
 
 
-def test_ssh_prefs_round_trip_and_partial_update(tauri):
-    # B4: the full {method, policy, ttl} is drivable + observable. ui.set_ssh_approval
-    # applies it; ui.ssh_prefs reads back exactly what the coordinator holds — and a
-    # partial update (one field) composes with the rest, the property the modal relies
-    # on when it sends only the changed control. Restore the prior prefs after (the app
-    # + coordinator are session-scoped, so a left-over policy would leak to later tests).
-    before = tauri.ssh_prefs_get()
-    try:
-        tauri.set_ssh_approval(method="prompt", policy="time-based-allow", ttl="4h")
-        got = tauri.ssh_prefs_get()
-        assert got["method"] == "prompt"
-        assert got["policy"] == "time-based-allow"
-        assert got["ttl"] == "4h"
-        # a policy-only update leaves method + ttl untouched (partial-update compose)
-        tauri.set_ssh_approval(policy="always-allow")
-        got = tauri.ssh_prefs_get()
-        assert got["policy"] == "always-allow"
-        assert got["method"] == "prompt"
-        assert got["ttl"] == "4h"
-    finally:
-        tauri.set_ssh_approval(
-            method=before["method"], policy=before["policy"], ttl=before["ttl"]
-        )
-
-
-def test_provider_mode_round_trip_drives_docker_policy(tauri, mock, broker):
-    # D: the AWS/Docker provider mode is drivable + observable AND actually changes
-    # the coordinator's namespace policy. The session broker delegates docker-
-    # credentials, so a set→emit→response round-trip proves the mode governs the
-    # auto-decision (the approvals-matrix pattern). Restore Deny after (the app +
-    # coordinator are session-scoped, so a left-over Approve would leak).
-    try:
-        # Approve → a docker request auto-approves by policy (no prompt/queue).
-        tauri.set_provider_mode("docker-credentials", "approve")
-        tauri.wait_until(
-            lambda: tauri.provider_modes_get().get("docker-credentials") == "approve",
-            timeout=15, what="docker mode == approve")
-        eid = emit_docker(mock, "prov-approve-shed")
-        assert verdict(mock, DOCKER, eid) == "approve"
-        assert audit_line(broker, DOCKER, "prov-approve-shed")["decided_by"] == "policy"
-
-        # Deny → a docker request auto-denies by policy (fail-closed).
-        tauri.set_provider_mode("docker-credentials", "deny")
-        tauri.wait_until(
-            lambda: tauri.provider_modes_get().get("docker-credentials") == "deny",
-            timeout=15, what="docker mode == deny")
-        eid2 = emit_docker(mock, "prov-deny-shed")
-        assert verdict(mock, DOCKER, eid2) == "deny"
-        assert audit_line(broker, DOCKER, "prov-deny-shed")["decided_by"] == "policy"
-
-        # A non-provider namespace is rejected (SSH has its own prefs path).
-        with pytest.raises(ShedError) as e:
-            tauri.set_provider_mode("ssh-agent", "approve")
-        assert e.value.code == "bad_request"
-    finally:
-        tauri.set_provider_mode("docker-credentials", "deny")
-
-
 def test_loginitem_probe(tauri):
     # B4: launch-at-login is drivable + observable (the Preferences "Launch at
     # login" toggle). On Linux (the shipped target) `auto-launch`
@@ -488,20 +412,21 @@ def test_preferences_window_opens(tauri):
     # rendered snapshot is reported under its own window label (prefs.dump), whose
     # close HIDES it, and whose reopen re-fronts the same window.
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    ssh = tauri.ssh_prefs_get()
     prefs = tauri.prefs_get()
     login = tauri.login_item_status()
     _open_prefs(tauri)
     assert tauri.prefs_dump()["title"] == "shed desktop — Preferences"
     # The reported values converge on the backend truth (the window fetches on mount).
-    tauri.wait_until(lambda: _prefs_values(tauri).get("policy") == ssh["policy"],
-                     timeout=15, what="reported ssh policy matches the coordinator")
+    tauri.wait_until(lambda: _prefs_values(tauri).get("preset") == prefs["terminal_preset"]
+                     and _prefs_values(tauri).get("login") == login,
+                     timeout=15, what="reported prefs match the backend")
+    # General, Terminal and Provisioning, and nothing of the broker: no broker,
+    # approvals, SSH, AWS, Docker or per-shed override section (plan 039 PR B).
+    tauri.wait_until(lambda: _prefs_sections(tauri) == ["general", "terminal", "provisioning"],
+                     timeout=15, what="the three sections")
     v = tauri.prefs_dump()["prefs"]["values"]
-    assert v["method"] == ssh["method"] and v["ttl"] == ssh["ttl"]
-    assert v["preset"] == prefs["terminal_preset"]
-    assert v["login"] == login
-    # Sections render in mac order; General + Terminal are always present.
-    assert _prefs_sections(tauri)[:2] == ["general", "terminal"]
+    for gone in ("policy", "method", "ttl", "provider_modes", "shed_rules_count", "broker_error"):
+        assert gone not in v, (gone, v)
     # Defensive: Preferences is no longer a dashboard modal.
     assert tauri.modal() != "prefs"
     # Close hides (never destroys)...
@@ -537,68 +462,6 @@ def test_preferences_theme_sync(tauri):
         tauri.prefs_close()
 
 
-def test_preferences_gated_sections(tauri, mock):
-    # The approval sections are namespace-gated (mac parity): they appear only for
-    # the namespaces the broker delegates to the app (its `shed-desktop` policies,
-    # fixed at launch). The session broker delegates all three; an app whose
-    # broker delegates only ssh-agent shows only the ssh section.
-    _open_prefs(tauri)
-    tauri.wait_until(lambda: {"ssh", "aws", "docker"} <= set(_prefs_sections(tauri)),
-                     timeout=15, what="all three gated sections visible")
-    assert "approvals-empty" not in _prefs_sections(tauri)
-    tauri.prefs_close()
-
-    def ssh_only(runtime_dir):
-        return broker_env.write_hermetic_broker(runtime_dir, {}, namespaces=(SSH,))
-
-    with _own_app(mock.base_url, ssh_only) as (own, _info):
-        _open_prefs(own)
-        own.wait_until(
-            lambda: "ssh" in _prefs_sections(own)
-            and not {"aws", "docker"} & set(_prefs_sections(own)),
-            timeout=20, what="ssh-only delegation shows no aws/docker section")
-        # Defensive: the prefs surface never reappears as a dashboard modal.
-        assert own.modal() != "prefs"
-        own.prefs_close()
-
-
-def test_preferences_shed_rules(tauri, mock, broker):
-    # Per-shed overrides (mac parity): a persisted approval decision installs a
-    # per-shed rule → the section appears in prefs.dump with the rows counted;
-    # removing the rule (prefs.remove_shed_rule — the row button's path) drops it
-    # again. Asserted against ENGINE truth (policy.list) rather than a fixed count:
-    # extra_rules persisted by earlier tests survive the per-test policy.set reset
-    # and get recomposed into the engine by the next rebuild, so the absolute count
-    # isn't ours to pin — the window must simply mirror the engine's shed-rule set.
-
-    def engine_shed_rules() -> list[dict]:
-        return [r for r in tauri.policy_list() if r.get("scope") == "shed"]
-
-    def mine() -> list[dict]:
-        return [r for r in engine_shed_rules() if r.get("shed") == "prefs-rules-shed"]
-
-    _open_prefs(tauri)
-    before = pending_ids(tauri)
-    eid = emit_sign(mock, "prefs-rules-shed", broker)
-    aid = new_approval(tauri, "prefs-rules-shed", before)
-    tauri.approval_decide(aid, "approve", scope="per-shed", persist=True)
-    assert verdict(mock, SSH, eid) == "approve"
-    # The rule lands in the engine, and the window mirrors the engine's rule set.
-    tauri.wait_until(lambda: mine(), timeout=15, what="persisted rule in policy.list")
-    tauri.wait_until(
-        lambda: _prefs_values(tauri).get("shed_rules_count") == len(engine_shed_rules()),
-        timeout=15, what="prefs.dump mirrors the engine's shed rules")
-    assert "shed-overrides" in _prefs_sections(tauri)
-    tauri.remove_shed_rule(mine()[0].get("server") or "", "prefs-rules-shed")
-    tauri.wait_until(lambda: not mine(), timeout=15, what="rule removed from the engine")
-    tauri.wait_until(
-        lambda: _prefs_values(tauri).get("shed_rules_count") == len(engine_shed_rules()),
-        timeout=15, what="prefs.dump mirrors the removal")
-    if not engine_shed_rules():
-        assert "shed-overrides" not in _prefs_sections(tauri)
-    tauri.prefs_close()
-
-
 def test_new_shed_dialog_opens(tauri):
     # The New-Shed dialog opens (ui.show_create → the frontend reports modal=="create")
     # and paints on the real WebView. The create LOGIC is covered by
@@ -614,130 +477,35 @@ def test_new_shed_dialog_opens(tauri):
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
 
 
-def test_navigate_egress_pane(tauri):
-    # The Egress pane (mac parity) is navigable end-to-end: the ipc.rs allowlist,
-    # the bridge PANES set, and the NAV entry all know it — and an unknown pane is
-    # still rejected (the allowlist didn't just open up).
+def test_system_pane_shows_the_servers_egress_profiles(tauri):
+    # Server-wide egress profiles live on the System pane (plan 039 PR B): the mock's
+    # fixture renders as UI truth (`egress.profiles` reads the pane's REPORTED rows,
+    # like agents.dump), with each profile's source and rules. Off the pane the dump
+    # blanks. The down-host error row is exercised in test_tauri_downhost.py.
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    tauri.navigate("egress")
-    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
-    with pytest.raises(ShedError) as e:
-        tauri.navigate("bogus")
-    assert e.value.code == "bad_request"
-
-
-def test_egress_profiles_render(tauri):
-    # The Profiles sub-tab renders the mock's fixture as UI truth (egress.profiles
-    # reads the pane's REPORTED rows, like agents.dump): both profiles appear with
-    # host + source, the auto-selected first profile's detail shows its allow/deny
-    # rules, and selection is drivable by name (egress.show).
-    #
-    # NOTE: this module's shared session instance points every configured server at
-    # the single in-process mock, so the down-host error row is exercised e2e in the
-    # DEDICATED module test_tauri_downhost.py (its own instance + the down-host
-    # fixture + the SHED_TAURI_MOCK_UNREACHABLE_HOSTS override); the shed-app unit
-    # level pins it too (backend.rs::egress_profiles_keeps_error_row_for_down_host).
-    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    tauri.navigate("egress")
-    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
-    tauri.egress_show(tab="profiles")
-    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("tab") == "profiles",
-                     timeout=15, what="profiles sub-tab shown")
+    tauri.navigate("system")
+    tauri.wait_until(lambda: tauri.current_pane() == "system", timeout=15, what="pane=system")
     tauri.wait_until(lambda: len((tauri.egress_dump() or {}).get("profiles") or []) == 2,
                      timeout=15, what="egress profile rows rendered")
     d = tauri.egress_dump()
-    rows = {(p["host"], p["name"], p["source"]) for p in d["profiles"]}
-    assert rows == {("mock", "default", "config"), ("mock", "custom", "user")}, f"unexpected rows: {d}"
+    rows = {(p["host"], p["name"], p["source"]): p for p in d["profiles"]}
+    assert set(rows) == {("mock", "default", "config"), ("mock", "custom", "user")}, d
     assert d["errors"] == []
-    # list→detail: the first profile auto-selects; its rule lists render.
-    sel = d["selected"]
-    assert sel["name"] == "default" and sel["source"] == "config"
-    assert sel["allow"] == ["*.github.com"]
-    assert sel["deny"] == ["evil.example.com"]
-    assert sel["mode"] == "audit"
-    # selection is drivable: pick the user profile, the detail follows.
-    tauri.egress_show(profile="custom")
-    tauri.wait_until(lambda: ((tauri.egress_dump() or {}).get("selected") or {}).get("name") == "custom",
-                     timeout=15, what="selected profile=custom")
-    sel = tauri.egress_dump()["selected"]
-    assert sel["source"] == "user"
-    assert sel["allow"] == ["api.example.com"]
-    assert sel["deny"] == []
-    # host-qualified selection: (host, name) resolves deterministically even when a
-    # name would collide across hosts. Single-host fixture, so `mock` must match and
-    # a wrong host must NOT (the selection stays put on the non-matching host).
-    tauri.egress_show(profile="default", host="mock")
-    tauri.wait_until(lambda: ((tauri.egress_dump() or {}).get("selected") or {}).get("name") == "default",
-                     timeout=15, what="host-qualified select host=mock profile=default")
-    assert tauri.egress_dump()["selected"]["host"] == "mock"
-    tauri.egress_show(profile="custom", host="nonexistent-host")
-    # No matching (host, name) row → selection is unchanged (still `default`).
-    assert tauri.egress_dump()["selected"]["name"] == "default"
-    # an unknown sub-tab is rejected, not blindly emitted.
-    with pytest.raises(ShedError) as e:
-        tauri.egress_show(tab="bogus")
-    assert e.value.code == "bad_request"
-    # off-pane the dump blanks (UI truth, like agents.dump off the agents pane).
+    default = rows[("mock", "default", "config")]
+    assert default["allow"] == ["*.github.com"]
+    assert default["deny"] == ["evil.example.com"]
+    assert default["mode"] == "audit"
+    assert rows[("mock", "custom", "user")]["allow"] == ["api.example.com"]
+    # A CEL rule is shown as its expression, read off the rendered row.
+    assert rows[("mock", "custom", "user")]["rule"] == 'request.host.endsWith(".example.test")'
+    assert default["rule"] is None
+    # The pane's rows are the op's: `egress.server_profiles` answers the same set.
+    hosts = tauri.egress_server_profiles()
+    assert {(h["host"], p["name"]) for h in hosts for p in h["profiles"]} == \
+        {("mock", "default"), ("mock", "custom")}
     tauri.navigate("sheds")
     tauri.wait_until(lambda: tauri.current_pane() == "sheds", timeout=15, what="pane=sheds")
     assert tauri.egress_dump() is None
-
-
-def test_egress_activity_filters_ns(mock):
-    # Mixed namespaces from a real broker: a private mock whose egress route
-    # streams one egress decision, plus one ssh sign approved by policy. The
-    # Egress pane's Activity sub-tab renders ONLY the ns=="egress" rows, while the
-    # merged feed (activity.list — the same data the main Activity pane renders)
-    # carries both namespaces.
-    shed = "egress-mix-shed"
-    egress_mock = MockShedServer(egress_events=[{
-        "ts": "2026-07-10T00:00:00Z", "shed": shed, "host": "evil.example.com",
-        "port": 443, "protocol": "https", "verdict": "deny", "reason": "default-deny"}])
-    egress_mock.start()
-    try:
-        with _own_app(mock.base_url, lambda rt: broker_env.write_hermetic_broker(
-                rt, {"mini3": egress_mock.base_url})) as (own, info):
-            own.policy_set([{"scope": "default", "action": "approve", "gate": "none"}])
-            eid = emit_sign(egress_mock, shed, info)
-            assert verdict(egress_mock, SSH, eid) == "approve"
-
-            def rows(ns):
-                return [e for e in own.activity_list() if e["shed"] == shed and e.get("ns") == ns]
-
-            own.wait_until(lambda: rows("egress") and rows(SSH), timeout=15,
-                           what="the egress and the ssh rows in the merged feed")
-            egress_row = rows("egress")[0]
-            assert egress_row["result"] == "deny", egress_row
-            assert egress_row["detail"] == "evil.example.com:443", egress_row
-            egress_total = len([e for e in own.activity_list() if e.get("ns") == "egress"])
-            assert egress_total == 1
-            # ...and strictly fewer than the whole feed (the ssh-agent rows exist beside it).
-            assert egress_total < len(own.activity_list())
-            own.navigate("egress")
-            own.wait_until(lambda: (own.egress_dump() or {}).get("tab") == "activity",
-                           timeout=15, what="egress activity sub-tab reported")
-            own.wait_until(lambda: (own.egress_dump() or {}).get("activity_count") == egress_total,
-                           timeout=15, what="only the egress rows rendered")
-    finally:
-        egress_mock.stop()
-
-
-def test_egress_pane_renders(tauri):
-    # Screenshot smoke (the test_system_pane_renders pattern): the Egress pane's
-    # Profiles list→detail paints on the real WebView without crashing (the data
-    # itself is pinned by test_egress_profiles_render above). TCC-gated on macOS,
-    # so Linux/Xvfb is the real gate.
-    if platform.system() == "Darwin":
-        pytest.skip("tauri screenshot on macOS is Screen-Recording-TCC-gated; Linux/Xvfb is the gate")
-    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    tauri.show_window()
-    tauri.navigate("egress")
-    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
-    tauri.egress_show(tab="profiles")
-    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("tab") == "profiles",
-                     timeout=15, what="profiles sub-tab shown")
-    png, w, h = tauri.screenshot(scale=1)
-    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
 
 
 def test_hosts_auth_reports_the_config_mode_unlearned(tauri):

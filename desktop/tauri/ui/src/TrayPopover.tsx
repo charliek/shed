@@ -1,16 +1,15 @@
-/* TrayPopover — the macOS menu-bar popover (B1b): a credential-broker status dot, ≤3
-   pending-approval cards, ≤6 running sheds, and a footer (Open dashboard ·
+/* TrayPopover — the macOS menu-bar popover (B1b): ≤6 running sheds and a footer (Open dashboard ·
    Preferences… · Check for Updates… [disabled] · Quit). A SEPARATE webview/entry
    from the dashboard shell, so it fetches its own data and reports its rows under
    the `popover` window key (never the dashboard's `main`, which
    `dashboard.dump`/`current_pane` read). */
 import { useEffect, useRef, useState } from "react";
-import { Fingerprint, Check, X, Shield, AppWindow, Settings, ArrowDownCircle, Power } from "lucide-react";
+import { AppWindow, Settings, ArrowDownCircle, Power } from "lucide-react";
 import {
-  inTauri, fetchSheds, fetchApprovals, fetchGateNamespaces, decideApproval,
+  inTauri, fetchSheds,
   openDashboard, openPreferences, quitApp, reportTray, resizePopover,
   updaterStatus, updaterCheck,
-  type Shed, type Approval, type UpdaterStatus,
+  type Shed, type UpdaterStatus,
 } from "@/lib/bridge";
 
 /** The row tooltip for each updater reason — `ok` is the enabled prompt; the rest are
@@ -24,8 +23,6 @@ const UPDATER_TOOLTIP: Record<UpdaterStatus["reason"], string> = {
 
 export default function TrayPopover() {
   const [sheds, setSheds] = useState<Shed[]>([]);
-  const [approvals, setApprovals] = useState<Approval[]>([]);
-  const [connected, setConnected] = useState(false);
   // The updater row's status (fetched once on mount — it's fixed for the process
   // lifetime). Null until fetched → the row renders disabled (the safe default).
   const [updater, setUpdater] = useState<UpdaterStatus | null>(null);
@@ -41,27 +38,21 @@ export default function TrayPopover() {
   useEffect(() => {
     if (!inTauri()) return;
     let cancelled = false;
-    // Per-slice generation guards (as in useUiBridge/useCoordinatorData) so a slower
-    // older fetch can't overwrite a newer one's rows — events can outrun fetches.
-    // `cancelled` drops any late resolve + unlistens if cleanup raced the async
-    // listen() setup (StrictMode double-mount).
-    const gen = { sheds: 0, approvals: 0, connected: 0 };
-    const loadSheds = () => { const m = ++gen.sheds; void fetchSheds().then((v) => { if (!cancelled && m === gen.sheds) setSheds(v); }); };
-    const loadApprovals = () => { const m = ++gen.approvals; void fetchApprovals().then((v) => { if (!cancelled && m === gen.approvals) setApprovals(v); }); };
-    const loadConnected = () => { const m = ++gen.connected; void fetchGateNamespaces().then((ns) => { if (!cancelled && m === gen.connected) setConnected(ns.length > 0); }); };
-    const loadAll = () => { loadSheds(); loadApprovals(); loadConnected(); };
+    // A generation guard (as in useUiBridge) so a slower older fetch can't overwrite
+    // a newer one's rows — events can outrun fetches. `cancelled` drops any late
+    // resolve + unlistens if cleanup raced the async listen() setup (StrictMode
+    // double-mount).
+    let gen = 0;
+    const loadSheds = () => { const m = ++gen; void fetchSheds().then((v) => { if (!cancelled && m === gen) setSheds(v); }); };
 
-    loadAll();
+    loadSheds();
     const un: Array<() => void> = [];
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      // Live while shown: approvals + the credential-broker dot re-fetch on coordinator
-      // events; sheds on a lifecycle `refresh`; everything on the Rust show path's
+      // Sheds re-fetch on a lifecycle `refresh`, and on the Rust show path's
       // `popover-refresh` so the popover freshens each time it opens.
-      un.push(await listen("approvals-changed", loadApprovals));
-      un.push(await listen("connected-changed", loadConnected));
       un.push(await listen("refresh", loadSheds));
-      un.push(await listen("popover-refresh", loadAll));
+      un.push(await listen("popover-refresh", loadSheds));
       if (cancelled) un.forEach((u) => u()); // cleanup already ran before listen resolved
     })();
     return () => { cancelled = true; un.forEach((u) => u()); };
@@ -69,23 +60,20 @@ export default function TrayPopover() {
 
   const running = sheds.filter((s) => s.status === "running");
   const runningTop = running.slice(0, 6);
-  const approvalsTop = approvals.slice(0, 3);
 
   // Report the rendered rows so `tray.dump` can assert the popover content (the
   // drivable truth, since OS tray clicks + a real screenshot aren't hermetic).
   useEffect(() => {
     if (!inTauri()) return;
     reportTray({
-      connected,
       running_sheds: runningTop.map((s) => ({ host: s.host, name: s.name })),
-      pending_approvals: approvalsTop.map((a) => ({ namespace: a.namespace, op: a.op, shed: a.shed })),
     });
-  }, [connected, sheds, approvals]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sheds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Content-size the window: measure the rendered root height and ask Rust to resize
   // the popover to hug it (no dead space). The root is
   // content-height (no min-h-screen), so its box height IS the content; a
-  // ResizeObserver re-measures when approvals/sheds change. rAF-debounced + only
+  // ResizeObserver re-measures when the sheds change. rAF-debounced + only
   // invoked when the height actually changed (>1px), so the window resize (which
   // reflows the root back to the same content height) can't feed a measure→resize loop.
   useEffect(() => {
@@ -129,51 +117,12 @@ export default function TrayPopover() {
     };
   }, []);
 
-  const decide = (a: Approval, decision: "approve" | "deny") =>
-    void decideApproval(a.id, decision, { scope: a.default_scope, ttl: a.default_ttl });
-
   return (
     <div ref={rootRef} className="flex w-full flex-col overflow-hidden rounded-[12px] bg-shed-surface text-shed-text" data-tray-popover>
-      {/* header — credential-broker status dot */}
-      <div className="flex items-center justify-between px-3.5 py-2.5">
+      <div className="flex items-center px-3.5 py-2.5">
         <span className="text-[13px] font-medium">shed desktop</span>
-        <span className="flex items-center gap-1.5 text-[11px]"
-              style={{ color: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }}>
-          <span className="h-2 w-2 rounded-full"
-                style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} />
-          credential broker
-        </span>
       </div>
       <div className="h-px bg-shed-border" />
-
-      {/* pending approvals (≤3) */}
-      {approvalsTop.length > 0 && (
-        <>
-          <div className="bg-shed-deny-bg px-3.5 py-2">
-            <div className="mb-1.5 text-[11px] font-semibold text-shed-danger">
-              {approvals.length} pending approval{approvals.length === 1 ? "" : "s"}
-            </div>
-            {approvalsTop.map((a) => (
-              <div key={a.id} className="flex items-center gap-2 py-1">
-                <Shield size={14} className="shrink-0 text-shed-text-muted" />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[12px] font-medium">{a.namespace} {a.op}</div>
-                  <div className="truncate text-[11px] text-shed-text-muted">
-                    {a.server ? `${a.server}/${a.shed}` : a.shed}
-                  </div>
-                </div>
-                <button onClick={() => decide(a, "approve")} title="Approve" className="hbtn shrink-0 text-shed-ok">
-                  {a.gate === "none" ? <Check size={16} /> : <Fingerprint size={16} />}
-                </button>
-                <button onClick={() => decide(a, "deny")} title="Deny" className="hbtn shrink-0 text-shed-danger">
-                  <X size={16} />
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="h-px bg-shed-border" />
-        </>
-      )}
 
       {/* running sheds (≤6) */}
       <div className="px-3.5 py-2">
@@ -216,7 +165,7 @@ export default function TrayPopover() {
 
 function FooterRow(
   { icon: Icon, label, onClick, disabled, title }:
-  { icon: typeof Shield; label: string; onClick?: () => void; disabled?: boolean; title?: string },
+  { icon: typeof Settings; label: string; onClick?: () => void; disabled?: boolean; title?: string },
 ) {
   return (
     <button

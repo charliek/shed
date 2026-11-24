@@ -142,6 +142,9 @@ pub async fn shed_delivery(backend: &Backend, server: &str, shed: &str) -> Resul
         "server": server,
         "shed": shed,
         "delivery": doc.get("delivery").cloned().unwrap_or(Value::Null),
+        // The shed's egress profiles (absent: none assigned), which its detail shows
+        // beside its recent blocks.
+        "egress_profiles": doc.get("egress_profiles").cloned().unwrap_or(Value::Null),
     }))
 }
 

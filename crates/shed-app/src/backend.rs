@@ -121,6 +121,9 @@ impl Backend {
         modes: Option<&Arc<AuthModeRegistry>>,
         unreachable_hosts: &HashSet<String>,
     ) -> Self {
+        // The mock URL (either form, `crate::mock_url_for`) is a test-mode seam: outside
+        // test mode it is ignored, so a stray variable never redirects a real client.
+        let mock_base_url = if test_mode { mock_base_url } else { None };
         if test_mode && mock_base_url.is_none() {
             return Self {
                 clients: Vec::new(),
@@ -145,8 +148,9 @@ impl Backend {
     }
 
     /// Build clients from an already-parsed config. When `mock_base_url` is set
-    /// (test mode) every server is redirected to that single hermetic mock —
-    /// plain HTTP, no pin, no token — so no real host is touched.
+    /// (test mode) every server is redirected to a hermetic mock — the one it names,
+    /// or the server's own override in it ([`crate::mock_url_for`]) — plain HTTP, no
+    /// pin, no token, so no real host is touched.
     pub fn from_config(config: &ShedConfig, mock_base_url: Option<&str>) -> Self {
         Self::from_config_with_minter(config, mock_base_url, None, &HashSet::new())
     }
@@ -189,7 +193,7 @@ impl Backend {
                         let url = if unreachable_hosts.contains(&s.name) {
                             "http://127.0.0.1:1".to_string()
                         } else {
-                            mock.to_string()
+                            crate::mock_url::mock_url_for(mock, &s.name)
                         };
                         Client::new(url, s.name.clone(), String::new(), None, None)
                     }
@@ -1223,6 +1227,60 @@ mod tests {
             .terminal_preview(None, "web", None)
             .unwrap();
         assert!(!plain.argv.iter().any(|a| a == "-i"));
+    }
+
+    /// The mock URL, in either form, is honoured only in test mode: outside it every
+    /// server is reached at its configured endpoint.
+    #[tokio::test]
+    async fn a_mock_url_outside_test_mode_is_ignored() {
+        let shed = |name: &str| format!(r#"{{"sheds":[{{"name":"{name}","status":"running"}}]}}"#);
+        let mock = MockServer::start_async().await;
+        let body = shed("from-mock");
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200).body(body);
+        })
+        .await;
+        let real = MockServer::start_async().await;
+        let body = shed("from-config");
+        real.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200).body(body);
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("shed-app-mockurl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "servers:\n    real:\n        host: 127.0.0.1\n        http_port: {}\ndefault_server: real\n",
+                real.port()
+            ),
+        )
+        .unwrap();
+        let names = |b: Backend| async move {
+            b.list_sheds()
+                .await
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+        };
+        let one = mock.base_url();
+        let per_server = format!("{one},real={one}");
+        for url in [&one, &per_server] {
+            assert_eq!(
+                names(Backend::from_env_parts(false, Some(url), &path)).await,
+                ["from-config"],
+                "{url} redirected a client outside test mode"
+            );
+            assert_eq!(
+                names(Backend::from_env_parts(true, Some(url), &path)).await,
+                ["from-mock"],
+                "{url} in test mode"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

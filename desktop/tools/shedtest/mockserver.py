@@ -54,8 +54,8 @@ _IMAGES_FIXTURE = {
          "alias": "base", "cached": True, "source": "config",
          "digest": "sha256:aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44",
          "size_bytes": _GiB},
-        {"name": "ghcr.io/x/shed-vz-extensions:v0.6.0", "docker_ref": "ghcr.io/x/shed-vz-extensions:v0.6.0",
-         "alias": "extensions", "cached": False, "source": "config", "size_bytes": 0},
+        {"name": "registry.example.test/team/devbox:v1", "docker_ref": "registry.example.test/team/devbox:v1",
+         "alias": "devbox", "cached": False, "source": "config", "size_bytes": 0},
         {"name": "sha256:ff8800", "cached": True, "source": "dangling",
          "digest": "sha256:ff8800aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc",
          "size_bytes": _GiB // 2},
@@ -68,7 +68,8 @@ _IMAGES_FIXTURE = {
 _EGRESS_FIXTURE = [
     {"name": "default", "source": "config",
      "profile": {"mode": "audit", "allow": ["*.github.com"], "deny": ["evil.example.com"]}},
-    {"name": "custom", "source": "user", "profile": {"allow": ["api.example.com"]}},
+    {"name": "custom", "source": "user",
+     "profile": {"allow": ["api.example.com"], "rule": 'request.host.endsWith(".example.test")'}},
 ]
 
 
@@ -192,91 +193,29 @@ DEFAULT_SHEDS = [
 
 
 # ---------------------------------------------------------------------------
-# Plugin message-bus endpoints (leg 3a.2, embedded-broker e2e).
-#
-# The two namespace-scoped routes the embedded broker's bus client (shed-broker
-# `bus.rs`) drives against a shed-server, plus the always-on egress consumer route.
-# Wire shapes are derived from the REAL server contract and pinned against two
-# in-repo references (the §3.8 anti-drift pin) so the two fakes can't diverge:
-#   * `tests/broker-wire/synthetic_bus.py` — the Go-vs-Rust differential bus
-#     (identical `_MESSAGES_RE`/`_RESPOND_RE`/`_EGRESS_PATH`, `data: {json}\n\n`
-#     SSE framing, 204-on-respond, 409-terminal-conflict, 501-egress-unavailable);
-#   * `docs/development/broker-wire-catalog.md` §0/§9 (the observable channels).
-#
-# Only the embedded-broker cells exercise these (the mock object is shared, but
-# these routes stay dormant for every non-broker test).
-_MESSAGES_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/messages$")
-_RESPOND_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/respond$")
+# The egress decision stream (`GET /api/egress/stream`): `501` (egress control not
+# enabled) unless the mock was built with `egress_events`, when it is a `200` SSE
+# stream of `data: {json}` decisions (`shed_core::models::EgressDecision`), each written
+# once, the stream held open; `push_egress` adds one at runtime.
 _EGRESS_PATH = "/api/egress/stream"
 
-# The machine pin (plan 035 §3.4): the identity headers every subscribe and respond
-# carries, and the pinned refusals a pinning server answers. KEPT IDENTICAL to
-# `tests/broker-wire/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
-# `NOT_SOURCE_ACTIVE`) — the same anti-drift pin as the routes above.
+# The machine pin (plan 035 §3.4): the identity headers a delivery stream and its
+# answers carry, and the binding a pinning server judges them against.
 MACHINE_ID_HEADER = "X-Shed-Machine-Id"
 MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
 NOT_SOURCE_ACTIVE = {
     "machine_id": "fedcba9876543210fedcba9876543210",
     "machine_name": "desk",
 }
-_REFUSALS: dict[str, tuple[int, object]] = {
-    "not-source": (
-        403,
-        {
-            "error": {
-                "code": "SOURCE_NOT_BOUND",
-                "message": 'credential source for this server is "desk"; '
-                "run 'shed source use <this machine>' to move it",
-            },
-            "source": NOT_SOURCE_ACTIVE,
-        },
-    ),
-    "machine-id-required": (
-        403,
-        {
-            "error": {
-                "code": "SOURCE_MACHINE_ID_REQUIRED",
-                "message": "this server needs to know which machine is asking; install the current shed desktop app",
-            }
-        },
-    ),
-    "forbidden": (
-        403,
-        {"error": {"code": "FORBIDDEN", "message": "a script key cannot subscribe"}},
-    ),
-    "unparseable-403": (403, '{"error": {"code": "SOURCE_NOT_BOUND"'),
-    "duplicate": (
-        409,
-        {
-            "error": {
-                "code": "SOURCE_DUPLICATE_STREAM",
-                "message": 'this machine already holds namespace "ssh-agent"',
-            }
-        },
-    ),
-}
-_RESPOND_REFUSALS: dict[int, dict] = {
-    503: {"error": {"code": "RESPONSE_NOT_DELIVERED", "message": "not delivered; try again"}},
-    429: {"error": {"code": "TOO_MANY_RESPONSES", "message": "too many answers in flight"}},
-    # The server's own code and words for a respond body over its limit
-    # (`internal/api/plugin_handlers.go`: `config.ErrRequestTooLarge`, `maxRespondBody`).
-    413: {"error": {"code": "REQUEST_TOO_LARGE", "message": "response body is over 16777216 bytes"}},
-    403: {
-        "error": {
-            "code": "FORBIDDEN",
-            "message": "response does not match a pending request for this namespace",
-        }
-    },
-}
 
 # Credential sources (plan 035 §3.4): `GET /api/sources` and `POST /api/sources/use`.
 # Unarmed (the default) the mock is a server older than the feature: both routes answer
 # chi's plain 404 for an unrouted path (labelled JSON by the server's middleware, no API
-# error body) and subscribes are served as before, so every cell that does not arm it is
-# unchanged. Armed (`arm_source`) it holds one binding: a subscribe whose machine id is
-# not the bound one is refused 403 SOURCE_NOT_BOUND naming the bound machine, a matching
-# one is served, and a move answers the document — the server's contract as the desktop
-# is built against it.
+# error body) and every delivery stream is served, so every cell that does not arm it is
+# unchanged. Armed (`arm_source`) it holds one binding: a delivery stream (or answer)
+# whose machine id is not the bound one is refused 403 SOURCE_NOT_BOUND naming the bound
+# machine, a matching one is served, and a move answers the document and ends every
+# other machine's stream — the server's contract as the desktop is built against it.
 _SOURCES_PATH = "/api/sources"
 _SOURCES_USE_PATH = "/api/sources/use"
 _PLAIN_404 = "404 page not found\n"
@@ -294,13 +233,10 @@ _SOURCE_USE_REFUSALS: dict[int, dict] = {
                                "may still take effect when the server restarts; check with "
                                "'shed source ls' before retrying"}},
 }
-# A respond that matches no pending request (`writeRespondError`, `plugin.ErrUnmatched`).
-_UNMATCHED = {"error": {"code": "FORBIDDEN",
-                        "message": "response does not match a pending request for this namespace"}}
 
 
 def _not_source_body(machine_id: str, machine_name: str) -> dict:
-    """The 403 SOURCE_NOT_BOUND body naming the bound machine (the `_REFUSALS`
+    """The 403 SOURCE_NOT_BOUND body naming the bound machine (the pinned
     "not-source" shape, with this binding's machine in it)."""
     return {
         "error": {
@@ -312,8 +248,7 @@ def _not_source_body(machine_id: str, machine_name: str) -> dict:
     }
 
 
-# How often an idle SSE loop re-checks the shutdown flag while waiting to push
-# (matches synthetic_bus `_SSE_POLL`).
+# How often an idle SSE loop re-checks the shutdown flag while waiting to push.
 _SSE_POLL = 0.1
 
 # The longest a held `GET /api/sheds` waits for its release (see
@@ -353,72 +288,27 @@ class MockShedServer:
         self._sheds_hold: threading.Event | None = None
         self._sheds_waiting = 0  # requests waiting on the hold right now
         self._sheds_hold_expired = 0  # requests that gave up at _SHEDS_HOLD_MAX
-        # ---- plugin message-bus state (leg 3a.2) ----
-        # One Condition guards all cross-thread bus state (the SSE handler threads
-        # touch it concurrently with the test thread), mirroring synthetic_bus.
-        self._bus_cond = threading.Condition()
-        self._bus_shutdown = threading.Event()
-        # ns -> Authorization header seen on its (latest) subscribe (None in open mode).
-        self._bus_subscribed: dict[str, str | None] = {}
-        # ns -> total subscribe attempts seen (latest-wins above loses the count of a
-        # 409-terminal namespace never retrying vs. one that legitimately reconnects).
-        self._bus_subscribe_counts: dict[str, int] = {}
-        # ns -> its currently-LIVE SSE listener `(token, machine id, end event)` — a
-        # second concurrent subscribe gets 409 NAMESPACE_ALREADY_REGISTERED (the real
-        # server's one-listener-per-ns invariant), released on disconnect so a later
-        # cell can re-subscribe cleanly. A source move releases the old machine's
-        # slots and sets their end events (its streams close), as the real server
-        # does; a stream's own release is by token, so it never frees a slot a newer
-        # listener holds.
-        self._bus_live: dict[str, tuple[object, str | None, threading.Event]] = {}
-        # namespaces pre-registered as conflicting → their FIRST subscribe already 409s
-        # (a competing listener owns them): the split-namespace 409 race cell.
-        self._bus_conflict: set[str] = set()
-        # ns -> response Envelopes POSTed back (arrival order).
-        self._bus_responses: dict[str, list[dict]] = {}
-        # ns -> queue of `data:` frames to push over its SSE stream.
-        self._bus_queues: dict[str, queue.Queue] = {}
-        self._bus_sse_threads: set[threading.Thread] = set()
+        # ---- streams: shutdown and the held SSE handler threads ----
+        self._shutdown = threading.Event()
+        self._sse_threads: set[threading.Thread] = set()
         self._egress_hits = 0
         # Opt-in egress decisions (`egress_events`): None keeps the route's 501
         # (egress unavailable). A list makes the route a 200 SSE stream that writes
-        # each decision once, as a `data: {json}` frame in the shape the broker's
-        # egress consumer decodes (`crates/shed-broker/src/egress.rs` `EgressDecision`,
-        # pinned by `tests/broker-wire/fixtures/egress_audit_entry.json`), then holds
-        # the stream open; a reconnect gets no repeat.
+        # each decision once, as a `data: {json}` frame (`EgressDecision`), then holds
+        # the stream open; a reconnect gets no repeat. `push_egress` adds more.
         self._egress_queue: queue.Queue | None = None
         if egress_events is not None:
             self._egress_queue = queue.Queue()
             for decision in egress_events:
                 self._egress_queue.put(json.dumps(decision, separators=(",", ":")))
-        # ---- the machine pin (plan 035 §3.4) ----
-        # ns -> the pinned refusal kind its subscribe answers, until `accept(ns)`.
-        self._bus_refuse: dict[str, str] = {}
-        # ns -> every (machine id, decoded machine name) its subscribes / responds carried.
-        self._bus_subscribe_identities: dict[str, list[tuple[str | None, str | None]]] = {}
-        self._bus_respond_identities: dict[str, list[tuple[str | None, str | None]]] = {}
-        # ns -> the statuses its next responds answer first ([(status, retry_after)]).
-        self._bus_respond_script: dict[str, list[tuple[int, str | None]]] = {}
-        # ns -> the monotonic time of each subscribe (what proves a woken retry came
-        # sooner than its backoff would have allowed).
-        self._bus_subscribe_times: dict[str, list[float]] = {}
-        # (ns, request id) -> {"shed", "machine", "gen"}: a request written on a stream
-        # and not yet answered finally — the server's pending set, stamped with the
-        # machine it went to and the binding generation then. A move drops every entry
-        # not stamped with the new binding (`plugin.Registry.Move`).
-        #
-        # NOT modelled here: re-delivery. The server hands a new stream of the same
-        # machine, at the same generation, every request still pending on its namespace
-        # (`plugin.Registry` `pendingForLocked`); this mock never re-sends a pending
-        # request on a later stream, so no cell here can see the daemon/app handoff of an
-        # in-flight request. That handoff is exercised against the broker wire harness's
-        # synthetic bus, which does model it (`tests/broker-wire/synthetic_bus.py`,
-        # `test_source_pin.py`).
-        self._bus_pending: dict[tuple[str, str], dict] = {}
+        # ---- provisioning by delivery (plan 039 A6) and the source binding; one
+        # Condition guards both (the stream handler threads touch them
+        # concurrently with the test thread) ----
+        self._dlv_cond = threading.Condition()
         # Set while `pause()` has the server down; the port it serves (kept across one).
         self._paused = False
         self._port = 0
-        # ---- credential sources (plan 035 §3.4); all under _bus_cond ----
+        # ---- credential sources (plan 035 §3.4); all under _dlv_cond ----
         self._src_armed = False
         self._src_bound: str | None = None  # the bound machine's id
         self._src_generation = 0
@@ -436,13 +326,15 @@ class MockShedServer:
         self._src_gets = 0  # GET /api/sources answered (busy and late ones included)
         self._src_late_answered = 0  # late GETs whose (old) answer has been written
         # ---- provisioning by delivery (plan 039 A6); all under _dlv_cond ----
-        self._dlv_cond = threading.Condition()
         # machine id -> the live stream {"id", "end", "queue"} it holds (one per machine).
         self._dlv_live: dict[str, dict] = {}
         # every stream opened: {"id", "machine_id", "machine_name", "at"}.
         self._dlv_streams: list[dict] = []
         # every GET of the stream route, refused or not (machine id, decoded name).
         self._dlv_attempts: list[tuple[str | None, str | None]] = []
+        # the monotonic time of each of those GETs (what proves a woken stream came
+        # sooner than its backoff would have allowed).
+        self._dlv_attempt_times: list[float] = []
         # request id -> {"stream", "machine_id", "deadline" (epoch), "request"}: sent, unanswered.
         self._dlv_pending: dict[str, dict] = {}
         # request id -> {"stream", "machine_id"}: answered (a repeat is already_answered).
@@ -468,6 +360,12 @@ class MockShedServer:
         self._provision_gate: threading.Event | None = None
         self.activity_events: list[dict] = [dict(e) for e in DEFAULT_ACTIVITY]
         self.activity_queries: list[dict] = []
+        # The server's view of the feed: ids of events this user may not see (they
+        # are scanned but never sent), and how many events one page may scan
+        # (`activity.go`'s bound) — past it the page ends where the scan stopped,
+        # possibly EMPTY, with a cursor. None: unbounded.
+        self.activity_hidden: set[str] = set()
+        self.activity_scan_budget: int | None = None
 
     @property
     def base_url(self) -> str:
@@ -509,6 +407,8 @@ class MockShedServer:
         with self._lock:
             self.activity_events = [dict(e) for e in DEFAULT_ACTIVITY]
             self.activity_queries = []
+            self.activity_hidden = set()
+            self.activity_scan_budget = None
         self.release_sheds_list()  # never leave a handler thread parked
 
     # -- the one-shot sheds-list hold (plan 026 §3.4, shed#400) ------------
@@ -609,41 +509,13 @@ class MockShedServer:
             self.sheds.append(shed)
 
     # -- plugin message-bus: test-facing helpers (leg 3a.2) ---------------
-    def pre_register_conflict(self, *namespaces: str) -> None:
-        """Mark namespaces as already-owned by a competing listener so their subscribe
-        answers 409 NAMESPACE_ALREADY_REGISTERED (terminal `rejected` client-side, no
-        retry). Call BEFORE the broker connects. Drives the split-namespace 409 cell."""
-        with self._bus_cond:
-            self._bus_conflict.update(namespaces)
-
-    def refuse(self, ns: str, kind: str) -> None:
-        """Answer `{ns}`'s subscribe with the pinned refusal `kind` (plan 035 §3.4) until
-        `accept(ns)`. Call before the broker connects to refuse its first attempt."""
-        assert kind in _REFUSALS, f"unknown refusal kind {kind!r}"
-        with self._bus_cond:
-            self._bus_refuse[ns] = kind
-
-    def accept(self, ns: str) -> None:
-        """Lift `{ns}`'s refusal: the broker's next retry is served."""
-        with self._bus_cond:
-            self._bus_refuse.pop(ns, None)
-
-    def respond_script(self, ns: str, script: list[tuple[int, str | None]]) -> None:
-        """Answer `{ns}`'s next responds with these `(status, retry_after)` first, each
-        with its pinned body and nothing recorded as delivered; then 204."""
-        for status, _ in script:
-            assert status in _RESPOND_REFUSALS, f"no pinned body for {status}"
-        with self._bus_cond:
-            self._bus_respond_script[ns] = list(script)
-
-    # -- credential sources (plan 035 §3.4) --------------------------------
     def arm_source(self, machine_id: str = NOT_SOURCE_ACTIVE["machine_id"],
                    machine_name: str = NOT_SOURCE_ACTIVE["machine_name"],
                    connected: bool = True) -> None:
         """Become a pinning server whose binding names `machine_id` (shown as
         `machine_name`, `connected` as given). Call before the app launches."""
         assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_armed = True
             self._src_bound = machine_id
             self._src_generation = 1
@@ -652,9 +524,9 @@ class MockShedServer:
                 "connected": connected}
 
     def know_machine(self, machine_id: str, machine_name: str) -> None:
-        """Record a machine as seen for this user — what a subscribe from its broker
+        """Record a machine as seen for this user — what a delivery stream from it
         does on the real server (a move to an unseen machine is 404)."""
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_machines.setdefault(machine_id, {
                 "name": machine_name, "first_seen": "2026-11-16T09:30:00Z",
                 "connected": None})
@@ -663,7 +535,7 @@ class MockShedServer:
         """Another machine takes the source (what its `shed source use` does on the
         real server): the binding moves, and this machine's streams end."""
         assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
-        with self._bus_cond:
+        with self._dlv_cond:
             assert self._src_armed, "arm_source first"
             self._src_machines.setdefault(machine_id, {
                 "name": machine_name, "first_seen": "2026-11-16T09:45:00Z",
@@ -672,57 +544,48 @@ class MockShedServer:
 
     def source_busy(self, times: int, retry_after: str = "1") -> None:
         """Answer the next `times` source reads 503 SOURCE_BUSY with `Retry-After`."""
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_busy_left = times
             self._src_busy_retry_after = retry_after
 
     def source_reads_late(self, *delays: float) -> None:
         """The next source reads each take the document as they arrive and answer it
         `delay` seconds later — a read overtaken by newer ones in transit."""
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_late_reads = list(delays)
 
     def source_gets(self) -> int:
-        with self._bus_cond:
+        with self._dlv_cond:
             return self._src_gets
 
     def source_late_answered(self) -> int:
-        with self._bus_cond:
+        with self._dlv_cond:
             return self._src_late_answered
 
     def delay_source_use(self, seconds: float) -> None:
         """Every following move waits this long (outside the lock) before it is
         applied — so two can be in flight at once."""
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_use_delay = seconds
 
-    def bus_live(self) -> dict[str, str | None]:
-        """ns -> the machine id holding its live slot."""
-        with self._bus_cond:
-            return {ns: mid for ns, (_t, mid, _e) in self._bus_live.items()}
-
     def source_bound(self) -> str | None:
-        with self._bus_cond:
+        with self._dlv_cond:
             return self._src_bound
 
     def source_use_requests(self) -> list[dict]:
         """Every `POST /api/sources/use` body received, refused ones included."""
-        with self._bus_cond:
+        with self._dlv_cond:
             return [dict(b) for b in self._src_use_requests]
 
     def source_use_script(self, statuses: list[int]) -> None:
         """Answer the next moves with these statuses (pinned bodies) first."""
         for status in statuses:
             assert status in _SOURCE_USE_REFUSALS, f"no pinned body for {status}"
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_use_script = list(statuses)
 
-    def subscribe_times(self, ns: str) -> list[float]:
-        with self._bus_cond:
-            return list(self._bus_subscribe_times.get(ns, []))
-
     def _src_document(self) -> dict:
-        """The GET/POST answer (caller holds _bus_cond)."""
+        """The GET/POST answer (caller holds _dlv_cond)."""
         binding = None
         if self._src_bound is not None:
             ref = [{"kind": "machine", "id": self._src_bound}]
@@ -731,42 +594,43 @@ class MockShedServer:
                        "generation": self._src_generation}
         machines = []
         for mid, m in self._src_machines.items():
-            held = sorted(ns for ns, (_t, live, _e) in self._bus_live.items() if live == mid)
             connected = m["connected"]
             if connected is None:
-                connected = bool(held)
+                connected = mid in self._dlv_live
             machines.append({"id": mid, "name": m["name"], "key_fingerprint": "SHA256:mock",
                              "first_seen": m["first_seen"], "connected": connected,
-                             "namespaces": held})
+                             "namespaces": []})
         return {"user": "mock-user", "binding": binding, "machines": machines}
 
     def _src_move_locked(self, mid: str) -> None:
-        """Bind `mid` (caller holds _bus_cond). As the real server's move: every slot
-        another machine holds is released and its stream told to end, so the new
-        source's subscribe is admitted and claims it, and the old machine's later
-        answers are refused (`_src_respond_refusal`)."""
+        """Bind `mid` (caller holds _dlv_cond). As the real server's move, and at
+        once rather than when the old stream's handler gets round to closing: every
+        other machine's delivery stream is unregistered and told to end, and its
+        pending requests fail. So only the new source holds a stream, a request can
+        never be pushed onto an ended one, the old machine's later answers are
+        refused SOURCE_NOT_BOUND, and after a move away and back its answer on the
+        old stream names a request that no longer waits (`unknown_request`)."""
         if mid == self._src_bound:
             return
         self._src_bound = mid
         self._src_generation += 1
-        for ns, (_t, live, end) in list(self._bus_live.items()):
-            if live != mid:
-                end.set()
-                del self._bus_live[ns]
-        for key, p in list(self._bus_pending.items()):
-            if p["machine"] != mid or p["gen"] != self._src_generation:
-                del self._bus_pending[key]
-        self._bus_cond.notify_all()
+        for owner, live in list(self._dlv_live.items()):
+            if owner != mid:
+                live["end"].set()
+                del self._dlv_live[owner]
+                for rid in [r for r, p in self._dlv_pending.items() if p["stream"] == live["id"]]:
+                    del self._dlv_pending[rid]
+        self._dlv_cond.notify_all()
 
     def _src_get(self) -> tuple[str, object, float] | None:
         """A read: None when unarmed (a plain 404), else `("busy", retry_after, 0)` or
         `("doc", document, delay)` — the document as it stands NOW, to be answered
         after `delay` seconds."""
-        with self._bus_cond:
+        with self._dlv_cond:
             if not self._src_armed:
                 return None
             self._src_gets += 1
-            self._bus_cond.notify_all()
+            self._dlv_cond.notify_all()
             if self._src_busy_left > 0:
                 self._src_busy_left -= 1
                 return "busy", self._src_busy_retry_after, 0.0
@@ -774,21 +638,21 @@ class MockShedServer:
             return "doc", self._src_document(), delay
 
     def _src_late_done(self) -> None:
-        with self._bus_cond:
+        with self._dlv_cond:
             self._src_late_answered += 1
-            self._bus_cond.notify_all()
+            self._dlv_cond.notify_all()
 
     def _src_use(self, body: dict) -> tuple[int, dict] | None:
         """A move: (status, body), or None when unarmed (a plain 404)."""
-        with self._bus_cond:
+        with self._dlv_cond:
             if not self._src_armed:
                 return None
             self._src_use_requests.append(dict(body))
-            self._bus_cond.notify_all()
+            self._dlv_cond.notify_all()
             delay = self._src_use_delay
         if delay:
             time.sleep(delay)
-        with self._bus_cond:
+        with self._dlv_cond:
             if self._src_use_script:
                 status = self._src_use_script.pop(0)
                 return status, _SOURCE_USE_REFUSALS[status]
@@ -805,13 +669,12 @@ class MockShedServer:
             return 200, self._src_document()
 
     def _src_admit(self, identity: tuple[str | None, str | None]) -> tuple[int, object] | None:
-        """The pin on a subscribe (caller holds _bus_cond): None to serve it, else the
-        refusal. Unarmed: always None."""
+        """The pin on a delivery stream (caller holds _dlv_cond): None to serve it,
+        else the refusal. Unarmed: always None. The stream route has checked the
+        machine headers already."""
         if not self._src_armed:
             return None
         mid, name = identity
-        if not mid:
-            return _REFUSALS["machine-id-required"]
         if mid not in self._src_machines:
             self._src_machines[mid] = {"name": name or "", "connected": None,
                                        "first_seen": "2026-11-16T09:30:00Z"}
@@ -820,225 +683,15 @@ class MockShedServer:
             return 403, _not_source_body(self._src_bound or "", bound.get("name", ""))
         return None
 
-    def _src_respond_refusal(self, identity: tuple[str | None, str | None]) -> tuple[int, dict] | None:
-        """The pin on a respond (caller holds _bus_cond): an armed mock accepts an
-        answer only from the bound machine — after a move the old machine's answers,
-        one in flight across the move included, are refused SOURCE_NOT_BOUND."""
-        if not self._src_armed:
-            return None
-        mid, _name = identity
-        if not mid:
-            return _REFUSALS["machine-id-required"]
-        if mid != self._src_bound:
-            bound = self._src_machines.get(self._src_bound or "", {})
-            return 403, _not_source_body(self._src_bound or "", bound.get("name", ""))
-        return None
-
-    def subscribe_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
-        with self._bus_cond:
-            return list(self._bus_subscribe_identities.get(ns, []))
-
-    def respond_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
-        """Every respond POST's identity, refused ones included (its length is the
-        attempt count)."""
-        with self._bus_cond:
-            return list(self._bus_respond_identities.get(ns, []))
-
-    def wait_for_subscribe(self, ns: str, timeout: float = 10.0) -> str | None:
-        """Block until the broker has subscribed to `{ns}`'s SSE stream (deadline poll,
-        not a sleep). Returns the recorded `Authorization` header (None in open mode)."""
-        deadline = time.monotonic() + timeout
-        with self._bus_cond:
-            while ns not in self._bus_subscribed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AssertionError(
-                        f"no subscribe for {ns!r} within {timeout}s; "
-                        f"subscribed so far={sorted(self._bus_subscribed)}")
-                self._bus_cond.wait(remaining)
-            return self._bus_subscribed[ns]
-
-    def subscribed_namespaces(self) -> list[str]:
-        """A sorted snapshot of the namespaces subscribed so far."""
-        with self._bus_cond:
-            return sorted(self._bus_subscribed)
-
-    def subscribe_count(self, ns: str) -> int:
-        """How many times `{ns}` has been subscribed (each SSE GET, including 409s).
-        Used to assert the bus does NOT hot-retry a terminal `rejected` namespace."""
-        with self._bus_cond:
-            return self._bus_subscribe_counts.get(ns, 0)
-
-    def push_request(self, ns: str, envelope: dict) -> None:
-        """Push one request Envelope onto `{ns}`'s SSE stream as a `data:` frame. Call
-        after `wait_for_subscribe(ns)` so a drainer is attached (the queue buffers, so
-        an early push simply waits)."""
-        frame = json.dumps(envelope, separators=(",", ":"))
-        self._bus_queue_for(ns).put(frame)
-
-    def await_response(self, ns: str, timeout: float = 10.0) -> dict:
-        """Block until the broker POSTs a response Envelope for `{ns}` and return the
-        first one (or raise on timeout). Deadline-driven."""
-        deadline = time.monotonic() + timeout
-        with self._bus_cond:
-            while not self._bus_responses.get(ns):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AssertionError(
-                        f"no response POSTed for {ns!r} within {timeout}s")
-                self._bus_cond.wait(remaining)
-            return self._bus_responses[ns][0]
-
-    def await_reply(self, ns: str, in_reply_to: str, timeout: float = 10.0) -> dict:
-        """Block until the broker POSTs the response to request `in_reply_to` on
-        `{ns}` and return it (or raise on timeout). Unlike `await_response`, which
-        returns the namespace's FIRST response, this finds one request's answer on
-        a mock that many requests go through (the session mocks)."""
-        deadline = time.monotonic() + timeout
-        with self._bus_cond:
-            while True:
-                for env in self._bus_responses.get(ns, []):
-                    if env.get("in_reply_to") == in_reply_to:
-                        return env
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AssertionError(
-                        f"no response to {in_reply_to!r} POSTed for {ns!r} within {timeout}s")
-                self._bus_cond.wait(remaining)
-
-    def replies_to(self, ns: str, in_reply_to: str) -> list[dict]:
-        """Every accepted response to request `in_reply_to` on `{ns}` (arrival order)."""
-        with self._bus_cond:
-            return [env for env in self._bus_responses.get(ns, [])
-                    if env.get("in_reply_to") == in_reply_to]
-
     def egress_hits(self) -> int:
-        with self._bus_cond:
+        with self._dlv_cond:
             return self._egress_hits
 
-    # -- plugin message-bus: internals (called from handler threads) ------
-    def _bus_queue_for(self, ns: str) -> queue.Queue:
-        with self._bus_cond:
-            q = self._bus_queues.get(ns)
-            if q is None:
-                q = queue.Queue()
-                self._bus_queues[ns] = q
-            return q
-
-    def _bus_record_subscribe(
-        self, ns: str, auth: str | None, identity: tuple[str | None, str | None]
-    ) -> tuple[int, object] | None:
-        """Record a subscribe; return the refusal `(status, body)` to answer it with
-        (None: serve). An armed binding refuses first, then any `refuse(ns)`."""
-        with self._bus_cond:
-            self._bus_subscribed[ns] = auth
-            self._bus_subscribe_counts[ns] = self._bus_subscribe_counts.get(ns, 0) + 1
-            self._bus_subscribe_identities.setdefault(ns, []).append(identity)
-            self._bus_subscribe_times.setdefault(ns, []).append(time.monotonic())
-            self._bus_cond.notify_all()
-            pinned = self._src_admit(identity)
-            if pinned is not None:
-                return pinned
-            kind = self._bus_refuse.get(ns)
-            return _REFUSALS[kind] if kind is not None else None
-
-    def pending(self) -> list[tuple[str, str]]:
-        """The (ns, request id) of every request delivered and not yet answered finally."""
-        with self._bus_cond:
-            return sorted(self._bus_pending)
-
-    def _bus_take(self, ns: str, frame: str, machine_id: str | None, gen: int,
-                  end: threading.Event, q: queue.Queue) -> bool:
-        """A stream's handler took `frame` off `{ns}`'s queue: may it write it? Only a
-        stream still live — not ended by a move, and (armed) admitted at the binding
-        generation now current — takes a request, as the server's `Listener.Take` refuses
-        an unregistered listener. A stream that may not puts the frame back at the head
-        of the queue for the next stream and ends (`False`). One that may stamps the
-        request pending with ITS machine and generation (`True`)."""
-        with self._bus_cond:
-            stale = end.is_set() or (self._src_armed and gen != self._src_generation)
-            if stale:
-                with q.mutex:
-                    q.queue.appendleft(frame)
-                    q.not_empty.notify()
-                return False
-            try:
-                env = json.loads(frame)
-            except ValueError:
-                return True
-            if isinstance(env, dict) and isinstance(env.get("id"), str):
-                self._bus_pending[(ns, env["id"])] = {
-                    "shed": (env.get("shed") or {}).get("name"),
-                    "machine": machine_id,
-                    "gen": gen,
-                }
-            return True
-
-    def _bus_next_respond_answer(
-        self, ns: str, identity: tuple[str | None, str | None], env: dict
-    ) -> tuple[int, object, str | None] | None:
-        """Record a respond; return `(status, body, retry_after)` to refuse it with
-        (None: accept). In the server's order — the machine headers' shape, the body's
-        size, then the binding: an armed mock refuses an answer without a machine id;
-        a body over the limit (a scripted 413); an armed binding refuses an answer from
-        another machine; an answer that matches no pending request of its namespace and
-        shed — armed: one delivered to this machine at the current generation — is
-        403 FORBIDDEN; then the scripted retryable answers; else delivered, a final
-        answer consuming its request."""
-        with self._bus_cond:
-            self._bus_respond_identities.setdefault(ns, []).append(identity)
-            self._bus_cond.notify_all()
-            # The server's order: the machine headers' shape, then the body's size,
-            # then the binding.
-            if self._src_armed and not identity[0]:
-                return (*_REFUSALS["machine-id-required"], None)
-            script = self._bus_respond_script.get(ns)
-            if script and script[0][0] == 413:
-                status, retry_after = script.pop(0)
-                return status, _RESPOND_REFUSALS[status], retry_after
-            pinned = self._src_respond_refusal(identity)
-            if pinned is not None:
-                return pinned[0], pinned[1], None
-            key = (ns, env.get("in_reply_to"))
-            p = self._bus_pending.get(key)
-            shed = (env.get("shed") or {}).get("name")
-            if p is None or p["shed"] != shed or (self._src_armed and (
-                    p["machine"] != identity[0] or p["gen"] != self._src_generation)):
-                return 403, _UNMATCHED, None
-            if script:
-                status, retry_after = script.pop(0)
-                return status, _RESPOND_REFUSALS[status], retry_after
-            if env.get("final"):
-                del self._bus_pending[key]
-            return None
-
-    def _bus_try_claim(self, ns: str, machine_id: str | None
-                       ) -> tuple[object, threading.Event, int] | str:
-        """Claim `{ns}`'s single live-listener slot for `machine_id`: its release token,
-        end event and the binding generation it was admitted at (bound to the stream for
-        its whole life, as the server's listener carries its generation), or why not:
-        `"duplicate"` when armed (the bound machine already holds it: the server's
-        retryable 409 SOURCE_DUPLICATE_STREAM), else `"conflict"` (a pre-marked
-        conflict, or an older server's terminal 409)."""
-        with self._bus_cond:
-            if ns in self._bus_conflict:
-                return "conflict"
-            if ns in self._bus_live:
-                return "duplicate" if self._src_armed else "conflict"
-            token, end = object(), threading.Event()
-            self._bus_live[ns] = (token, machine_id, end)
-            gen = self._src_generation
-            self._bus_cond.notify_all()
-            return token, end, gen
-
-    def _bus_release(self, ns: str, token: object) -> None:
-        """Release `{ns}`'s slot if `token` still holds it (a move may already have
-        released it, and a newer listener may hold it now)."""
-        with self._bus_cond:
-            live = self._bus_live.get(ns)
-            if live is not None and live[0] is token:
-                del self._bus_live[ns]
-                self._bus_cond.notify_all()
+    def push_egress(self, decision: dict) -> None:
+        """Write one egress decision on the egress stream (the mock must have been
+        built with `egress_events`, so the route streams instead of answering 501)."""
+        assert self._egress_queue is not None, "build the mock with egress_events=[]"
+        self._egress_queue.put(json.dumps(decision, separators=(",", ":")))
 
     # -- provisioning by delivery (plan 039 A6): test-facing helpers -------
     def _dlv_wait(self, what: str, cond, timeout: float):
@@ -1063,6 +716,11 @@ class MockShedServer:
         """Every GET of the stream route, refused ones too."""
         with self._dlv_cond:
             return list(self._dlv_attempts)
+
+    def delivery_attempt_times(self) -> list[float]:
+        """The monotonic time of every GET of the stream route, in order."""
+        with self._dlv_cond:
+            return list(self._dlv_attempt_times)
 
     def live_delivery_stream(self, timeout: float = 10.0, after: int = 0) -> dict:
         """The live stream once one is open and at least `after` + 1 were opened."""
@@ -1140,9 +798,13 @@ class MockShedServer:
         or the new stream's record."""
         with self._dlv_cond:
             self._dlv_attempts.append((mid, name))
+            self._dlv_attempt_times.append(time.monotonic())
             self._dlv_cond.notify_all()
             if self._dlv_refuse:
                 return self._dlv_refuse.pop(0)
+            pinned = self._src_admit((mid, name))
+            if pinned is not None:
+                return pinned
             if mid in self._dlv_live:
                 return (409, _api_error(
                     "SOURCE_DUPLICATE_STREAM",
@@ -1171,10 +833,14 @@ class MockShedServer:
 
     def _dlv_answer(self, rid: str, stream: str | None, mid: str, name: str,
                     raw: bytes) -> tuple[int, dict | None]:
-        """Judge one answer in the contract's order; record it."""
+        """Judge one answer in the contract's order — the binding first — and record it."""
         with self._dlv_cond:
             known = self._dlv_pending.get(rid) or self._dlv_done.get(rid)
-            if known is None:
+            bound = self._src_bound if self._src_armed else None
+            if bound is not None and mid != bound:
+                status, body = 403, _not_source_body(
+                    bound, self._src_machines.get(bound, {}).get("name", ""))
+            elif known is None:
                 status, body = 404, _api_error("unknown_request", "no such request is waiting")
             elif known["stream"] != stream or known["machine_id"] != mid:
                 status, body = 403, _api_error(
@@ -1207,32 +873,39 @@ class MockShedServer:
         with self._lock:
             self.activity_queries.append({"since": since, "shed": shed, "limit": limit})
             events = [dict(e) for e in self.activity_events]
-        if shed:
-            events = [e for e in events if e.get("shed", {}).get("name") == shed]
+            hidden = set(self.activity_hidden)
+            budget = self.activity_scan_budget
         if since:
             ids = [e["id"] for e in events]
             events = events[ids.index(since) + 1:] if since in ids else []
-        page = events[:limit]
-        more = len(events) > limit
-        return {"events": page, "next": page[-1]["id"] if more and page else ""}
+        page: list[dict] = []
+        scanned = 0
+        for e in events:
+            if budget is not None and scanned >= budget:
+                # The scan budget ran out: the page ends here, a cursor at the last
+                # event scanned, whatever it holds (possibly nothing).
+                return {"events": page, "next": events[scanned - 1]["id"]}
+            scanned += 1
+            if e["id"] in hidden or (shed and e.get("shed", {}).get("name") != shed):
+                continue
+            page.append(e)
+            if len(page) == limit:
+                more = scanned < len(events)
+                return {"events": page, "next": e["id"] if more else ""}
+        return {"events": page, "next": ""}
 
-    def _bus_record_response(self, ns: str, env: dict) -> None:
-        with self._bus_cond:
-            self._bus_responses.setdefault(ns, []).append(env)
-            self._bus_cond.notify_all()
-
-    def _bus_record_egress(self) -> None:
-        with self._bus_cond:
+    def _record_egress(self) -> None:
+        with self._dlv_cond:
             self._egress_hits += 1
-            self._bus_cond.notify_all()
+            self._dlv_cond.notify_all()
 
-    def _bus_register_sse_thread(self) -> None:
-        with self._bus_cond:
-            self._bus_sse_threads.add(threading.current_thread())
+    def _register_sse_thread(self) -> None:
+        with self._dlv_cond:
+            self._sse_threads.add(threading.current_thread())
 
-    def _bus_unregister_sse_thread(self) -> None:
-        with self._bus_cond:
-            self._bus_sse_threads.discard(threading.current_thread())
+    def _unregister_sse_thread(self) -> None:
+        with self._dlv_cond:
+            self._sse_threads.discard(threading.current_thread())
 
     def start(self) -> None:
         state = self
@@ -1302,13 +975,8 @@ class MockShedServer:
                 if self._unauthorized():
                     return
                 path = urlsplit(self.path).path
-                # -- plugin message-bus routes (leg 3a.2) --
                 if path == _EGRESS_PATH:
                     self._serve_egress()
-                    return
-                m = _MESSAGES_RE.match(path)
-                if m:
-                    self._serve_sse(unquote(m.group(1)))
                     return
                 if path == _SOURCES_PATH:
                     read = state._src_get()
@@ -1366,42 +1034,6 @@ class MockShedServer:
                 else:
                     self._send(404, {"error": "not found"})
 
-            # -- plugin message-bus handlers (leg 3a.2) -------------------
-            # Framing derived from synthetic_bus.py / the wire catalog §0/§9 (anti-drift
-            # pin): SSE `data: {json}\n\n` request frames, respond → 204, subscribe →
-            # 409 NAMESPACE_ALREADY_REGISTERED when the ns is already claimed, egress →
-            # 501 (unavailable). HTTP/1.0 (the handler default, as the create SSE below)
-            # → the broker's reqwest client reads the streamed body until connection
-            # close, exactly as the app backend already reads the create stream.
-            def _serve_sse(self, ns: str):
-                """Record the subscribe, then either 409 (ns already claimed / a
-                pre-marked conflict — terminal `rejected`, no retry) or hold a 200
-                `text/event-stream` and push queued request frames until teardown /
-                client disconnect."""
-                identity = self._identity()
-                refusal = state._bus_record_subscribe(
-                    ns, self.headers.get("Authorization"), identity)
-                if refusal is not None:
-                    status, body = refusal
-                    self._send_raw(status, body)
-                    return
-                claim = state._bus_try_claim(ns, identity[0])
-                if claim == "duplicate":
-                    status, body = _REFUSALS["duplicate"]
-                    self._send_raw(status, body)
-                    return
-                if claim == "conflict":
-                    # NAMESPACE_ALREADY_REGISTERED — a second listener is terminal.
-                    self._send(409, {"error": "namespace already registered",
-                                     "code": "NAMESPACE_ALREADY_REGISTERED"})
-                    return
-                token, end, gen = claim
-                try:
-                    self._stream_sse(state._bus_queue_for(ns), end, ns=ns,
-                                     machine_id=identity[0], gen=gen)
-                finally:
-                    state._bus_release(ns, token)
-
             # -- provisioning by delivery (plan 039 A6) ------------------
             def _delivery_machine(self) -> tuple[str, str] | None:
                 """The machine headers, valid (32 lowercase hex; a name of 1 to 63
@@ -1430,6 +1062,7 @@ class MockShedServer:
                 if machine is None:
                     with state._dlv_cond:
                         state._dlv_attempts.append(self._identity())
+                        state._dlv_attempt_times.append(time.monotonic())
                         state._dlv_cond.notify_all()
                     self._machine_required()
                     return
@@ -1449,10 +1082,10 @@ class MockShedServer:
                 except OSError:
                     state._dlv_close(live)
                     return
-                state._bus_register_sse_thread()
+                state._register_sse_thread()
                 quiet_since = time.monotonic()
                 try:
-                    while not state._bus_shutdown.is_set() and not live["end"].is_set():
+                    while not state._shutdown.is_set() and not live["end"].is_set():
                         if self._peer_gone():
                             break
                         try:
@@ -1473,7 +1106,7 @@ class MockShedServer:
                     pass
                 finally:
                     state._dlv_close(live)
-                    state._bus_unregister_sse_thread()
+                    state._unregister_sse_thread()
 
             def _serve_delivery_answer(self, rid: str):
                 length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1535,25 +1168,20 @@ class MockShedServer:
                 frame("complete", doc)
 
             def _serve_egress(self):
-                """The always-on egress-audit consumer route. Record the hit, then
-                501 (unavailable) so the broker's egress subscriber backs off (wire
-                catalog §9) — unless the mock was built with `egress_events`, when it
-                streams them (each once) and holds the stream until teardown or the
-                client goes."""
-                state._bus_record_egress()
+                """The egress decision stream. Record the hit, then 501 (egress
+                control not enabled) so the app's egress feed rests — unless the mock
+                was built with `egress_events`, when it streams them (each once) and
+                holds the stream until teardown or the client goes."""
+                state._record_egress()
                 if state._egress_queue is None:
                     self._send(501, {"error": "egress unavailable"})
                     return
                 self._stream_sse(state._egress_queue, threading.Event())
 
-            def _stream_sse(self, q, end: threading.Event, ns: str | None = None,
-                            machine_id: str | None = None, gen: int = 0):
+            def _stream_sse(self, q, end: threading.Event):
                 """Send the 200 SSE handshake, then hold the connection and drain `q`,
                 writing each frame as a `data:` line, until shutdown / a `None` sentinel
-                / client disconnect / `end` (a source move closed this stream). Each
-                frame written is a pending request of `ns`, stamped with `machine_id` and
-                the generation `gen` this stream was admitted at; a frame taken after the
-                stream stopped being live goes back for the next stream."""
+                / client disconnect / `end`."""
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -1562,9 +1190,9 @@ class MockShedServer:
                     self.wfile.flush()
                 except OSError:
                     return
-                state._bus_register_sse_thread()
+                state._register_sse_thread()
                 try:
-                    while not state._bus_shutdown.is_set() and not end.is_set():
+                    while not state._shutdown.is_set() and not end.is_set():
                         if self._peer_gone():
                             break  # the client went away: its slot is free again
                         try:
@@ -1573,16 +1201,13 @@ class MockShedServer:
                             continue
                         if frame is None:  # teardown sentinel
                             break
-                        if ns is not None and not state._bus_take(
-                                ns, frame, machine_id, gen, end, q):
-                            break
                         try:
                             self.wfile.write(("data: " + frame + "\n\n").encode())
                             self.wfile.flush()
                         except OSError:
                             break  # client disconnected
                 finally:
-                    state._bus_unregister_sse_thread()
+                    state._unregister_sse_thread()
 
             def _peer_gone(self) -> bool:
                 """Whether the client closed its side (EOF readable), consuming nothing."""
@@ -1593,30 +1218,6 @@ class MockShedServer:
                     return self.connection.recv(1, socket.MSG_PEEK) == b""
                 except (OSError, ValueError):
                     return False
-
-            def _serve_respond(self, ns: str):
-                """Read a response Envelope body, record it for `ns`, return 204."""
-                length = int(self.headers.get("Content-Length", "0") or "0")
-                body = self.rfile.read(length) if length > 0 else b""
-                try:
-                    env = json.loads(body)
-                except ValueError:
-                    self._send(400, {"error": "bad response body"})
-                    return
-                refused = state._bus_next_respond_answer(
-                    ns, self._identity(), env if isinstance(env, dict) else {})
-                if refused is not None:
-                    status, refusal, retry_after = refused
-                    self._send_raw(
-                        status, refusal,
-                        {"Retry-After": retry_after} if retry_after is not None else None)
-                    return
-                state._bus_record_response(ns, env)
-                # 204 No Content — the status the client expects (a non-204 is a bus
-                # error on both sides). Explicit zero-length, no body.
-                self.send_response(204)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
 
             def do_POST(self):
                 if self._unauthorized():
@@ -1629,10 +1230,6 @@ class MockShedServer:
                 m = _PROVISION_RE.match(path)
                 if m:
                     self._serve_provision(unquote(m.group(1)))
-                    return
-                m = _RESPOND_RE.match(path)
-                if m:
-                    self._serve_respond(unquote(m.group(1)))
                     return
                 if path == _SOURCES_USE_PATH:
                     try:
@@ -1719,18 +1316,16 @@ class MockShedServer:
         self._paused = True
         self._httpd.shutdown()  # no new connection is served
         self._httpd.server_close()  # the port refuses
-        self._bus_shutdown.set()  # every held stream ends
-        with self._bus_cond:
-            threads = list(self._bus_sse_threads)
+        self._shutdown.set()  # every held stream ends
+        with self._dlv_cond:
+            threads = list(self._sse_threads)
         for t in threads:
             t.join(timeout=2)
         if self._thread is not None:
             self._thread.join(timeout=2)
         self._httpd = None
         self._thread = None
-        self._bus_shutdown.clear()
-        with self._bus_cond:
-            self._bus_pending.clear()
+        self._shutdown.clear()
 
     def resume(self) -> None:
         """Serve again, on the port `pause()` closed."""
@@ -1739,17 +1334,14 @@ class MockShedServer:
         self._serve(self._port)
 
     def stop(self) -> None:
-        # Unblock + join any live SSE handler threads first (a broker cell's held
-        # subscribe), so no socket lingers past shutdown (ResourceWarning-safe),
-        # mirroring synthetic_bus.stop().
-        self._bus_shutdown.set()
+        # Unblock + join any live SSE handler threads first (a held stream), so no
+        # socket lingers past shutdown (ResourceWarning-safe).
+        self._shutdown.set()
         self.release_sheds_list()
-        with self._bus_cond:
-            for q in self._bus_queues.values():
-                q.put(None)  # per-queue teardown sentinel
+        with self._dlv_cond:
             if self._egress_queue is not None:
                 self._egress_queue.put(None)
-            threads = list(self._bus_sse_threads)
+            threads = list(self._sse_threads)
         for t in threads:
             t.join(timeout=2)
         if self._httpd is not None:

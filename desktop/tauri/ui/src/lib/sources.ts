@@ -31,7 +31,7 @@
  * yet there is nothing to keep, so none is shown, and the reads are still asked for.
  *
  * **A move's read-back can come too early.** A confirmed move whose read-back shows
- * this machine "not connected" (its broker has not connected yet) asks for one later
+ * this machine "not connected" (its delivery stream has not connected yet) asks for one later
  * read, so the row does not stay stale.
  *
  * **One read at a time.** The window's reader ([createSourceReader]) never has two
@@ -172,7 +172,7 @@ export function applyRead(
       retry = true;
     } else {
       next.rows[r.host] = r;
-      // The move's read-back came before its broker connected: look once more.
+      // The move's read-back came before its delivery stream connected: look once more.
       if (held && r.this_machine && !r.connected) retry = true;
     }
     next.applied[r.host] = seq;

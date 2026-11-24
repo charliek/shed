@@ -1,11 +1,11 @@
 """tauri-only down-host E2E: a per-host UNREACHABLE server surfaces as an error
-row end-to-end (the Egress pane's error rows, the System pane's per-host df, and
+row end-to-end (the System pane's egress error rows and per-host df, and
 — shed#300 — the Sheds pane's host-error strip + its failure-aware empty state),
 while the reachable `mock` host stays healthy.
 
-This is the e2e closure of the gap `test_tauri.py::test_egress_profiles_render`
-documents (the shared harness blanket-redirects every configured server to the
-one in-process mock, so the error row was only unit-tested). It launches its OWN
+This is the e2e closure of the gap `test_tauri.py::test_system_pane_shows_the_servers_egress_profiles`
+leaves (the shared harness sends every configured server to the one in-process
+mock, so the error row would only be unit-tested). It launches its OWN
 hermetic app instance — a distinct throwaway HOME/XDG_RUNTIME_DIR → a distinct
 socket + single-instance lock (keyed to the socket dir), so it coexists with the
 session instance without touching the session fixture — pointed at the dedicated
@@ -46,8 +46,8 @@ def _downhost_app(mock_base_url: str, *, config: Path = DOWNHOST_CONFIG,
     socket/proc, so it never touches ui._state (the session instance's
     bookkeeping).
 
-    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
-    this instance never takes a listener slot on a session mock."""
+    Its delivery stream on the session mock is its own machine's, beside the
+    session app's (one stream per machine), so it never takes the session's place."""
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(
@@ -83,7 +83,7 @@ def _downhost_app(mock_base_url: str, *, config: Path = DOWNHOST_CONFIG,
 def downhost(mock):
     """A ready client for a self-managed down-host tauri instance. `mock` is the
     session-scoped shared mock server (reused, not re-created); the instance itself
-    — and its broker, which serves no server — is throwaway."""
+    is throwaway."""
     with _downhost_app(mock.base_url) as client:
         yield client
 
@@ -99,14 +99,10 @@ def alldown(mock):
 
 
 def test_egress_error_row_for_down_host(downhost):
-    # The Egress pane renders the reachable mock's two profiles AND exactly one
-    # error row for the unreachable `down` host — the e2e closure of the gap
-    # test_tauri.py::test_egress_profiles_render documents.
-    downhost.navigate("egress")
-    downhost.wait_until(lambda: downhost.current_pane() == "egress", timeout=15, what="pane=egress")
-    downhost.egress_show(tab="profiles")
-    downhost.wait_until(lambda: (downhost.egress_dump() or {}).get("tab") == "profiles",
-                        timeout=15, what="profiles sub-tab shown")
+    # The System pane's egress profiles render the reachable mock's two profiles AND
+    # exactly one error row for the unreachable `down` host.
+    downhost.navigate("system")
+    downhost.wait_until(lambda: downhost.current_pane() == "system", timeout=15, what="pane=system")
     downhost.wait_until(lambda: len((downhost.egress_dump() or {}).get("errors") or []) == 1,
                         timeout=15, what="down-host error row rendered")
     d = downhost.egress_dump()

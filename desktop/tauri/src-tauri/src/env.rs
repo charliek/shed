@@ -9,9 +9,10 @@ use std::path::PathBuf;
 pub struct Env {
     /// `SHED_TAURI_TEST_MODE=1` — unlocks test-only behavior + echoed by `identify`.
     pub test_mode: bool,
-    /// In test mode, every host client is pointed at this single mock base URL
-    /// (`SHED_TAURI_MOCK_BASE_URL`). Echoed by `identify` so the harness can fail
-    /// fast if a run isn't actually hermetic.
+    /// In test mode, every host client is pointed at this mock base URL
+    /// (`SHED_TAURI_MOCK_BASE_URL`): one URL for every server, or a default followed
+    /// by `,<server>=<url>` overrides (`shed_app::mock_url_for`). Echoed by `identify`
+    /// so the harness can fail fast if a run isn't actually hermetic.
     pub mock_base_url: Option<String>,
     /// TEST-ONLY per-host down simulation: the comma-separated server NAMES from
     /// `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (parsed only in test mode) that the
@@ -173,7 +174,9 @@ impl Env {
         }
         Self {
             test_mode,
-            mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
+            // Test mode only, like every mock seam: outside it a stray variable never
+            // redirects a client (either form: one URL, or per-server overrides).
+            mock_base_url: test_only(test_mode, var("SHED_TAURI_MOCK_BASE_URL")),
             mock_unreachable_hosts,
             roost_sockets,
             ssh_bin: ssh_bin.map(PathBuf::from),

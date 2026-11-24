@@ -1,13 +1,13 @@
-/* shed desktop — the app shell (Plex reskin). Sidebar + header + the six panes,
+/* shed desktop — the app shell (Plex reskin). Sidebar + header + the four panes,
    over live shed-core data. Nav is driven by clicks AND by the Rust `ui.navigate`
    op (via the `navigate` Tauri event); the rendered pane + a computed-style sample
    are reported back to Rust (useUiBridge) so the harness can assert them over IPC.
    The shared visual vocabulary lives in components/{primitives,dialog}. */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
-  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
-  Fingerprint, Moon, Sun, Settings, X,
+  Boxes, Sparkles, ScrollText, HardDrive, Box, Plus,
+  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink,
+  Moon, Sun, Settings, X, ChevronDown, ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import owlOrange from "@/assets/owl-orange.svg";
@@ -16,7 +16,7 @@ import {
   cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, FactChip, ActBtn,
   PageHead, HeadAction, RefreshHeadButton, Empty, type Tone,
 } from "@/components/primitives";
-import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
+import { Scrim, DialogShell, Field, Select, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { LanePanel } from "@/components/LanePanel";
 import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote } from "@/lib/crazeRows";
@@ -36,6 +36,12 @@ import {
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import { DeliveryBadge, ShedDeliveryDetail, provisionRunOf, useShedDelivery, type ShedDeliveryState } from "@/components/ShedDelivery";
 import { readDelivery } from "@/lib/delivery";
+import { ShedEgressDetail } from "@/components/ShedEgress";
+import {
+  EMPTY_FEED, actorText, appendPage, deliveryText, errorText, outcomeTone, readPage,
+  type ActivityFeed,
+} from "@/lib/activity";
+import { profileSummary } from "@/lib/egress";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
   reportShedRoost, renderedText, useRoostBoard,
@@ -44,47 +50,30 @@ import {
 import {
   useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
-  fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
-  fetchEgressProfiles, reportEgress, inTauri,
+  fetchEgressProfiles, reportEgress, inTauri, listServerActivity, reportActivity, reportScrolled,
   openPreferences, setAppearanceState,
   sessionKey, reportAgents, useRcSessions,
   crazeCreate, crazeOpenTerminal, crazeReopen, crazeSaved, laneFailure,
-  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor,
+  shedsEmptyState, hostFailureFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
-  type Modal, type CreateProgress, type Approval, type AuditEntry,
-  type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
+  type Modal, type CreateProgress,
+  type HostEgressProfiles,
   type RcSession, type RcState,
   type MachineStatus, type AgentsLoad, type ShedCrazeEntry,
   agentsEmptyState,
 } from "@/lib/bridge";
 
-/** "server/shed" when multi-server, else the shed name. */
-function qualifiedShed(server: string | null | undefined, shed: string | null | undefined): string {
-  return server ? `${server}/${shed ?? ""}` : (shed ?? "");
-}
-/** HH:mm:ss of an ISO/flexible timestamp (best-effort; the raw string on a miss). */
-function shortTime(ts: string): string {
+/** A timestamp as the Activity pane shows it: the date and time (the raw text on a miss). */
+function eventTime(ts: string): string {
   const d = new Date(ts);
   return Number.isNaN(d.getTime())
     ? ts
-    : d.toLocaleTimeString(undefined, { hour12: false });
-}
-/** The one-line activity detail: `op · server/shed · detail`. */
-function activityDetail(e: AuditEntry): string {
-  return [e.op, qualifiedShed(e.server, e.shed), e.detail].filter(Boolean).join(" · ");
-}
-/** The hint under an approval card, reflecting the grant its Approve applies. */
-function approveHint(scope: Approval["default_scope"]): string {
-  if (scope === "per-session") return "Approve grants for this session";
-  if (scope === "per-shed") return "Approve grants for this shed";
-  return "Approve allows this request only";
+    : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 const NAV: [Pane, string, typeof Box][] = [
   ["sheds", "Sheds", Boxes],
-  ["approvals", "Approvals", Shield],
   ["agents", "Agents", Sparkles],
   ["activity", "Activity", ScrollText],
-  ["egress", "Egress", Globe],
   ["system", "System", HardDrive],
 ];
 
@@ -323,9 +312,12 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                 const busy = isBusy(s);
                 const dotColor = running ? "var(--shed-ok)" : busy ? "var(--shed-attention)" : "var(--shed-text-muted)";
                 const delivery = readDelivery(s.delivery);
-                const deliveryShown = !!delivery && dlv.open?.server === s.host && dlv.open?.shed === s.name;
+                // The row's detail: its delivery (when it has a record) and its egress.
+                const detailShown = dlv.open?.server === s.host && dlv.open?.shed === s.name;
+                const toggleDetail = () => dlv.setOpen(detailShown ? null : { server: s.host, shed: s.name });
                 return (
                   <div key={`${host}/${s.name}`} data-shed-row data-shed-host={s.host} data-shed-name={s.name}
+                    data-scroll-anchor={`shed:${s.host}/${s.name}`}
                     className={cardCls} style={{ animation: "shed-in .25s ease" }}>
                   <div className="flex items-center gap-3.5 px-[18px] py-[15px]">
                     <Dot className="h-2.5 w-2.5" style={{ background: dotColor }} />
@@ -334,12 +326,20 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                         <span className="text-[16px] font-semibold text-shed-text">{s.name}</span>
                         {s.backend && <Tag kind={s.backend} />}
                         {s.image && <ImageChip>{s.image}</ImageChip>}
-                        {delivery && (
-                          <DeliveryBadge
-                            rec={delivery}
-                            open={deliveryShown}
-                            onToggle={() => dlv.setOpen(deliveryShown ? null : { server: s.host, shed: s.name })}
-                          />
+                        {delivery ? (
+                          <DeliveryBadge rec={delivery} open={detailShown} onToggle={toggleDetail} />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={toggleDetail}
+                            title={detailShown ? "Hide details" : "Show details"}
+                            aria-expanded={detailShown}
+                            className="hbtn inline-flex flex-none items-center gap-1 rounded-md px-1.5 py-[3px] font-mono text-[10.5px] font-semibold leading-none"
+                            style={{ background: "var(--shed-inset)", color: "var(--shed-text-secondary)" }}
+                            data-shed-detail-toggle
+                          >
+                            details {detailShown ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                          </button>
                         )}
                       </div>
                       <MetaLine s={s} />
@@ -392,7 +392,14 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                       )}
                     </div>
                   </div>
-                  {deliveryShown && delivery && (
+                  {/* The egress section leads: it is short, and the delivery's item
+                      table below it can be long. Keyed by the incarnation: a shed
+                      created again under its name is another shed, and starts with
+                      none of the old one's blocks. */}
+                  {detailShown && (
+                    <ShedEgressDetail key={`${s.host}/${s.name}/${s.created_at ?? ""}`} shed={s} />
+                  )}
+                  {detailShown && delivery && (
                     <ShedDeliveryDetail
                       shed={s}
                       rec={delivery}
@@ -406,60 +413,6 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
             </div>
           </div>
         ))
-      )}
-    </div>
-  );
-}
-
-/* ---- Approvals pane ------------------------------------------------------- */
-function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
-  const now = useNowTick();
-  return (
-    <div>
-      <PageHead
-        title="Credential approvals"
-        sub="Requests routed from the credential broker when its approval mode is shed-desktop."
-        right={<span className="text-[14px] text-shed-text-muted">gate: shed-desktop</span>}
-      />
-      {approvals.length === 0 ? (
-        <Empty icon={Shield} title="No pending requests" body="When an agent asks the host to use a credential, it shows up here for you to approve or deny." />
-      ) : (
-        <div className="flex flex-col gap-3">
-          {approvals.map((a) => {
-            const t = Date.parse(a.expires_at);
-            // A malformed/absent expiry parses to NaN; the backend treats it as
-            // already-expired (fail-closed), so show 0s rather than "NaNs".
-            const secs = Number.isFinite(t) ? Math.max(0, Math.round((t - now) / 1000)) : 0;
-            const biometric = a.gate !== "none";
-            return (
-              <div key={a.id} className={cn(cardCls, "p-5")} style={{ animation: "shed-in .25s ease" }}>
-                <div className="flex items-start gap-[15px]">
-                  <div className="flex h-11 w-11 flex-none items-center justify-center rounded-[11px]" style={{ background: "var(--shed-tag-vz-bg)" }}>
-                    <Key size={20} style={{ color: "var(--shed-tag-vz-text)" }} />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[18px] font-bold text-shed-text">{a.namespace} · {a.op}</div>
-                    <div className="mt-1.5 text-[14px] leading-snug text-shed-text-muted">shed {qualifiedShed(a.server, a.shed)} · {a.detail}</div>
-                  </div>
-                  <span className="flex-none text-[14px] font-semibold" style={{ color: secs <= 10 ? "var(--shed-danger)" : "var(--shed-attention)" }}>expires in {secs}s</span>
-                </div>
-                <div className="mt-[18px] flex items-center">
-                  <span className="flex-1 text-[13px] text-shed-text-muted">{approveHint(a.default_scope)}</span>
-                  <div className="flex gap-[11px]">
-                    <button onClick={() => void decideApproval(a.id, "deny")} className="hbtn rounded-[10px] px-5 py-[11px] text-[15px] font-semibold" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)", border: "none" }}>Deny</button>
-                    <button
-                      onClick={() => void decideApproval(a.id, "approve", { scope: a.default_scope, ttl: a.default_ttl })}
-                      className="hbtn inline-flex items-center gap-[9px] rounded-[10px] px-[22px] py-[11px] text-[15px] font-semibold"
-                      style={{ background: "var(--shed-approve)", color: "var(--shed-approve-fg)", border: "none" }}
-                    >
-                      {biometric && <Fingerprint size={18} />} Approve
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
       )}
     </div>
   );
@@ -760,52 +713,204 @@ function SessionCard({ session: s, onKilled, onError, onTranscript }:
 }
 
 /* ---- Activity pane -------------------------------------------------------- */
-/** One audit row (mono time + ns pill + detail + outcome) — shared by the
-    Activity pane and the Egress pane's Activity sub-tab. */
-function ActivityRow({ entry: e, divider }: { entry: AuditEntry; divider: boolean }) {
-  const ok = e.result === "ok" || e.result === "approved";
-  return (
-    <div className={cn("row-hover flex items-center gap-3.5 px-[18px] py-[13px]", divider && "border-t border-shed-border")}>
-      <span className="w-[70px] flex-none font-mono text-[13px] text-shed-text-muted">{shortTime(e.ts)}</span>
-      {e.ns && <span className="flex-none rounded-md px-[7px] py-1 font-mono text-[11px] font-semibold leading-none" style={{ background: "var(--shed-agent-pill-bg)", color: "var(--shed-agent-pill-text)" }}>{e.ns}</span>}
-      <span className="min-w-0 flex-1 truncate text-[14px] text-shed-text-secondary">{activityDetail(e)}</span>
-      <span className="flex flex-none items-center gap-2">
-        <span className="text-[13px] font-semibold" style={{ color: ok ? "var(--shed-ok)" : "var(--shed-denied)" }}>{e.result}</span>
-        {e.approval && e.approval !== "none" && <span className="text-[12px] text-shed-text-muted">{e.approval}</span>}
-      </span>
-    </div>
-  );
-}
+/** How many events a page asks for. */
+const ACTIVITY_PAGE = 50;
 
+/** The servers' own activity (`GET /api/activity` on every configured server, merged
+ *  newest first): what happened to your sheds, who did it, and how it ended. The
+ *  server decides what a user may see. A server that could not be read is named
+ *  above the list and keeps its place: its events come with a later page. */
 function ActivityPane() {
-  const activity = useCoordinatorData<AuditEntry[]>("activity-changed", fetchActivity, []);
+  const [feed, setFeed] = useState<ActivityFeed>(EMPTY_FEED);
+  const [state, setState] = useState<"loading" | "ready" | "failed">("loading");
+  const [older, setOlder] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const gen = useRef(0);
+  const feedNow = useRef(feed);
+  feedNow.current = feed;
+  const olderNow = useRef(false);
+  const why = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
+
+  const load = useCallback(() => {
+    const g = ++gen.current;
+    olderNow.current = false;
+    setOlder(false);
+    setState("loading");
+    void listServerActivity({ limit: ACTIVITY_PAGE }).then(
+      (p) => {
+        if (g !== gen.current) return;
+        setFeed(appendPage(EMPTY_FEED, readPage(p)));
+        setFailure(null);
+        setState("ready");
+      },
+      (e: unknown) => {
+        if (g !== gen.current) return;
+        setFailure(why(e));
+        setState("failed");
+      },
+    );
+  }, []);
+  useEffect(() => load(), [load]);
+
+  // Older events, from the cursor the last page left. One read at a time.
+  const loadOlder = useCallback(() => {
+    const cursor = feedNow.current.next;
+    if (!cursor || olderNow.current) return;
+    const g = gen.current;
+    olderNow.current = true;
+    setOlder(true);
+    void listServerActivity({ limit: ACTIVITY_PAGE, cursor })
+      .then(
+        (p) => {
+          if (g === gen.current) setFeed((f) => appendPage(f, readPage(p)));
+        },
+        (e: unknown) => {
+          if (g === gen.current) setFailure(why(e));
+        },
+      )
+      .finally(() => {
+        if (g !== gen.current) return;
+        olderNow.current = false;
+        setOlder(false);
+      });
+  }, []);
+
+  // The harness's press (`ui.press_activity_older`, test mode only): this pane's own
+  // button, clicked, so a hidden or disabled one takes no press.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let un: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const u = await listen("press-activity-older", () => {
+        const btn = root.current?.querySelector<HTMLButtonElement>("button[data-activity-older]");
+        if (btn && !btn.disabled) btn.click();
+      });
+      if (cancelled) u();
+      else un = u;
+    })();
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, []);
+
+  // Report what the pane rendered (`activity.dump`), read back off its own nodes.
+  const key = JSON.stringify([feed, state, older, failure]);
+  useEffect(() => {
+    const el = root.current;
+    if (!el) return;
+    const btn = el.querySelector<HTMLButtonElement>("button[data-activity-older]");
+    reportActivity({
+      state,
+      events: Array.from(el.querySelectorAll<HTMLElement>("[data-activity-event]")).map((row) => {
+        const cell: Record<string, string | null> = { id: row.dataset.activityEvent ?? null };
+        row.querySelectorAll<HTMLElement>("[data-col]").forEach((c) => {
+          cell[c.dataset.col!] = c.textContent;
+        });
+        return cell;
+      }),
+      errors: Array.from(el.querySelectorAll("[data-activity-error]")).map((e) => e.textContent),
+      failure: el.querySelector("[data-activity-failure]")?.textContent ?? null,
+      older: btn ? { disabled: btn.disabled, text: btn.textContent } : null,
+      empty: el.querySelector("[data-activity-empty]")?.textContent ?? null,
+    });
+  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => reportActivity(null), []);
+
   return (
-    <div>
+    <div ref={root} data-scroll-anchor="activity">
       <PageHead
         title="Activity"
-        sub="Credential broker audit + shed-desktop decisions, newest first."
+        sub="What happened to your sheds on each server, newest first."
+        right={<RefreshHeadButton onClick={load} />}
       />
-      {activity.length === 0 ? (
-        <Empty icon={ScrollText} title="No activity yet" body="Credential checks and your approval decisions will appear here." />
-      ) : (
-        <div className={cn(cardCls, "overflow-hidden")}>
-          {activity.map((e, i) => (
-            <ActivityRow key={`${e.id}-${i}`} entry={e} divider={i > 0} />
+      {feed.errors.length > 0 && (
+        <div className={cn(cardCls, "mb-3 flex flex-col gap-1 px-[18px] py-3")} style={{ borderColor: "var(--shed-danger)" }}>
+          {feed.errors.map((e) => (
+            <div key={e.server} className="break-words font-mono text-[12px]" style={{ color: "var(--shed-danger)" }} data-activity-error>
+              {errorText(e)}
+            </div>
           ))}
         </div>
+      )}
+      {failure && (
+        <div className="mb-3 break-words font-mono text-[12px]" style={{ color: "var(--shed-danger)" }} data-activity-failure>
+          {failure}
+        </div>
+      )}
+      {state === "loading" ? (
+        <div className="px-1 py-8 text-center text-[13px] text-shed-text-muted">Loading activity…</div>
+      ) : (
+        <>
+          {/* A page can be empty and still have a continuation (a server's scan
+              budget ran out among events this user may not see), so the empty
+              state never hides "Load older". */}
+          {feed.events.length === 0 ? (
+            <div data-activity-empty>
+              <Empty
+                icon={ScrollText}
+                title={feed.next ? "No activity on this page" : "No activity yet"}
+                body={feed.next
+                  ? "The servers have older events to look through: load the next page."
+                  : "Creating, starting, stopping and provisioning a shed, and each delivery, appear here."}
+              />
+            </div>
+          ) : (
+          <div className={cn(cardCls, "overflow-hidden")}>
+            {feed.events.map((e, i) => {
+              const tone = outcomeTone(e);
+              const outcome = deliveryText(e.delivery) ?? e.result ?? "";
+              return (
+                <div
+                  key={`${e.server}/${e.id}`}
+                  className={cn("row-hover flex items-center gap-3 px-[18px] py-[11px]", i > 0 && "border-t border-shed-border")}
+                  data-activity-event={`${e.server}/${e.id}`}
+                >
+                  <span className="w-[128px] flex-none font-mono text-[12px] text-shed-text-muted" data-col="at">{eventTime(e.at)}</span>
+                  <span className="flex-none rounded-md px-[7px] py-1 font-mono text-[11px] font-semibold leading-none" style={{ background: "var(--shed-inset)", color: "var(--shed-text-secondary)" }} data-col="server">{e.server}</span>
+                  <span className="flex-none rounded-md px-[7px] py-1 font-mono text-[11px] font-semibold leading-none" style={{ background: "var(--shed-agent-pill-bg)", color: "var(--shed-agent-pill-text)" }} data-col="kind">{e.kind}</span>
+                  <span className="min-w-0 flex-1 truncate text-[13.5px]">
+                    <span className="font-semibold text-shed-text" data-col="shed">{e.shed.name}</span>
+                    <span className="text-shed-text-muted"> · </span>
+                    <span className="text-shed-text-secondary" data-col="actor">{actorText(e.actor)}</span>
+                  </span>
+                  <span
+                    className="flex-none text-[12.5px] font-semibold"
+                    style={{ color: tone === "ok" ? "var(--shed-ok)" : tone === "bad" ? "var(--shed-denied)" : "var(--shed-text-muted)" }}
+                    data-col="outcome"
+                  >
+                    {outcome}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          )}
+          {feed.next && (
+            <div className="mt-3 flex justify-center">
+              <button
+                type="button"
+                onClick={loadOlder}
+                disabled={older}
+                className="hbtn rounded-[9px] border border-shed-border bg-shed-surface px-4 py-2 text-[13px] font-medium text-shed-text-secondary"
+                style={{ opacity: older ? 0.6 : 1 }}
+                data-activity-older
+              >
+                {older ? "Loading…" : "Load older"}
+              </button>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
 
-/* ---- Egress pane (mac parity: Activity feed filter + Profiles list→detail) - */
-type EgressTab = "activity" | "profiles";
-type EgressRow = { host: string; info: EgressProfileInfo };
-/** Unique even if a host ever returns a config + user profile of the same name
-    (the mac EgressProfilesView id shape). */
-const egressRowId = (r: EgressRow) => `${r.host}/${r.info.source}/${r.info.name}`;
-
-/** The config|user source badge (user = accent tint, config = neutral). */
+/* ---- System pane ---------------------------------------------------------- */
+/** The config|user source badge of an egress profile (user = accent tint, config = neutral). */
 function SourceBadge({ source }: { source: string }) {
   const user = source === "user";
   return (
@@ -821,277 +926,114 @@ function SourceBadge({ source }: { source: string }) {
   );
 }
 
-/** One-line profile summary for the list rows (mirrors the mac `summary`). */
-function egressSummary(p: EgressProfile): string {
-  const parts: string[] = [];
-  if (p.mode) parts.push(`mode=${p.mode}`);
-  if (p.allow?.length) parts.push(`allow=${p.allow.length}`);
-  if (p.deny?.length) parts.push(`deny=${p.deny.length}`);
-  if (p.rule) parts.push("rule");
-  return parts.length ? parts.join(" ") : "(empty)";
-}
-
-/** A mono uppercase label + mono rows — the detail's allow/deny/mode/rule blocks. */
-function EgressRuleBlock({ label, items }: { label: string; items: string[] }) {
-  if (!items.length) return null;
-  return (
-    <div>
-      <div className="mb-1.5 font-mono text-[10.5px] uppercase leading-none tracking-[.05em] text-shed-text-muted">{label}</div>
-      {items.map((it) => (
-        <div key={it} className="font-mono text-[13px] leading-relaxed text-shed-text">{it}</div>
-      ))}
-    </div>
-  );
-}
-
-function EgressPane() {
-  const [tab, setTab] = useState<EgressTab>("activity");
-  const [hosts, setHosts] = useState<HostEgressProfiles[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
-  // A profile selection requested via `egress.show` that arrived before rows loaded
-  // (the listener records it here rather than resolving against an empty list). The
-  // auto-select effect applies it once rows land — see the listener + effect below.
-  const [pendingSelect, setPendingSelect] = useState<{ profile: string; host?: string } | null>(null);
-  // Egress decisions = audit entries with ns=="egress" — the same coordinator
-  // feed the Activity pane renders, filtered frontend-side (mac parity).
-  const activity = useCoordinatorData<AuditEntry[]>("activity-changed", fetchActivity, []);
-  const egress = activity.filter((e) => e.ns === "egress");
-
-  // Fetch per-host profiles on mount + Refresh (generation guard as in SystemPane).
-  const gen = useRef(0);
-  const load = useCallback(() => {
-    const g = ++gen.current;
-    void fetchEgressProfiles().then((r) => {
-      if (g === gen.current) {
-        setHosts(r);
-        setLoaded(true);
-      }
+/** Every server's egress profiles (config baseline and user-managed), view-only: they
+ *  are managed with `shed egress profile`. A server that could not list them (egress
+ *  not enabled, unreachable) says so in its own row. */
+function EgressProfilesSection({ hosts, loaded }: { hosts: HostEgressProfiles[]; loaded: boolean }) {
+  const root = useRef<HTMLDivElement>(null);
+  const key = JSON.stringify([hosts, loaded]);
+  // Report what was RENDERED, read back off the section's own nodes after the commit,
+  // so a field the pane does not show cannot pass as shown.
+  useEffect(() => {
+    const el = root.current;
+    if (!loaded || !el) return;
+    const text = (n: Element, f: string) => n.querySelector(`[data-field="${f}"]`)?.textContent ?? null;
+    const items = (n: Element, f: string) =>
+      Array.from(n.querySelectorAll(`[data-field="${f}"] [data-item]`)).map((i) => i.textContent ?? "");
+    reportEgress({
+      profiles: Array.from(el.querySelectorAll<HTMLElement>("[data-egress-profile]")).map((n) => ({
+        host: n.dataset.egressHost ?? "",
+        name: text(n, "name") ?? "",
+        source: text(n, "source") ?? "",
+        mode: text(n, "mode"),
+        allow: items(n, "allow"),
+        deny: items(n, "deny"),
+        rule: text(n, "rule"),
+      })),
+      errors: Array.from(el.querySelectorAll<HTMLElement>("[data-egress-host-error]")).map((n) => ({
+        host: n.dataset.egressHostError ?? "",
+        error: n.textContent ?? "",
+      })),
     });
-  }, []);
-  useEffect(() => load(), [load]);
-
-  const rows: EgressRow[] = hosts.flatMap((h) => h.profiles.map((info) => ({ host: h.host, info })));
-  const errorRows = hosts.filter((h) => h.error);
-  const multiHost = hosts.length > 1;
-  const selectedRow = rows.find((r) => egressRowId(r) === selected) ?? null;
-
-  // Auto-select the first profile once rows land (list→detail renders without a
-  // click), and re-select if a refresh dropped the selected one. A pending
-  // `egress.show` selection (recorded before rows loaded) takes precedence.
-  useEffect(() => {
-    if (!rows.length) return;
-    if (pendingSelect) {
-      const m = rows.find(
-        (r) =>
-          r.info.name === pendingSelect.profile &&
-          (pendingSelect.host === undefined || r.host === pendingSelect.host),
-      );
-      setPendingSelect(null); // applied, or rows loaded without a match — consume it
-      if (m) {
-        setSelected(egressRowId(m));
-        return;
-      }
-    }
-    if (!rows.some((r) => egressRowId(r) === selected)) {
-      setSelected(egressRowId(rows[0]));
-    }
-  }, [hosts, selected, pendingSelect]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Build the current rendered snapshot. Held in a ref so the listener effect can
-  // publish the INITIAL report the instant it attaches (before any data-driven
-  // re-report), which keeps the readiness invariant below true.
-  const buildReport = useCallback(
-    (): EgressReport => ({
-      tab,
-      profiles: rows.map((r) => ({ host: r.host, name: r.info.name, source: r.info.source })),
-      errors: errorRows.map((h) => ({ host: h.host, error: h.error ?? "" })),
-      selected: selectedRow
-        ? {
-            host: selectedRow.host,
-            name: selectedRow.info.name,
-            source: selectedRow.info.source,
-            allow: selectedRow.info.profile.allow ?? [],
-            deny: selectedRow.info.profile.deny ?? [],
-            mode: selectedRow.info.profile.mode ?? null,
-            rule: selectedRow.info.profile.rule ?? null,
-          }
-        : null,
-      activity_count: egress.length,
-    }),
-    [tab, rows, errorRows, selectedRow, egress.length],
-  );
-  const reportRef = useRef(buildReport);
-  reportRef.current = buildReport;
-
-  // Readiness invariant (mirrors useUiBridge): the egress-show LISTENER is attached
-  // BEFORE the pane publishes ANY egress snapshot, so a non-null reported snapshot
-  // proves the listener is live — which `egress.show` relies on to fail-fast
-  // (frontend_not_ready) rather than lose an emit to the async attach race. `ready`
-  // gates the data-driven re-report below; this effect owns the initial report.
-  const ready = useRef(false);
-  useEffect(() => {
-    if (!inTauri()) return;
-    let cancelled = false;
-    const uns: Array<() => void> = [];
-    void import("@tauri-apps/api/event").then(async ({ listen }) => {
-      uns.push(
-        await listen<{ tab?: unknown; profile?: unknown; host?: unknown }>("egress-show", (e) => {
-          const t = e.payload?.tab;
-          if (t === "activity" || t === "profiles") setTab(t);
-          const p = e.payload?.profile;
-          if (typeof p === "string") {
-            const h = e.payload?.host;
-            // Record as pending (never resolve against a possibly-empty rows list
-            // here): the auto-select effect applies it by (host, name) — or by name
-            // (first match) when no host is given — once rows are present.
-            setPendingSelect({ profile: p, host: typeof h === "string" ? h : undefined });
-          }
-        }),
-      );
-      if (cancelled) {
-        uns.forEach((u) => u());
-        return;
-      }
-      ready.current = true; // listener live → the snapshot may now publish
-      reportEgress(reportRef.current()); // initial report AFTER the listener attaches
-    });
-    return () => {
-      cancelled = true;
-      ready.current = false;
-      uns.forEach((u) => u());
-      // Clear the reported snapshot on unmount so an off-pane or freshly-remounted-
-      // but-not-yet-reported `egress.profiles` dump returns null, never stale data.
-      reportEgress(null);
-    };
-  }, []);
-
-  // Publish the rendered egress state so the `egress.profiles` op can observe it
-  // (UI truth). Stays IN the pane so it fires only while mounted, like reportAgents;
-  // gated on `ready` so the listener effect owns the initial report.
-  useEffect(() => {
-    if (!inTauri() || !ready.current) return;
-    reportEgress(reportRef.current());
-  }, [tab, hosts, selected, egress.length]); // eslint-disable-line react-hooks/exhaustive-deps
-
+  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => reportEgress(null), []);
   return (
-    <div>
-      <PageHead
-        title="Egress"
-        sub={tab === "activity"
-          ? "Per-shed network egress decisions (allow/deny), newest first. View-only — egress policy is configured on the server."
-          : "Egress profiles on each server (config baseline + user-managed). View-only — manage them with `shed egress profile`."}
-        right={
-          <div className="flex items-center gap-[18px]">
-            {tab === "profiles" && <HeadAction icon={RefreshCw} label="Refresh" color="var(--shed-accent)" onClick={load} />}
-            <div className="w-[210px]">
-              <Segmented
-                options={[["activity", "Activity"], ["profiles", "Profiles"]]}
-                value={tab}
-                set={(v) => setTab(v as EgressTab)}
-              />
-            </div>
-          </div>
-        }
-      />
-      {tab === "activity" ? (
-        egress.length === 0 ? (
-          <Empty
-            icon={Globe}
-            title="No egress activity yet"
-            body="Enable egress control on a server and create a shed with --egress to see allow/deny decisions here."
-          />
-        ) : (
-          <div className={cn(cardCls, "overflow-hidden")}>
-            {egress.map((e, i) => (
-              <ActivityRow key={`${e.id}-${i}`} entry={e} divider={i > 0} />
-            ))}
-          </div>
-        )
-      ) : !loaded ? (
-        <div className="px-1 py-8 text-center text-[13px] text-shed-text-muted">Loading egress profiles…</div>
-      ) : rows.length === 0 ? (
-        errorRows.length === 0 ? (
-          <Empty
-            icon={Globe}
-            title="No egress profiles"
-            body="Define them in the server config or with `shed egress profile set`. Requires egress enabled on the server."
-          />
-        ) : (
-          // Surface host failures (egress disabled / unreachable) instead of a
-          // misleading "no profiles" when every fetch actually errored.
-          <div className={cn(cardCls, "flex flex-col gap-2 px-6 py-8 text-center")}>
-            <div className="text-[14px] font-semibold text-shed-text">Couldn't load egress profiles</div>
-            {errorRows.map((h) => (
-              <div key={h.host} className="break-words font-mono text-[12px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>
-                {h.host}: {h.error}
-              </div>
-            ))}
-          </div>
-        )
+    <div ref={root} className="mt-7" data-system-egress data-scroll-anchor="system-egress">
+      <div className="mb-3 pl-0.5 font-mono text-[11px] font-semibold uppercase leading-none tracking-[.09em] text-shed-text-muted">Egress profiles</div>
+      {!loaded ? (
+        <div className="px-1 py-4 text-[13px] text-shed-text-muted">Loading egress profiles…</div>
+      ) : hosts.length === 0 ? (
+        <div className="px-1 py-4 text-[13px] text-shed-text-muted">No servers are configured.</div>
       ) : (
-        <div className="flex items-start gap-4">
-          {/* list: profile name + source badge (+ host when multi-host, + error rows) */}
-          <div className={cn(cardCls, "w-[280px] flex-none overflow-hidden")}>
-            {rows.map((r, i) => {
-              const id = egressRowId(r);
-              const active = id === selected;
-              return (
-                <button
-                  key={id}
-                  onClick={() => setSelected(id)}
-                  className={cn("row-hover block w-full px-3.5 py-2.5 text-left", i > 0 && "border-t border-shed-border")}
-                  style={{ background: active ? "var(--shed-accent-subtle)" : "transparent" }}
-                >
-                  <span className="flex items-center gap-2">
-                    <span className="min-w-0 truncate text-[13.5px] font-semibold text-shed-text">{r.info.name}</span>
-                    <SourceBadge source={r.info.source} />
-                  </span>
-                  {multiHost && <span className="mt-0.5 block font-mono text-[10.5px] text-shed-text-muted">{r.host}</span>}
-                  <span className="mt-0.5 block truncate font-mono text-[11px] text-shed-text-muted">{egressSummary(r.info.profile)}</span>
-                </button>
-              );
-            })}
-            {errorRows.map((h) => (
-              <div key={h.host} className="break-words border-t border-shed-border px-3.5 py-2.5 font-mono text-[11px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>
-                {h.host}: {h.error}
-              </div>
-            ))}
-          </div>
-          {/* detail: the selected profile's rules */}
-          <div className={cn(cardCls, "min-w-0 flex-1 px-[19px] py-[17px]")}>
-            {selectedRow ? (
-              <div className="flex flex-col gap-4">
-                <div className="flex items-center gap-2.5">
-                  <span className="text-[18px] font-bold text-shed-text">{selectedRow.info.name}</span>
-                  <SourceBadge source={selectedRow.info.source} />
-                  {multiHost && <span className="font-mono text-[12px] text-shed-text-muted">{selectedRow.host}</span>}
+        <div className="flex flex-col gap-3">
+          {hosts.map((h) => (
+            <div key={h.host} className={cn(cardCls, "px-[19px] py-[15px]")} data-egress-host={h.host}>
+              <div className="mb-2 text-[14px] font-semibold text-shed-text">{h.host}</div>
+              {h.error ? (
+                <div className="break-words font-mono text-[12px] leading-relaxed" style={{ color: "var(--shed-danger)" }} data-egress-host-error={h.host}>{h.error}</div>
+              ) : h.profiles.length === 0 ? (
+                <div className="text-[12.5px] text-shed-text-muted">No egress profiles. Define them in the server config or with `shed egress profile set`.</div>
+              ) : (
+                <div className="flex flex-col gap-2.5">
+                  {h.profiles.map((p) => (
+                    <div key={`${p.source}/${p.name}`} data-egress-profile={`${h.host}/${p.name}`} data-egress-host={h.host}>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[13.5px] font-semibold text-shed-text" data-field="name">{p.name}</span>
+                        <span data-field="source" className="contents"><SourceBadge source={p.source} /></span>
+                        <span className="font-mono text-[11px] text-shed-text-muted">{profileSummary(p.profile)}</span>
+                      </div>
+                      {p.profile.mode && (
+                        <div className="mt-0.5 font-mono text-[12px] leading-relaxed text-shed-text-secondary">
+                          <span className="text-shed-text-muted">mode </span>
+                          <span data-field="mode">{p.profile.mode}</span>
+                        </div>
+                      )}
+                      {(["allow", "deny"] as const).map((k) =>
+                        (p.profile[k] ?? []).length ? (
+                          <div key={k} className="mt-0.5 font-mono text-[12px] leading-relaxed text-shed-text-secondary">
+                            <span className="text-shed-text-muted">{k} </span>
+                            <span data-field={k}>
+                              {(p.profile[k] ?? []).map((item, i) => (
+                                <span key={i}>{i > 0 && ", "}<span data-item>{item}</span></span>
+                              ))}
+                            </span>
+                          </div>
+                        ) : null,
+                      )}
+                      {p.profile.rule && (
+                        <div className="mt-0.5 break-words font-mono text-[12px] leading-relaxed text-shed-text-secondary">
+                          <span className="text-shed-text-muted">rule </span>
+                          <span data-field="rule">{p.profile.rule}</span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
-                <EgressRuleBlock label="allow" items={selectedRow.info.profile.allow ?? []} />
-                <EgressRuleBlock label="deny" items={selectedRow.info.profile.deny ?? []} />
-                {selectedRow.info.profile.mode && <EgressRuleBlock label="mode" items={[selectedRow.info.profile.mode]} />}
-                {selectedRow.info.profile.rule && <EgressRuleBlock label="rule" items={[selectedRow.info.profile.rule]} />}
-              </div>
-            ) : (
-              <div className="py-10 text-center text-[13px] text-shed-text-muted">Select a profile</div>
-            )}
-          </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
   );
 }
 
-/* ---- System pane ---------------------------------------------------------- */
 function SystemPane({ sheds }: { sheds: Shed[] }) {
   const [rows, setRows] = useState<HostDiskUsage[]>([]);
   // Generation guard (as in useUiBridge's fetchSheds): a slower earlier Refresh
   // can't resolve last and overwrite a newer fetch with stale rows.
+  const [egress, setEgress] = useState<HostEgressProfiles[]>([]);
+  const [egressLoaded, setEgressLoaded] = useState(false);
   const gen = useRef(0);
   const load = useCallback(() => {
     const g = ++gen.current;
     void fetchSystemDf().then((r) => {
       if (g === gen.current) setRows(r);
+    });
+    void fetchEgressProfiles().then((r) => {
+      if (g !== gen.current) return;
+      setEgress(r);
+      setEgressLoaded(true);
     });
   }, []);
   useEffect(() => load(), [load]);
@@ -1105,7 +1047,7 @@ function SystemPane({ sheds }: { sheds: Shed[] }) {
     <div>
       <PageHead
         title="System"
-        sub="Disk usage per host (images, sheds, snapshots, orphans)."
+        sub="Disk usage per server (images, sheds, snapshots, orphans), and each server's egress profiles."
         right={<HeadAction icon={RefreshCw} label="Refresh" color="var(--shed-accent)" onClick={load} />}
       />
       <div className="flex flex-col gap-3">
@@ -1144,6 +1086,7 @@ function SystemPane({ sheds }: { sheds: Shed[] }) {
           );
         })}
       </div>
+      <EgressProfilesSection hosts={egress} loaded={egressLoaded} />
     </div>
   );
 }
@@ -1638,12 +1581,6 @@ export default function App() {
       updateDraft(machine, (d) => settle(d, { ok: false, refusal: { code: f.code, message: f.message } }));
     }
   }, [refreshRc, updateDraft, setModal]);
-  // Live approval queue (drives the badge + the pane) + the delegated namespaces
-  // (a non-empty set = the credential broker handshook, so it's connected).
-  const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
-  const gateNs = useCoordinatorData<string[]>("connected-changed", fetchGateNamespaces, []);
-  const connected = gateNs.length > 0;
-  const pending = approvals.length;
   // The Agents sidebar badge count is derived from the shared session list — always
   // consistent with what the Agents pane renders.
   const agentCount = rcSessions.length;
@@ -1681,10 +1618,10 @@ export default function App() {
   // `badges.hosts` is the configured server count (`system_df`), not the
   // session-host list.
   // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds
-  // derived there, hosts/agents/pending from here), the sidebar's rendered rows,
+  // derived there, hosts/agents from here), the sidebar's rendered rows,
   // and the mode so the report is one complete snapshot, never a partial that
   // races the `main` slot / tray count.
-  const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending, {
+  const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, {
     servers: hostRows.map((h) => ({ name: h.host, reachable: h.usage != null })),
   });
 
@@ -1762,6 +1699,24 @@ export default function App() {
         }),
       );
       uns.push(await listen("confirm-roost-consent", () => confirmRoostBootstrap()));
+      // `ui.scroll_to {anchor}` (test mode): bring a section into view, so a
+      // screenshot can show what is below the fold.
+      uns.push(
+        await listen<{ anchor?: unknown; token?: unknown }>("scroll-to", (e) => {
+          const anchor = e.payload?.anchor;
+          if (typeof anchor !== "string") return;
+          const el = Array.from(document.querySelectorAll<HTMLElement>("[data-scroll-anchor]"))
+            .find((x) => x.dataset.scrollAnchor === anchor);
+          el?.scrollIntoView({ block: "start" });
+          // After a frame, so the scroll has been painted when the harness reads it.
+          requestAnimationFrame(() =>
+            reportScrolled({
+              anchor, token: e.payload?.token ?? null, found: !!el,
+              animations: document.getAnimations().length,
+            }),
+          );
+        }),
+      );
       uns.push(await listen("close-roost-consent", () => setRoostConsent(null)));
       uns.push(
         await listen<{ mode?: unknown }>("set-appearance", (e) => {
@@ -1797,13 +1752,11 @@ export default function App() {
         </div>
         {NAV.map(([id, label, Icon]) => {
           const active = pane === id;
-          const isApprovals = id === "approvals";
           const badge =
             id === "sheds" ? sheds.length
             : id === "agents" ? agentCount
             : id === "system" ? hosts.length
-            : isApprovals && pending ? pending : null;
-          const alert = isApprovals && pending > 0;
+            : null;
           return (
             <button
               key={id}
@@ -1819,7 +1772,7 @@ export default function App() {
               {badge != null && (
                 <span
                   className="rounded-full px-2 py-0.5 font-mono text-[11px] font-semibold leading-none"
-                  style={{ background: alert ? "var(--shed-deny-bg)" : "var(--shed-inset)", color: alert ? "var(--shed-danger)" : "var(--shed-text-secondary)" }}
+                  style={{ background: "var(--shed-inset)", color: "var(--shed-text-secondary)" }}
                 >
                   {badge}
                 </span>
@@ -1850,14 +1803,6 @@ export default function App() {
           <Box size={19} className="text-shed-text-secondary" />
           <span className="text-[14px] font-semibold text-shed-text">shed desktop</span>
           <div className="flex-1" />
-          {pending > 0 && (
-            <button onClick={() => setPane("approvals")} className="hlink inline-flex items-center gap-1.5 rounded-lg px-[9px] py-1.5 text-[13px] font-semibold" style={{ color: "var(--shed-danger)" }}>
-              <Shield size={15} /> {pending} pending
-            </button>
-          )}
-          <span className="inline-flex items-center gap-2 text-[13px] font-medium text-shed-text-secondary">
-            <Dot className="h-2 w-2" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> credential broker · {connected ? "connected" : "connecting…"}
-          </span>
           <button onClick={() => void openPreferences()} title="Preferences" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
             <Settings size={18} />
           </button>
@@ -1882,7 +1827,6 @@ export default function App() {
                 delivery={shedDelivery}
               />
             )}
-            {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && (
               <AgentsPane
                 sessions={rcSessions}
@@ -1908,7 +1852,6 @@ export default function App() {
               />
             )}
             {pane === "activity" && <ActivityPane />}
-            {pane === "egress" && <EgressPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}
           </div>
         </main>

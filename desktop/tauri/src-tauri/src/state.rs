@@ -135,7 +135,7 @@ mod tests {
     fn full(hosts: u64, rows: usize, servers: usize) -> Value {
         json!({
             "pane": "sheds",
-            "badges": { "sheds": rows, "agents": 0, "hosts": hosts, "pending": 0 },
+            "badges": { "sheds": rows, "agents": 0, "hosts": hosts },
             "sheds": vec![json!({ "name": "s" }); rows],
             "sidebar": { "servers": vec![json!({ "name": "h" }); servers], "machines": [] },
             "refresh_token": 0,

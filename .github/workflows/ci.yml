@@ -96,7 +96,6 @@ jobs:
             tauri:
               - 'desktop/tauri/**'
               - 'crates/**'
-              - 'desktop/packaging/polkit/**'
               # tauri.conf.json bundles launcher scripts from Resources/bin,
               # and the Linux legs run inside this Dockerfile's image
               - 'desktop/Resources/**'
@@ -678,7 +677,7 @@ jobs:
       - name: Install-validate in a clean container
         # apt-installs the .deb (resolving its runtime deps) in a fresh ubuntu:24.04
         # and asserts the binary launches under Xvfb + answers identify, the bundled
-        # shedctl drives it, and the polkit action is present.
+        # shedctl drives it, and no polkit action ships.
         run: |
           # shellcheck disable=SC2012  # controlled out/ dir, glob is safe
           ./linux/scripts/validate-deb.sh "$(ls -t out/shed-desktop_*.deb | head -1)"
@@ -774,9 +773,10 @@ jobs:
         with:
           shed-path: ${{ github.workspace }}
           out-dir: desktop/tools/shedtest/.craze-bin
-      # The Tauri crate's Linux-only approval-seam tests (polkit/libnotify gate is
-      # fail-closed: never Approved without a real auth). Docker (ubuntu:24.04),
-      # same image as the render gate below; no display needed.
+      # The Tauri crate's clippy and unit tests on Linux, where its Linux-only code
+      # (the autostart login item, the scrot screenshot) is compiled; tauri-lint
+      # and tauri-test run on the Mac leg only. Docker (ubuntu:24.04), same image
+      # as the render gate below; no display needed.
       #
       # SHED_CRAZE_BIN_DIR is the IN-CONTAINER path (the action exported the
       # host's), and SHED_CRAZE_REQUIRE=1 turns a skipped craze cell into a

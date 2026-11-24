@@ -66,7 +66,8 @@ pub struct DeliveryOptions {
     pub key_path: PathBuf,
     /// The `known_hosts` the SSH minter pins servers against.
     pub known_hosts: String,
-    /// Test mode: every server at this URL.
+    /// Test mode: every server at this URL, or its own override in it
+    /// ([`shed_app::mock_url_for`]).
     pub mock_base_url: Option<String>,
     /// Test mode: servers pointed at a closed port.
     pub unreachable_hosts: HashSet<String>,
@@ -463,7 +464,7 @@ fn targets_of(opts: &DeliveryOptions) -> Result<Vec<ServerTarget>, String> {
             t.url = if opts.unreachable_hosts.contains(&t.name) {
                 "http://127.0.0.1:1".into()
             } else {
-                mock.clone()
+                shed_app::mock_url_for(mock, &t.name)
             };
             t.tls_fingerprint = String::new();
             t.ssh_port = 0;

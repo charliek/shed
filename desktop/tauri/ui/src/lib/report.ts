@@ -24,7 +24,7 @@
  * stays free of everything `bridge.ts` pulls in. */
 
 /** The badge counts a report carries (`bridge.ts`'s `Badges`, structurally). */
-export type ReportBadges = { sheds: number; agents: number; hosts: number; pending: number };
+export type ReportBadges = { sheds: number; agents: number; hosts: number };
 
 /** The report the shell sends when it has built none yet: the pane and nothing
  *  else — no badges, no sheds, no sidebar rows, no modal, no host failures, and
@@ -47,7 +47,7 @@ export function seededReport<P>(pane: P): SeededReport<P> {
     sheds: [],
     refreshToken: 0,
     modal: null,
-    badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
+    badges: { sheds: 0, agents: 0, hosts: 0 },
     sidebar: { servers: [] },
     hostErrors: [],
   };

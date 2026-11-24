@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import broker_env
+import hermetic
 from client import IPCClient, ShedError, TauriClient, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -164,7 +164,6 @@ def _quit_subproc(target: str) -> None:
 
 
 def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Path, state_dir: Path,
-           broker: tuple[dict, "broker_env.BrokerInfo"] | None = None,
            unreachable_hosts: tuple[str, ...] = (),
            roost_sockets: dict[str, object] | None = None,
            ssh_bin: object | None = None,
@@ -175,9 +174,6 @@ def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Pat
 
     `state_dir` is the throwaway per-session dir; it doubles as HOME +
     XDG_RUNTIME_DIR (so ~/.shed and the runtime socket are both isolated).
-    `broker` is the app's hermetic credential broker, `(overrides, info)` from
-    `broker_env.write_hermetic_broker`; None writes one that serves no server
-    (see `subproc_env`).
     `unreachable_hosts` are config server NAMES the backend points at a closed
     port instead of the mock (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host
     override) so the per-host error row is exercisable e2e.
@@ -227,7 +223,7 @@ def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Pat
     """
     _cfg(target)
     _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
-                    runtime_dir=state_dir, broker=broker,
+                    runtime_dir=state_dir,
                     unreachable_hosts=unreachable_hosts,
                     roost_sockets=roost_sockets,
                     ssh_bin=ssh_bin, roost_jail=roost_jail,
@@ -237,7 +233,6 @@ def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Pat
 
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 config_path: Path,
-                broker: tuple[dict, "broker_env.BrokerInfo"] | None = None,
                 unreachable_hosts: tuple[str, ...] = (),
                 roost_sockets: dict[str, object] | None = None,
                 ssh_bin: object | None = None,
@@ -255,13 +250,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     pinned to the fixture, test mode + mock are set, and `<PREFIX>_SOCKET` and
     `<PREFIX>_LOG_FILE` are cleared so the defaults (under runtime_dir) are used.
 
-    `broker` is the launch's hermetic credential broker, `(overrides, info)` from
-    `broker_env` (the app brokers in process, for every server its broker file
-    names). None writes one into `runtime_dir` that serves NO server, so a launch
-    that needs no credentials never subscribes on a mock. Either way the
-    overrides are applied and `broker_env.validate` runs here, before the caller
-    spawns: a launch env that could reach the developer's agent, keys or
-    servers raises instead.
+    `mock_base_url` is one mock for every server, or `hermetic.mock_url`'s list
+    with per-server overrides. `hermetic.overrides` is applied and
+    `hermetic.validate` runs here, before the caller spawns: a launch env that
+    could reach the developer's agent, keys, proxies or servers raises instead.
 
     `craze_home` / `craze_runtime_dir` are craze's own `CRAZE_HOME` /
     `CRAZE_RUNTIME_DIR`, set-or-cleared so a developer's own values never reach
@@ -274,11 +266,9 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # The app's log file (#414) lands under here on Linux (macOS: under HOME's
     # ~/Library/Logs) — never in the developer's own ~/.local/state.
     env["XDG_STATE_HOME"] = str(runtime_dir / "state")
-    # The embedded broker's persistent state (its machine identity file and its
-    # credential store, plan 035 §3.4). Set explicitly: on Linux it otherwise follows
-    # `$XDG_DATA_HOME`, which an isolated HOME does not redirect, so a developer with
-    # that exported would have a hermetic run write `machine.json` into their real data
-    # dir (and two cells would share one identity). `broker_env` sets it again below.
+    # This machine's identity file and credential store (`shed_source::paths`), set
+    # again by `hermetic.overrides` below. Set explicitly: on Linux it otherwise
+    # follows `$XDG_DATA_HOME`, so two cells would share one identity.
     env["SHED_BROKER_STATE_DIR"] = str(runtime_dir / "broker-state")
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
@@ -304,7 +294,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #  * SOCKET — cleared unconditionally so the XDG default (under
     #    runtime_dir) is used.
     #  * DELIVERY_CONFIG — the delivery settings (`delivery.toml`, plan 039): set
-    #    by a cell that writes its own (inside runtime_dir, `broker_env.validate`
+    #    by a cell that writes its own (inside runtime_dir, `hermetic.validate`
     #    holds it there), else cleared so the default under the throwaway HOME is
     #    read and an inherited one never points a run at the developer's settings.
     #  * LOG_FILE — cleared unconditionally, like SOCKET (#414): an inherited
@@ -347,9 +337,8 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
             env[key] = str(value)
         else:
             env.pop(key, None)
-    overrides, info = broker or broker_env.write_hermetic_broker(runtime_dir, {})
-    broker_env.apply(env, overrides)
-    broker_env.validate(env, info)
+    hermetic.apply(env, hermetic.overrides(runtime_dir))
+    hermetic.validate(env, runtime_dir)
     return env
 
 
@@ -383,7 +372,7 @@ def linux_autostart_dir(runtime_dir: Path) -> Path:
 
 
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
-                    runtime_dir: Path, broker: tuple[dict, "broker_env.BrokerInfo"] | None = None,
+                    runtime_dir: Path,
                     unreachable_hosts: tuple[str, ...] = (),
                     roost_sockets: dict[str, object] | None = None,
                     ssh_bin: object | None = None,
@@ -396,7 +385,7 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
             f"{target} binary not found at {cfg.binary}; build it first "
             f"(tauri: `make tauri-build`).")
     env = subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
-                      config_path=config_path, broker=broker,
+                      config_path=config_path,
                       unreachable_hosts=unreachable_hosts,
                       roost_sockets=roost_sockets,
                       ssh_bin=ssh_bin, roost_jail=roost_jail,

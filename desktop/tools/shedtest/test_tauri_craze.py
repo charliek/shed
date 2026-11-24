@@ -646,7 +646,7 @@ class Bridge:
 def _launch(mock, *, runtime_dir: Path, ssh_bin: Path | None = None,
             config: Path = FIXTURES / "config-craze-shed.yaml"):
     """An independent app instance: its own HOME/XDG_RUNTIME_DIR, its own
-    broker (which serves no server), the session app untouched. Sheds are
+    machine identity, the session app untouched. Sheds are
     reached over `ssh_bin`; there is no local craze seam and no roost-socket
     map (a non-empty map would stop every shed from spawning ssh)."""
     cfg = ui._SUBPROC["tauri"]
