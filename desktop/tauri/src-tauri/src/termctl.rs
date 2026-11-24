@@ -68,7 +68,11 @@ impl TerminalCtl {
     }
 
     /// Persist the terminal preference.
-    pub fn prefs_set_terminal(&self, preset: &str, template: Option<String>) -> Result<Value, TermError> {
+    pub fn prefs_set_terminal(
+        &self,
+        preset: &str,
+        template: Option<String>,
+    ) -> Result<Value, TermError> {
         self.prefs.set_terminal(parse_preset(preset)?, template);
         Ok(json!({}))
     }
@@ -87,8 +91,13 @@ impl TerminalCtl {
             .terminal_preview(host, shed, session)
             .map_err(|e| err("action_failed", e.to_string()))?;
         let (preset, template) = self.resolve_pref(preset, template)?;
-        let inv =
-            terminal::resolve_launch(preset, &cmd, shed, template.as_deref(), self.scripts_dir.as_deref());
+        let inv = terminal::resolve_launch(
+            preset,
+            &cmd,
+            shed,
+            template.as_deref(),
+            self.scripts_dir.as_deref(),
+        );
         Ok(json!({
             "argv": cmd.argv,
             "command": cmd.command,
@@ -112,8 +121,13 @@ impl TerminalCtl {
             .terminal_preview(host, shed, session)
             .map_err(|e| err("action_failed", e.to_string()))?;
         let (preset, template) = self.resolve_pref(preset, template)?;
-        let inv =
-            terminal::resolve_launch(preset, &cmd, shed, template.as_deref(), self.scripts_dir.as_deref());
+        let inv = terminal::resolve_launch(
+            preset,
+            &cmd,
+            shed,
+            template.as_deref(),
+            self.scripts_dir.as_deref(),
+        );
         self.spawn(&inv)?;
         Ok(json!({ "command": cmd.command }))
     }

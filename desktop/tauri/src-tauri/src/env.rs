@@ -9,9 +9,10 @@ use std::path::PathBuf;
 pub struct Env {
     /// `SHED_TAURI_TEST_MODE=1` — unlocks test-only behavior + echoed by `identify`.
     pub test_mode: bool,
-    /// In test mode, every host client is pointed at this single mock base URL
-    /// (`SHED_TAURI_MOCK_BASE_URL`). Echoed by `identify` so the harness can fail
-    /// fast if a run isn't actually hermetic.
+    /// In test mode, every host client is pointed at this mock base URL
+    /// (`SHED_TAURI_MOCK_BASE_URL`): one URL for every server, or a default followed
+    /// by `,<server>=<url>` overrides (`shed_app::mock_url_for`). Echoed by `identify`
+    /// so the harness can fail fast if a run isn't actually hermetic.
     pub mock_base_url: Option<String>,
     /// TEST-ONLY per-host down simulation: the comma-separated server NAMES from
     /// `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (parsed only in test mode) that the
@@ -82,13 +83,9 @@ pub struct Env {
     /// never read outside test mode — and never read in a release build either,
     /// for the reason on [`exec_seam`].
     pub roost_jail_fs_root: bool,
-    /// The `extensions.yaml` the embedded broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
-    /// else `~/.config/shed/extensions.yaml`). The harness overrides it to keep a run
-    /// hermetic.
-    pub broker_extensions_path: PathBuf,
     /// The delivery settings (plan 039 §3.8, `delivery.toml`): `SHED_TAURI_DELIVERY_CONFIG`,
-    /// else `~/.config/shed/delivery.toml`, beside `extensions.yaml`. The harness overrides
-    /// it, as it does the broker's config, to keep a run hermetic.
+    /// else `~/.config/shed/delivery.toml`. The harness overrides it to keep a run
+    /// hermetic.
     pub delivery_settings_path: PathBuf,
     /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
     /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
@@ -96,8 +93,8 @@ pub struct Env {
     /// `None` when nothing resolves one (file logging off). Not a test seam: it only
     /// moves where this process writes its own log.
     pub log_file: Option<PathBuf>,
-    /// `SHED_TAURI_LOG=debug`: DEBUG for the shed crates' `tracing` events and the
-    /// embedded broker's quiet tier, and roost-ipc's events at all — off without it,
+    /// `SHED_TAURI_LOG=debug`: DEBUG for the shed crates' `tracing` events, and
+    /// roost-ipc's events at all — off without it,
     /// since they carry ssh's own stderr (everything else stays at INFO).
     pub log_debug: bool,
 }
@@ -177,7 +174,9 @@ impl Env {
         }
         Self {
             test_mode,
-            mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
+            // Test mode only, like every mock seam: outside it a stray variable never
+            // redirects a client (either form: one URL, or per-server overrides).
+            mock_base_url: test_only(test_mode, var("SHED_TAURI_MOCK_BASE_URL")),
             mock_unreachable_hosts,
             roost_sockets,
             ssh_bin: ssh_bin.map(PathBuf::from),
@@ -186,9 +185,6 @@ impl Env {
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_socket_path),
-            broker_extensions_path: var("SHED_TAURI_EXTENSIONS_CONFIG")
-                .map(PathBuf::from)
-                .unwrap_or_else(default_extensions_path),
             delivery_settings_path: var("SHED_TAURI_DELIVERY_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_delivery_path),
@@ -297,16 +293,6 @@ fn exec_seam<T>(
 fn jail_flag(test_mode: bool, release_build: bool, raw: Option<&str>) -> (bool, Option<String>) {
     let (value, refusal) = exec_seam(test_mode, release_build, "SHED_TAURI_ROOST_JAIL", raw);
     (value == Some("1"), refusal)
-}
-
-/// The embedded broker's `extensions.yaml` (`~/.config/shed/extensions.yaml`). Pre-expanded off `$HOME` so the broker's own
-/// tilde-expansion is a no-op; a missing file is not fatal here (the bridge synthesizes
-/// the fresh-install default).
-fn default_extensions_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".config/shed/extensions.yaml")
 }
 
 fn default_delivery_path() -> PathBuf {

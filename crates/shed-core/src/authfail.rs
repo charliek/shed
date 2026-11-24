@@ -65,8 +65,8 @@
 //!    restart or a network blip produces, and a false positive costs a real
 //!    SSH mint (which, on desktop, can raise a Touch ID prompt). It is
 //!    instead recognized by [`is_connection_lost_message`] as "the request
-//!    was never dispatched", which `http.rs` (and `shed-broker`'s bus)
-//!    answer with ONE plain re-send on a fresh connection — safe because
+//!    was never dispatched", which `http.rs` (and the retired broker's bus)
+//!    answered with ONE plain re-send on a fresh connection — safe because
 //!    this rendering specifically proves the request never reached the wire.
 //!    **The same hyper `Kind::Canceled` category also renders as**
 //!    `operation was canceled: connection closed` (`client/dispatch.rs`,
@@ -202,7 +202,7 @@ fn matches_auth_alert(tail: &str) -> bool {
 /// the bare "operation was canceled" description (as an earlier version of
 /// this constant did) would make [`is_connection_lost_message`]'s callers
 /// re-send a request that could have reached the peer — for
-/// `shed-broker/src/bus.rs`'s POST of a plugin-listener response, a real
+/// the plugin bus's POST of a listener response, a real
 /// duplicate-delivery bug, not a cosmetic one. Do not widen this past what a
 /// caller may safely act on twice; a test that needs to recognize BOTH
 /// renderings (because IT can prove neither ever reached its own server —
@@ -307,7 +307,7 @@ mod tests {
     /// handshake itself is what the server rejected, so no request body was
     /// ever accepted regardless of which rendering comes back — which is
     /// what makes retrying on both safe HERE without proving anything about
-    /// `http.rs` or `shed-broker`'s bus.
+    /// `http.rs`.
     fn is_ambiguous_canceled(msg: &str) -> bool {
         // Exactly the two renderings finding 6 documents, and no wider. A bare
         // `contains("operation was canceled")` would swallow every future
@@ -489,9 +489,7 @@ mod tests {
     /// alongside a concurrent `cargo build --release` loop on a sizeable crate
     /// (originally `-p shed-gx`, see `load-run.txt` for that exact loop; `shed-gx`
     /// retired in plan 025 C1, shed#390, so a re-run picks whatever crate is
-    /// currently heaviest to compile in this workspace — `shed-broker`, with its
-    /// `aws-sdk-*`/`notify`/`saphyr-parser` leaf deps, is the obvious one today —
-    /// the point is sustained CPU starvation during the loopback handshake, not
+    /// currently heaviest to compile in this workspace — the point is sustained CPU starvation during the loopback handshake, not
     /// which crate in particular produces it) whenever this module's dependencies
     /// bump enough that the measured rate might have moved, and update
     /// [`AMBIGUOUS_RETRY_ATTEMPTS`]'s doc with the new numbers. Every attempt is

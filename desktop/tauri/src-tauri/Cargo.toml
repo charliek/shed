@@ -27,9 +27,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 # The shared protocol + app-logic crates (cross-workspace path deps — this links
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
-# `broker` only: the embedded credential broker. This crate never enables any
-# other shed-app feature.
-shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
+shed-app = { path = "../../../crates/shed-app" }
 # Toolkit-free shed-only desktop runtime (plan 038): hosts, craze, lanes,
 # slash, and the orderly shutdown. This crate is the Tauri adapter over it.
 shed-desktop-core = { path = "../../../crates/shed-desktop-core" }
@@ -45,15 +43,12 @@ shed-craze = { path = "../../../crates/shed-craze" }
 # as shed-craze. No direct `roost-ipc` — shed-roost is the only crate that
 # names those wire types.
 shed-roost = { path = "../../../crates/shed-roost" }
-# "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
 # "signal" backs the orderly shutdown's signal thread (plan 026 §3.3).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 libc = "0.2"
-# For the prod FailClosedGate's async AuthGate impl (real polkit gate = B6).
-async-trait = "0.1"
 # Advisory file lock for the single-instance guard (flock, keyed to the socket
 # dir — hermetic, unlike an identifier-scoped plugin).
 fs2 = "0.4"
@@ -80,23 +75,10 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
-# The Linux notifier posts + withdraws approval banners over the session bus
-# directly (freedesktop Notifications), so a resolved request's --urgency=critical
-# banner (which never auto-expires) is closed precisely — not left lingering.
-# Linux-only: the mac build posts via osascript, so zbus never enters the mac dep
-# tree. default-features=false + "tokio" routes zbus's I/O through the app's tokio
-# runtime instead of spinning up a second (async-io) reactor.
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-
-# The macOS Touch-ID gate (B3): LAContext.evaluatePolicy via objc2 — pure Rust, no
-# Swift toolchain. Target-gated to macOS ONLY so the Linux/WebKitGTK render gate
-# never pulls LocalAuthentication (objc2 0.6.4 is already transitively in the lock).
+# macOS-only: objc2 for the AppKit glue the updater and the IPC code use (pure Rust,
+# no Swift toolchain). Target-gated so the Linux/WebKitGTK build never pulls it.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-block2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
-objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 # NSApp.activate before a Sparkle check (updater.rs) — the crate's own Gap 1: on a
 # tray/accessory app the Sparkle window can appear behind/unfocused. objc2-app-kit
 # 0.3 is already transitively in the lock (the sparkle-updater crate pulls it); we

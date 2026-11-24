@@ -44,12 +44,6 @@ env_file: ~/.shed/env
 
 log_level: debug
 
-extensions:
-  enabled:
-    - ssh-agent
-    - aws-credentials
-    - docker-credentials
-
 default_backend: vz
 
 vz:
@@ -64,7 +58,6 @@ vz:
   default_image: ghcr.io/charliek/shed-vz-full:v0.5.9
   image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.9
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.9
     full: ghcr.io/charliek/shed-vz-full:v0.5.9
   pull_policy: missing
   

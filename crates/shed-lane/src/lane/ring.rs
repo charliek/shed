@@ -1,6 +1,6 @@
 //! The bounded feed ring — **the owner of `seq`**.
 //!
-//! Ported from the rc hub's `MessageRing` (`shed-broker/src/rc_hub/messages.rs`,
+//! Ported from the rc hub's `MessageRing` (the retired broker's `rc_hub/messages.rs`,
 //! itself `hub_messages.go`'s `messageRing`): item + byte caps with drop-oldest,
 //! field sanitization and text trimming on the way in, and a monotonic `seq`
 //! assigned at [`MessageRing::append`]. It moved here when a second adapter

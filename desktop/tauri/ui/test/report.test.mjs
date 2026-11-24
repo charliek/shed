@@ -21,7 +21,7 @@ function built(over = {}) {
     sheds: [{ name: "hello-world", host: "mock", status: "running" }],
     refreshToken: 3,
     modal: null,
-    badges: { sheds: 1, agents: 0, hosts: 2, pending: 0 },
+    badges: { sheds: 1, agents: 0, hosts: 2 },
     sidebar: {
       servers: [
         { name: "mock", reachable: true },
@@ -41,7 +41,7 @@ test("with no report built yet, the initial report is the seed for the current p
     sheds: [],
     refreshToken: 0,
     modal: null,
-    badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
+    badges: { sheds: 0, agents: 0, hosts: 0 },
     sidebar: { servers: [] },
     hostErrors: [],
   });
@@ -72,7 +72,7 @@ test("a built report that really is empty is still re-sent, not replaced by the 
   // modal, the mode and the echoed token.
   const latest = built({
     sheds: [],
-    badges: { sheds: 0, agents: 0, hosts: 0, pending: 0 },
+    badges: { sheds: 0, agents: 0, hosts: 0 },
     sidebar: { servers: [] },
     hostErrors: [],
     modal: "create",

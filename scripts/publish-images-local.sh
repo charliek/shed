@@ -23,21 +23,16 @@
 #        shed ssh-config publish-test > /tmp/publish-test-ssh
 #        ssh -F /tmp/publish-test-ssh shed-publish-test
 #
-#   3. Inside the shed, neutralise the docker credential helper. The
-#      shed-agent installs a credsStore that talks to the host over
-#      vsock; inside a validation shed there is no host to answer, so
-#      docker pull/push hangs:
+#   3. Only in a shed built from an image older than v0.11: neutralise
+#      the docker credential helper those images configured. It talks to
+#      the host over vsock; inside a validation shed there is no host to
+#      answer, so docker pull/push hangs:
 #        echo '{}' > "$HOME/.docker/config.json"
 #
 #   4. Cross-build the in-VM binaries on the host (or get them onto the
-#      shed however you like) and copy the project tree in. The guest
-#      extension binaries + /etc overlay are staged by the shared
-#      scripts/stage-guest-binaries.sh (into vz/shed-ext-*, vz/docker-
-#      credential-shed, vz/ext-etc/), the same script the rootfs builds
-#      and the publish workflow use:
+#      shed however you like) and copy the project tree in:
 #        GOOS=linux GOARCH=arm64 go build -o vz/shed-agent     ./cmd/shed-agent
 #        GOOS=linux GOARCH=arm64 go build -o vz/shed-firstboot ./cmd/shed-firstboot
-#        ./scripts/stage-guest-binaries.sh vz arm64
 #        # On the host, scp the project tree and the linux/arm64 shed CLI:
 #        scp -F /tmp/publish-test-ssh -r . shed-publish-test:/home/shed/work
 #        GOOS=linux GOARCH=arm64 go build -o /tmp/shed ./cmd/shed
@@ -52,7 +47,7 @@
 #      Inputs (override via env):
 #        VERSION       (default: v0.0.0-local)
 #        REGISTRY_HOST (default: localhost:5050)
-#        VARIANTS      (default: "base extensions full")
+#        VARIANTS      (default: "base full")
 #        WORK_DIR      (default: current dir; must contain vz/ initramfs/
 #                       scripts/build-initramfs.sh)
 #        STORE_DIR     (default: /tmp/publish-images-local-store)
@@ -67,7 +62,7 @@
 #     docker-container driver runs in its own netns and cannot.
 #   * Starts a registry:2 container with --network host on :5050.
 #   * Builds the shed-overlay initramfs via scripts/build-initramfs.sh.
-#   * For each variant (base, extensions, full):
+#   * For each variant (base, full):
 #       - shed image build  (writes OCI layout + manifest with
 #                            io.shed.source-ref annotation)
 #       - shed image push   (streams the OCI layout to the registry)
@@ -89,7 +84,7 @@ set -euo pipefail
 
 VERSION="${VERSION:-v0.0.0-local}"
 REGISTRY_HOST="${REGISTRY_HOST:-localhost:5050}"
-VARIANTS="${VARIANTS:-base extensions full}"
+VARIANTS="${VARIANTS:-base full}"
 WORK_DIR="${WORK_DIR:-$(pwd)}"
 STORE_DIR="${STORE_DIR:-/tmp/publish-images-local-store}"
 OUT_DIR="${OUT_DIR:-/tmp/publish-images-local}"
@@ -192,11 +187,6 @@ command -v "${SHED_BIN}" >/dev/null || fail "shed binary missing at ${SHED_BIN}"
 [ -x "${WORK_DIR}/scripts/build-initramfs.sh" ]  || fail "build-initramfs.sh missing/not executable"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-agent" ]     || fail "${WORK_DIR}/${BACKEND_DIR}/shed-agent missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot" ] || fail "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
-# Guest extension binaries + /etc overlay staged by scripts/stage-guest-binaries.sh.
-for guest_bin in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed; do
-  [ -f "${WORK_DIR}/${BACKEND_DIR}/${guest_bin}" ] || fail "${WORK_DIR}/${BACKEND_DIR}/${guest_bin} missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"
-done
-[ -d "${WORK_DIR}/${BACKEND_DIR}/ext-etc" ]        || fail "${WORK_DIR}/${BACKEND_DIR}/ext-etc missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"
 
 mkdir -p "${OUT_DIR}"
 

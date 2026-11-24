@@ -20,7 +20,7 @@
 set -uo pipefail
 
 phase=""
-variant=extensions
+variant=full
 pins=""
 link_key=""
 bake_user=""
@@ -36,6 +36,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "${phase}" in live|sealed) ;; *) echo "verify: --phase must be live or sealed" >&2; exit 2 ;; esac
+case "${variant}" in base|full) ;; *) echo "verify: --variant must be base or full" >&2; exit 2 ;; esac
 [ "$(id -u)" -eq 0 ] || { echo "verify: must run as root" >&2; exit 2; }
 
 failures=0
@@ -186,23 +187,26 @@ verify_live() {
   for tool in git gh tmux jq curl rg nvim; do
     check "${tool} is installed" command -v "${tool}"
   done
-  if [ "${variant}" = extensions ]; then
-    check "strix is installed" command -v strix
-    check "prox is installed" command -v prox
-    check "parcel is installed" command -v parcel
-    check "envsecrets is installed" command -v envsecrets
-    if [ -n "${pins}" ]; then
-      local rv rp cv
-      rv="$(sed -nE 's/^ROOST_SESSION_VERSION=([0-9.]+)$/\1/p' "${pins}")"
-      rp="$(sed -nE 's/^ROOST_SESSION_PROTOCOL=([0-9]+)$/\1/p' "${pins}")"
-      cv="$(sed -nE 's/^CRAZE_VERSION=([0-9.]+)$/\1/p' "${pins}")"
-      check "roost-session is ${rv}/protocol ${rp}" bash -c \
-        "/usr/bin/roost-session identify | jq -e '.session_protocol == ${rp} and .app_version == \"${rv}\"'"
-      expect "craze version" "${cv}" "$(/usr/bin/craze --version 2>&1)"
-    else
-      fail "roost-session and craze pins" "--pins not given"
-    fi
+  # base and full: roost-session and craze at their pins.
+  if [ -n "${pins}" ]; then
+    local rv rp cv
+    rv="$(sed -nE 's/^ROOST_SESSION_VERSION=([0-9.]+)$/\1/p' "${pins}")"
+    rp="$(sed -nE 's/^ROOST_SESSION_PROTOCOL=([0-9]+)$/\1/p' "${pins}")"
+    cv="$(sed -nE 's/^CRAZE_VERSION=([0-9.]+)$/\1/p' "${pins}")"
+    check "roost-session is ${rv}/protocol ${rp}" bash -c \
+      "/usr/bin/roost-session identify | jq -e '.session_protocol == ${rp} and .app_version == \"${rv}\"'"
+    expect "craze version" "${cv}" "$(/usr/bin/craze --version 2>&1)"
+  else
+    fail "roost-session and craze pins" "--pins not given"
   fi
+  # full adds the stridelabs apt tools; base has none of them.
+  for tool in strix prox parcel envsecrets; do
+    if [ "${variant}" = full ]; then
+      check "${tool} is installed" command -v "${tool}"
+    else
+      check "${tool} is not installed (base)" bash -c "! command -v ${tool}"
+    fi
+  done
 }
 
 verify_sealed() {

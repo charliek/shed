@@ -40,18 +40,20 @@ steps.
 
 | Variant | Description |
 |---------|-------------|
-| `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, and the shed-agent. No Docker, no coding agents, no language runtimes. |
-| `extensions` | `base` + [credential brokering](extensions.md) (SSH agent forwarding, AWS STS proxy, Docker credential helper) plus `strix` and `prox` from the stridelabs apt repo. No Docker daemon, no coding agents pinned — start here for custom images. |
-| `full` | `extensions` + Docker CE (with `docker compose`), `parcel` and `envsecrets` (from the stridelabs apt repo), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
+| `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, the shed-agent, [`roost-session`](#roost-session-and-craze) and [`craze`](#roost-session-and-craze). No Docker, no coding agents, no language runtimes. Start here for custom images. |
+| `full` | `base` + Docker CE (with `docker compose`), `strix`, `prox`, `parcel` and `envsecrets` (from the stridelabs apt repo), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
 
-Each variant inherits from the one above it as a discrete OCI layer, so
-`shed image pull shed-vz-full` reuses the `base` and `extensions` layers
-already cached locally.
+`full` inherits from `base` as a discrete OCI layer, so
+`shed image pull shed-vz-full` reuses the `base` layers already cached locally.
+
+!!! note "The `extensions` variant is gone"
+    Earlier releases published a third variant, `extensions`, that carried the SSH agent,
+    AWS and Docker credential helpers. Those helpers were removed in v0.11 (credentials now
+    arrive by [delivery](delivery.md)), and so was the variant: `--image extensions` is an
+    unknown alias, and the `extensions` images are no longer built. See the [v0.10 to v0.11 upgrade guide](../upgrades/v0.10-to-v0.11.md).
 
 !!! note "Docker is only in `full`"
-    The Docker daemon ships **only** in the `full` variant. `base` and
-    `extensions` install the `docker-credential-shed` helper config but not
-    the daemon. Provisioning hooks that use `docker` / `docker compose`
+    The Docker daemon ships **only** in the `full` variant. Provisioning hooks that use `docker` / `docker compose`
     (Testcontainers, service stacks) therefore require the `full` image.
     `full` does **not** ship a system Node.js or Python — install language
     runtimes per-project (e.g. `uv` provisions Python, `bun` is built in).
@@ -61,31 +63,19 @@ already cached locally.
 
 The `full` variant installs `parcel` and `envsecrets` from the stridelabs apt repository, unpinned like `strix` and `prox`; a broken release of either can break an image build. `envsecrets` used to be installed through mise and now comes from apt (mise itself stays). They are what [credential delivery](delivery.md) gives logins to: the `envsecrets-login` provider delivers an envsecrets config and passphrase so the shed pulls secrets for itself. A shed built from an image published before this change has neither tool until it is recreated from a newer image; the agent in such an image also predates delivery protocol 2, so delivery ends as `image_too_old`.
 
-The remote backend's cloud image installs the same two tools beside `strix` and `prox`.
+The remote backend's cloud image has the same two variants: `base` (with roost-session and craze) and `full` (plus the four apt tools), `full` the default. Its image family is named for the variant and architecture, `shed-<variant>-<arch>` (for example `shed-full-amd64`).
 
-### `extensions` variant
+### roost-session and craze
 
-The `extensions` variant adds [credential brokering](extensions.md) on top of `base`. It includes:
+Both variants include:
 
-- **`shed-ssh-agent`** — SSH agent proxy that forwards key operations to your Mac (private keys never enter the VM).
-- **`shed-aws-proxy`** — AWS credential proxy that vends short-lived STS tokens via the host.
-- **`docker-credential-shed`** — Docker credential helper that delegates registry authentication to the host. Guest Docker is pre-configured with `{"credsStore": "shed"}`.
-- **`shed-ext`** — CLI for checking extension connectivity and health.
-- **`strix`** — TUI for staging and reviewing diffs, from the stridelabs apt repo.
-- **`prox`** — process manager with an HTTP API and TUI, from the stridelabs apt repo.
 - **`/usr/bin/roost-session`** — the headless [roost](https://github.com/charliek/roost) daemon, roost v0.0.26 (session protocol 6, the last roost release that speaks it), baked from the standalone release asset and checksum-verified at build time with a build-time `identify` assert. No systemd unit is enabled — `shed attach`, the desktop app, and the phone app start it on first contact. Kept in lockstep with `crates/shed-roost/src/bootstrap/source.rs`'s `RELEASE_PIN` by `make check-roost-pin`.
 - **`/usr/bin/craze`** — the [craze](https://github.com/charliek/craze) agent-lane CLI the desktop and phone drive (the desktop's create sheet starts a remote hub), craze v0.4.1, baked from the standalone release asset (a tarball holding the bare `craze` binary) and checksum-verified at build time with a `craze --version` equality assert. No systemd unit is enabled — the desktop's create sheet starts a remote hub. The version and per-architecture digests are pinned in-tree, never fetched: a `.sha256` from the same mutable release proves transport, not provenance. Kept in lockstep with `craze-pin.env`'s `CRAZE_RELEASE` by `make check-craze-pin`. A shed keeps the craze its image baked; recreate it to pick up a newer bake.
-- Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables.
 
-**When to use it:** as a base for organization-specific images, or when you
-want credential brokering without the full coding-agent set.
-
-**Prerequisite:** the shed desktop app on your machine, which is the credential broker. See the
-[macOS quickstart](../getting-started/macos-quickstart.md) for setup and the
-[Extensions configuration reference](../extensions/configuration.md).
+**When to use `base`:** as the starting point for organization-specific images, or when you want a small shed and will bring your own tools.
 
 ```bash
-shed create mydev --image extensions
+shed create mydev --image base
 ```
 
 ## Published Images
@@ -95,10 +85,8 @@ Pre-built images for each variant are published per release to `ghcr.io`:
 | Image | Platform | Tag Format |
 |-------|----------|------------|
 | `ghcr.io/charliek/shed-vz-base` | linux/arm64 | `:vX.Y.Z` |
-| `ghcr.io/charliek/shed-vz-extensions` | linux/arm64 | `:vX.Y.Z` |
 | `ghcr.io/charliek/shed-vz-full` | linux/arm64 | `:vX.Y.Z` |
 | `ghcr.io/charliek/shed-fc-base` | linux/amd64 | `:vX.Y.Z` |
-| `ghcr.io/charliek/shed-fc-extensions` | linux/amd64 | `:vX.Y.Z` |
 | `ghcr.io/charliek/shed-fc-full` | linux/amd64 | `:vX.Y.Z` |
 
 Each release publishes a `:vX.Y.Z` tag matching the `shed` version (e.g.
@@ -197,8 +185,8 @@ LAYER  DIGEST                                                                   
 The `CREATED BY` column is the corresponding history entry from the OCI
 config — most often the `Dockerfile` line that produced the layer. The
 big shared layers — `ubuntu:24.04` (ordinal 1) and the APT install
-(ordinal 2) — appear with the same digest in `base`, `extensions`, and
-`full`, so the underlying tar.gz blobs cost once across all three
+(ordinal 2) — appear with the same digest in `base` and
+`full`, so the underlying tar.gz blobs cost once across both
 variants.
 
 ### Known build quirks
@@ -262,10 +250,9 @@ the manifest digest in the local store. That means a tag pushed from one
 host and pulled by another resolves to the same digest, and `shed image
 inspect` shows identical manifest annotations on both sides.
 
-Registry authentication uses your Docker credential helper (e.g. the
-Docker credential proxy extension when the `extensions` variant is
-running). For host-side `shed image push` invocations, the regular
-`~/.docker/config.json` credential resolution applies.
+Registry authentication for a host-side `shed image push` uses the regular
+`~/.docker/config.json` credential resolution of the machine running the
+command.
 
 The upload streams the layer blobs straight from disk, so they must all
 be present. An image pulled **boot-only** has none — push fails a layer
@@ -333,7 +320,7 @@ Every shed-built manifest carries these annotations (visible via
 
 | Annotation | Description |
 |---|---|
-| `io.shed.variant` | One of `base`, `extensions`, `full`, or a custom string for derivations. |
+| `io.shed.variant` | One of `base`, `full`, or a custom string for derivations. |
 | `io.shed.source-ref` | The Docker / OCI reference the image was pulled or built from. |
 | `io.shed.kernel.digest` | Digest of the kernel blob embedded in the image. |
 | `io.shed.initrd.digest` | Digest of the initrd (shed-built initramfs) blob. |
@@ -377,7 +364,7 @@ Panic messages from the initramfs are numbered for triage:
 Shed pulls published OCI references registry-direct on first `shed create`
 (no Docker daemon needed for pull). The rootfs images are published in
 lockstep with each release — `ghcr.io/charliek/shed-<backend>-{base,
-extensions,full}:vX.Y.Z`.
+full}:vX.Y.Z`.
 
 A released `shed-server` resolves them from **its own version**, so the
 common config names no image at all and never carries a tag to bump:
@@ -488,7 +475,6 @@ pin versioned tags so a cache hit is always the right image.
 
 ```bash
 shed create myproject --image full        # batteries-included
-shed create myproject --image extensions  # credential brokering, no agents
 shed create tools --image base            # minimal
 shed create app --image ghcr.io/you/custom:v1   # any ref directly
 ```
@@ -508,12 +494,12 @@ shed image ls
 ## Creating Custom Images
 
 The easiest path is a Dockerfile that extends a published variant. Most
-custom images start from `extensions` — you get credential brokering for
-free, no coding agents are pre-pinned, and your layer sits on top of a
-stable shed-managed base.
+custom images start from `base` — roost-session and craze are in place, no
+coding agents are pre-pinned, and your layer sits on top of a stable
+shed-managed base.
 
 ```dockerfile
-FROM ghcr.io/charliek/shed-vz-extensions:vX.Y.Z
+FROM ghcr.io/charliek/shed-vz-base:vX.Y.Z
 
 USER shed
 ENV PATH="/home/shed/.local/bin:${PATH}"

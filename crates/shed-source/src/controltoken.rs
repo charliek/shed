@@ -330,3 +330,7 @@ impl ControlCredentialMinter for ControlTokenProvider {
 /// The `auth_mode` literals carried on the wire (mirror `sdk.AuthModeToken`/`MTLS`).
 const AUTH_MODE_TOKEN: &str = "token";
 const AUTH_MODE_MTLS: &str = "mtls";
+
+#[cfg(test)]
+#[path = "controltoken_tests.rs"]
+mod tests;

@@ -1,9 +1,9 @@
-# shed-ext-rc (retired)
+# RC helper (retired)
 
-`shed-ext-rc` was the guest-side helper for **remote-control (RC) sessions**: detached
+The guest RC helper was the guest-side helper for **remote-control (RC) sessions**: detached
 `tmux` sessions (`rc-<slug>`) that ran an agent (`claude`, `codex`, `cursor-agent`,
 `opencode`) or a shell inside a shed, plus a resident **RC activity hub**
-(`shed-ext-rc serve`) that derived live status for them.
+(its `serve` verb) that derived live status for them.
 
 **It is gone.** Plan 022 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328))
 retired the whole RC-hub stack this binary was part of: the guest binary no longer ships
@@ -12,7 +12,7 @@ an inert copy that nothing calls any more — nothing invokes it, and it is not 
 cleaned up); the server's RC routes, enrichment, and feature tokens are deleted;
 `shed plan` and the Remote-Control mode of `shed attach` are removed, not rebased; the
 desktop app's hub half of the Agents pane is gone; and the Rust hub (`crates/shed-rc-engine`,
-`shed-broker`'s `rc_hub` module, the host-agent's `rc-hub` role) is deleted with it. See the
+the broker's `rc_hub` module, the host-agent's `rc-hub` role) is deleted with it. See the
 [v0.8.2 → v0.9.0 upgrade note](../upgrades/v0.8.2-to-v0.9.0.md) for what that means for an
 existing shed and desktop install.
 
@@ -23,7 +23,7 @@ Agent sessions are now **roost tabs**, not `rc-*` tmux sessions:
 - **`shed attach <shed>`** opens a shed as a roost tab when a local
   [roost](https://github.com/charliek/roost) app is running; with no local roost app,
   `--tmux`, or `SHED_ATTACH=tmux`, it falls back to a plain tmux session — the same floor
-  this binary used to manage, now driven directly by the CLI instead of `shed-ext-rc`. See
+  this binary used to manage, now driven directly by the CLI instead of the guest RC helper. See
   [`shed attach`](../reference/cli.md#shed-attach).
 - **`shed sessions`** lists a shed's roost tabs above its tmux rows, and `sessions kill`
   closes either. See [`shed sessions`](../reference/cli.md#shed-sessions).

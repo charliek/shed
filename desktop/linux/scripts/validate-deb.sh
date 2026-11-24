@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the shed-desktop .deb in a CLEAN ubuntu:24.04 container and assert the
 # installed binary launches (its runtime deps resolve) and answers identify, that
-# the bundled shedctl can drive it, and that the polkit action is installed.
+# the bundled shedctl can drive it, and that no polkit action ships (the approval
+# gate that used it is gone, plan 039 PR B).
 # Used by `make deb-validate` and the CI deb job — proves the .deb's `depends:`
 # are correct on a machine without the -dev packages.
 set -euo pipefail
@@ -25,14 +26,13 @@ docker run --rm \
     apt-get update -qq
     # apt resolves the .deb's runtime deps (libwebkit2gtk-4.1-0, libgtk-3-0,
     # libayatana-appindicator3-1, librsvg2-2, libsoup-3.0-0, libc6). --no-install-recommends
-    # so 'polkitd' (a Recommends) is NOT pulled — proves the app launches + fails
-    # closed without polkit, i.e. that polkit is genuinely only a Recommends.
+    # keeps the container to exactly those.
     apt-get install -y -qq --no-install-recommends /pkg/${DEB_FILE} xvfb python3
     command -v shed-desktop
     command -v shedctl
-    # The polkit action must ship in the package (the credential-approval gate
-    # authenticates against it).
-    test -f /usr/share/polkit-1/actions/ai.stridelabs.shed-desktop.policy
-    echo 'polkit action present'
+    # No polkit action ships: the credential-approval gate is gone.
+    test ! -e /usr/share/polkit-1/actions/ai.stridelabs.shed-desktop.policy
+    if dpkg -L shed-desktop | grep -q polkit; then echo 'a polkit file ships' >&2; exit 1; fi
+    echo 'no polkit action'
     python3 /scripts/deb_identify_check.py
   "

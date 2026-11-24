@@ -1383,6 +1383,19 @@ func TestRefreshAndLookupsRace(t *testing.T) {
 	work.Wait()
 	close(stop)
 	wg.Wait()
+	// A refetch above can leave a rebuild running in the background, still
+	// writing the GitHub key cache: let it finish before the temp dir goes.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		l.flightMu.Lock()
+		idle := l.running == nil && l.queued == nil
+		l.flightMu.Unlock()
+		if idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a background rebuild never finished")
+		}
+	}
 }
 
 // manyKeys returns n fresh keys and their authorized_keys body.

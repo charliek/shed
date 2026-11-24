@@ -1,12 +1,11 @@
 # tests/machine-transport — the machine-transport differential
 
-The **fourth** pytest suite in this repo, and — like the other three — never merged
+The **third** pytest suite in this repo, and — like the other two — never merged
 with them:
 
 | suite | what it drives |
 |---|---|
 | `tests/integration/` | a LIVE `shed-server` create cycle |
-| `tests/broker-wire/` | the desktop app's credential broker's wire output, vs recorded goldens |
 | `desktop/tools/shedtest/` | the desktop app over its IPC socket |
 | **`tests/machine-transport/`** | **every transport that reaches a machine over SSH, against one shared contract** |
 
@@ -88,7 +87,7 @@ argument. One test asserts the security property directly: a payload that would
 ## The Dart leg
 
 There isn't one, and plan 013 (the Roost Pivot's S1/S3m) is the reason there
-won't be. shed-mobile composes no `sx`/`shed-ext-rc` wire of its own for
+won't be. shed-mobile composes no `sx` or guest RC helper wire of its own for
 reaching a machine's `roost-session` — since that plan it execs the string
 `roost_ipc::ssh::remote_command()` hands it through the bridge
 (`roost_remote_command()` over FRB), the same composer every other client
@@ -96,7 +95,7 @@ uses, so there is nothing left for a Dart-side leg to independently verify.
 
 The `shed_core::machine::*` argv builders this contract pins used to be `sx
 rc`'s — `sx` was sunset, unreleased, in plan 016, and S6 (plan 022, C8,
-`charliek/shed#328`) deleted the RC hub, `shed-ext-rc`, and the Go engine that
+`charliek/shed#328`) deleted the RC hub, the guest RC helper, and the Go engine that
 subject belonged to. The corpus did NOT retire with them: 18 of its 19
 scenarios were **re-pointed**, not deleted, onto `["sh", "-c", <script>]`
 — the shape `shed_app::machine::exec` composed for `shed-gx`'s discovery

@@ -7,13 +7,13 @@ import { initialReport } from "@/lib/report";
 import { pairRowsWithCards } from "@/lib/shedStatus";
 import type { SourceMachine, SourceRow, SourceStatus } from "@/lib/sources";
 
-export type Pane = "sheds" | "approvals" | "agents" | "activity" | "egress" | "system";
+export type Pane = "sheds" | "agents" | "activity" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
 export type Modal = null | "create" | "craze";
 
-const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "egress", "system"];
+const PANES: readonly Pane[] = ["sheds", "agents", "activity", "system"];
 
 /** Narrow an untrusted value (an IPC payload) to a known pane. */
 export function isPane(x: unknown): x is Pane {
@@ -35,6 +35,9 @@ export type Shed = {
   /** The shed's delivery record (plan 039 §3.6) as its server sent it, or null from
    *  a server older than delivery. Read with `readDelivery` (`lib/delivery`). */
   delivery?: unknown;
+  /** When this incarnation of the shed was created, verbatim: what names it to the
+   *  egress feed (`egress.recent`). */
+  created_at?: string | null;
 };
 
 /** Why a host couldn't be listed. `other` is the open set (rendered generically). */
@@ -116,10 +119,10 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return core.invoke<T>(cmd, args).catch(() => undefined);
 }
 
-/** The sidebar nav badge counts (sheds / active RC sessions / hosts / pending
- *  approvals), carried in the shell's full snapshot so the harness can assert the
- *  rendered counts as UI truth via `ui.badges` — not pixels. */
-export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
+/** The sidebar nav badge counts (sheds / active RC sessions / hosts), carried in
+ *  the shell's full snapshot so the harness can assert the rendered counts as UI
+ *  truth via `ui.badges` — not pixels. */
+export type Badges = { sheds: number; agents: number; hosts: number };
 
 /** What the shell knows about the sidebar's two sections before the host
  *  failures are folded in (which `report` does, since it holds them). */
@@ -251,8 +254,8 @@ function report({ pane, sheds, refreshToken, modal, badges, sidebar, mode, hostE
  *  Returns the live sheds + a `refresh` callback (a lifecycle button chains it to
  *  re-fetch after its action). A no-op in a plain browser.
  *
- *  This owns the SINGLE report path — the shell's badges (`agentCount`/`hostCount`/
- *  `pending` supplied by App, `sheds` derived here) and the active `mode` fold into
+ *  This owns the SINGLE report path — the shell's badges (`agentCount`/`hostCount`
+ *  supplied by App, `sheds` derived here) and the active `mode` fold into
  *  one full snapshot, so there are no partial `ui_report`s to race the `main` slot
  *  or drop keys (App must apply `data-mode` before this effect runs — a
  *  useLayoutEffect — so the sampled colors reflect the flip).
@@ -269,7 +272,6 @@ export function useUiBridge(
   mode: "light" | "dark",
   agentCount: number,
   hostCount: number,
-  pending: number,
   sidebar: SidebarInput,
 ): { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
@@ -431,7 +433,7 @@ export function useUiBridge(
     if (!inTauri() || !ready.current) return;
     // `hosts` = the configured-host count (with reachability) the shell supplies —
     // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
-    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
+    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount };
     const payload: ReportPayload = { pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors };
     latestReport.current = payload;
     report(payload);
@@ -439,7 +441,7 @@ export function useUiBridge(
     // (a reference dep would re-report on every render — the flap this whole
     // shape exists to avoid).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pane, sheds, hostErrors, refreshToken, modal, mode, agentCount, hostCount, pending, JSON.stringify(sidebar)]);
+  }, [pane, sheds, hostErrors, refreshToken, modal, mode, agentCount, hostCount, JSON.stringify(sidebar)]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
   return { sheds, hostErrors, refresh };
@@ -482,7 +484,7 @@ export async function fetchHostRows(): Promise<HostDiskUsage[]> {
   return (await core.invoke<HostDiskUsage[] | null>("system_df")) ?? [];
 }
 
-/* ---- egress (mac parity: profiles per host + the ns=="egress" activity) ---- */
+/* ---- egress: server profiles (System) and a shed's recent blocks ---------- */
 
 /** One egress profile fragment, as shed-core decodes it (shed-server's
  *  `config.EgressProfile` — all fields optional). */
@@ -502,39 +504,61 @@ export type HostEgressProfiles = {
   error?: string | null;
 };
 
-/** Per-host egress profiles for the Egress pane's Profiles sub-tab. */
+/** Every server's egress profiles, for the System pane. */
 export async function fetchEgressProfiles(): Promise<HostEgressProfiles[]> {
   return (await invoke<HostEgressProfiles[]>("egress_profiles")) ?? [];
 }
 
-/** The Egress pane's rendered state, reported so the `egress.profiles` op can
- *  observe it (UI truth, like `reportAgents`): the active sub-tab, the flat
- *  profile rows + per-host error rows, the selected profile's detail, and how
- *  many ns=="egress" activity rows the Activity sub-tab renders. Keys are
- *  additive + stable — the harness asserts them. */
-export type EgressReport = {
-  tab: "activity" | "profiles";
-  profiles: { host: string; name: string; source: string }[];
-  errors: { host: string; error: string }[];
-  selected: {
+/** The System pane's rendered profiles, reported so the `egress.profiles` op can
+ *  observe them (UI truth, like `reportAgents`): every profile row as shown, and each
+ *  server that could not list its profiles. Keys are additive + stable — the harness
+ *  asserts them. */
+export type SystemEgressReport = {
+  profiles: {
     host: string;
     name: string;
     source: string;
+    mode: string | null;
     allow: string[];
     deny: string[];
-    mode?: string | null;
-    rule?: string | null;
-  } | null;
-  activity_count: number;
+    rule: string | null;
+  }[];
+  errors: { host: string; error: string }[];
 };
 
-/** Report the rendered Egress pane state (mounted-only, like `reportAgents` —
- *  `ui_report` merges this `egress` key with the shell's snapshot). Pass `null` on
- *  unmount to CLEAR the key (the merge overwrites `egress` with null, not skips it),
- *  so an off-pane or freshly-remounted-but-not-yet-reported `egress.profiles` dump
- *  returns null instead of the previous mount's stale snapshot. */
-export function reportEgress(snapshot: EgressReport | null): void {
+/** Report the System pane's profiles (mounted-only). `null` on unmount CLEARS the key,
+ *  so an off-pane `egress.profiles` answers null, never a stale snapshot. */
+export function reportEgress(snapshot: SystemEgressReport | null): void {
   void invoke("ui_report", { snapshot: { egress: snapshot } });
+}
+
+/** One egress decision the app kept (`egress.recent`; every string cleaned for display
+ *  by the Rust side). */
+export type EgressEvent = {
+  server: string;
+  ts: string;
+  shed: string;
+  shed_created_at: string;
+  host: string;
+  port: number;
+  resolved_ip: string;
+  protocol: string;
+  verdict: string;
+  reason: string;
+};
+
+/** A shed incarnation's recent blocks (its kept `deny` decisions, newest first).
+ *  THROWS the refusal (no creation time, the feed not started). */
+export async function fetchEgressBlocks(server: string, shed: string, createdAt: string): Promise<EgressEvent[]> {
+  const r = await invokeStrict<{ events?: EgressEvent[] }>("egress_recent", {
+    server, shed, createdAt, blocks: true,
+  });
+  return r.events ?? [];
+}
+
+/** What the open shed detail's egress section rendered (`shed_egress.dump`), or null. */
+export function reportShedEgress(snapshot: Record<string, unknown> | null): void {
+  void invoke("ui_report", { snapshot: { shed_egress: snapshot } });
 }
 
 /* ---- terminal + prefs (the Preferences view + the shed-card button) ------- */
@@ -571,24 +595,6 @@ export async function setLoginItem(enabled: boolean): Promise<void> {
   await core.invoke("loginitem_set", { enabled });
 }
 
-/* ---- credential broker (leg 3a.2) ----------------------------------------- */
-
-/** The credential-broker status the Preferences section reads: the config
- *  provenance, the resolved ssh mode, gate namespaces, per-server health, and any
- *  broker-failed error (fields that don't apply are null/empty). Mirrors
- *  `broker::BrokerRuntime::status`. */
-export type BrokerStatus = {
-  config: { source: "loaded" | "synthesized" | "error" | null; message: string | null };
-  resolved_ssh_mode: string | null;
-  gate_namespaces: string[];
-  servers: unknown[];
-  broker_error: string | null;
-};
-
-export async function getBrokerStatus(): Promise<BrokerStatus | undefined> {
-  return invoke<BrokerStatus>("broker_status");
-}
-
 /* ---- credential sources (plan 035 §3.4) ------------------------------------ */
 
 /* The row types and how reads and moves are reconciled live in `sources.ts` (pure,
@@ -611,7 +617,7 @@ function cleanRow(r: SourceRow): SourceRow {
   return { ...r, source: cleanMachine(r.source), busy: !!r.busy, unreachable: !!r.unreachable };
 }
 
-/** The source rows (swallowing, like `getBrokerStatus`: `undefined` on any failure). */
+/** The source rows (swallowing, like `invoke`: `undefined` on any failure). */
 export async function getSourceStatus(): Promise<SourceStatus | undefined> {
   const s = await invoke<SourceStatus>("source_status");
   if (!s) return undefined;
@@ -625,9 +631,9 @@ export async function getSourceStatus(): Promise<SourceStatus | undefined> {
 /** "Use this machine": make this machine the source on `host`, answering that host's
  *  row as the server left it after the move. THROWS the refusal in plain words
  *  (unlike the swallowing `invoke`), which the row shows. */
-export async function makeThisMachineSource(host: string): Promise<{ row: SourceRow; woke_broker: boolean }> {
+export async function makeThisMachineSource(host: string): Promise<{ row: SourceRow; woke_source: boolean }> {
   const core = await import("@tauri-apps/api/core");
-  const res = await core.invoke<{ row: SourceRow; woke_broker: boolean }>("source_use", { host });
+  const res = await core.invoke<{ row: SourceRow; woke_source: boolean }>("source_use", { host });
   return { ...res, row: cleanRow(res.row) };
 }
 
@@ -692,7 +698,9 @@ export function previewDelivery(server: string, shed?: string): Promise<Record<s
   return invokeStrict("delivery_preview", { server, shed: shed ?? null });
 }
 
-/** The delivery record of a shed's document (null for a server older than delivery). */
+/** The delivery record of a shed's document (null for a server older than delivery),
+ *  its explicit `egress_profiles` (null: none, the server's default applies), and its
+ *  effective `egress` as the server resolved it (null, with `egress_error`: unread). */
 export function getShedDelivery(server: string, shed: string): Promise<Record<string, unknown>> {
   return invokeStrict("shed_delivery", { server, shed });
 }
@@ -709,6 +717,16 @@ export function listServerActivity(opts: { limit?: number; cursor?: string | nul
     cursor: opts.cursor ?? null,
     shed: opts.shed ?? null,
   });
+}
+
+/** The last `ui.scroll_to` the dashboard carried out (`ui.scrolled`). */
+export function reportScrolled(snapshot: { anchor: string; token: unknown; found: boolean; animations: number }): void {
+  void invoke("ui_report", { snapshot: { scrolled: snapshot } });
+}
+
+/** What the Activity pane rendered (`activity.dump`), or null off the pane. */
+export function reportActivity(snapshot: Record<string, unknown> | null): void {
+  void invoke("ui_report", { snapshot: { activity: snapshot } });
 }
 
 /** What the open shed delivery detail rendered (`shed_delivery.dump`), or null when
@@ -766,123 +784,6 @@ export async function createCancel(createId: string): Promise<void> {
   await invoke("create_cancel", { createId });
 }
 
-/* ---- approvals + activity (Phase B) --------------------------------------- */
-
-/** A pending approval card, as the coordinator serializes it (metadata only —
- *  never key material). `gate` drives the fingerprint affordance. */
-export type Approval = {
-  id: string;
-  namespace: string;
-  op: string;
-  shed: string;
-  server?: string;
-  detail: string;
-  expires_at: string;
-  gate: "none" | "biometrics" | "biometrics-or-password";
-  default_scope: "per-request" | "per-session" | "per-shed";
-  default_ttl: string;
-};
-
-/** An audit entry (a decision or a streamed host event) for the Activity feed. */
-export type AuditEntry = {
-  id: string;
-  ts: string;
-  source: string;
-  server?: string | null;
-  shed?: string | null;
-  ns?: string | null;
-  op?: string | null;
-  result: string;
-  detail?: string | null;
-  approval?: string | null;
-  policy?: string | null;
-};
-
-export async function fetchApprovals(): Promise<Approval[]> {
-  return (await invoke<Approval[]>("approvals_list")) ?? [];
-}
-
-/** Approve/deny a pending request. `scope`/`ttl` apply the grant on approve;
- *  `persist` installs a per-shed always-allow/deny rule. */
-export async function decideApproval(
-  id: string,
-  decision: "approve" | "deny",
-  opts?: { scope?: string; ttl?: string; persist?: boolean },
-): Promise<void> {
-  await invoke("approval_decide", {
-    id,
-    decision,
-    scope: opts?.scope,
-    ttl: opts?.ttl,
-    persist: opts?.persist ?? false,
-  });
-}
-
-export async function fetchActivity(limit = 200): Promise<AuditEntry[]> {
-  return (await invoke<AuditEntry[]>("activity_list", { limit })) ?? [];
-}
-
-export async function fetchGateNamespaces(): Promise<string[]> {
-  return (await invoke<string[]>("gate_namespaces")) ?? [];
-}
-
-/** The current SSH approval prefs, as the coordinator serializes them. */
-export type SshPrefs = {
-  method: "biometrics-or-password" | "biometrics" | "prompt";
-  policy: string;
-  ttl: string;
-};
-
-export async function getSshApproval(): Promise<SshPrefs> {
-  return (
-    (await invoke<SshPrefs>("ssh_prefs_get")) ??
-    // Dev-only fallback (non-Tauri `invoke` → null); mirror Rust SshPrefs::default().
-    { method: "biometrics-or-password", policy: "time-based-allow", ttl: "2h" }
-  );
-}
-
-export async function setSshApproval(method?: string, policy?: string, ttl?: string): Promise<void> {
-  await invoke("set_ssh_approval", { method, policy, ttl });
-}
-
-/** The AWS/Docker provider approval modes, keyed by the full namespace string
- *  (`aws-credentials`/`docker-credentials`) → `"approve"` | `"deny"`. A namespace
- *  absent from the map is Deny (fail-closed default). */
-export type ProviderModes = Record<string, "approve" | "deny">;
-
-export async function getProviderModes(): Promise<ProviderModes> {
-  return (await invoke<ProviderModes>("provider_modes_get")) ?? {};
-}
-
-/** Set an AWS/Docker provider mode. THROWS on a rejected namespace (the coordinator
- *  only accepts the two providers), unlike the error-swallowing `invoke`. */
-export async function setProviderMode(
-  ns: "aws-credentials" | "docker-credentials",
-  decision: "approve" | "deny",
-): Promise<void> {
-  const core = await import("@tauri-apps/api/core");
-  await core.invoke("set_provider_mode", { ns, decision });
-}
-
-/** A per-shed override rule (the Preferences "Per-shed overrides" list). */
-export type ShedRule = {
-  scope: string;
-  server?: string | null;
-  namespace?: string | null;
-  shed?: string | null;
-  action: "approve" | "deny" | "prompt";
-  gate?: string;
-};
-
-export async function listShedRules(): Promise<ShedRule[]> {
-  return (await invoke<ShedRule[]>("policy_list_shed")) ?? [];
-}
-
-/** Remove one per-shed override rule (its row's remove button). */
-export async function removeShedRule(server: string, shed: string): Promise<void> {
-  await invoke("remove_shed_rule", { server, shed });
-}
-
 /** The app-wide light/dark appearance, read synchronously by the Preferences window
  *  on mount (`null` = unset → fall back to `prefers-color-scheme`). */
 export async function getAppearanceState(): Promise<"light" | "dark" | null> {
@@ -904,13 +805,7 @@ export type PrefsReport = {
   values: {
     preset: string;
     template: string;
-    policy: string;
-    method: string;
-    ttl: string;
     login: boolean;
-    provider_modes: ProviderModes;
-    shed_rules_count: number;
-    broker_error: string | null;
     /** The credential-source rows as rendered (supporting servers only), plan 035. */
     sources: {
       host: string;
@@ -939,53 +834,6 @@ export type PrefsReport = {
  *  calling window's label, so it can never clobber the dashboard's `main`). */
 export function reportPrefs(snapshot: PrefsReport): void {
   void invoke("ui_report", { snapshot: { prefs: snapshot } });
-}
-
-/** Keep a coordinator-backed slice live: fetch on mount, then re-fetch whenever
- *  the coordinator emits `event` (the TauriEventSink app.emit). `fetch` is held
- *  in a ref so the subscription is set up once (a no-op in a plain browser). */
-export function useCoordinatorData<T>(event: string, fetch: () => Promise<T>, initial: T): T {
-  const [data, setData] = useState<T>(initial);
-  const fetchRef = useRef(fetch);
-  fetchRef.current = fetch;
-  const gen = useRef(0);
-  useEffect(() => {
-    if (!inTauri()) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    // A generation guard (as in useUiBridge): events can fire faster than fetches
-    // resolve (e.g. disconnect then expiry), so a slower older fetch must not
-    // overwrite a newer one's rows — drop any fetch that isn't the latest.
-    const reload = () => {
-      const mine = ++gen.current;
-      void fetchRef.current().then((d) => {
-        if (!cancelled && mine === gen.current) setData(d);
-      });
-    };
-    void (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      const un = await listen(event, reload);
-      if (cancelled) un();
-      else unlisten = un;
-      reload(); // initial fetch, after the listener is live
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [event]);
-  return data;
-}
-
-/** A 1s wall-clock tick for the "expires in Ns" countdown (display only — the
- *  backend's own tick decides the actual expiry). */
-export function useNowTick(intervalMs = 1000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(t);
-  }, [intervalMs]);
-  return now;
 }
 
 /* ---- remote-control agents (B2.4) ----------------------------------------- */
@@ -1078,7 +926,7 @@ const RC_KIND_TOOL: Record<string, string | undefined> = {
  *  capabilities say is installed.
  *
  *  **Absent capabilities offer NOTHING** (S6). They used to fall back to
- *  claude+shell, which was right for a shed whose `shed-ext-rc` was too old to
+ *  claude+shell, which was right for a shed whose guest RC helper was too old to
  *  advertise — it had always had both. There is no such binary any more: a host's
  *  contract is roost's synthesized one, present for every host in the payload, so
  *  absence means there is no roost-session to launch into and the fallback would
@@ -2381,9 +2229,7 @@ export async function resizePopover(height: number): Promise<void> {
  *  content AC — OS tray clicks aren't drivable). The popover webview invokes this,
  *  so Rust keys it under the `popover` snapshot, never the dashboard's `main`. */
 export function reportTray(rows: {
-  connected: boolean;
   running_sheds: { host: string; name: string }[];
-  pending_approvals: { namespace: string; op: string; shed: string }[];
 }): void {
   void invoke("ui_report", { snapshot: { tray: rows } });
 }

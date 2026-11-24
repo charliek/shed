@@ -119,22 +119,23 @@ shed server add shed.example.com --ssh-port 2222 \
   --tls-fingerprint sha256:<hex> --fingerprint SHA256:<ssh>
 ```
 
-## 3. Credential brokering over TLS
+## 3. Credential delivery over TLS
 
-The shed desktop app on your laptop is the credential broker. Its broker **enrolls its
+The shed desktop app on your laptop is your credential source. It **enrolls its
 own `credentials`-scope certificate** over the same SSH bootstrap channel —
-there is no credential to paste — and subscribes to the credential bus over
-the pinned TLS connection, brokering SSH signatures / cloud credentials to
-your remote shed. It picks up `api_url` and `tls_cert_fingerprint` from the
+there is no credential to paste — and holds a delivery stream open over
+the pinned TLS connection, answering the server when a shed is created or
+provisioned with the files and variables you configured
+([Credentials in a shed](credentials-in-a-shed.md)). It picks up `api_url` and `tls_cert_fingerprint` from the
 same `~/.shed/config.yaml` entry, and persists its own certificate/key in its
 state dir (never the same key material the CLI holds — one certificate per
 process, per scope). The app also needs launch at login on, which it turns on at its first
-launch, since credentials are answered only while it runs.
+launch, since credentials are delivered only while it runs.
 
 The bus stream is long-lived and often idle; shed-server sends an SSE
 keepalive comment every 25 s so an idle NAT or proxy does not evict the
-connection. If the broker reconnects across a blip, a credential request it had
-not answered is delivered to it again; no other machine ever receives it.
+connection. If the app reconnects across a blip it opens a new stream; a request that was
+waiting on the old one has failed, and `shed provision <name>` finishes it.
 
 The first machine whose desktop app connects becomes your
 **credential source** on this server, and only it answers your sheds'
@@ -297,13 +298,13 @@ limits of this example:
   matched on purpose: it names the address holding the most connections, not
   the one refused.
 
-## No broker on the server
+## No credential source on the server
 
-A server has no credential broker unless a desktop app runs there. Credential requests are
-answered only while the shed desktop app is running on your machine; a machine without the
-app (a server, or a box with no desktop session) has no broker. Run the app on your own
-machine and make it your credential source (see [Credential brokering over
-TLS](#3-credential-brokering-over-tls)). The credential bus (`credentials` scope) and Connect
+A server has no credential source unless a desktop app runs there. Credentials are
+delivered only while the shed desktop app is running on your machine; a machine without the
+app (a server, or a box with no desktop session) is not a source. Run the app on your own
+machine and make it your credential source (see [Credential delivery over
+TLS](#3-credential-delivery-over-tls)). The credential bus (`credentials` scope) and Connect
 tunnel (`control` or `credentials`) ride the single pinned-TLS listener, so the app reaches
 them over `https://` with the pinned cert and its own credentials-scope client certificate.
 Remote `shed forward` keeps working at the same time, because there is no separate

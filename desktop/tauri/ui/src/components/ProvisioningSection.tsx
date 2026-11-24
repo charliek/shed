@@ -25,7 +25,7 @@ import {
 } from "@/lib/bridge";
 import {
   ONLY_KEYS, PROVIDERS, PROVIDER_DETAIL, PROVIDER_FIELDS, PROVIDER_LABEL,
-  configFromDraft, draftFromConfig, edit, formatSize, onlyText, redactedConfig,
+  configFromDraft, draftFromConfig, edit, formatSize, noServerLimit, onlyText, redactedConfig,
   type ProviderDraft,
 } from "@/lib/delivery";
 
@@ -398,6 +398,11 @@ export function ProvisioningSection({ reloadKey, sources, sourcesKey, onReport }
                         only {only}
                       </div>
                     )}
+                    {on && noServerLimit(p?.only) && (
+                      <div className="mt-0.5 text-[11.5px] text-shed-warn-fg" data-delivery-unlimited>
+                        No server limit: delivers to every server in your shed config.
+                      </div>
+                    )}
                   </div>
                   {!isEditing && (
                     <button type="button" className={prefsButton} onClick={() => startEdit(name)} data-delivery-button="edit">
@@ -718,7 +723,7 @@ function ProviderEditor({ name, draft, setDraft, busy, onSave, onCancel }: {
         </div>
       )}
       <div>
-        <span className={label}>Only for (every list given must match)</span>
+        <span className={label}>Only for (every list given must match; with no servers listed it delivers to every server in your shed config)</span>
         <div className="grid grid-cols-3 gap-1.5">
           {ONLY_KEYS.map((k) => (
             <div key={k}>

@@ -35,20 +35,18 @@ log_level: info
 # Environment file (KEY=value per line, injected into VMs)
 # env_file: /root/.shed/env
 
-# Extensions provide credential brokering from host to VM.
-# Requires the shed desktop app on your machine.
+# Extensions to enable in VMs: each name matches a manifest in the image's
+# /etc/shed-extensions.d/, and the agent starts its systemd unit.
 # extensions:
 #   enabled:
-#     - ssh-agent
-#     - aws-credentials
-#     - docker-credentials
+#     - my-extension
 
 vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
   # default_image / image_aliases resolve from the server version when unset:
-  # ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z. Pin explicitly to
+  # ghcr.io/charliek/shed-vz-{base,full}:vX.Y.Z. Pin explicitly to
   # override the registry or variant — see the full reference above.
   # missing (default) | always | never
   pull_policy: missing
@@ -66,7 +64,7 @@ vz:
 firecracker:
   kernel_path: /var/lib/shed/firecracker/images/vmlinux
   # default_image / image_aliases resolve from the server version when unset:
-  # ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z. Pin explicitly to
+  # ghcr.io/charliek/shed-fc-{base,full}:vX.Y.Z. Pin explicitly to
   # override the registry or variant — see the full reference above.
   # missing (default) | always | never
   pull_policy: missing

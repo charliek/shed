@@ -103,9 +103,7 @@ mounts:
     target: /home/shed/.config/gh
     readonly: false
 
-# Intentionally NO extensions block: dev sheds don't need ssh-agent /
-# docker-credentials brokering (same rationale as the macOS parallel-dev
-# config).
+# Intentionally NO extensions block (same as the macOS parallel-dev config).
 
 firecracker:
   # Same as deb config — kernel + images pinned to the latest release
@@ -114,7 +112,6 @@ firecracker:
   default_image: ghcr.io/charliek/shed-fc-full:v0.5.9
   image_aliases:
     base:       ghcr.io/charliek/shed-fc-base:v0.5.9
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.9
     full:       ghcr.io/charliek/shed-fc-full:v0.5.9
     # The image the newer integration tests create from: exec semantics
     # (process-group cleanup on disconnect, a separate stderr stream) need

@@ -2,22 +2,20 @@
 //!
 //! Enforces the workspace dependency boundaries via `cargo metadata` and
 //! per-package `cargo tree` over every target (each crate resolved alone, so
-//! sibling members like `shed-broker-harness` never unify features into it).
-//! Every rule holds under both the crate's default features and
-//! `--all-features`, except `shed-app`'s, which is default-features only:
+//! no sibling member unifies features into it). Every rule holds under both the
+//! crate's default features and `--all-features`:
 //! - `shed-lane` is a pure leaf (no `shed-core`, `shed-roost`, `shed-app`,
-//!   `shed-broker`, `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
+//!   `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
 //! - `shed-core` is pure shed-server protocol (no `roost-ipc`, `shed-roost`,
-//!   `shed-app`, `shed-broker`, `shed-craze`, or UI toolkits).
+//!   `shed-app`, `shed-craze`, or UI toolkits).
 //! - `shed-craze` depends on `shed-lane` only (no `shed-core`, `shed-roost`,
-//!   `shed-app`, `shed-broker`, `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
-//! - `shed-app` (default features) has no `roost-ipc`, `shed-roost`, `shed-lane`
-//!   (direct), `shed-craze`, `shed-broker`, `saphyr-parser`, or UI toolkits.
+//!   `shed-app`, `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
+//! - `shed-app` has no `roost-ipc`, `shed-roost`, `shed-lane`
+//!   (direct), `shed-craze`, `saphyr-parser`, or UI toolkits.
 //! - `shed-desktop-core`: toolkit-free desktop runtime — no `tauri`, `wry`,
-//!   `tao`, `webkit2gtk`, `iced`, `shed-broker`, `saphyr-parser`,
-//!   and no direct `roost-ipc` (normal, build, or dev).
-//! - `shed-broker`, `shed-broker-harness`, and `shedctl` have no `roost-ipc` or
-//!   `shed-roost` (direct or transitive).
+//!   `tao`, `webkit2gtk`, `iced`, `saphyr-parser`, and no direct `roost-ipc`
+//!   (normal, build, or dev).
+//! - `shedctl` has no `roost-ipc` or `shed-roost` (direct or transitive).
 //! - `shed-roost` is the SOLE direct `roost-ipc` consumer in `crates/` (across
 //!   normal, build, and dev dependencies).
 //! - No crate in `crates/` depends on `tauri`, `wry`, `tao`,
@@ -25,12 +23,12 @@
 //! - `shed-provision` reaches no workspace crate; `shed-provision-providers`
 //!   reaches only `shed-provision`; neither reaches `saphyr-parser`,
 //!   `tokio` or `reqwest` (plan 039 §3.7). `shed-core`, `shed-lane`,
-//!   `shed-roost`, `shed-craze` and `shed-app` (default features) reach
+//!   `shed-roost`, `shed-craze` and `shed-app` reach
 //!   neither, so shed-mobile's build is unchanged. All of these hold across
 //!   normal, build and dev edges.
 //! - `shed-source` (plan 039 §3.7) reaches no workspace crate but `shed-core`,
 //!   `shed-lane` and `shed-provision`, and never `saphyr-parser`; `shed-core`, `shed-lane`,
-//!   `shed-roost`, `shed-craze` and `shed-app` (default features) do not reach
+//!   `shed-roost`, `shed-craze` and `shed-app` do not reach
 //!   it, so shed-mobile's build is unchanged. All across normal, build and dev
 //!   edges.
 
@@ -69,18 +67,11 @@ fn no_deps_metadata() -> Value {
 /// edge kinds (`normal,build` or `normal,build,dev`), for EVERY target and
 /// for both `pkg`'s default features and `--all-features`: a rule here is
 /// unconditional, so a non-default feature or a target-specific dependency
-/// that reaches a forbidden crate must fail it too. (`shed-app`'s default-only
-/// rule uses [`resolved_default_deps`] instead, since `broker` is meant to be
-/// opt-in.)
+/// that reaches a forbidden crate must fail it too.
 fn resolved_deps(pkg: &str, edges: &str) -> HashSet<String> {
     let mut deps = cargo_tree(pkg, edges, false);
     deps.extend(cargo_tree(pkg, edges, true));
     deps
-}
-
-/// `pkg`'s graph under its default features only, for every target.
-fn resolved_default_deps(pkg: &str, edges: &str) -> HashSet<String> {
-    cargo_tree(pkg, edges, false)
 }
 
 fn cargo_tree(pkg: &str, edges: &str, all_features: bool) -> HashSet<String> {
@@ -163,7 +154,6 @@ fn crate_isolation_invariants() {
         "shed-core",
         "shed-roost",
         "shed-app",
-        "shed-broker",
         "shed-craze",
         "roost-ipc",
         "reqwest",
@@ -177,13 +167,7 @@ fn crate_isolation_invariants() {
 
     // 3. `shed-core`: pure shed-server protocol.
     let core_deps = resolved_normal_deps("shed-core");
-    for forbidden in [
-        "shed-roost",
-        "shed-app",
-        "shed-broker",
-        "shed-craze",
-        "roost-ipc",
-    ] {
+    for forbidden in ["shed-roost", "shed-app", "shed-craze", "roost-ipc"] {
         assert!(
             !core_deps.contains(forbidden),
             "`shed-core` must not depend on `{forbidden}`"
@@ -196,7 +180,6 @@ fn crate_isolation_invariants() {
         "shed-core",
         "shed-roost",
         "shed-app",
-        "shed-broker",
         "roost-ipc",
         "reqwest",
         "chrono",
@@ -207,8 +190,8 @@ fn crate_isolation_invariants() {
         );
     }
 
-    // 5. `shed-app` (default features): no roost-ipc, shed-roost, shed-craze,
-    //    shed-broker, saphyr-parser, and no direct `shed-lane` dep.
+    // 5. `shed-app`: no roost-ipc, shed-roost, shed-craze,
+    //    saphyr-parser, and no direct `shed-lane` dep.
     let app_pkg = packages
         .iter()
         .find(|p| p["name"].as_str() == Some("shed-app"))
@@ -221,30 +204,17 @@ fn crate_isolation_invariants() {
                 !["shed-lane", "shed-roost", "shed-craze", "roost-ipc"].contains(&dep_name),
                 "`shed-app` must not directly depend on `{dep_name}`"
             );
-            if dep_name == "shed-broker" {
-                assert_eq!(
-                    dep["optional"].as_bool(),
-                    Some(true),
-                    "`shed-app`'s `shed-broker` dependency must remain optional"
-                );
-            }
         }
     }
-    let app_deps = resolved_default_deps("shed-app", "normal,build");
-    for forbidden in [
-        "shed-roost",
-        "shed-craze",
-        "shed-broker",
-        "roost-ipc",
-        "saphyr-parser",
-    ] {
+    let app_deps = resolved_deps("shed-app", "normal,build");
+    for forbidden in ["shed-roost", "shed-craze", "roost-ipc", "saphyr-parser"] {
         assert!(
             !app_deps.contains(forbidden),
-            "`shed-app` (default features) must not depend on `{forbidden}`"
+            "`shed-app` must not depend on `{forbidden}`"
         );
     }
 
-    // 6. `shed-desktop-core`: toolkit-free, broker-free, no direct `roost-ipc`
+    // 6. `shed-desktop-core`: toolkit-free, no direct `roost-ipc`
     //    across normal, build, AND dev dependencies.
     let desktop_core_pkg = packages
         .iter()
@@ -259,37 +229,17 @@ fn crate_isolation_invariants() {
             dep_name, "roost-ipc",
             "`shed-desktop-core` must NEVER directly depend on `roost-ipc` (normal, build, or dev)"
         );
-        assert_ne!(
-            dep_name, "shed-broker",
-            "`shed-desktop-core` must NEVER depend on `shed-broker` (normal, build, or dev)"
-        );
-        if dep_name == "shed-app" {
-            let features = dep["features"].as_array().expect("shed-app features");
-            assert!(
-                !features.iter().any(|f| f.as_str() == Some("broker")),
-                "`shed-desktop-core` must depend on `shed-app` with default features ONLY (never `broker`)"
-            );
-        }
     }
     let desktop_core_deps = resolved_deps("shed-desktop-core", "normal,build,dev");
-    for forbidden in [
-        "tauri",
-        "wry",
-        "tao",
-        "webkit2gtk",
-        "iced",
-        "shed-broker",
-        "saphyr-parser",
-    ] {
+    for forbidden in ["tauri", "wry", "tao", "webkit2gtk", "iced", "saphyr-parser"] {
         assert!(
             !desktop_core_deps.contains(forbidden),
             "`shed-desktop-core` must not depend on `{forbidden}` (normal/build/dev)"
         );
     }
 
-    // 7. `shed-broker`, `shed-broker-harness`, and `shedctl` never pull in
-    //    `roost-ipc` or `shed-roost`.
-    for pkg in ["shed-broker", "shed-broker-harness", "shedctl"] {
+    // 7. `shedctl` never pulls in `roost-ipc` or `shed-roost`.
+    for pkg in ["shedctl"] {
         let deps = resolved_normal_deps(pkg);
         for forbidden in ["roost-ipc", "shed-roost"] {
             assert!(
@@ -335,19 +285,19 @@ fn crate_isolation_invariants() {
             );
         }
     }
-    let app_deps = resolved_default_deps("shed-app", "normal,build,dev");
+    let app_deps = resolved_deps("shed-app", "normal,build,dev");
     for forbidden in ["shed-provision", "shed-provision-providers"] {
         assert!(
             !app_deps.contains(forbidden),
-            "`shed-app` (default features) must not depend on `{forbidden}` (normal/build/dev)"
+            "`shed-app` must not depend on `{forbidden}` (normal/build/dev)"
         );
     }
 
     // 8b. `shed-source` (plan 039 §3.7): the machine identity, credential store,
-    //     minter and control-token provider extracted from `shed-broker`, and the
+    //     minter and control-token provider, and the
     //     delivery stream client. Reaches only `shed-core`, `shed-lane` and
     //     `shed-provision` (every feature, `test-support` included,
-    //     and every target), never the broker's YAML parser; shed-mobile's crates
+    //     and every target), never `saphyr-parser`; shed-mobile's crates
     //     do not reach it.
     let deps = resolved_deps("shed-source", "normal,build,dev");
     // `shed-provision` (pure: the contract's documents and the stream's framing) is the
@@ -372,8 +322,8 @@ fn crate_isolation_invariants() {
         );
     }
     assert!(
-        !resolved_default_deps("shed-app", "normal,build,dev").contains("shed-source"),
-        "`shed-app` (default features) must not depend on `shed-source` (normal/build/dev)"
+        !resolved_deps("shed-app", "normal,build,dev").contains("shed-source"),
+        "`shed-app` must not depend on `shed-source` (normal/build/dev)"
     );
 
     // 9. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`

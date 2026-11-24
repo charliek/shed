@@ -1446,6 +1446,12 @@ const MAX_DOCUMENT_BYTES: usize = 8 << 20;
 const MAX_ERROR_BODY_BYTES: usize = 16 << 10;
 /// The most progress lines a provision keeps.
 const MAX_PROVISION_PROGRESS: usize = 512;
+/// How long opening the egress stream may take, its credential (a mint) included.
+const EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The largest egress decision frame.
+const MAX_EGRESS_EVENT_BYTES: usize = 64 << 10;
+/// How long a refusal's body on the egress stream may take to arrive.
+const EGRESS_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Client {
     /// GET a JSON document, bounded, with its refusal's API error.
@@ -1484,6 +1490,15 @@ impl Client {
         self.get_document(&["api", "sheds", name], &[]).await
     }
 
+    /// `GET /api/egress/{name}` (control scope): the shed's EFFECTIVE egress as the server
+    /// resolves it (`shed egress show`'s document: `enabled`, `profiles`, `port`, `rules`,
+    /// `recent`), undecoded. Unlike the shed document's `egress_profiles` (the explicit
+    /// selection only), `profiles` here includes the server's default profiles a shed
+    /// created without `--egress` runs under.
+    pub async fn egress_shed_status(&self, name: &str) -> Result<serde_json::Value, ApiFailure> {
+        self.get_document(&["api", "egress", name], &[]).await
+    }
+
     /// `GET /api/activity?since=&shed=&limit=` (plan 039 §3.6): one page of the server's
     /// activity feed, newest first, `{events, next}`, undecoded.
     pub async fn activity(
@@ -1515,6 +1530,89 @@ impl Client {
         let mut progress = Vec::new();
         let result = self.provision_stream(name, &mut progress).await;
         ProvisionOutcome { progress, result }
+    }
+
+    /// `GET /api/egress/stream` (control scope): calls `on_open` once the server has
+    /// answered `200`, then hands each decision the server streams to `on_decision`,
+    /// until the stream ends (`Ok`), goes `idle` with no byte at all
+    /// (`Ok`: the server sends no keepalive, so a long silence is ended here and the
+    /// caller opens a fresh stream), or fails. A refusal before the stream is the
+    /// error, with its status (`501`, or `404` from an older server: egress control is
+    /// not enabled there). Opening it, the credential included, is bounded; reading it is
+    /// not, beyond `idle`. A frame that is not a decision is skipped; one past 64 KiB
+    /// ends the stream as an error.
+    // Its transport is the control client's, on purpose: the same pin-or-WebPKI policy as
+    // every other control call the app makes (lead ruling, plan 039 B3).
+    pub async fn egress_stream(
+        &self,
+        idle: Duration,
+        on_open: &mut (dyn FnMut() + Send),
+        on_decision: &mut (dyn FnMut(crate::models::EgressDecision) + Send),
+    ) -> Result<(), ApiFailure> {
+        let url = self
+            .build_url(&["api", "egress", "stream"], &[])
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        let connect = self.send_resolved(EGRESS_CONNECT_TIMEOUT, |http| {
+            http.get(url.clone())
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+        });
+        let sent = match tokio::time::timeout(EGRESS_CONNECT_TIMEOUT, connect).await {
+            Err(_) => {
+                return Err(ApiFailure::from_shed(&ShedError::Transport(
+                    "egress stream connect timeout".into(),
+                )))
+            }
+            Ok(r) => r.map_err(|e| ApiFailure::from_shed(&e))?,
+        };
+        let status = sent.resp.status().as_u16();
+        let _transport = sent.transport;
+        let mut resp = sent.resp;
+        if !(200..300).contains(&status) {
+            // Bounded in time as well as size: a refusal whose body stalls keeps its status
+            // and whatever arrived, so the caller backs off rather than waiting forever.
+            let mut body = Vec::new();
+            let read = async {
+                while let Ok(Some(chunk)) = resp.chunk().await {
+                    let room = MAX_ERROR_BODY_BYTES - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    if body.len() >= MAX_ERROR_BODY_BYTES {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(EGRESS_ERROR_BODY_TIMEOUT, read).await;
+            return Err(ApiFailure::from_body(status, &body));
+        }
+        on_open();
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new().with_max_event_bytes(MAX_EGRESS_EVENT_BYTES);
+        let mut handle = |ev: crate::sse::SseEvent| {
+            if ev.event.is_empty() || ev.event == "egress" {
+                if let Ok(d) = serde_json::from_str(&ev.data) {
+                    on_decision(d);
+                }
+            }
+        };
+        loop {
+            match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) | Ok(None) => break,
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.map_err(|e| {
+                        ApiFailure::from_shed(&ShedError::Transport(crate::authfail::flatten(&e)))
+                    })?;
+                    let events = parser
+                        .try_feed(&chunk)
+                        .map_err(|e| ApiFailure::from_shed(&ShedError::Transport(e.to_string())))?;
+                    for ev in events {
+                        handle(ev);
+                    }
+                }
+            }
+        }
+        for ev in parser.finish() {
+            handle(ev);
+        }
+        Ok(())
     }
 
     async fn provision_stream(
@@ -3051,6 +3149,40 @@ mod tests {
 
     // ---- the delivery-era routes (plan 039) ----
 
+    /// An egress refusal whose body never finishes: the stream still ends, within the
+    /// body's deadline, with the status (and nothing opened).
+    #[tokio::test]
+    async fn an_egress_refusal_whose_body_stalls_still_ends_with_its_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"error\"")
+                .await
+                .unwrap();
+            // Holds the connection with the body unfinished.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(sock);
+        });
+        let c = Client::new(url, "s".into(), String::new(), None, None).unwrap();
+        let mut opened = false;
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            EGRESS_ERROR_BODY_TIMEOUT + Duration::from_secs(5),
+            c.egress_stream(Duration::from_secs(60), &mut || opened = true, &mut |_| {}),
+        )
+        .await
+        .expect("the stalled body is bounded");
+        let e = out.unwrap_err();
+        assert_eq!(e.status, Some(503));
+        assert!(!opened);
+        assert!(started.elapsed() >= EGRESS_ERROR_BODY_TIMEOUT);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn provision_streams_progress_and_ends_with_the_document() {
         let server = MockServer::start_async().await;
@@ -3152,6 +3284,31 @@ mod tests {
             ""
         );
         let e = c.shed_document("gone").await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn a_sheds_effective_egress_is_read_from_the_egress_route() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/egress/folio");
+                t.status(200)
+                    .body(r#"{"shed":"folio","enabled":true,"profiles":["default"],"port":20001}"#);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/egress/gone");
+                t.status(404)
+                    .body(r#"{"error":{"code":"SHED_NOT_FOUND","message":"no such shed"}}"#);
+            })
+            .await;
+        let c = client(&server);
+        let s = c.egress_shed_status("folio").await.unwrap();
+        assert_eq!(s["profiles"][0], "default");
+        assert_eq!(s["port"], 20001);
+        let e = c.egress_shed_status("gone").await.unwrap_err();
         assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
     }
 

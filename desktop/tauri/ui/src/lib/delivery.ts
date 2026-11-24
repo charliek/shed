@@ -432,6 +432,13 @@ export const edit = {
 
 /** The `only` rule in one line for a provider's row: `servers: a, b · repos: x/*`,
  *  or `""` when it has none. */
+/** True when a provider's `only` names no server: it then delivers to every
+ *  server in the shed config that asks (the plan's rule; shown in Preferences). */
+export function noServerLimit(only: unknown): boolean {
+  const o = obj(only);
+  return !o || strs(o.servers).length === 0;
+}
+
 export function onlyText(only: unknown): string {
   const o = obj(only);
   if (!o) return "";

@@ -694,7 +694,7 @@ fn command_line(pid: u32) -> Option<String> {
 /// forks while this recipe's copy still holds its write fd carries that fd
 /// into its child until the child execs, and an exec of the copy in that
 /// window fails "Text file busy" — the classic fork/exec race, the same one
-/// `shed-broker`'s `run_shim` retries. Anything but `ETXTBSY` is returned at
+/// `shed-source`'s bootstrap shim tests retry. Anything but `ETXTBSY` is returned at
 /// once; a busy file that stays busy fails loudly, because that is no longer
 /// the transient race.
 async fn spawn_fresh(cmd: &mut Command, what: &str) -> Child {

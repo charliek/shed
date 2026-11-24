@@ -40,7 +40,7 @@ func TestResolveImageSelectors(t *testing.T) {
 	cfg := &VZConfig{
 		DefaultImage: "ghcr.io/charliek/shed-vz-full:v0.6.0",
 		ImageAliases: map[string]string{
-			"extensions": "ghcr.io/charliek/shed-vz-extensions:v0.6.0",
+			"base": "ghcr.io/charliek/shed-vz-base:v0.6.0",
 		},
 		PullPolicy: "missing",
 		ImagesDir:  dir,
@@ -63,11 +63,11 @@ func TestResolveImageSelectors(t *testing.T) {
 	})
 
 	t.Run("alias resolves to its underlying ref", func(t *testing.T) {
-		got, err := cfg.ResolveImage("extensions")
+		got, err := cfg.ResolveImage("base")
 		if err != nil {
-			t.Fatalf("ResolveImage(extensions): %v", err)
+			t.Fatalf("ResolveImage(base): %v", err)
 		}
-		if got.DockerRef != "ghcr.io/charliek/shed-vz-extensions:v0.6.0" {
+		if got.DockerRef != "ghcr.io/charliek/shed-vz-base:v0.6.0" {
 			t.Errorf("DockerRef = %q, want the aliased ref", got.DockerRef)
 		}
 	})

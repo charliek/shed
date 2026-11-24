@@ -136,9 +136,8 @@ pub struct MinterError {
 }
 
 impl MinterError {
-    /// A non-terminal mint failure. Crate-private in a shipped build, as it was in the
-    /// broker; `pub` under `test-support` only, so `shed-broker`'s tests can script a
-    /// `Minter` that fails.
+    /// A non-terminal mint failure. Crate-private in a shipped build; `pub` under
+    /// `test-support` only, so an embedder's tests can script a `Minter` that fails.
     #[cfg(not(any(test, feature = "test-support")))]
     pub(crate) fn new(message: String) -> Self {
         Self {
@@ -234,9 +233,10 @@ impl CredentialMinter {
     }
 
     /// A minter with an injected bootstrap runner (mirror Go's `bootstrapRun` field) —
-    /// tests drive minting without spawning ssh.
-    #[cfg(test)]
-    fn with_runner(known_hosts_path: &str, runner: Arc<dyn BootstrapRunner>) -> Self {
+    /// tests drive minting without spawning ssh (`test-support` exposes it, with the
+    /// runner's types, to an embedder's tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_runner(known_hosts_path: &str, runner: Arc<dyn BootstrapRunner>) -> Self {
         Self {
             known_hosts_path: expand_tilde(known_hosts_path),
             runner,
@@ -1495,7 +1495,7 @@ impl CredentialSource {
 
     /// Proactively re-mint at ~50% of the time until expiry (jittered), so an idle
     /// server's token stays fresh. Stops when `cancel` resolves. Spawned per secure server
-    /// by the supervisor's group builder (`shed_broker::bus::spawn_server_group`).
+    /// by whoever holds the source for a long-lived stream.
     pub async fn refresh_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let delay = self.next_refresh_delay();
@@ -1606,8 +1606,7 @@ async fn wait_outcome(
     }
 }
 
-/// The minter's tests, and the helpers `shed-broker`'s bus, supervisor and egress tests
-/// share (`FakeMinter`, `MonoClock`, `WallClock`, `TestCa`, `TestUser`,
+/// The minter's tests, and the helpers this crate's and its embedders' tests share (`FakeMinter`, `MonoClock`, `WallClock`, `TestCa`, `TestUser`,
 /// `minted_cert_for`, `tmp_store`, `pat_then_admin`, `MISMATCH`). Under `test-support`
 /// alone (a non-test build of this crate) the `#[test]`s compile away, so the helpers
 /// only they use are dead there; that is expected, not a lint to act on.

@@ -361,15 +361,15 @@ exit 0
     .await;
     assert!(pid_alive(bridge_pid));
 
-    // Run production `shutdown_children` with a broker drain hook.
-    let broker_drained = Arc::new(AtomicBool::new(false));
-    let drain: crate::shutdown::BrokerDrain = {
-        let broker_drained = Arc::clone(&broker_drained);
-        Box::new(move || broker_drained.store(true, Ordering::SeqCst))
+    // Run production `shutdown_children` with a source drain hook.
+    let source_drained = Arc::new(AtomicBool::new(false));
+    let drain: crate::shutdown::SourceDrain = {
+        let source_drained = Arc::clone(&source_drained);
+        Box::new(move || source_drained.store(true, Ordering::SeqCst))
     };
     let report = shutdown_children(&gate, &hosts, &lanes, Some(&drain)).await;
 
-    assert!(broker_drained.load(Ordering::SeqCst));
+    assert!(source_drained.load(Ordering::SeqCst));
     assert!(report.gate_drained);
     assert_eq!(report.crazes, 1);
     assert_eq!(report.masters, 1);
@@ -536,7 +536,7 @@ exit 0
 
 /// **Fix 8**: `ShedDesktopRuntime` owns ONE `Arc<Shutdown>` shared by
 /// `shutdown_coordinator()` and `shutdown_children()`; concurrent callers share
-/// a single shutdown execution and `broker` runs exactly once.
+/// a single shutdown execution and the source drain runs exactly once.
 #[tokio::test]
 async fn shutdown_coordinator_is_idempotent_across_concurrent_callers() {
     let runtime = ShedDesktopRuntime::start_headless(
@@ -548,23 +548,10 @@ async fn shutdown_coordinator_is_idempotent_across_concurrent_callers() {
         },
         false,
     );
-    let drains = Arc::new(AtomicUsize::new(0));
-    let drain: crate::shutdown::BrokerDrain = {
-        let drains = Arc::clone(&drains);
-        Box::new(move || {
-            drains.fetch_add(1, Ordering::SeqCst);
-        })
-    };
-    runtime.set_broker_drain(drain);
-    // The delivery runtime's drain runs once too, after the broker's.
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let source_drains = Arc::new(AtomicUsize::new(0));
     runtime.set_source_drain({
         let source_drains = Arc::clone(&source_drains);
-        let drains = Arc::clone(&drains);
-        let order = Arc::clone(&order);
         Box::new(move || {
-            order.lock().unwrap().push(drains.load(Ordering::SeqCst));
             source_drains.fetch_add(1, Ordering::SeqCst);
         })
     });
@@ -575,10 +562,8 @@ async fn shutdown_coordinator_is_idempotent_across_concurrent_callers() {
 
     let (_r1, _r2, _r3) = tokio::join!(coord_a.run(), coord_b.run(), runtime.shutdown_children(),);
     assert!(coord_a.is_done());
-    assert_eq!(drains.load(Ordering::SeqCst), 1);
+    assert_eq!(source_drains.load(Ordering::SeqCst), 1);
     // Subsequent calls return immediately without re-running.
     let _ = runtime.shutdown_children().await;
-    assert_eq!(drains.load(Ordering::SeqCst), 1);
     assert_eq!(source_drains.load(Ordering::SeqCst), 1);
-    assert_eq!(*order.lock().unwrap(), vec![1], "the broker drained first");
 }

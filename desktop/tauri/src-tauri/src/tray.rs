@@ -1,10 +1,9 @@
 //! The system tray / menu-bar (B1a foundation + B1 menu + B1b mac popover).
 //!
-//! Both platforms get a native menu (Open Dashboard / Approvals / Preferences /
-//! Quit). On **Linux** that menu IS the tray surface — Tauri emits no tray
-//! left-click events or icon geometry there (`tauri-2.11/src/tray/mod.rs`: "Linux:
-//! Unsupported"), so a rich anchored popover is impossible; a click opens the menu.
-//! On **macOS** the menu moves to **right-click** and a **left-click opens the rich
+//! Both platforms get a native menu (Open Dashboard / Preferences / Quit). On
+//! **Linux** that menu IS the tray surface — Tauri emits no tray left-click events
+//! or icon geometry there (`tauri-2.11/src/tray/mod.rs`: "Linux: Unsupported"), so
+//! a rich anchored popover is impossible; a click opens the menu. On **macOS** the menu moves to **right-click** and a **left-click opens the rich
 //! popover** (B1b) — a second, opaque webview anchored at the tray via
 //! `tauri-plugin-positioner`. Building the tray is best-effort (a headless /
 //! no-SNI host may have nowhere to show it), so a failure logs and the
@@ -40,31 +39,28 @@ pub const POPOVER_MAX_HEIGHT: f64 = 640.0;
 /// Menu item ids — kept in sync with [`menu_item_ids`] so `tray.dump` can assert
 /// the menu over IPC without reaching into the native menu.
 const ID_OPEN: &str = "open";
-const ID_APPROVALS: &str = "approvals";
 const ID_PREFS: &str = "preferences";
 const ID_QUIT: &str = "quit";
 
 /// The tray menu's actionable item ids, in order — the drivable view of the menu.
 pub fn menu_item_ids() -> Vec<&'static str> {
-    vec![ID_OPEN, ID_APPROVALS, ID_PREFS, ID_QUIT]
+    vec![ID_OPEN, ID_PREFS, ID_QUIT]
 }
 
 /// Build + install the tray. Best-effort: returns the build error to the caller,
 /// which logs and continues (the window stays reachable regardless).
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, ID_OPEN, "Open Dashboard", true, None::<&str>)?;
-    let approvals = MenuItem::with_id(app, ID_APPROVALS, "Approvals", true, None::<&str>)?;
     let prefs = MenuItem::with_id(app, ID_PREFS, "Preferences…", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit Shed Desktop", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &approvals, &prefs, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &prefs, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Shed Desktop")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             ID_OPEN => show_main(app),
-            ID_APPROVALS => open_pane(app, "approvals"),
             ID_PREFS => open_prefs(app),
             ID_QUIT => app.exit(0),
             _ => {}
@@ -102,7 +98,9 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template@2x.png")) {
         Ok(icon) => builder = builder.icon(icon).icon_as_template(true),
         Err(e) => {
-            app_warn!("shed-desktop-tauri: tray template icon failed to decode ({e}); using app icon");
+            app_warn!(
+                "shed-desktop-tauri: tray template icon failed to decode ({e}); using app icon"
+            );
             if let Some(icon) = app.default_window_icon().cloned() {
                 builder = builder.icon(icon);
             }
@@ -129,7 +127,11 @@ pub fn update_running_count(app: &AppHandle, running: usize) {
         return;
     }
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let title = if running > 0 { format!(" {running}") } else { String::new() };
+        let title = if running > 0 {
+            format!(" {running}")
+        } else {
+            String::new()
+        };
         let _ = tray.set_title(Some(title));
     }
 }

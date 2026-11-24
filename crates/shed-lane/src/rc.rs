@@ -4,7 +4,7 @@
 //!
 //! **This is types, not machinery.** Plan 022 (S6, `charliek/shed#328`) deleted
 //! the RC hub and with it everything in this file that DID something: the
-//! `shed-ext-rc` argv builders, the create/prompt invocations, the permission-mode
+//! RC-helper argv builders, the create/prompt invocations, the permission-mode
 //! table, the stdout decoders, the non-interactive SSH argv, and the last of the
 //! claude.ai pane classifier. What is left is what the SURVIVORS read — the lane
 //! adapters (craze; gx until plan 025 C1 retired it, shed#390),
@@ -48,7 +48,7 @@ pub const ATTACH_NONE: &str = "none";
 ///
 /// **Two axes lived in one enum, and plan 025 retired one agent generation of
 /// the second.** The six kinds through `shell` mirrored the guest's `rc.Kind`
-/// — the tmux/RC registry the `shed-ext-rc` binary carried, deleted with the
+/// — the tmux/RC registry the guest RC helper binary carried, deleted with the
 /// hub in plan 022 (S6, `charliek/shed#328`). `Codex`, `Cursor`, `Gx` and
 /// `Grok` were the direct-agent and roost-only row kinds that named an agent
 /// shed could see or launch without a shared provider abstraction behind it;
@@ -214,7 +214,7 @@ impl RcState {
     /// treated as `Starting` (transient) rather than `Dead`, so a forward-compat
     /// session is never shown as gone. Mirrors mobile's `RcState.fromWire`
     /// (`rc_models.dart:176-181`). The strict serde derive above stays the
-    /// contract for `shed-ext-rc` stdout (golden-pinned); this is for the
+    /// contract for RC-helper stdout (golden-pinned); this is for the
     /// tolerant server-enrichment paths (overview `rc` blocks, rc-events).
     pub fn from_wire(s: &str) -> RcState {
         match s {
@@ -332,13 +332,13 @@ pub enum RcError {
     NotFound(String),
     #[error("invalid rc request: {0}")]
     BadRequest(String),
-    #[error("shed-ext-rc is not installed on this shed — update the shed image")]
+    #[error("the RC helper is not installed on this shed — update the shed image")]
     MissingBinary,
     #[error("rc operation failed: {0}")]
     Failed(String),
 }
 
-/// The neutral, target-agnostic session shape printed by `shed-ext-rc` (it runs
+/// The neutral, target-agnostic session shape printed by the guest RC helper (it runs
 /// inside the shed and can't know the host alias / shed name — the app injects
 /// those and maps `id`→`rc_id`). Optional fields are absent (not null) when
 /// unknown; `managed` defaults to false on a legacy payload.
@@ -367,7 +367,7 @@ pub struct RcSessionDto {
     pub kind: RcKind,
     pub state: RcState,
     // Strict (binary output, golden-pinned): `managed`
-    // is required — a DTO omitting it is a shed-ext-rc contract violation, not a
+    // is required — a DTO omitting it is a RC-helper contract violation, not a
     // silent "unmanaged". (The enriched `RcSession` model below stays defensive.)
     pub managed: bool,
     /// The session's CURRENT lane (contract v2): `"tui"` (an rc-tmux pane) or
@@ -590,7 +590,7 @@ impl RcKindFeatures {
     }
 }
 
-/// The `shed-ext-rc capabilities` payload, also embedded in the `list` envelope.
+/// The RC helper `capabilities` payload, also embedded in the `list` envelope.
 /// Tells a client which kinds a shed offers, which agents are installed (and at
 /// what version), the feature set, and per-kind UI hints. Mirrors the guest's
 /// `rc.Capabilities` (`internal/ext/rc/capabilities.go`). Optional maps/lists
@@ -651,7 +651,7 @@ pub struct RcSession {
     pub display_name: String,
     /// The session's working directory when known. `None` for a server-enriched
     /// overview row that carries none (Dart parity, `rc_models.dart:261`);
-    /// [`RcSession::from_dto`] (the `shed-ext-rc` stdout path) still fills the
+    /// [`RcSession::from_dto`] (the RC-helper stdout path) still fills the
     /// [`DEFAULT_WORKDIR`] fallback, so it is always `Some` there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
@@ -733,7 +733,7 @@ impl RcSession {
             // characters (category Cf: bidi overrides, zero-widths, BOM), then
             // trim; a value that is only such chars degrades to None. The feed
             // decoder and the overview path both clean this text, so the
-            // shed-ext-rc stdout path (`from_dto`) must not be laxer.
+            // RC-helper stdout path (`from_dto`) must not be laxer.
             last_message: dto.last_message.and_then(|m| {
                 let cleaned = dart_trim(&strip_format_chars(&m)).to_string();
                 if cleaned.is_empty() {
@@ -1385,7 +1385,7 @@ mod tests {
     const LIST_GOLDEN: &str = include_str!("../../fixtures/rcSessionDto.golden.json");
 
     /// The envelope the golden is shaped as. It was `RcSessionListDto` in this
-    /// module until S6 (`charliek/shed#328`) deleted the `shed-ext-rc` stdout
+    /// module until S6 (`charliek/shed#328`) deleted the RC-helper stdout
     /// contract along with the binary that produced it; the golden itself
     /// survives because it is the cross-repo pin for [`RcSessionDto`] and
     /// [`RcCapabilities`], which BOTH survive (`roost::model` synthesizes exactly
@@ -2083,7 +2083,7 @@ mod tests {
         assert!(j.get("last_message").is_none());
     }
 
-    // Finding 3: the guest-controlled last_message on the shed-ext-rc stdout
+    // Finding 3: the guest-controlled last_message on the RC-helper stdout
     // path must be sanitized exactly like the overview / feed paths — a bidi
     // override (U+202E) that could visually reverse the preview is stripped.
     #[test]

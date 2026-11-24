@@ -3,7 +3,6 @@
 //! Clients link this crate directly. Decoders in `models` must
 //! reproduce the defensive semantics documented there exactly.
 
-pub mod approval;
 pub mod authfail;
 pub mod certuser;
 pub mod config;

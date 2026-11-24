@@ -4,7 +4,7 @@ The app speaks newline-delimited JSON over a Unix socket — the same contract
 `shedctl` uses. The wire (connect / `_readline` / `call` / `identify` /
 `wait_until`) and the core ops (sheds.list / sheds.refresh / lifecycle / create)
 live on the `IPCClient` base; `TauriClient` adds the rest of the op surface,
-grouped by the `_ApprovalOps` and `_RcOps` mixins. Request ids are
+with the `_RcOps` mixin for the Agents ops. Request ids are
 string-wrapped int64 on the wire, ints here.
 """
 
@@ -152,66 +152,6 @@ class IPCClient:
             time.sleep(0.1)
 
 
-class _ApprovalOps:
-    """The credential-approval op surface (SSH-approval prefs / policy / approvals
-    / activity / notifications). `self.call` comes from the `IPCClient` base."""
-
-    def set_ssh_approval(self, method: str | None = None, policy: str | None = None,
-                         ttl: str | None = None) -> None:
-        """Set SSH approval prefs (any subset) and reset live SSH grants.
-
-        `policy` is one of: always-allow | per-shed-allow | time-based-allow |
-        always-ask | always-deny.
-        """
-        params: dict = {}
-        if method is not None:
-            params["method"] = method
-        if policy is not None:
-            params["policy"] = policy
-        if ttl is not None:
-            params["ttl"] = ttl
-        self.call("ui.set_ssh_approval", params)
-
-    def ssh_prefs_get(self) -> dict:
-        """The coordinator's current SSH approval prefs ({method, policy, ttl}) —
-        the read side of set_ssh_approval, so a test can assert what a set applied."""
-        return self.call("ui.ssh_prefs")
-
-    def approvals_list(self) -> list[dict]:
-        return self.call("approvals.list")["approvals"]
-
-    def approval_decide(self, id: str, decision: str, scope: str | None = None,
-                        ttl: str | None = None, persist: bool = False) -> None:
-        params: dict = {"id": id, "decision": decision, "persist": persist}
-        if scope is not None:
-            params["scope"] = scope
-        if ttl is not None:
-            params["ttl"] = ttl
-        self.call("approval.decide", params)
-
-    def activity_list(self, limit: int = 200) -> list[dict]:
-        return self.call("activity.list", {"limit": limit})["entries"]
-
-    def activity_log_path(self) -> str:
-        return self.call("activity.log_path")["path"]
-
-    def policy_set(self, rules: list[dict]) -> None:
-        self.call("policy.set", {"rules": rules})
-
-    def policy_list(self) -> list[dict]:
-        return self.call("policy.list")["rules"]
-
-    def notifications_list(self) -> list[dict]:
-        return self.call("notifications.list")["notifications"]
-
-    def notification_invoke(self, id: str, action: str) -> None:
-        self.call("notification.invoke", {"id": id, "action": action})
-
-    def notification_open(self) -> None:
-        """Drive a notification-body tap → opens the dashboard on Approvals."""
-        self.call("notification.open")
-
-
 class _RcOps:
     """The Agents op surface — list and inject_test.
 
@@ -251,9 +191,9 @@ class _RcOps:
         self.call("rc.inject_test", params)
 
 
-class TauriClient(_ApprovalOps, _RcOps, IPCClient):
-    """The Tauri client's op surface: the `IPCClient` core ops + the approval ops
-    (`_ApprovalOps`, B3) + the RC/Agents ops (`_RcOps`, B2) + the UI ops."""
+class TauriClient(_RcOps, IPCClient):
+    """The Tauri client's op surface: the `IPCClient` core ops + the RC/Agents ops
+    (`_RcOps`, B2) + the UI, source, delivery, activity and egress ops."""
 
     def screenshot(self, scale: int = 1) -> tuple[bytes, int, int]:
         r = self.call("app.screenshot", {"scale": scale})
@@ -285,12 +225,6 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
     def prefs_close(self) -> None:
         """Close (hide) the Preferences window — the close-hides singleton contract."""
         self.call("prefs.close")
-
-    def remove_shed_rule(self, server: str, shed: str) -> None:
-        """Remove one per-shed override rule + persist the remaining set (the same
-        path as the Preferences row's remove button). `server` is matched verbatim
-        ('' = the single/unnamed server)."""
-        self.call("prefs.remove_shed_rule", {"server": server, "shed": shed})
 
     def show_create(self) -> None:
         """Open the New-Shed dialog (raises the window + emits the event)."""
@@ -330,26 +264,8 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         is guaranteed to be visible."""
         return self.call("sidebar.dump")
 
-    def provider_modes_get(self) -> dict:
-        """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —
-        the read side of set_provider_mode. A namespace absent from the map is Deny."""
-        return self.call("prefs.provider_modes")
-
-    def set_provider_mode(self, namespace: str, decision: str) -> None:
-        """Set an AWS/Docker provider mode + persist. `namespace` is the full string
-        ('aws-credentials'|'docker-credentials'); `decision` is 'approve'|'deny'. A
-        non-provider namespace is rejected (bad_request)."""
-        self.call("prefs.set_provider", {"namespace": namespace, "decision": decision})
-
     def activate(self) -> None:
         self.call("app.activate")
-
-    # -- credential broker (leg 3a.2) ------------------------------------
-    def broker_status(self) -> dict:
-        """The LiveStatus-shaped broker snapshot: `{config:{source, message},
-        resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh,
-        broker_error}`. The embedded broker's truth op."""
-        return self.call("broker.status")
 
     # -- credential sources (plan 035 §3.4) -------------------------------
     def source_status(self) -> dict:
@@ -361,7 +277,7 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
 
     def source_use(self, host: str) -> dict:
         """Make THIS machine the credential source on `host` (one request, never
-        retried); `{row, woke_broker}`. Raises `ShedError` with the refusal: `bad_request`
+        retried) and reopen its delivery stream there; `{row, woke_source}`. Raises `ShedError` with the refusal: `bad_request`
         (unknown host), `machine_identity_unavailable`, `source_machine_not_found`,
         `forbidden`, `unsupported`, `action_failed`."""
         return self.call("source.use", {"host": host})
@@ -420,38 +336,56 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         return self.call("system.df")["usage"]
 
     def egress_dump(self) -> dict | None:
-        """The Egress pane's rendered state (`egress.profiles` UI truth, like
-        agents_dump): `{tab, profiles, errors, selected, activity_count}` — or
-        None unless the UI is on the egress pane and it has reported."""
+        """The System pane's rendered egress profiles (`egress.profiles` UI truth,
+        like agents_dump): `{profiles, errors}` — or None unless the UI is on the
+        System pane and it has reported."""
         return self.call("egress.profiles").get("egress")
 
-    def egress_show(self, tab: str | None = None, profile: str | None = None,
-                    host: str | None = None) -> None:
-        """Drive the Egress pane's sub-tab ('activity'|'profiles') and/or the
-        selected profile — the `egress.show` op → `egress-show` event. Selection
-        resolves by (host, name) when `host` is given, else by name (first match).
+    def egress_show(self, server: str, shed: str) -> None:
+        """Open `shed`'s detail on the Sheds pane (its delivery and its egress): the
+        `egress.show` op, an alias of `ui.show_shed_delivery`."""
+        self.call("egress.show", {"server": server, "shed": shed})
 
-        The pane's `egress-show` listener attaches asynchronously after mount, so the
-        op returns `frontend_not_ready` until the pane has reported (its snapshot is
-        non-null, which implies the listener is live). Retry on that — never on a real
-        error like `bad_request` — so a drive right after navigation can't be lost to
-        the attach race (harness convention: wait, don't sleep-and-hope)."""
+    def shed_egress_dump(self) -> dict | None:
+        """What the open shed detail's egress section rendered (`shed_egress.dump`):
+        `{server, shed, created_at, profiles, blocks, note, error, rendered}`, or None
+        when no detail is open."""
+        return self.call("shed_egress.dump").get("detail")
+
+    def egress_recent(self, server: str, shed: str, created_at: str,
+                      blocks: bool = False) -> list[dict]:
+        """A shed incarnation's kept egress decisions, newest first (`egress.recent`)."""
+        return self.call("egress.recent", {"server": server, "shed": shed,
+                                           "created_at": created_at, "blocks": blocks})["events"]
+
+    def egress_status(self) -> list[dict]:
+        """Each server's egress stream consumer (`egress.status`)."""
+        return self.call("egress.status")["servers"]
+
+    def egress_server_profiles(self) -> list[dict]:
+        """Each server's egress profiles, or its error (`egress.server_profiles`)."""
+        return self.call("egress.server_profiles")["hosts"]
+
+    def activity_server_list(self, limit: int | None = None, cursor: str | None = None,
+                             shed: str | None = None) -> dict:
+        """One merged page of every server's activity (`activity.server_list`):
+        `{events, next, errors}`."""
         params: dict = {}
-        if tab is not None:
-            params["tab"] = tab
-        if profile is not None:
-            params["profile"] = profile
-        if host is not None:
-            params["host"] = host
-        deadline = time.monotonic() + scaled_timeout(15.0)
-        while True:
-            try:
-                self.call("egress.show", params)
-                return
-            except ShedError as e:
-                if e.code != "frontend_not_ready" or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.1)
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        if shed is not None:
+            params["shed"] = shed
+        return self.call("activity.server_list", params)
+
+    def activity_dump(self) -> dict | None:
+        """What the Activity pane rendered (`activity.dump`), or None off the pane."""
+        return self.call("activity.dump").get("activity")
+
+    def press_activity_older(self) -> None:
+        """Press the Activity pane's own "Load older" (test mode only)."""
+        self.call("ui.press_activity_older")
 
     def terminal_preview(self, shed: str | None = None, host: str | None = None,
                          session: str | None = None, preset: str | None = None,

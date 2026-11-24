@@ -1,7 +1,6 @@
 //! The RFC3339 time helpers the source's modules share (std-only; no chrono).
 //!
-//! Moved here from `shed-broker`'s `status` module (plan 039 §3.7), which re-exports
-//! them, so every broker caller keeps its `crate::status::…` path.
+//! Moved here from the retired broker's `status` module (plan 039 §3.7).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,9 +48,8 @@ pub fn rfc3339_utc(unix_secs: i64) -> String {
 }
 
 /// Days from the civil date to the unix epoch (Howard Hinnant's `days_from_civil`;
-/// the inverse of the civil-from-days math in [`rfc3339_utc`] above). One
-/// implementation for this crate's `bootstrap` and the broker's `aws_backend`, which
-/// reaches it through `shed_broker::status` (crate-private there).
+/// the inverse of the civil-from-days math in [`rfc3339_utc`] above). Used by
+/// this crate's `bootstrap`.
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -68,10 +66,7 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// drops it), `Err(())` for a malformed non-empty value. The inverse of
 /// [`rfc3339_utc`]; a round-trip against it is unit-pinned.
 ///
-/// One implementation for the mint-bundle deserializer (`bootstrap::de_expires_at`)
-/// and the broker's egress consumer (`egress::egress_audit_entry`, through
-/// `shed_broker::status`, crate-private there) — mirroring how `days_from_civil` is
-/// shared. Go's `d.Time.UTC().Format(RFC3339)` is reproduced exactly incl. the
+/// Used by the mint-bundle deserializer (`bootstrap::de_expires_at`). Go's `d.Time.UTC().Format(RFC3339)` is reproduced exactly incl. the
 /// zero-time and offset-normalize cases.
 #[allow(clippy::result_unit_err)]
 pub fn parse_rfc3339_to_unix(s: &str) -> Result<Option<i64>, ()> {

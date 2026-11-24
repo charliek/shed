@@ -41,7 +41,6 @@ jobs:
       tauri: ${{ steps.filter.outputs.tauri }}
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
-      brokerwire: ${{ steps.filter.outputs.brokerwire }}
       machinetransport: ${{ steps.filter.outputs.machinetransport }}
       integrationunits: ${{ steps.filter.outputs.integrationunits }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -97,7 +96,6 @@ jobs:
             tauri:
               - 'desktop/tauri/**'
               - 'crates/**'
-              - 'desktop/packaging/polkit/**'
               # tauri.conf.json bundles launcher scripts from Resources/bin,
               # and the Linux legs run inside this Dockerfile's image
               - 'desktop/Resources/**'
@@ -118,33 +116,6 @@ jobs:
               - 'desktop/pyproject.toml'
               - 'desktop/uv.lock'
               - 'craze-pin.env'
-            brokerwire:
-              # The broker wire-goldens leg: the desktop app's embedded broker
-              # (shed-broker, and shed-app's `broker` bridge that hosts it), the
-              # test-only process that runs it for the harness, their shared wire
-              # contract (sdk envelope + ext/protocol payloads), the harness, the
-              # committed wire reference, and the shared build manifests/locks/
-              # toolchain a dependency bump would ride in on. (release-snapshot
-              # does not use this filter: it runs when the go or ci filter
-              # matches.)
-              - 'crates/shed-broker/**'
-              # the broker's identity, credential store, minter and
-              # control-token provider, extracted in plan 039 (re-exported).
-              - 'crates/shed-source/**'
-              - 'crates/shed-app/**'
-              - 'crates/shed-broker-harness/**'
-              - 'crates/shed-core/**'
-              # shed-broker depends on shed-core, which depends on shed-lane.
-              - 'crates/shed-lane/**'
-              - 'crates/rust-toolchain.toml'
-              - 'crates/Cargo.toml'
-              - 'crates/Cargo.lock'
-              - 'sdk/**'
-              - 'internal/ext/protocol/**'
-              - 'tests/broker-wire/**'
-              - 'docs/development/broker-wire-catalog.md'
-              - 'go.mod'
-              - 'go.sum'
             machinetransport:
               # The machine-transport differential's live leg (plan 025 C5): the
               # shared contract + goldens + the pytest suite, and the two Rust
@@ -173,11 +144,9 @@ jobs:
               - '.github/workflows/docs.yml'
             images:
               # The `images` leg proves the vz/firecracker image Dockerfiles
-              # (extensions stage) still build before a tag does (#404).
+              # (base stage) still build before a tag does (#404).
               - 'vz/**'
               - 'firecracker/**'
-              - 'guest/extensions/etc/**'
-              - 'scripts/stage-guest-binaries.sh'
               - 'scripts/install-input-sha.sh'
             ci:
               - '.github/workflows/**'
@@ -205,8 +174,8 @@ jobs:
       # NOT run `cd sdk && go test` here because sdk/bootstrap's TestRunSuccess
       # is an SSH integration test that isn't robust on the CI runner (it drives
       # the system ssh binary against a spawned test server). Keeping sdk out of
-      # the CI test command matches pre-existing behavior; the imported
-      # extensions code's use of the sdk is fully compile-checked.
+      # the CI test command matches pre-existing behavior; the root module's
+      # use of the sdk is fully compile-checked.
       #
       # SHED_REQUIRE_SSHD=1: the remote transport's real-sshd leg
       # (internal/remote/transport/sshlink) builds and runs an OpenSSH
@@ -216,7 +185,7 @@ jobs:
         env:
           SHED_REQUIRE_SSHD: "1"
       # The one exception to the sdk rule above: sdk/bootstrap's text checks
-      # against the Rust broker run no ssh, so they run here, and nothing else
+      # against the Rust source (shed-source's bootstrap) run no ssh, so they run here, and nothing else
       # of the sdk module does. TestNoSSHIdentitiesTextMatchesRust reads the
       # Rust NoSshIdentities text and the shared stderr table
       # (crates/fixtures/bootstrap-stderr/); TestRustTextReaderFailsClosed holds
@@ -224,11 +193,11 @@ jobs:
       # crates/fixtures/shellword/, is read by internal/config's
       # TestShellWordSharedTable, which `go test ./...` above runs. The Rust
       # side of the stderr table, in shed-source (plan 039: moved there from
-      # shed-broker with bootstrap.rs), runs in core-mac, core-linux and
-      # broker-wire; of the shellword table, in shed-core, in core-mac and
+      # the retired broker with bootstrap.rs), runs in core-mac and core-linux;
+      # of the shellword table, in shed-core, in core-mac and
       # core-linux. A change to only crates/fixtures/** or the Rust text runs
       # this job too: the `gocrossread` filter.)
-      - name: sdk text checks against the Rust broker (no ssh)
+      - name: sdk text checks against the Rust source (no ssh)
         working-directory: sdk
         run: go test -v -count=1 -run '^(TestNoSSHIdentitiesTextMatchesRust|TestRustTextReaderFailsClosed)$' ./bootstrap/
 
@@ -490,8 +459,8 @@ jobs:
     name: core-mac
     needs: changes
     timeout-minutes: 30
-    # The Rust core workspace on macOS: shed-broker's Touch ID gate and the
-    # other cfg(target_os = "macos") paths only compile and run here. core-linux
+    # The Rust core workspace on macOS: the cfg(target_os = "macos") paths
+    # (shed-source's state dir among them) only compile and run here. core-linux
     # covers the Linux side.
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: macos-15
@@ -558,8 +527,8 @@ jobs:
         # shed-provision and shed-provision-providers (plan 039): the first's
         # tests read tests/provision-contract/v1 from the checkout. shed-source
         # (plan 039 §3.7): the machine identity, credential store and minter
-        # extracted from shed-broker; its state-dir and flock paths differ on
-        # Linux.
+        # extracted from the retired broker; its state-dir and flock paths differ
+        # on Linux.
         run: |
           cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers -p shed-source --all-targets --locked
           cargo test -p shed-lane -p shed-roost --all-targets --features test-support --locked
@@ -588,55 +557,6 @@ jobs:
         run: |
           cargo test -p shed-craze --all-targets --features test-support --locked
           cargo clippy -p shed-craze --all-targets --features test-support --locked -- -D warnings
-
-  # The broker wire-goldens leg (the Go twin sunset in plan 006; the harness
-  # moved off the daemon onto the desktop app's broker in plan 037). One Linux job
-  # covers BOTH the broker core and its test-only host's build+test+clippy
-  # (shed-broker, shed-broker-harness — the harness crate is not a default member,
-  # so it is named here) AND the hermetic wire harness that runs the app's
-  # embedded broker in that host and asserts its wire-visible output against
-  # goldens recorded from the last agreeing Go↔Rust run. Rust + Python on one
-  # runner (the "third pytest suite").
-  broker-wire:
-    name: broker-wire (wire goldens)
-    needs: changes
-    if: ${{ needs.changes.outputs.brokerwire == 'true' || needs.changes.outputs.ci == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustc --version && cargo --version
-      - name: C toolchain (ring's crypto backend needs build-essential)
-        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
-        timeout-minutes: 12
-        run: |
-          set -euo pipefail
-          ok=""
-          for attempt in 1 2 3; do
-            if sudo timeout 120 apt-get update; then ok=1; break; fi
-            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
-            sleep 10
-          done
-          if [ -z "${ok}" ]; then
-            echo "::error::apt-get update failed 3x — mirror outage?"
-            exit 1
-          fi
-          sudo timeout 300 apt-get install -y build-essential
-      - uses: astral-sh/setup-uv@v6
-      # The broker core and the harness's host (its unit tests, and the check that
-      # no crate depends on it and it is no default member), and shed-source, the
-      # modules extracted from the broker in plan 039 (their tests moved with them).
-      - name: Broker + harness host — test + clippy (Linux)
-        working-directory: crates
-        run: |
-          cargo test -p shed-broker -p shed-broker-harness -p shed-source --all-targets --locked
-          cargo clippy -p shed-broker -p shed-broker-harness -p shed-source --all-targets --locked -- -D warnings
-      - name: Wire goldens + golden runners
-        # Builds shed-broker-harness (conftest) and runs the pytest suite against
-        # the recorded goldens + the Rust golden-fixture runners.
-        run: make test-broker-wire
 
   # The machine-transport differential's LIVE leg (plan 025 C5, P10): every
   # scenario's wire line through a throwaway sshd on 127.0.0.1, asserting the
@@ -757,18 +677,19 @@ jobs:
       - name: Install-validate in a clean container
         # apt-installs the .deb (resolving its runtime deps) in a fresh ubuntu:24.04
         # and asserts the binary launches under Xvfb + answers identify, the bundled
-        # shedctl drives it, and the polkit action is present.
+        # shedctl drives it, and no polkit action ships.
         run: |
           # shellcheck disable=SC2012  # controlled out/ dir, glob is safe
           ./linux/scripts/validate-deb.sh "$(ls -t out/shed-desktop_*.deb | head -1)"
 
   # ---- image build legs (#404) ----------------------------------------------
   # Until #404 the first CI build of an image change was the release tag itself.
-  # This builds the `extensions` stage of each backend's Dockerfile on the PR,
-  # without pushing. `extensions` and not `full`: `full` only adds third-party
-  # installs (Docker's apt repo, profile scripts) that would make PR CI flakier,
-  # and the tag still builds all three. Native runners (arm64 for vz, amd64 for
-  # fc) because the extensions RUN executes the baked binaries.
+  # This builds the `base` stage of each backend's Dockerfile on the PR,
+  # without pushing. `base` and not `full`: `full` only adds third-party
+  # installs (Docker's and stridelabs' apt repos, the coding agents) that would
+  # make PR CI flakier, and the tag still builds both. Native runners (arm64 for
+  # vz, amd64 for fc) because base's roost-session and craze RUN executes the
+  # baked binaries.
   # Cache: PRs read main's cache and write none (PR caches are branch-scoped and
   # would only churn the 10 GB budget with GBs of kernel layers); only a push to
   # main writes it, with a mode per backend (fc max, vz min).
@@ -786,13 +707,13 @@ jobs:
             runner: ubuntu-24.04-arm
             context: vz
             arch: arm64
-            target: shed-vz-extensions
+            target: shed-vz-base
             cache-mode: min
           - backend: fc
             runner: ubuntu-latest
             context: firecracker
             arch: amd64
-            target: shed-fc-extensions
+            target: shed-fc-base
             cache-mode: max
     steps:
       - uses: actions/checkout@v6
@@ -811,7 +732,6 @@ jobs:
           arch="${{ matrix.arch }}"
           GOOS=linux GOARCH="${arch}" go build -o "${ctx}/shed-agent" ./cmd/shed-agent
           GOOS=linux GOARCH="${arch}" go build -o "${ctx}/shed-firstboot" ./cmd/shed-firstboot
-          ./scripts/stage-guest-binaries.sh "${ctx}" "${arch}"
           echo "install_sha=$(./scripts/install-input-sha.sh "${ctx}")" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - name: Build the ${{ matrix.target }} stage (no push)
@@ -853,9 +773,10 @@ jobs:
         with:
           shed-path: ${{ github.workspace }}
           out-dir: desktop/tools/shedtest/.craze-bin
-      # The Tauri crate's Linux-only approval-seam tests (polkit/libnotify gate is
-      # fail-closed: never Approved without a real auth). Docker (ubuntu:24.04),
-      # same image as the render gate below; no display needed.
+      # The Tauri crate's clippy and unit tests on Linux, where its Linux-only code
+      # (the autostart login item, the scrot screenshot) is compiled; tauri-lint
+      # and tauri-test run on the Mac leg only. Docker (ubuntu:24.04), same image
+      # as the render gate below; no display needed.
       #
       # SHED_CRAZE_BIN_DIR is the IN-CONTAINER path (the action exported the
       # host's), and SHED_CRAZE_REQUIRE=1 turns a skipped craze cell into a
@@ -1017,12 +938,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, core-mac, core-linux, broker-wire, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, core-mac, core-linux, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.core-mac.result }} ${{ needs.core-linux.result }} ${{ needs.broker-wire.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.core-mac.result }} ${{ needs.core-linux.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

@@ -1,41 +1,32 @@
 # Build Your Own Image
 
 This tutorial walks through deriving a custom shed image from the
-published `extensions` variant, pushing it to a private registry, and
+published `base` variant, pushing it to a private registry, and
 booting a shed from it.
 
 We'll build an image with [uv](https://docs.astral.sh/uv/) (Python
 package manager), Python 3.13, and [OpenCode](https://opencode.ai)
 preinstalled.
 
-## Why start from `extensions`?
+## Why start from `base`?
 
-The three published variants are:
+The two published variants are:
 
 | Variant | Contents | Recommended use |
 |---|---|---|
-| `base` | OS layer only. systemd, SSH, git, build tools, the shed-agent. No Docker. | Tiny images. You'll wire up coding agents and credentials yourself. |
-| `extensions` | `base` + [credential brokering](../reference/extensions.md). No Docker daemon, no coding agents pinned. | **Custom images.** Credentials work out of the box; you choose the runtime/agent set. |
-| `full` | `extensions` + Docker CE (with `docker compose`), mise, bun, and coding agents (Claude Code, OpenCode, Codex CLI). | Default for `shed create`. |
+| `base` | OS layer: systemd, SSH, git, build tools, the shed-agent, roost-session and craze. No Docker, no coding agents. | **Custom images.** You choose the runtime and agent set. |
+| `full` | `base` + Docker CE (with `docker compose`), `strix`, `prox`, `parcel`, `envsecrets`, mise, bun, and coding agents (Claude Code, OpenCode, Codex CLI). | Default for `shed create`. |
 
-`extensions` is the right starting point because:
+`base` is the right starting point because:
 
-- Credential brokering is preconfigured — SSH agent forwarding, AWS STS,
-  and Docker registry auth work without further setup.
 - No coding agents are pinned, so you choose versions yourself without
   fighting `full`'s defaults.
 - Building on a published variant means the shed-overlay boot setup,
-  kernel/initrd, and credential brokering are already in place — you only
-  add your own top layers.
-
-## Prerequisites
-
-- A host with Docker installed (for `docker buildx`).
-- `shed` and `shed-server` already set up. See
-  [VZ Setup](../getting-started/vz-setup.md) or
-  [Firecracker Setup](../getting-started/fc-setup.md).
-- A private registry you can push to. We'll use
-  `ghcr.io/myorg/my-shed-image:v1` in examples — substitute your own.
+  kernel/initrd, the agent and roost-session are already in place — you
+  only add your own top layers.
+- Credentials still reach your image: [delivery](../reference/delivery.md)
+  writes files and environment variables into any shed whose agent speaks
+  delivery protocol 2, which every `base` image from v0.11 does.
 
 ## 1. Write the Dockerfile
 
@@ -43,10 +34,10 @@ Save the following as `Dockerfile.shed` in an empty directory:
 
 ```dockerfile
 # Pick the variant matching your backend platform.
-# VZ (macOS arm64): shed-vz-extensions
-# Firecracker (Linux amd64): shed-fc-extensions
+# VZ (macOS arm64): shed-vz-base
+# Firecracker (Linux amd64): shed-fc-base
 ARG SHED_VERSION=v0.5.1
-FROM ghcr.io/charliek/shed-vz-extensions:${SHED_VERSION}
+FROM ghcr.io/charliek/shed-vz-base:${SHED_VERSION}
 
 USER root
 
@@ -73,11 +64,11 @@ ENTRYPOINT ["/sbin/init"]
 
 Notes on the constraints:
 
-- **`FROM ghcr.io/charliek/shed-vz-extensions`** (or `shed-fc-extensions`
+- **`FROM ghcr.io/charliek/shed-vz-base`** (or `shed-fc-base`
   for Firecracker) — the layer below yours must be a shed-managed
   variant. Other base images will not boot.
 - **Do not remove the `shed` user (UID 1000)** — much of the shed-agent
-  and credential brokering assumes it exists.
+  and credential delivery assumes it exists.
 - **Do not disable `shed-agent.service`** — it's how the host talks to
   the guest.
 - **`ENTRYPOINT ["/sbin/init"]`** is mandatory. Shed boots via systemd.
@@ -225,9 +216,8 @@ shed image pull ghcr.io/myorg/my-shed-image:v1 -t my-image
 
 `shed image pull` is registry-direct — no Docker daemon required on
 the shed server. Authentication uses
-`~/.docker/config.json` and any installed credential helpers (including
-the Docker credential proxy extension when an `extensions`-based
-shed is running).
+`~/.docker/config.json` and any credential helper installed on the
+machine that runs the command.
 
 The pull is **boot-only** by default: the host boots from the prebuilt
 erofs blob, so the layer tarballs aren't downloaded (roughly half the
@@ -244,8 +234,8 @@ shed image inspect my-image
 
 You should see roughly 9–11 layers in the manifest: your `RUN curl … uv …`,
 `RUN curl … opencode …`, the `LABEL` and any other top-of-Dockerfile
-instructions you added, then the 7-or-so layers from the parent
-`extensions` variant. `shed image ls` shows the image under `LAYERS` as
+instructions you added, then the layers from the parent
+`base` variant. `shed image ls` shows the image under `LAYERS` as
 `boot-only` (the layer *blobs* weren't downloaded) and its `SIZE` is the
 on-disk footprint (erofs + kernel + initrd), not the full layer set.
 
@@ -274,7 +264,6 @@ vz:
   default_image: my-image        # a local label (-t), or the full ghcr.io ref
   image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.1
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
     full: ghcr.io/charliek/shed-vz-full:v0.5.1
     my-image: ghcr.io/myorg/my-shed-image:v1
   pull_policy: missing

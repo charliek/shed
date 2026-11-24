@@ -32,7 +32,7 @@ running app.
 | `shedctl raw <op> [--param k=v ...]` | any | Call an arbitrary op; each value is parsed as JSON when it parses (`3`, `true`, `{"a":1}`), else sent as a string |
 
 Every other op in the [IPC catalog](ipc.md) — navigation, create, terminal, agent sessions,
-approvals, `system.df` — is reached through `shedctl raw`.
+delivery, `system.df` — is reached through `shedctl raw`.
 
 A successful reply prints its `result` as pretty JSON and exits 0. An error reply prints
 `error <code>: <message>` and exits 1, as does an unreachable socket. A usage error exits 2.
@@ -46,5 +46,5 @@ shedctl raw ui.show_window
 shedctl screenshot --out /tmp/shot.png
 shedctl shed stop my-shed --host buildbox
 shedctl raw system.df                        # per-host disk usage
-shedctl raw approval.decide --param id=<req-id> --param decision=approve
+shedctl raw delivery.status                  # this machine's delivery streams
 ```

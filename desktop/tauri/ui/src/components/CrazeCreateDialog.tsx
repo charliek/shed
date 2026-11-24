@@ -197,6 +197,12 @@ export function CrazeCreateDialog({
     pick, onEdit, recent: [] as string[], press: () => {},
     choose: (_mode: CrazeSheetMode) => {}, resume: (_id: string) => {},
   });
+  // Whether the doors' listeners are attached. The sheet reports itself
+  // (`craze_create.dump`) only once they are — the readiness invariant
+  // `useUiBridge` keeps — so "the sheet reported" means a door sent now is heard.
+  // Reporting earlier let a door sent right after the sheet opened fire before
+  // its listener attached, and be lost.
+  const [doorsLive, setDoorsLive] = useState(false);
   useEffect(() => {
     doors.current = {
       pick,
@@ -241,6 +247,7 @@ export function CrazeCreateDialog({
         }),
       );
       if (cancelled) uns.forEach((u) => u());
+      else setDoorsLive(true);
     });
     return () => {
       cancelled = true;
@@ -251,8 +258,9 @@ export function CrazeCreateDialog({
   // Report what the sheet RENDERED (`craze_create.dump`), read back off its
   // DOM after the commit — the `launch.dump` rule — so the dump cannot claim a
   // provider row, a dimming or a value the sheet does not show.
-  const shape = JSON.stringify([load, draft, machineNote, canCreate, titleField, resume, modesOffered, locked]);
+  const shape = JSON.stringify([load, draft, machineNote, canCreate, titleField, resume, modesOffered, locked, doorsLive]);
   useEffect(() => {
+    if (!doorsLive) return;
     const root = document.querySelector("[data-craze-create]");
     const modeButtons = Array.from(root?.querySelectorAll<HTMLButtonElement>("[data-craze-mode]") ?? []);
     const savedRoot = root?.querySelector<HTMLElement>("[data-saved]");

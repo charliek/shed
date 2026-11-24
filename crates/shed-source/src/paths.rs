@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// `user_home_dir` returns `$HOME`, falling back to `/tmp` when unset (mirrors the
 /// Go daemon's `userHomeDir` → `os.UserHomeDir` with a `/tmp` fallback). Moved here
-/// from `shed-broker`'s `config` (plan 039 §3.7), which re-exports it.
+/// from the retired broker's `config` (plan 039 §3.7).
 pub fn user_home_dir() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(h) if !h.is_empty() => PathBuf::from(h),
@@ -15,8 +15,8 @@ pub fn user_home_dir() -> PathBuf {
 }
 
 /// `expand_tilde` expands a leading `~/` to the user's home directory (mirrors the
-/// Go daemon's `expandTilde`). Moved here from `shed-broker`'s `config` (plan 039
-/// §3.7), which re-exports it.
+/// Go daemon's `expandTilde`). Moved here from the retired broker's `config` (plan
+/// 039 §3.7).
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         return user_home_dir().join(rest).to_string_lossy().into_owned();

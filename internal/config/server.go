@@ -802,14 +802,26 @@ func (c *ServerConfig) validateBindAddress() error {
 // ExtensionsConfig configures which extensions the agent should enable.
 type ExtensionsConfig struct {
 	// Enabled lists the extension namespaces to activate in VMs
-	// (e.g., ["ssh-agent", "aws-credentials"]).
+	// (e.g., ["my-extension"]).
 	Enabled []string `yaml:"enabled"`
+}
+
+// retiredExtensions are the extension names whose in-VM helper binaries were
+// removed in v0.11 (plan 039). Naming one in extensions.enabled fails config
+// load; every other name keeps working through the generic manifest mechanism.
+var retiredExtensions = map[string]bool{
+	"ssh-agent":          true,
+	"aws-credentials":    true,
+	"docker-credentials": true,
 }
 
 // Validate checks that all extension namespaces are valid and unique.
 func (e *ExtensionsConfig) Validate() error {
 	seen := make(map[string]bool, len(e.Enabled))
 	for _, ns := range e.Enabled {
+		if retiredExtensions[ns] {
+			return fmt.Errorf("extension %q was removed in v0.11 and can no longer be enabled; remove it from extensions.enabled (see docs/upgrades/v0.10-to-v0.11.md)", ns)
+		}
 		if ns == "" {
 			return fmt.Errorf("extension namespace must not be empty")
 		}
@@ -1201,9 +1213,8 @@ func applyImageVersionDefaults(backend, defaultImage string, aliases map[string]
 	}
 	if len(aliases) == 0 {
 		aliases = map[string]string{
-			"base":       version.RootfsRef(backend, "base", tag),
-			"extensions": version.RootfsRef(backend, "extensions", tag),
-			"full":       version.RootfsRef(backend, "full", tag),
+			"base": version.RootfsRef(backend, "base", tag),
+			"full": version.RootfsRef(backend, "full", tag),
 		}
 	}
 	return defaultImage, aliases
@@ -1455,6 +1466,14 @@ type ResolvedImage struct {
 	PullPolicy string
 }
 
+// retiredImageVariant is the image variant removed in v0.11 (plan 039 §3.12).
+// A store upgraded from v0.10 can still hold a tag label of that name (every
+// pull writes one named after the image's repository), so the word is never
+// resolved through a label: unless an operator's own alias names it, it
+// resolves as any unknown word does, never to the old image with the retired
+// credential helpers.
+const retiredImageVariant = "extensions"
+
 // resolveImageRef classifies an image selector into a ResolvedImage. It is a
 // thin classifier — all cache-vs-pull logic (the ref-index lookup and
 // pull_policy enforcement) lives in vmimage.EnsureImage, so this returns
@@ -1478,7 +1497,7 @@ func resolveImageRef(defaultImage string, aliases map[string]string, pullPolicy,
 	default:
 		if aliased, ok := aliases[ref]; ok {
 			ref = aliased
-		} else if imagesDir != "" {
+		} else if imagesDir != "" && selector != retiredImageVariant {
 			// A raw selector may be a cosmetic tag label set via
 			// `shed image pull/build -t`. Resolve that first — a bare
 			// word like "mylabel" otherwise parses as a Docker ref
@@ -1521,7 +1540,7 @@ func availableImageVariants(aliases map[string]string, imagesDir string) []strin
 		tags, err := vmimage.ListTags(imagesDir)
 		if err == nil {
 			for _, name := range tags {
-				if name != "" {
+				if name != "" && name != retiredImageVariant {
 					seen[name] = true
 				}
 			}
@@ -2399,6 +2418,12 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	}
 	if err := c.validateNetwork(); err != nil {
 		return err
+	}
+	// The retired helpers are refused by every loader, the CLI's included.
+	if c.Extensions != nil {
+		if err := c.Extensions.Validate(); err != nil {
+			return fmt.Errorf("extensions config: %w", err)
+		}
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}

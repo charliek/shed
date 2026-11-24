@@ -114,8 +114,8 @@ func readStderrCauseTable(t *testing.T) []stderrCause {
 }
 
 // TestNoSSHIdentitiesTextMatchesRust: the refusal of every key reads the same
-// whichever client met it — the CLI (this package) or the desktop's broker
-// (crates/shed-broker, whose bootstrap lives in crates/shed-source). It reads the Rust source string and requires it to be
+// whichever client met it — the CLI (this package) or the desktop's source
+// (crates/shed-source's bootstrap). It reads the Rust source string and requires it to be
 // Go's sentinel and hint, then ssh's words, byte for byte; and, for every case
 // of the table both languages read (crates/fixtures/bootstrap-stderr/), Go's
 // error is the Rust text with that case's cause, escaped and clipped as the

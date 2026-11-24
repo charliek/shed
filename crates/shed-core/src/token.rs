@@ -549,12 +549,9 @@ const MINT_FAILED_REDACTED: &str = "control token mint failed";
 /// server issued a certificate for the other user each time, to be thrown away.
 ///
 /// One definition serves both of the app's credential paths: this provider, and the
-/// embedded broker's credential source (`CredentialSource` in
-/// `crates/shed-source/src/minter.rs`, plan 037 A25), which reads these two constants and
-/// [`next_refusal_backoff`] from here. The broker's credential streams reconnect on the
-/// same schedule with their own copy, `INITIAL_BACKOFF` and `MAX_BACKOFF` in
-/// `crates/shed-broker/src/bus.rs` (a stream's backoff, not a refusal's). Keep the two
-/// equal.
+/// source's credential source (`CredentialSource` in `crates/shed-source/src/minter.rs`,
+/// plan 037 A25), which reads these two constants and [`next_refusal_backoff`] from
+/// here.
 ///
 /// The wait is measured on the monotonic clock ([`ControlTokenProvider`]'s `now_mono`),
 /// to the full resolution of [`Instant`]: a wall clock read in whole seconds would let a
@@ -771,7 +768,7 @@ pub fn name_jitter(name: &str, max_ms: u64) -> u64 {
 // OPTIONAL there (absent/zero → non-expiring `None`). These parsers are the
 // MOBILE-parity view: expiry is REQUIRED and a bundle without one is rejected.
 // The two must not be merged (§3.5); shed-core also must never depend on
-// shed-broker (the dependency direction is broker → core).
+// shed-source (the dependency direction is source → core).
 // ---------------------------------------------------------------------------
 
 /// Fail-closed rejection of an SSH `_bootstrap` token bundle. Mirrors the
@@ -1091,9 +1088,9 @@ fn require_expiry_unix(obj: &serde_json::Map<String, Value>) -> Result<u64, Toke
 /// digits validated then truncated.
 ///
 /// Std-only (shed-core carries no time dependency): the same Howard Hinnant
-/// days-from-civil mechanism as `shed-broker/src/status.rs:
+/// days-from-civil mechanism as `shed-source/src/time.rs:
 /// parse_rfc3339_to_unix` — PORTED, not imported (the dependency direction is
-/// broker → core), and with one semantic difference: the broker collapses the
+/// source → core), and with one semantic difference: the source collapses the
 /// Go zero time `0001-01-01T00:00:00Z` to `None` (Go `IsZero()` parity),
 /// while this parser has no such case — it returns the plain instant
 /// (-62135596800), matching Dart's `DateTime.tryParse`, which parses the Go
@@ -1167,7 +1164,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 }
 
 /// Days from the civil date to the unix epoch (Howard Hinnant's
-/// `days_from_civil`; the same math as `shed-broker/src/status.rs:171-179`).
+/// `days_from_civil`; the same math as `shed-source/src/time.rs`).
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1302,7 +1299,7 @@ impl State {
 /// COMPLETES as a failure) and never a wrong cached token (the cancelled
 /// mint's result is dropped, not cached). The upgrade, if it ever matters, is
 /// provider-owned in-flight mint state joined by waiters off the lock —
-/// shed-broker's watch-based single-flight (`shed-source/src/minter.rs`,
+/// shed-source's watch-based single-flight (`shed-source/src/minter.rs`,
 /// module docs) is the in-repo pattern.
 pub struct ControlTokenProvider {
     server: String,

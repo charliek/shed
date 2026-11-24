@@ -63,10 +63,11 @@ crates/                   # shared Rust core workspace (sibling of desktop/)
   shed-lane/              # pure leaf: lane contract, RC DTOs, slash menu, craze argv
   shed-core/              # pure protocol client: HTTP/SSE, decoders, TLS, token FSM, config
   shed-roost/             # roost client; the only roost-ipc crate in this workspace
-  shed-app/               # UI-free shed client: Backend, approval Coordinator, broker bridge
-  shed-desktop-core/      # toolkit-free shed-only hosts, craze and lanes
-  shed-broker/            # the credential broker the app embeds
-  shed-broker-harness/    # test-only host of the app's broker (tests/broker-wire)
+  shed-app/               # UI-free shed client: Backend
+  shed-desktop-core/      # toolkit-free shed-only hosts, craze, lanes, delivery runtime
+  shed-source/            # machine identity, cert store, control minting, delivery stream
+  shed-provision/         # provision contract (documents, validation, bundle builder)
+  shed-provision-providers/ # the five providers
   shed-craze/             # craze agent-lane adapter
   shedctl/                # headless IPC client (shipped in the Linux .deb)
 desktop/
@@ -76,7 +77,7 @@ desktop/
   Resources/bin/          # bundled terminal openers (shed-open-ghostty, shed-open-roost.py)
   scripts/                # macOS bundle, DMG, notarize, Sparkle fetch + appcast
   linux/scripts/          # .deb build + validation
-  packaging/              # nfpm config, desktop entry, polkit action, icons
+  packaging/              # nfpm config, desktop entry, icons
   tools/shedtest/         # pytest functional harness + in-process mock shed-server
   Dockerfile.tauri-linux  # the Linux render-gate / .deb build image
   Dockerfile.linux        # the shed-core Linux test image

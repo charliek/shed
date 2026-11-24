@@ -77,7 +77,7 @@ func TestApplyDefaultsSynthesizesDefaultOnReleaseBuild(t *testing.T) {
 		if want := "ghcr.io/charliek/shed-vz-full:v0.6.2"; cfg.DefaultImage != want {
 			t.Errorf("synthesized DefaultImage = %q, want %q", cfg.DefaultImage, want)
 		}
-		assertAliasTrio(t, cfg.ImageAliases, "vz")
+		assertAliasPair(t, cfg.ImageAliases, "vz")
 	})
 
 	t.Run("firecracker", func(t *testing.T) {
@@ -86,7 +86,7 @@ func TestApplyDefaultsSynthesizesDefaultOnReleaseBuild(t *testing.T) {
 		if want := "ghcr.io/charliek/shed-fc-full:v0.6.2"; cfg.DefaultImage != want {
 			t.Errorf("synthesized DefaultImage = %q, want %q", cfg.DefaultImage, want)
 		}
-		assertAliasTrio(t, cfg.ImageAliases, "fc")
+		assertAliasPair(t, cfg.ImageAliases, "fc")
 	})
 }
 
@@ -159,12 +159,13 @@ func TestSynthesizedRefsAreProtectableDockerRefs(t *testing.T) {
 	}
 }
 
-func assertAliasTrio(t *testing.T, aliases map[string]string, backend string) {
+// assertAliasPair: a release build synthesizes the two variants, base and
+// full. The extensions variant was removed in v0.11 (plan 039) and has no alias.
+func assertAliasPair(t *testing.T, aliases map[string]string, backend string) {
 	t.Helper()
 	want := map[string]string{
-		"base":       "ghcr.io/charliek/shed-" + backend + "-base:v0.6.2",
-		"extensions": "ghcr.io/charliek/shed-" + backend + "-extensions:v0.6.2",
-		"full":       "ghcr.io/charliek/shed-" + backend + "-full:v0.6.2",
+		"base": "ghcr.io/charliek/shed-" + backend + "-base:v0.6.2",
+		"full": "ghcr.io/charliek/shed-" + backend + "-full:v0.6.2",
 	}
 	if len(aliases) != len(want) {
 		t.Fatalf("aliases = %v, want %v", aliases, want)
@@ -176,6 +177,92 @@ func assertAliasTrio(t *testing.T, aliases map[string]string, backend string) {
 	}
 }
 
+// --image extensions on a release build resolves exactly as any other
+// unknown word does (a bare Docker Hub ref that is not a shed image), never to
+// a shed-<backend>-extensions image: the extensions variant was removed in
+// v0.11 (plan 039 §3.12) and no alias names it.
+func TestRetiredExtensionsAliasIsUnknown(t *testing.T) {
+	setVersion(t, "0.6.2")
+	for _, backend := range []string{"vz", "fc"} {
+		t.Run(backend, func(t *testing.T) {
+			var resolve func(string) (ResolvedImage, error)
+			var aliases map[string]string
+			if backend == "vz" {
+				cfg := &VZConfig{ImagesDir: t.TempDir()}
+				cfg.applyDefaults()
+				resolve, aliases = cfg.ResolveImage, cfg.ImageAliases
+			} else {
+				cfg := &FirecrackerConfig{ImagesDir: t.TempDir()}
+				cfg.applyDefaults()
+				resolve, aliases = cfg.ResolveImage, cfg.ImageAliases
+			}
+			if _, ok := aliases["extensions"]; ok {
+				t.Fatalf("aliases = %v, want no extensions alias", aliases)
+			}
+			got, err := resolve("extensions")
+			if err != nil {
+				t.Fatalf("ResolveImage(extensions): %v", err)
+			}
+			unknown, err := resolve("nosuchvariant")
+			if err != nil {
+				t.Fatalf("ResolveImage(nosuchvariant): %v", err)
+			}
+			if got.Path != "" || unknown.Path != "" {
+				t.Fatalf("paths = %q, %q; want none for an unknown word", got.Path, unknown.Path)
+			}
+			if want := strings.Replace(unknown.DockerRef, "nosuchvariant", "extensions", 1); got.DockerRef != want {
+				t.Errorf("ResolveImage(extensions).DockerRef = %q, want %q (as an unknown word resolves)", got.DockerRef, want)
+			}
+			if strings.Contains(got.DockerRef, "charliek/shed-") {
+				t.Errorf("ResolveImage(extensions).DockerRef = %q names a shed image", got.DockerRef)
+			}
+		})
+	}
+}
+
 func containsToken(s string) bool {
 	return strings.Contains(s, shedVersionToken)
+}
+
+// A store upgraded from v0.10 keeps a tag label named "extensions" (every pull
+// writes one named after the image's repository). --image extensions must not
+// resolve through it to the old image with the retired helpers: it resolves as
+// an unknown word does, and the label is not offered as an available name. An
+// operator's own alias of that name still wins.
+func TestRetiredExtensionsLabelInAnUpgradedStoreIsIgnored(t *testing.T) {
+	setVersion(t, "0.6.2")
+	dir := t.TempDir()
+	installCachedBlob(t, dir, "extensions", "ghcr.io/charliek/shed-vz-extensions:v0.8.0")
+	installCachedBlob(t, dir, "mylabel", "ghcr.io/example/custom:v1")
+	cfg := &VZConfig{ImagesDir: dir}
+	cfg.applyDefaults()
+
+	got, err := cfg.ResolveImage("extensions")
+	if err != nil {
+		t.Fatalf("ResolveImage(extensions): %v", err)
+	}
+	unknown, err := cfg.ResolveImage("nosuchvariant")
+	if err != nil {
+		t.Fatalf("ResolveImage(nosuchvariant): %v", err)
+	}
+	if got.Path != "" {
+		t.Fatalf("ResolveImage(extensions).Path = %q: resolved through the old label", got.Path)
+	}
+	if want := strings.Replace(unknown.DockerRef, "nosuchvariant", "extensions", 1); got.DockerRef != want {
+		t.Errorf("ResolveImage(extensions).DockerRef = %q, want %q (as an unknown word resolves)", got.DockerRef, want)
+	}
+	// Another label still resolves.
+	if lbl, err := cfg.ResolveImage("mylabel"); err != nil || lbl.Path == "" {
+		t.Errorf("ResolveImage(mylabel) = %#v, %v; want the label's blob", lbl, err)
+	}
+	for _, name := range availableImageVariants(cfg.ImageAliases, dir) {
+		if name == "extensions" {
+			t.Errorf("available names %v offer the retired label", availableImageVariants(cfg.ImageAliases, dir))
+		}
+	}
+	// An operator's own alias of that name is theirs.
+	own := &VZConfig{ImagesDir: dir, ImageAliases: map[string]string{"extensions": "ghcr.io/example/mine:v1"}}
+	if r, err := own.ResolveImage("extensions"); err != nil || r.DockerRef != "ghcr.io/example/mine:v1" {
+		t.Errorf("ResolveImage(extensions) with an operator alias = %#v, %v", r, err)
+	}
 }

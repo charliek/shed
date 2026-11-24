@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-import broker_env
+import hermetic
 import ui
 from client import ShedError, TauriClient
 from mockserver import DELIVERED_RECORD, MockShedServer
@@ -128,7 +128,7 @@ def rig():
     home = Path(tempfile.mkdtemp(prefix="shed-prov-"))
     proc = None
     try:
-        broker = broker_env.write_hermetic_broker(home, {})
+        hermetic.generate_key(home / ".ssh")
         _script(home / "bin" / "gh", f"""case "$1 $2" in
   "auth token") echo {GH_TOKEN} ;;
   "api user") echo octo-test ;;
@@ -146,7 +146,7 @@ esac""")
         key_lines = [l for l in key_text.splitlines() if l and not l.startswith("-----")]
 
         env = ui.subproc_env(cfg, runtime_dir=home, mock_base_url=mock.base_url,
-                             config_path=CONFIG, broker=broker, delivery_config=settings)
+                             config_path=CONFIG, delivery_config=settings)
         sock = home / cfg.sock_rel
         log = home / "provisioning-ui.log"
         log_fh = open(log, "wb")

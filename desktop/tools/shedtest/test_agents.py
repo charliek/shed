@@ -77,13 +77,13 @@ def agents_app(shed_roost, mock):
     pattern: its own throwaway HOME / XDG_RUNTIME_DIR (hence
     its own socket and single-instance lock), `ui._state` untouched, the session
     app left running. `ui.quit` + `ui.launch` would leave the session app dead at
-    teardown, and the autouse `_reset_policy` / `_reset_mock` fixtures dial its
+    teardown, and the autouse `_reset_mock` fixture dials its
     socket before every test — so every module collected after this one would die
     at setup. That would make this file's position in the alphabet load-bearing,
     and this file sorts early.
 
-    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
-    it never takes a listener slot on the session mock.
+    Its delivery stream on the session mock is its own machine's, beside the
+    session app's (one stream per machine), so it never takes the session's place.
 
     Short `mkdtemp` prefixes: the IPC socket lives under the runtime dir, and a
     Unix socket path must stay inside SUN_LEN.

@@ -15,7 +15,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-variant=extensions
+variant=full
 arch=""
 bake_user=""
 while [ $# -gt 0 ]; do

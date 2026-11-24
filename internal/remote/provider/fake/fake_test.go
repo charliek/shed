@@ -23,7 +23,7 @@ func specFor(t *testing.T, env, id, name string) provider.Spec {
 		[]string{testKey},
 		provider.DefaultSizes()[0],
 		provider.DefaultDiskGB,
-		"shed-extensions-test",
+		"shed-full-test",
 		24*time.Hour,
 	)
 	if err != nil {
@@ -639,8 +639,8 @@ func TestResolveImage(t *testing.T) {
 		in, want string
 		wantErr  error
 	}{
-		{"shed-extensions-v1-amd64", "shed-extensions-v1-amd64", nil},
-		{"family/shed-extensions-amd64", "shed-extensions-amd64-fake0001", nil},
+		{"shed-full-v1-amd64", "shed-full-v1-amd64", nil},
+		{"family/shed-full-amd64", "shed-full-amd64-fake0001", nil},
 		{"", "", provider.ErrInvalid},
 	}
 	for _, tt := range tests {

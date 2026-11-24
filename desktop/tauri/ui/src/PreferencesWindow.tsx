@@ -1,80 +1,24 @@
-/* PreferencesWindow — the dedicated Preferences window (label "preferences"), the
-   Tauri port of the mac PreferencesView's grouped form: General / Terminal / the
-   namespace-gated approval sections (SSH, AWS, Docker) / Per-shed overrides, in
-   the mac section order. A fixed-size decorated window; its own webview + React
+/* PreferencesWindow — the dedicated Preferences window (label "preferences"): General,
+   Terminal and Provisioning (with this machine's source rows), in that order. A fixed-size decorated window; its own webview + React
    root so it never mounts `useUiBridge`. It reports `{sections, values, mode}`
    under the `prefs` key so the harness drives + asserts it via `prefs.dump`. */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { Segmented, Select, Switch } from "@/components/dialog";
+import { Select, Switch } from "@/components/dialog";
 import { Footnote, Section } from "@/components/prefsKit";
 import { ProvisioningSection, type ProvisioningReport } from "@/components/ProvisioningSection";
 import {
   inTauri,
   fetchTerminalPresets, getPrefs, setTerminalPref,
   getLoginItem, setLoginItem,
-  getSshApproval, setSshApproval,
-  fetchGateNamespaces, useCoordinatorData,
-  getProviderModes, setProviderMode,
-  listShedRules, removeShedRule,
   getAppearanceState, reportPrefs,
-  getBrokerStatus,
   getSourceStatus, makeThisMachineSource, cleanMachineText,
-  type TerminalPresetInfo, type SshPrefs, type ProviderModes, type ShedRule,
-  type PrefsReport, type BrokerStatus,
+  type TerminalPresetInfo, type PrefsReport,
 } from "@/lib/bridge";
 import {
   EMPTY_SOURCES,
   beginMove, canUse, createSourceReader, moveConfirmed, moveFailed, shownRows,
   type SourceReader, type SourcesState,
 } from "@/lib/sources";
-
-/* The credential namespaces the credential broker can delegate (mac CredentialNamespace). */
-const NS_SSH = "ssh-agent";
-const NS_AWS = "aws-credentials";
-const NS_DOCKER = "docker-credentials";
-
-// How an SSH-key approval is confirmed. On Linux "Authenticate" routes through
-// polkit; "Prompt only" needs no gate — a plain Approve button.
-const APPROVAL_METHODS: { id: SshPrefs["method"]; label: string; detail: string }[] = [
-  { id: "biometrics-or-password", label: "Authenticate", detail: "Confirm with your login password." },
-  { id: "prompt", label: "Prompt only", detail: "A plain Approve button — no password." },
-];
-
-// The SSH approval policies, most → least permissive (mirrors SshApprovalPolicy in
-// shed-core). `prompts` gates the Method radios and `usesDuration` gates the
-// Duration field.
-const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration: boolean }[] = [
-  { id: "always-allow", label: "Always Allow", prompts: false, usesDuration: false },
-  { id: "per-shed-allow", label: "Per Shed Allow", prompts: true, usesDuration: false },
-  { id: "time-based-allow", label: "Time Based Allow", prompts: true, usesDuration: true },
-  { id: "always-ask", label: "Always Ask", prompts: true, usesDuration: false },
-  { id: "always-deny", label: "Always Deny", prompts: false, usesDuration: false },
-];
-
-/** An AWS/Docker provider section: a Segmented Allow|Deny + the mac live-note. */
-function ProviderSection({ title, mode, onChange }:
-  { title: string; mode: "approve" | "deny"; onChange: (v: "approve" | "deny") => void }) {
-  return (
-    <>
-      <Section title={title}>
-        <div className="flex items-center gap-3 px-3.5 py-2.5">
-          <span className="text-[13px] text-shed-text">Mode</span>
-          <span className="flex-1" />
-          <span className="w-[170px]">
-            <Segmented
-              options={[["approve", "Allow"], ["deny", "Deny"]]}
-              value={mode}
-              set={(v) => onChange(v as "approve" | "deny")}
-            />
-          </span>
-        </div>
-      </Section>
-      <Footnote>Live — takes effect immediately. Credentials fail closed (deny) when shed-desktop isn't running.</Footnote>
-    </>
-  );
-}
 
 export default function PreferencesWindow() {
   // Appearance: seeded from the Rust-held app-wide state (the dashboard's mode);
@@ -84,14 +28,8 @@ export default function PreferencesWindow() {
   const [presets, setPresets] = useState<TerminalPresetInfo[]>([]);
   const [preset, setPreset] = useState("custom");
   const [template, setTemplate] = useState("");
-  const [method, setMethod] = useState<SshPrefs["method"]>("biometrics-or-password");
-  const [policy, setPolicy] = useState("time-based-allow");
-  const [ttl, setTtl] = useState("2h");
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
   const [loginBusy, setLoginBusy] = useState(false);
-  const [providerModes, setModes] = useState<ProviderModes>({});
-  const [shedRules, setShedRules] = useState<ShedRule[]>([]);
-  const [broker, setBroker] = useState<BrokerStatus | null>(null);
   // Provisioning (plan 039 A7): what its section rendered, and a key that re-reads it.
   const [provisioning, setProvisioning] = useState<ProvisioningReport | null>(null);
   const [provisioningKey, setProvisioningKey] = useState(0);
@@ -137,12 +75,7 @@ export default function PreferencesWindow() {
       if (sourceReader.current === reader) sourceReader.current = null;
     };
   }, [sourceOps]);
-  const sshGen = useRef(0);
   const reloadGen = useRef(0); // bumped per reloadAll; guards every fetch's application
-  const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
-  // Which namespaces the credential broker delegates here — gates the approval sections.
-  // Own subscription (separate React root ⇒ separate hook instance from the shell's).
-  const gateNs = useCoordinatorData<string[]>("connected-changed", fetchGateNamespaces, []);
 
   useEffect(() => {
     if (!inTauri()) return;
@@ -193,27 +126,9 @@ export default function PreferencesWindow() {
       setPreset(p.terminal_preset);
       setTemplate(p.terminal_template);
     });
-    void getProviderModes().then((v) => {
-      if (fresh()) setModes(v);
-    });
-    void listShedRules().then((v) => {
-      if (fresh()) setShedRules(v);
-    });
-    void getBrokerStatus().then((v) => {
-      if (fresh() && v) setBroker(v);
-    });
     // Ordered per server by its own sequence (`lib/sources.ts`), not by `fresh()`.
     sourceOps.reload();
     setProvisioningKey((k) => k + 1);
-    // SSH keeps its own guard on top: applySsh bumps sshGen on an optimistic
-    // edit, so a slow load must not clobber a newer edit (not just a newer reload).
-    const mine = ++sshGen.current;
-    void getSshApproval().then((p) => {
-      if (mine !== sshGen.current || !fresh()) return;
-      setMethod(p.method);
-      setPolicy(p.policy);
-      setTtl(p.ttl);
-    });
   }, [sourceOps]);
 
   useEffect(() => {
@@ -258,48 +173,9 @@ export default function PreferencesWindow() {
       setLoginBusy(false);
     })();
   };
-  // Apply one SSH-pref delta: set it optimistically, persist only the changed
-  // field, then reconcile ALL three from the backend — so a rejected/failed write
-  // can't leave the method radio misrepresenting the actual gate strength. A
-  // generation guard drops a superseded reload so fast Duration typing can't be
-  // clobbered by an out-of-order confirm.
-  const applySsh = (delta: { method?: SshPrefs["method"]; policy?: string; ttl?: string }) => {
-    if (delta.method !== undefined) setMethod(delta.method);
-    if (delta.policy !== undefined) setPolicy(delta.policy);
-    if (delta.ttl !== undefined) setTtl(delta.ttl);
-    const mine = ++sshGen.current;
-    void (async () => {
-      await setSshApproval(delta.method, delta.policy, delta.ttl);
-      const p = await getSshApproval();
-      if (mine !== sshGen.current) return; // superseded by a newer change
-      setMethod(p.method);
-      setPolicy(p.policy);
-      setTtl(p.ttl);
-    })();
-  };
-  // A provider mode: optimistic, then reconcile from the coordinator (the setter
-  // throws on a rejected namespace; the read-back is the truth either way).
-  const chooseProviderMode = (ns: typeof NS_AWS | typeof NS_DOCKER, decision: "approve" | "deny") => {
-    setModes((m) => ({ ...m, [ns]: decision }));
-    void (async () => {
-      try {
-        await setProviderMode(ns, decision);
-      } catch {
-        // fall through to reconcile from the backend truth
-      }
-      setModes(await getProviderModes());
-    })();
-  };
-  const removeRule = (r: ShedRule) => {
-    void (async () => {
-      await removeShedRule(r.server ?? "", r.shed ?? "");
-      setShedRules(await listShedRules());
-    })();
-  };
   // "Use this machine" on one server: ONE click, no confirmation. A move is undone the
-  // same way (one click on the other machine), nothing is lost but the other machine's
-  // waiting approvals, and the footnote says so — a dialog would only slow down the one
-  // thing this row is for. The row flips optimistically and owns itself until the move
+  // same way (one click on the other machine), and the footnote says what it does — a
+  // dialog would only slow down the one thing this row is for. The row flips optimistically and owns itself until the move
   // answers (its button is gone meanwhile: no second move on that row can overlap). A
   // confirmed move shows the server's own answer, then is read back; a refused one
   // goes back to the row it replaced, keeps the refusal under it in the words the
@@ -397,30 +273,18 @@ export default function PreferencesWindow() {
   const thisMachine = src.thisMachine;
   const thisMachineError = src.thisMachineError;
 
-  const policyMeta = SSH_POLICIES.find((p) => p.id === policy);
-  const sshGated = gateNs.includes(NS_SSH);
-  const awsGated = gateNs.includes(NS_AWS);
-  const dockerGated = gateNs.includes(NS_DOCKER);
-  const anyGated = sshGated || awsGated || dockerGated;
-
   // The mac availableTerminalPresets shape: offer the installed presets, plus the
   // persisted one even if it's (no longer) installed so the picker stays truthful.
   const presetOpts = presets
     .filter((p) => p.available || p.id === preset)
     .map((p) => ({ value: p.id, label: p.available ? p.label : `${p.label} (not installed)` }));
 
-  // The visible section ids, in mac order — reported so the harness asserts
-  // gated visibility as logical content, not pixels.
+  // The visible section ids, in order — reported so the harness asserts them as
+  // logical content, not pixels.
   const sections: string[] = [
     "general",
     "terminal",
-    ...(broker ? ["broker"] : []),
     ...(provisioning ? ["provisioning"] : []),
-    ...(anyGated ? [] : ["approvals-empty"]),
-    ...(sshGated ? ["ssh"] : []),
-    ...(awsGated ? ["aws"] : []),
-    ...(dockerGated ? ["docker"] : []),
-    ...(shedRules.length ? ["shed-overrides"] : []),
   ];
 
   // Report the rendered snapshot on mount + every value/visibility change, deduped
@@ -430,13 +294,7 @@ export default function PreferencesWindow() {
     values: {
       preset,
       template,
-      policy,
-      method,
-      ttl,
       login: launchAtLogin,
-      provider_modes: providerModes,
-      shed_rules_count: shedRules.length,
-      broker_error: broker?.broker_error ?? null,
       sources: sourceRows.map((r) => ({
         host: r.host,
         source_name: r.source ? r.source.name : null,
@@ -471,7 +329,10 @@ export default function PreferencesWindow() {
           <Switch on={launchAtLogin} set={toggleLaunchAtLogin} disabled={loginBusy} />
         </label>
       </Section>
-      <Footnote>Open Shed Desktop when you sign in.</Footnote>
+      <Footnote>
+        Open Shed Desktop when you sign in. This machine answers provisioning requests only
+        while the app is running.
+      </Footnote>
 
       <Section title="Terminal">
         <label className="flex items-center gap-3 px-3.5 py-2.5">
@@ -504,41 +365,6 @@ export default function PreferencesWindow() {
           'Which terminal opens when you click "Open in Terminal" on a shed.'
         )}
       </Footnote>
-
-      {broker && (
-        <>
-          <Section title="Credential broker">
-            {/* Credentials need the app running (plan 037 §3.1.4): the same launch-at-login
-                switch as General, beside the reason it matters. */}
-            <label className="flex items-center gap-3 px-3.5 py-2.5" data-broker-login>
-              <span className="text-[13px] text-shed-text">
-                Credentials are answered only while this app is running.
-              </span>
-              <span className="flex-1" />
-              <span className="flex-none text-[12px] text-shed-text-muted">Launch at login</span>
-              <Switch on={launchAtLogin} set={toggleLaunchAtLogin} disabled={loginBusy} />
-            </label>
-            {/* The broker's state + any broker-failed error — the status surface the tray
-                reuses; visible so a failed broker isn't silent. */}
-            <div className="border-t border-shed-border px-3.5 py-2.5" data-broker-active>
-              <div className="flex items-center gap-2">
-                <span
-                  className="h-2 w-2 shrink-0 rounded-full"
-                  style={{ background: broker.broker_error ? "var(--shed-danger)" : "var(--shed-ok)" }}
-                />
-                <span className="text-[12px] text-shed-text-muted">
-                  {broker.broker_error ? "The in-app broker did not start." : "Brokering credentials in this app."}
-                </span>
-              </div>
-              {broker.broker_error && (
-                <div className="mt-1 text-[12px] font-medium text-shed-danger" data-broker-error>
-                  Broker unavailable: {broker.broker_error}
-                </div>
-              )}
-            </div>
-          </Section>
-        </>
-      )}
 
       {/* Provisioning (plan 039 A7): the providers, the credential source rows (which
           machine answers for you on each server), and the preview. */}
@@ -625,10 +451,9 @@ export default function PreferencesWindow() {
           {sourceRows.length > 0 && (
             <Footnote>
               <span data-source-footnote>
-                One machine answers credential requests per server, and nothing fails over on
-                its own: if the source is off, nothing answers until you choose another. Moving
-                the source here makes this machine answer at once and drops any approval still
-                waiting on the other machine.
+                One machine answers provisioning requests per server, and nothing fails over
+                on its own: if the source is off, nothing answers until you choose another.
+                Moving the source here makes this machine answer at once.
               </span>
             </Footnote>
           )}
@@ -636,136 +461,6 @@ export default function PreferencesWindow() {
           )
         }
       />
-
-      {!anyGated && (
-        <Section title="Approvals">
-          <p className="px-3.5 py-2.5 text-[12px] leading-relaxed text-shed-text-muted">
-            No extensions are delegated to shed-desktop. Set an extension's{" "}
-            <code className="font-mono">approval.policy</code> to{" "}
-            <code className="font-mono">shed-desktop</code> in extensions.yaml to manage it here.
-          </p>
-        </Section>
-      )}
-
-      {sshGated && (
-        <>
-          <Section title="SSH approvals">
-            <label className="flex items-center gap-3 px-3.5 py-2.5">
-              <span className="flex-none text-[13px] text-shed-text">Approval policy</span>
-              <span className="flex-1" />
-              {/* The dialog Select (appearance-none + own caret): WebKitGTK renders a
-                  raw native <select>'s button text illegibly in dark mode. */}
-              <span className="w-[190px]" data-ssh-policy>
-                <Select
-                  value={policy}
-                  onChange={(v) => applySsh({ policy: v })}
-                  options={SSH_POLICIES.map((p) => ({ value: p.id, label: p.label }))}
-                />
-              </span>
-            </label>
-
-            {/* Duration — only the time-based policy carries one (policy.usesDuration). */}
-            {policyMeta?.usesDuration && (
-              <label className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5">
-                <span className="text-[13px] text-shed-text">Duration</span>
-                <span className="flex-1" />
-                <input
-                  value={ttl}
-                  // Free text → keep each keystroke LOCAL (optimistic) and persist only
-                  // on blur/Enter, and only when it changed. applySsh resets live SSH
-                  // grants + rewrites prefs.json, so a per-keystroke persist would revoke
-                  // active grants and churn disk mid-typing.
-                  onChange={(e) => setTtl(e.target.value)}
-                  onFocus={() => {
-                    ttlAtFocus.current = ttl;
-                  }}
-                  onBlur={() => {
-                    if (ttl !== ttlAtFocus.current) applySsh({ ttl });
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") e.currentTarget.blur();
-                  }}
-                  placeholder="2h"
-                  className="w-[72px] rounded-md border border-shed-border bg-shed-inset px-2 py-1 text-right font-mono text-[13px] text-shed-text outline-none"
-                  data-ssh-ttl
-                />
-              </label>
-            )}
-
-            {/* Method — only the prompting policies confirm an approval (policy.prompts). */}
-            {policyMeta?.prompts &&
-              APPROVAL_METHODS.map((m) => {
-                const active = method === m.id;
-                return (
-                  <label
-                    key={m.id}
-                    className="flex cursor-pointer items-center gap-3 border-t border-shed-border px-3.5 py-2.5"
-                    style={{ background: active ? "var(--shed-accent-subtle)" : undefined }}
-                  >
-                    <input
-                      type="radio"
-                      name="approval-method"
-                      checked={active}
-                      onChange={() => applySsh({ method: m.id })}
-                      style={{ accentColor: "var(--shed-accent)" }}
-                    />
-                    <span className="text-[13px] text-shed-text">{m.label}</span>
-                    <span className="flex-1" />
-                    <span className="truncate text-[12px] text-shed-text-muted">{m.detail}</span>
-                  </label>
-                );
-              })}
-          </Section>
-          <Footnote>
-            Always Allow / Always Deny decide every SSH sign with no prompt. The others prompt,
-            then remember your approval per the policy. Changing the policy clears live grants.
-            “Method” is the confirmation prompt shown when approving.
-          </Footnote>
-        </>
-      )}
-
-      {awsGated && (
-        <ProviderSection
-          title="AWS credentials"
-          mode={providerModes[NS_AWS] ?? "deny"}
-          onChange={(v) => chooseProviderMode(NS_AWS, v)}
-        />
-      )}
-      {dockerGated && (
-        <ProviderSection
-          title="Docker credentials"
-          mode={providerModes[NS_DOCKER] ?? "deny"}
-          onChange={(v) => chooseProviderMode(NS_DOCKER, v)}
-        />
-      )}
-
-      {shedRules.length > 0 && (
-        <Section title="Per-shed overrides">
-          {shedRules.map((r, i) => (
-              <div
-                key={`${r.server ?? ""}/${r.shed ?? ""}`}
-                className={cn("flex items-center gap-2 px-3.5 py-2", i > 0 && "border-t border-shed-border")}
-              >
-                <span className="text-[13px] text-shed-text">{r.shed}</span>
-                {r.server ? <span className="text-[11px] text-shed-text-muted">{r.server}</span> : null}
-                <span className="flex-1" />
-                <span
-                  className="text-[11px] font-semibold"
-                  style={{ color: r.action === "deny" ? "var(--shed-danger)" : "var(--shed-text-muted)" }}
-                >
-                  {r.action === "deny" ? "auto-deny" : "auto-approve"}
-                </span>
-                <button
-                  onClick={() => removeRule(r)}
-                  title="Remove this override"
-                  className="hlink flex h-6 w-6 flex-none items-center justify-center rounded-md text-shed-text-muted"
-                >
-                  <X size={14} />
-                </button>
-              </div>
-            ))}
-        </Section>
-      )}
     </div>
   );
 }

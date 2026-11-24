@@ -286,7 +286,7 @@ type HostKeyReader interface {
 }
 
 // ImagePrefixFamily marks a configured image reference as a family rather
-// than an exact name: "family/shed-extensions-amd64". A family hands out its
+// than an exact name: "family/shed-full-amd64". A family hands out its
 // newest image, so production configs name an exact image instead.
 const ImagePrefixFamily = "family/"
 

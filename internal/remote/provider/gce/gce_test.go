@@ -99,8 +99,8 @@ func testClient(t *testing.T, f *fakeCompute, mod ...func(*Config)) *Client {
 }
 
 func addImages(f *fakeCompute) {
-	f.images[f.project+"/shed-extensions-amd64-v1"] = fImage{name: "shed-extensions-amd64-v1", family: "shed-extensions-amd64", status: "READY", deprecated: "DEPRECATED"}
-	f.images[f.project+"/shed-extensions-amd64-v2"] = fImage{name: "shed-extensions-amd64-v2", family: "shed-extensions-amd64", status: "READY"}
+	f.images[f.project+"/shed-full-amd64-v1"] = fImage{name: "shed-full-amd64-v1", family: "shed-full-amd64", status: "READY", deprecated: "DEPRECATED"}
+	f.images[f.project+"/shed-full-amd64-v2"] = fImage{name: "shed-full-amd64-v2", family: "shed-full-amd64", status: "READY"}
 	f.images[f.project+"/shed-old"] = fImage{name: "shed-old", status: "READY", deprecated: "OBSOLETE"}
 	f.images[f.project+"/shed-pending"] = fImage{name: "shed-pending", status: "PENDING"}
 	f.images["ubuntu-os-cloud/ubuntu-2404-noble-amd64-v20261105"] = fImage{name: "ubuntu-2404-noble-amd64-v20261105", family: "ubuntu-2404-lts-amd64", status: "READY"}
@@ -110,8 +110,8 @@ func TestConformance(t *testing.T) {
 	providertest.Run(t, providertest.Harness{
 		Env:    testEnv,
 		Size:   provider.DefaultSizes()[0],
-		Image:  "shed-extensions-amd64-v1",
-		Family: provider.ImagePrefixFamily + "shed-extensions-amd64",
+		Image:  "shed-full-amd64-v1",
+		Family: provider.ImagePrefixFamily + "shed-full-amd64",
 		New: func(t *testing.T) (provider.Provider, providertest.Controls) {
 			f := newFakeCompute(t)
 			addImages(f)
@@ -158,7 +158,7 @@ func goldenSpec(t *testing.T, repo string, maxRun time.Duration) provider.Spec {
 		LandingDir: "/home/shed/r",
 	}
 	spec, err := provider.NewSpec(id, shed, []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGolden shed-server"},
-		provider.DefaultSizes()[0], 50, "shed-extensions-amd64-v2", maxRun)
+		provider.DefaultSizes()[0], 50, "shed-full-amd64-v2", maxRun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,11 +657,11 @@ func TestImages(t *testing.T) {
 		in, want string
 		err      error
 	}{
-		{"shed-extensions-amd64-v2", "shed-extensions-amd64-v2", nil},
-		{"family/shed-extensions-amd64", "shed-extensions-amd64-v2", nil},
+		{"shed-full-amd64-v2", "shed-full-amd64-v2", nil},
+		{"family/shed-full-amd64", "shed-full-amd64-v2", nil},
 		{"projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64", "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", nil},
 		{"projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", nil},
-		{"projects/test-proj/global/images/shed-extensions-amd64-v2", "shed-extensions-amd64-v2", nil},
+		{"projects/test-proj/global/images/shed-full-amd64-v2", "shed-full-amd64-v2", nil},
 		{"family/none", "", provider.ErrNotFound},
 		{"missing-image", "", provider.ErrNotFound},
 		{"shed-old", "", provider.ErrNotFound},

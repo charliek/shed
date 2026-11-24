@@ -46,9 +46,9 @@
 //! * therefore, if an observer event DISAGREES with the latest synchronous
 //!   write, a newer mint has already superseded it — the event is stale, and it
 //!   is dropped ([`AuthModeRegistry::record_observed`]);
-//! * where no synchronous write exists at all (the embedded
-//!   broker, whose `EmbeddedTokenMinter` holds no registry), the observer is
-//!   the only writer and always applies.
+//! * where no synchronous write exists at all (a minter that holds no
+//!   registry, as the desktop's `shed-source` minter does), the observer is the
+//!   only writer and always applies.
 //!
 //! The per-server `sync_seq` is the monotonic ordinal of the last synchronous
 //! write. It is what makes "has the minter spoken for this server, and how
@@ -72,8 +72,8 @@ pub struct AuthModeState {
 /// Per-server credential-mode state, shared by the minter (which reads it to
 /// decide whether to expect a certificate) and the app surface (which renders
 /// it). Interior-mutable so it can be handed to the minter BEFORE the Backend
-/// that seeds it from config exists — the launch order the embedded broker
-/// already imposes.
+/// that seeds it from config exists — the desktop's launch order (minter
+/// before Backend).
 #[derive(Default)]
 pub struct AuthModeRegistry {
     inner: Mutex<Inner>,
@@ -148,7 +148,7 @@ impl AuthModeRegistry {
     /// that is strictly LOWER priority than [`Self::record`].
     ///
     /// Applied only when it cannot be stale: either the minter has never spoken
-    /// for this server (the embedded brokers, where the observer is the only
+    /// for this server (a minter with no registry, where the observer is the only
     /// writer), or it agrees with what the minter last said. A disagreement
     /// means a newer synchronous write already superseded the mint this event
     /// describes, so the event is dropped rather than allowed to walk it back.
@@ -376,7 +376,7 @@ mod tests {
 
     /// The mirror image: mint N was mtls, mint N+1 saw the server back on
     /// tokens, and N's late callback would re-assert certificates — producing a
-    /// false "upgrade the broker" refusal against a token server.
+    /// false "upgrade the app" refusal against a token server.
     #[test]
     fn the_inverse_interleaving_cannot_re_assert_certificates() {
         let r = AuthModeRegistry::new();
@@ -393,8 +393,7 @@ mod tests {
 
     /// The guard is a PRIORITY rule, not a mute: an observer write that agrees
     /// with the minter still applies (it is the same fact), and where the minter
-    /// has never spoken — the embedded broker, whose
-    /// `EmbeddedTokenMinter` holds no registry — the observer is the only writer
+    /// has never spoken — a minter that holds no registry — the observer is the only writer
     /// and always applies.
     #[test]
     fn the_observer_still_writes_when_it_is_not_contradicting_the_minter() {

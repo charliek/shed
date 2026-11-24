@@ -3,15 +3,14 @@
 # Multi-stage Dockerfile for VZ (Apple Virtualization.framework) rootfs images.
 #
 # Stages:
-#   shed-vz-base        - Minimal: shed infrastructure + basic dev tools
-#   shed-vz-extensions  - Base + shed-extensions credential brokering (no coding agents).
-#                         Recommended starting point for users who customize their own image.
-#   shed-vz-full        - Extensions + Bun + all coding agents
-#                         (Claude Code, OpenCode, Codex CLI, Cursor CLI).
+#   shed-vz-base        - Minimal: shed infrastructure + basic dev tools,
+#                         plus roost-session and craze.
+#   shed-vz-full        - Base + Docker, mise, Bun, the coding agents
+#                         (Claude Code, OpenCode, Codex CLI, Cursor CLI) and the
+#                         stridelabs apt tools (strix, prox, parcel, envsecrets).
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/arm64 --target shed-vz-base --output type=oci,dest=base.tar .
-#   docker buildx build --platform linux/arm64 --target shed-vz-extensions --output type=oci,dest=ext.tar .
 #   docker buildx build --platform linux/arm64 --target shed-vz-full --output type=oci,dest=full.tar .
 #
 # Or use the build script:
@@ -249,67 +248,13 @@ __git_prompt() {
 export PS1='\[\033[1;36m\][\[\033[1;32m\]shed:${SHED_NAME:-dev}\[\033[1;36m\]]\[\033[0m\] \[\033[01;34m\]\w\[\033[00m\]$(__git_prompt) \$ '
 PROMPT_EOF
 
-WORKDIR /home/shed
-ENTRYPOINT ["/sbin/init"]
-
-
-# =============================================================================
-# Stage: shed-vz-extensions
-# Base + shed-extensions credential brokering (SSH agent, AWS proxy,
-# Docker credentials). No coding agents or language runtimes —
-# recommended starting point for users who customize their own image.
-#
-# The guest binaries + /etc overlay are built in-tree and staged into the
-# build context by scripts/stage-guest-binaries.sh (from cmd/shed-ext-* and
-# guest/extensions/etc/) — installed here from /ctx rather than pulled from a
-# published ghcr.io/charliek/shed-extensions image.
-# =============================================================================
-FROM shed-vz-base AS shed-vz-extensions
-
-# SHED_INSTALL_SHA is stage-scoped (ARGs don't cross FROM boundaries), so it
-# must be redeclared here and echoed in the RUN below — otherwise a rebuilt
-# guest binary that collides on size+mtime is silently reused from BuildKit's
-# content-blind bind-mount cache, baking a stale binary (#227). The build
-# scripts pass the real whole-context hash; `unknown` disables the cache-bust
-# for ad-hoc `docker build` invocations.
-ARG SHED_INSTALL_SHA=unknown
-
-# Layer: bring in the staged shed-extensions binaries + service units + config
-# + the Docker credentials helper config — all in a single COPY-via-bind RUN
-# so this stage adds exactly one layer on top of base.
-RUN --mount=type=bind,source=.,target=/ctx \
-    echo "SHED_INSTALL_SHA=${SHED_INSTALL_SHA}" && \
-    set -euo pipefail && \
-    mkdir -p /etc/environment.d /etc/shed-extensions.d /home/shed/.docker && \
-    install -m 0755 /ctx/shed-ext-ssh-agent       /usr/local/bin/shed-ext-ssh-agent && \
-    install -m 0755 /ctx/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials && \
-    install -m 0755 /ctx/docker-credential-shed   /usr/local/bin/docker-credential-shed && \
-    install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-ssh-agent.service       /etc/systemd/system/shed-ext-ssh-agent.service && \
-    install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/shed-ext-aws-credentials.service && \
-    install -m 0644 /ctx/ext-etc/environment.d/shed-extensions.conf              /etc/environment.d/shed-extensions.conf && \
-    cp -r /ctx/ext-etc/shed-extensions.d/. /etc/shed-extensions.d/ && \
-    # Docker creds helper config for the shed user.
-    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
-    chown -R shed:shed /home/shed/.docker
-    # Units ship disabled — shed-agent enables them from server config.
-
-# stridelabs apt repo: strix (a TUI for staging/diffs) and prox (a process
-# manager with an HTTP API + TUI) are developer tools for use inside a
-# shed, pulled from stridelabs' own apt repo rather than built in-tree
-# like the shed-extensions binaries above.
-#
-# NOTE: unlike the Docker CE block further down, this keyring is `.gpg`, not
-# `.asc`. Docker serves an ARMORED key, so apt can read it from a `.asc`
-# as-is; apt.stridelabs.ai/pubkey.gpg serves a BINARY OpenPGP key, and apt
-# only accepts binary keyrings under a `.gpg` name. Naming it `.asc` makes
-# `apt-get update` fail with "NO_PUBKEY ... the repository is not signed",
-# which is how this was found. This matches the recipe this repo already
-# documents in docs/getting-started/linux-quickstart.md. No dearmor step is
-# needed either way — the key is already in the form apt wants.
+# Layer 4: roost-session and craze, which the desktop app and the phone start
+# in every shed (plan 039 §3.12: both moved here from the retired `extensions`
+# stage, with their pins and checks).
 #
 # roost-session (the headless roost daemon) is baked from the standalone release asset —
 # no headless deb exists, and the GUI deb would pull ~45 X11/Wayland packages. Kept in
-# lockstep with RELEASE_PIN in crates/shed-core/src/roost/bootstrap/source.rs —
+# lockstep with RELEASE_PIN in crates/shed-roost/src/bootstrap/source.rs —
 # `make check-roost-pin` asserts it (the check-kernel-pin precedent). Digests are pinned
 # IN-TREE, not fetched: a .sha256 from the same mutable release proves transport, not
 # provenance. These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so
@@ -338,18 +283,9 @@ ARG CRAZE_SHA256_AMD64=7fe27b7d6d98725182f55f6e1f359945ea01d312b76641a0513d0a30b
 ARG CRAZE_SHA256_ARM64=ec4e5b48a0f71f0a882de318d774b5b4c54848f5ce1d8d42da0cc0d6eb740ac8
 
 # Plain statements under `set -euo pipefail`, no `&&`/`||` chains: set -e ignores a
-# failure in a non-final element of an `&&`/`||` list, and the old chain's trailing `||`
-# put every earlier failure behind the wrong error message. Each failure now stops the
+# failure in a non-final element of an `&&`/`||` list. Each failure stops the
 # build at its own command (or its own ERROR line).
 RUN set -euo pipefail; \
-    install -m 0755 -d /etc/apt/keyrings; \
-    curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg; \
-    chmod a+r /etc/apt/keyrings/stridelabs.gpg; \
-    printf "Types: deb\nURIs: https://apt.stridelabs.ai\nSuites: noble\nComponents: main\nSigned-By: /etc/apt/keyrings/stridelabs.gpg\n" \
-       > /etc/apt/sources.list.d/stridelabs.sources; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends strix prox; \
-    rm -rf /var/lib/apt/lists/*; \
     arch="$(dpkg --print-architecture)"; \
     case "${arch}" in amd64) want="${ROOST_SESSION_SHA256_AMD64}";; arm64) want="${ROOST_SESSION_SHA256_ARM64}";; *) echo "ERROR: no roost-session digest for ${arch}" >&2; exit 1;; esac; \
     base="https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}"; \
@@ -379,13 +315,13 @@ ENTRYPOINT ["/sbin/init"]
 
 # =============================================================================
 # Stage: shed-vz-full
-# Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI, Cursor CLI).
-# mise stays as a tool manager (envsecrets, parcel, strix and prox come from
-# the stridelabs apt repo). Node/Python/uv
+# Base + Docker + Bun + coding agents (Claude Code, OpenCode, Codex CLI, Cursor CLI)
+# + strix, prox, parcel and envsecrets from the stridelabs apt repo.
+# mise stays as a tool manager. Node/Python/uv
 # dropped — Bun is the JS runtime + package manager, and users who
 # need Python can `uv python install 3.13` inside a shed.
 # =============================================================================
-FROM shed-vz-extensions AS shed-vz-full
+FROM shed-vz-base AS shed-vz-full
 
 ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.bun/bin:/home/shed/.local/bin:${PATH}"
 # CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside
@@ -393,7 +329,7 @@ ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.bun/bin:/home/shed/.loc
 # credential mount of ~/.claude/ cover all Claude state.
 ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 
-# Docker (only in `full`). base + extensions ship without docker; users
+# Docker (only in `full`). base ships without docker; users
 # who want nested containers pull `full`. docker-buildx-plugin is NOT
 # installed (rarely used by coding agents; users can `apt install` on
 # demand). docker-compose-plugin is kept for `docker compose`.
@@ -416,12 +352,26 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && install -m 0644 /usr/local/share/shed-docker-daemon.json /etc/docker/daemon.json \
     && SYSTEMD_OFFLINE=1 systemctl enable docker
 
-# parcel and envsecrets from the stridelabs apt repo (configured in the
-# `extensions` stage), unpinned like strix and prox. Plan 039: delivery gives
-# a shed the logins these tools need; envsecrets used to come from mise.
+# Developer tools from the stridelabs apt repo, unpinned: strix (a TUI for
+# staging/diffs), prox (a process manager with an HTTP API + TUI), parcel and
+# envsecrets. Plan 039: delivery gives a shed the logins these tools need.
+#
+# NOTE: unlike the Docker CE block above, this keyring is `.gpg`, not
+# `.asc`. Docker serves an ARMORED key, so apt can read it from a `.asc`
+# as-is; apt.stridelabs.ai/pubkey.gpg serves a BINARY OpenPGP key, and apt
+# only accepts binary keyrings under a `.gpg` name. Naming it `.asc` makes
+# `apt-get update` fail with "NO_PUBKEY ... the repository is not signed",
+# which is how this was found. This matches the recipe this repo already
+# documents in docs/getting-started/linux-quickstart.md. No dearmor step is
+# needed either way — the key is already in the form apt wants.
 RUN set -euo pipefail; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg; \
+    chmod a+r /etc/apt/keyrings/stridelabs.gpg; \
+    printf "Types: deb\nURIs: https://apt.stridelabs.ai\nSuites: noble\nComponents: main\nSigned-By: /etc/apt/keyrings/stridelabs.gpg\n" \
+       > /etc/apt/sources.list.d/stridelabs.sources; \
     apt-get update; \
-    apt-get install -y --no-install-recommends parcel envsecrets; \
+    apt-get install -y --no-install-recommends strix prox parcel envsecrets; \
     rm -rf /var/lib/apt/lists/*
 
 # Layer: install all language runtimes + coding agents as the shed user,

@@ -25,7 +25,7 @@ Firecracker runs without its jailer.
   A user list is refused in open mode.
 - Upgrade the desktop app on every machine that answers credential requests to
   0.10.0 or newer before the server: a server that pins refuses an older
-  broker.
+  desktop app.
 - Decide the **whole** list before the first start with it. On that start a
   server with exactly one user gives that user every shed that has no user; a
   server with several gives none away (see [Sheds with no
@@ -242,9 +242,10 @@ shed source use desktop        # by name, id, or an id prefix of 8+ hex digits
 
 or from the desktop app on the machine you want, with "Use this machine". The
 old machine stops answering at once, and its requests in flight are dropped.
-The new one answers when its broker next connects (within about 30 s, or at
+The new one answers when its app next connects (within about 30 s, or at
 once from the desktop app). Nothing fails over: while the source is off or
-asleep, its user's credential requests get no answer.
+asleep, a create for its user ends with delivery not done (run `shed provision`
+once it is back).
 
 An admin can see and move another user's source with `--user bob`, choosing
 among bob's own machines. The details are in [Security › One machine answers

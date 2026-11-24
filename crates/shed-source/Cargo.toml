@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-source — what a machine needs to be a source (plan 039 §3.7): its identity (`<state>/broker/machine.json`), the state directory, the client-credential store, the SSH-bootstrap minter and the control-token provider (extracted from shed-broker, which re-exports them), and the delivery side: server discovery from the shed CLI config, the delivery stream client, the per-server tasks and a TokenMinter over the control-token provider. Reaches only shed-core, shed-lane and shed-provision; no YAML parser."
+description = "shed-source — what a machine needs to be a source (plan 039 §3.7): its identity (`<state>/broker/machine.json`), the state directory, the client-credential store, the SSH-bootstrap minter and the control-token provider (extracted from the retired credential broker), and the delivery side: server discovery from the shed CLI config, the delivery stream client, the per-server tasks and a TokenMinter over the control-token provider. Reaches only shed-core, shed-lane and shed-provision; no YAML parser."
 
 [lib]
 name = "shed_source"
@@ -15,9 +15,9 @@ workspace = true
 
 [features]
 # The minter's test seams and helpers (a thread-local store root, injected clocks,
-# `minter::tests`), for shed-broker's tests, which exercise the bus, supervisor and
-# egress consumer against them. Enabled ONLY by shed-broker's `[dev-dependencies]`,
-# so it is on in test builds and off in every shipped build (resolver 2 does not
+# `minter::tests`, the SSH-bootstrap seam), for shed-desktop-core's tests of the
+# production wiring (the cold-launch mint). Enabled ONLY by `[dev-dependencies]`, so
+# it is on in test builds and off in every shipped build (resolver 2 does not
 # unify dev-dependency features into a normal build).
 test-support = ["dep:tempfile", "dep:rcgen"]
 
@@ -49,8 +49,7 @@ futures-util = { workspace = true }
 rustls = { workspace = true }
 # The minter's `known_hosts` pin pre-check. The ecdsa/p256/p384/p521/rsa/dsa features
 # give ssh-key's `known_hosts` parser the same host-key-algorithm coverage as Go's
-# `x/crypto/ssh.ParseKnownHosts`; the same feature set as shed-broker's (which also
-# signs with it), so cargo unifies one build.
+# `x/crypto/ssh.ParseKnownHosts`.
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "p256", "p384", "p521", "rsa", "dsa", "std"] }
 # `test-support` only (see [features]): the helpers build throwaway stores and
 # certificates.

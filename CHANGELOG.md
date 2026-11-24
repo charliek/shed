@@ -29,9 +29,9 @@ All notable changes to this project will be documented in this file.
   on re-encode — and is not interpreted. An interactive roost session,
   or a host you used to name under `machines:`, belongs in the `roost` app. The
   shared Rust client is now `shed-lane`, `shed-core`, `shed-roost`, `shed-craze`,
-  `shed-app` and `shed-desktop-core` (plus `shed-broker`, `shed-broker-harness` and
-  `shedctl`). The opencode adapter crate is gone.
-- **Images: the `extensions` and `full` images bake craze 0.4.1** (0.10.1 baked 0.2.0). In a
+  `shed-app` and `shed-desktop-core` (plus `shedctl`; the credential broker crates went in
+  part B below). The opencode adapter crate is gone.
+- **Images: the `base` and `full` images bake craze 0.4.1** (0.10.1 baked 0.2.0). In a
   shed built from them, the desktop's create sheet lists craze's `claude` provider, which
   craze 0.4.0 added, and no longer lists `gx`, which it removed. A shed keeps the craze its
   image baked; recreate it to pick up the new one.
@@ -68,13 +68,41 @@ All notable changes to this project will be documented in this file.
     and hooks run as before. `shed reset` clears delivered items and names
     `shed provision`. `--no-provision` skips the install hook only, not delivery, and `shed provision` does not run a hook skipped that way.
   - **Follow-ups.** Actions the server takes on its own (remote sweeps and reconcile) are not
-    audited yet. The ask-per-use credential helpers stay in this release; their removal and the
-    two-variant image change are a later part of the same plan. The first machine that connects
+    audited yet. The ask-per-use credential helpers and the `extensions` image went in part B, below. The first machine that connects
     for a user is bound as their source, and the app streams to every configured server; of the
     `only` rules only `only.servers` is judged on the person's machine (`only.backends` and
     `only.repos` match what the server wrote), so a provider enabled with no `only.servers`
     delivers to any configured server that asks. Set `only.servers` on every provider; whether a
     provider with no `only.servers` should deliver nowhere is an open decision.
+- **Credential delivery, part B: the ask-per-use model is removed (plan 039).** Credentials
+  now reach a shed only by delivery; nothing is asked per use and nothing is approved.
+  - **Removed.** The three in-VM helpers (the SSH agent, the AWS credential endpoint and the
+    Docker credential helper), their guest overlay and `internal/ext`; the `extensions` image
+    (the images are now `base`, with roost-session and craze, and `full`, which adds `strix`,
+    `prox`, `parcel` and `envsecrets`; the cloud image has the same two variants, families
+    `shed-base-amd64` and `shed-full-amd64`); `--image extensions` is an unknown alias. The
+    desktop app's in-process credential broker and its Approvals (the pane, badge, banner, tray
+    list, Touch ID and Linux polkit gates, the signing check, `extensions.yaml`, the broker
+    audit log); the crates `shed-broker` and `shed-broker-harness`, the wire suite
+    `tests/broker-wire`, and the polkit policy in the `.deb`. The bus stays: `internal/plugin`,
+    `/api/plugins`, the credentials scope, the SDK clients, the agent's proxy and health frame,
+    and the generic `extensions:` key.
+  - **Breaking.** A server config naming `ssh-agent`, `aws-credentials` or
+    `docker-credentials` in `extensions.enabled` fails to load, with a message naming the
+    upgrade guide. A config or script naming the `extensions` image, and a cloud environment
+    naming the `extensions` image family, must change to `full`. A shed made before this
+    release keeps running but gets nothing delivered until it is recreated. See
+    `docs/upgrades/v0.10-to-v0.11.md`.
+  - **Desktop.** The sidebar is Sheds, Agents, Activity and System. Activity lists each
+    configured server's own feed (`GET /api/activity`), merged newest first; a shed's detail
+    shows its delivery and its egress profile and recent blocks; egress profiles are listed in
+    System. The app mints its control certificate through `shed-source`, keeping the machine
+    identity and certificate store paths. The source rows moved to Preferences → Provisioning;
+    there is no unbind, a pin is only moved.
+  - **Docs.** New `docs/guides/credentials-in-a-shed.md` (the five providers, AWS and registry
+    sign-in inside a shed, and the trade stated plainly: a usable credential is inside the shed
+    while it runs); the source-binding, extensions and architecture pages are rewritten for
+    delivery and the bus alone.
 
 ## v0.10.1 — 2026-11-20
 

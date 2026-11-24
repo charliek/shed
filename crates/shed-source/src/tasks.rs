@@ -84,8 +84,13 @@ impl SourceTasks {
 
     /// Runs one stream per target of `targets` (by name): a new server starts, a changed
     /// one restarts, one no longer listed stops. After [`Self::stop`] nothing starts.
+    ///
+    /// Lock order, here and in [`Self::restart`] and [`Self::stop`]: `stopped`, then
+    /// `running`, the first held across the map's change, so no task is added once
+    /// [`Self::stop`] has run.
     pub fn reconcile(&self, targets: &[ServerTarget]) {
-        if *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        if *stopped {
             return;
         }
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -133,6 +138,23 @@ impl SourceTasks {
         }
     }
 
+    /// Opens `name`'s stream again at once, whatever it was waiting for (a machine just
+    /// made the source should not wait out a backoff). `false` when no stream runs for
+    /// `name`, or after [`Self::stop`].
+    pub fn restart(&self, name: &str) -> bool {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        if *stopped {
+            return false;
+        }
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(old) = running.remove(name) else {
+            return false;
+        };
+        let _ = old.stop.send(true);
+        running.insert(name.to_string(), self.spawn(&old.target));
+        true
+    }
+
     /// Every server's status, by name.
     pub fn status(&self) -> Vec<ServerStatus> {
         self.running
@@ -158,7 +180,8 @@ impl SourceTasks {
 
     /// Stops every stream (non-blocking) and starts none after.
     pub fn stop(&self) {
-        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
         for r in self
             .running
             .lock()
@@ -256,6 +279,54 @@ mod tests {
             .iter()
             .all(|s| s.status.state == StreamState::Stopped));
         assert_eq!(b.streams().len(), 1);
+    }
+
+    /// "Use this machine" reopens a server's stream at once; an unknown server, or a
+    /// stopped set, restarts nothing.
+    #[tokio::test]
+    async fn restart_reopens_one_servers_stream() {
+        let a = Fake::start().await;
+        let t = tasks();
+        let mut ta = target(&a.url);
+        ta.name = "a".into();
+        t.reconcile(&[ta]);
+        a.wait_streams(1).await;
+        assert!(t.restart("a"));
+        a.wait_streams(2).await;
+        assert_eq!(t.servers(), vec!["a"]);
+        assert!(!t.restart("nope"));
+        t.stop();
+        assert!(!t.restart("a"));
+        assert!(t.join(Duration::from_secs(10)).await);
+    }
+
+    /// A restart or reconcile racing the shutdown's stop never leaves a task whose stop
+    /// signal was not sent: both hold the stopped flag across the map's change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nothing_escapes_a_stop_that_races_restart_or_reconcile() {
+        for i in 0..200 {
+            let t = Arc::new(tasks());
+            let mut ta = target("http://127.0.0.1:1");
+            ta.name = "a".into();
+            t.reconcile(std::slice::from_ref(&ta));
+            let (r, s) = (t.clone(), t.clone());
+            let mut changed = ta.clone();
+            changed.user = format!("u{i}");
+            let racer = std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    r.restart("a");
+                } else {
+                    r.reconcile(&[changed]);
+                }
+            });
+            let stopper = std::thread::spawn(move || s.stop());
+            racer.join().unwrap();
+            stopper.join().unwrap();
+            for (name, run) in t.running.lock().unwrap().iter() {
+                assert!(*run.stop.borrow(), "round {i}: {name} escaped the stop");
+            }
+            assert!(t.join(Duration::from_secs(10)).await);
+        }
     }
 
     #[tokio::test]

@@ -3,8 +3,9 @@
 //! The five-phase sequence lives in [`shed_desktop_core::shutdown`] and is not
 //! duplicated here. This module is how the app's exit paths reach it:
 //!
-//! * [`install_broker_drain`] registers the embedded broker's drain on the
-//!   runtime's single [`Shutdown`] before any exit can start;
+//! * [`install_shutdown_log`] sends the shutdown's phase lines to the app's log
+//!   (the source runtime's drain is registered by the setup hook, on the
+//!   runtime's single [`Shutdown`], before any exit can start);
 //! * [`await_orderly_shutdown`] is what `RunEvent::Exit` and a coded
 //!   `ExitRequested` (tray Quit, `app.quit`, a finished signal) block on —
 //!   [`ShedDesktopRuntime::shutdown_children`];
@@ -23,16 +24,9 @@ use tauri::Manager;
 
 pub use shed_desktop_core::ESCAPE;
 
-/// Register the embedded broker's drain as the runtime's first shutdown step.
-///
-/// A non-blocking signal. No-op once shutdown has already begun.
-pub fn install_broker_drain(runtime: &ShedDesktopRuntime, app: &tauri::AppHandle) {
-    let app = app.clone();
-    runtime.set_broker_drain(Box::new(move || {
-        if let Some(rt) = app.try_state::<crate::broker::BrokerRuntime>() {
-            rt.signal_shutdown();
-        }
-    }));
+/// Send the shutdown's phase and completion lines to the app's log. No-op once
+/// shutdown has already begun.
+pub fn install_shutdown_log(runtime: &ShedDesktopRuntime) {
     runtime.set_shutdown_log(Arc::new(|line: &str| {
         app_info!("shed-desktop-tauri: {line}");
     }));
@@ -142,6 +136,11 @@ async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<Shutdown>) {
         };
         // Written and flushed before the exit: the sink appends per line.
         app_warn!("shed-desktop-tauri: exiting now (signal {again})");
-        std::process::exit(128 + again);
+        // `_exit`, not `std::process::exit`: this is the escape from a held
+        // shutdown, so the webview and runtime threads are still running, and
+        // the C `atexit` handlers `exit` runs can tear state out from under
+        // them (seen as a SIGSEGV instead of `128 + signo`).
+        // SAFETY: `_exit` takes a plain int and never returns.
+        unsafe { libc::_exit(128 + again) }
     }
 }

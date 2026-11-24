@@ -25,8 +25,7 @@ make -C desktop e2e                # e2e-tauri: the hermetic pytest harness (no 
 That is what CI runs on `macos-15`: the **`tauri-mac`** job (`tauri-lint`, `tauri-test`, the
 craze binaries, `SHED_TAURI_TEST_TIMEOUT_SCALE=4 make -C desktop e2e-tauri`, then the bundle
 smoke below) and the **`core-mac`** job (`make -C desktop core-test core-lint` — the
-`cfg(target_os = "macos")` paths in `crates/`, e.g. `shed-broker`'s Touch ID gate, only
-compile there).
+`cfg(target_os = "macos")` paths in `crates/` only compile there).
 
 - **Craze cells.** `test_tauri_craze.py` drives the real craze hub and skips without the
   pinned binaries. `make craze-binaries` (repo root) builds them and prints
@@ -41,8 +40,8 @@ compile there).
 
 ## How the harness launches the app
 
-`desktop/tools/shedtest/conftest.py` starts two in-process mock shed-servers
-(`mockserver.py`: the session mock, and `studio`, a bus-only second one), then runs the debug
+`desktop/tools/shedtest/conftest.py` starts the shared in-process mock shed-server
+(`mockserver.py`; a cell that needs more makes its own private mocks), then runs the debug
 binary (`tauri/src-tauri/target/debug/shed-desktop-tauri`, override `SHED_TAURI_BIN`) with:
 
 - `SHED_TAURI_TEST_MODE=1`, `SHED_TAURI_MOCK_BASE_URL=<mock>`,
@@ -50,24 +49,17 @@ binary (`tauri/src-tauri/target/debug/shed-desktop-tauri`, override `SHED_TAURI_
 - a throwaway dir as `HOME`, every `XDG_*_HOME`, `XDG_RUNTIME_DIR` and
   `SHED_BROKER_STATE_DIR` (`<runtime>/broker-state`), so it never reads your `~/.shed`, your
   prefs, your keys or your real socket;
-- a **hermetic credential broker** (`broker_env.py`). The app brokers in process, and a real
-  broker answers for every server in its list with the keys under its HOME, so every launch
-  gets its own: an `extensions.yaml` with `ssh.mode: local-keys` and every namespace
-  delegated to the app (`shed-desktop`), a server file naming only mocks on `127.0.0.1`
-  (the session broker serves the session mock as `mini3` and the second as `studio`), a
-  throwaway `ssh-keygen` key, and AWS/Docker credentials of constants. `SSH_AUTH_SOCK`,
-  `AWS_*` file overrides and `DOCKER_CONFIG` are removed.
+- **a hermetic launch environment** (`hermetic.py`). The app is a credential source in
+  process and reads keys, a `gh` sign-in and config under its HOME to answer delivery
+  requests, so `hermetic.overrides` removes the developer's `SSH_AUTH_SOCK`, `AWS_*` file
+  overrides and `DOCKER_CONFIG`, unsets every proxy and sets `NO_PROXY=*`.
 
-**`broker_env.validate` runs before every spawn** (inside `ui.subproc_env`, so a
-self-managed launch cannot skip it): it raises if the env carries `SSH_AUTH_SOCK` or a proxy
-variable (every launch removes them and sets `NO_PROXY=*`), if HOME, an XDG dir, the broker
-state dir or the extensions config is outside the runtime dir, or if the broker's server file
-is not byte for byte the one `render_server_file` makes for the launch's own mocks (each
-exactly `http://127.0.0.1:<port>`). After launch the
-session is held to exactly its two mock URLs (`broker_env.check_running` on `broker.status`),
-and an autouse guard fails any test after which a session mock saw a subscribe from another
-machine id. A self-managed launch that needs no credentials gets a broker that serves NO
-server (`ui.subproc_env`'s default), so it never takes a listener slot on a session mock.
+**`hermetic.validate` runs before every spawn** (inside `ui.subproc_env`, so a
+self-managed launch cannot skip it): it raises if the env carries one of the removed
+variables or a proxy variable, if HOME, an XDG dir, the state dir or
+`SHED_TAURI_DELIVERY_CONFIG` is outside the runtime dir, or if any mock URL in
+`SHED_TAURI_MOCK_BASE_URL` is not exactly `http://127.0.0.1:<port>`. A cell that needs two
+servers names a per-server mock URL with `hermetic.mock_url`.
 
 `identify` is checked before any test runs (`test_mode`, the mock URL, `core: "rust"`,
 `platform: "tauri"`), so a run that isn't hermetic fails fast instead of touching a real
@@ -115,7 +107,7 @@ instead: `dashboard.dump`, `ui.current_pane`, `ui.modal`, `ui.badges`, `ui.compu
 `prefs.dump`, `tray.dump`, `agents.dump`, `sidebar.dump`, `shed_roost.dump`,
 `roost_consent.dump`, `craze_create.dump`, `lane.dump`, `lane_settings.dump`, `toast.dump`.
 `launch.dump` and `machines.dump` answer `unknown_op`. They report what the frontend rendered, not just what the backend
-holds. "Use this machine" in the credential-source UI, and the broker's `machine.json`,
+holds. "Use this machine" in the credential-source UI, and the app's `machine.json`,
 are the credential source for a server — a different thing from a host list.
 
 ## macOS-only behavior the e2e covers
@@ -137,21 +129,18 @@ are the credential source for a server — a different thing from a host list.
   (`make run`, `tauri dev`) never applies the default, so your own build never registers
   itself. The unwritable-prefs cell makes `prefs.json` a directory (a read-only directory
   does not stop root in Docker).
-- **Approvals** (`test_approvals.py`, `test_tauri_broker.py`): the Touch ID gate is never
-  shown under the harness (no `biometrics*` policy is ever written; the harness broker
-  delegates to the app). Requests come through the mocks' plugin bus (`bus_stimulus.py`:
-  `emit_sign`/`emit_docker`/`emit_aws` on the session mock, `mini3`, or on `studio`), and
-  outcomes are read from the bus answer (`verdict`) and the broker's audit file
-  (`audit_line`: `decided_by`, `scope`, `ttl`). The native `LAContext` error mapping is
-  covered by the Tauri crate's unit tests (`approval.rs`, macOS-only).
-- **Credential sources** (`test_tauri_broker.py`, the "(d1b)" cells, plan 035 §3.4): the
-  Preferences source rows and "Use this machine", driven through `source.status`/`source.use`
-  and the test-mode `ui.press_source_use {host}` door (the window clicks its own
-  `button[data-source-use]`), against the mock armed with `arm_source`. Nothing here is
-  macOS-specific, but the machine identity file lives under the harness's
-  `SHED_BROKER_STATE_DIR` (`<runtime>/broker-state`), never `~/Library/Application
-  Support/shed` — a run that finds a real `machine.json` there has lost its hermeticity. The
-  shedtest-linux skill has the op and mock details.
+- **Credential sources** (`test_tauri_source.py`, plan 039 PR B; re-hosted from the old
+  broker cells): the app binds through its delivery stream, a pinning mock refuses another
+  machine's stream with `403 SOURCE_NOT_BOUND`, and "Use this machine" (`source.use`, or the
+  test-mode `ui.press_source_use {host}` door that clicks the Preferences row's own
+  `button[data-source-use]`) moves the binding and reopens the stream at once, against the
+  mock armed with `arm_source`. Nothing here is macOS-specific, but the machine identity file
+  lives under the harness's `SHED_BROKER_STATE_DIR` (`<runtime>/broker-state`), never
+  `~/Library/Application Support/shed` — a run that finds a real `machine.json` there has
+  lost its hermeticity. The shedtest-linux skill has the op and mock details. There is no
+  Approvals pane and no Touch ID gate any more.
+- **Server views** (`test_tauri_server_views.py`): the four sidebar entries, Activity merged
+  across two mocks, a shed's detail (delivery and egress) and the System pane's profiles.
 
 ## The bundle + DMG (the shipped artifact)
 

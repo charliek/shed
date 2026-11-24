@@ -12,7 +12,6 @@
 # Usage:
 #   ./scripts/build-vz-rootfs.sh                      # Build full variant
 #   ./scripts/build-vz-rootfs.sh --variant base        # Build base variant
-#   ./scripts/build-vz-rootfs.sh --variant extensions  # Build extensions variant
 #   ./scripts/build-vz-rootfs.sh --variant full        # Build full variant
 #   ./scripts/build-vz-rootfs.sh --all                  # Build all variants
 #   ./scripts/build-vz-rootfs.sh --force-kernel         # Force kernel re-extraction
@@ -28,7 +27,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$HOME/Library/Application Support/shed/vz}"
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-vz-<name> stages can be built too.
-KNOWN_VARIANTS="base extensions full"
+KNOWN_VARIANTS="base full"
 
 # Defaults
 VARIANT="full"
@@ -116,12 +115,8 @@ cleanup() {
     fi
     # Remove the staged binaries from the build context so the working
     # tree stays clean after the script exits (Dockerfile COPYs them
-    # via relative paths during the build). Includes the guest extension
-    # binaries + /etc overlay staged by stage-guest-binaries.sh.
-    rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot" \
-          "$VZ_DIR/shed-ext-ssh-agent" "$VZ_DIR/shed-ext-aws-credentials" \
-          "$VZ_DIR/docker-credential-shed"
-    rm -rf "$VZ_DIR/ext-etc"
+    # via relative paths during the build).
+    rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot"
 }
 
 trap cleanup EXIT
@@ -143,8 +138,8 @@ build_prereqs() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
     cd "$PROJECT_ROOT"
-    # Same stamps + derivation as stage-guest-binaries.sh (env-overridable;
-    # commit-date BuildDate keeps the BuildKit bind-mount layer cache stable).
+    # Version stamps (env-overridable; commit-date BuildDate keeps the
+    # BuildKit bind-mount layer cache stable).
     GV="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
     GC="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
     GD="${BUILD_DATE:-$(git show -s --format=%cI HEAD 2>/dev/null || echo unknown)}"
@@ -153,9 +148,6 @@ build_prereqs() {
 
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
     GOOS=linux GOARCH=arm64 go build -ldflags "$GUEST_LDFLAGS" -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
-
-    echo "=== Staging guest extension binaries + /etc overlay (linux/arm64) ==="
-    "$SCRIPT_DIR/stage-guest-binaries.sh" "$VZ_DIR" arm64
 
     echo "=== Building host shed CLI ==="
     mkdir -p "$PROJECT_ROOT/bin"

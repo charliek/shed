@@ -1,28 +1,35 @@
 # Credential Source
 
-A shed server sends a user's credential requests (the `ssh-agent`, `aws-credentials` and
-`docker-credentials` namespaces) to **one** of that user's machines: the user's
-**credential source** on that server. Every other machine of the same user is refused and
-keeps retrying. On a server with no user list there is one implicit user, so one machine
-answers for every shed on it.
+A shed server asks **one** of a user's machines for what that user's sheds should hold: the
+user's **credential source** on that server. Every other machine of the same user is refused
+and keeps retrying. The same pin decides which machine may answer for the shed [message
+bus](../reference/extensions.md), if you run an extension on it. On a server with no user
+list there is one implicit user, so one machine answers for every shed on it.
 
-This page covers how a machine identifies itself, how the source is chosen, what the other
-machines show, and how to move the source. The server side of the same rules is in
+What the source is asked for is [credential delivery](../reference/delivery.md): the files
+and environment variables a new shed holds (an SSH key, a GitHub token, API keys, an
+envsecrets login), chosen by the [providers](../guides/credentials-in-a-shed.md) you turn
+on. The source answers without a prompt. The pin is therefore the line between a machine
+that can draw those items and one that cannot: **the pin is which machine the server asks
+for a shed user's delivery.**
+
+This page covers how a machine identifies itself, how the pin is set, what the other
+machines show, and how to move it. The server side of the same rules is in
 [Security](../reference/security.md); the commands are in the [CLI reference](../reference/cli.md).
 
 ## Machine identity
 
-Each machine that runs the shed desktop app has a broker, and the broker keeps an identity
-in one file. One machine is one app, so one identity; a machine without the app has no broker
-and no identity:
+Each machine that runs the shed desktop app keeps an identity in one file. One machine is one
+app, so one identity; a machine without the app has no identity and cannot be a source:
 
 | Platform | Path |
 |---|---|
 | macOS | `~/Library/Application Support/shed/broker/machine.json` |
 | Linux | `$XDG_DATA_HOME/shed/broker/machine.json`, else `~/.local/share/shed/broker/machine.json` |
 
-`SHED_BROKER_STATE_DIR` replaces the `shed` directory above. An app started with a different
-`SHED_BROKER_STATE_DIR` is a different machine.
+The directory is still named `broker` so that an identity and certificate store made by an
+earlier version are used as they are. `SHED_BROKER_STATE_DIR` replaces the `shed` directory
+above. An app started with a different `SHED_BROKER_STATE_DIR` is a different machine.
 
 ```json
 {"schema":1,"id":"0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60","name":"laptop","created_at":"2026-11-16T09:12:03Z"}
@@ -31,100 +38,105 @@ and no identity:
 | Field | Rule |
 |---|---|
 | `id` | 32 lowercase hexadecimal characters, random, created once. This is what a server matches on. |
-| `name` | What people see and type. Taken once, when the file is created, from the first label of the hostname (`laptop.local` → `laptop`; an IP address is kept whole); `machine-<first 8 characters of the id>` when there is no usable hostname. Renaming the host later does not rename the machine, and a name edited by hand in the file is used. 1 to 63 bytes of UTF-8, no control characters. |
+| `name` | What people see and type. Taken once, when the file is created, from the first label of the hostname (`laptop.local` becomes `laptop`; an IP address is kept whole); `machine-<first 8 characters of the id>` when there is no usable hostname. Renaming the host later does not rename the machine, and a name edited by hand in the file is used. 1 to 63 bytes of UTF-8, no control characters. |
 
-The file is mode `0600` in a `0700` directory. It is loaded once when the broker starts,
-before it connects anywhere; the desktop app shows it in Preferences and in `broker.status`.
+The file is mode `0600` in a `0700` directory. It is loaded once when the app starts, before
+it connects anywhere.
 
-What the broker does with the file it finds:
+What the app does with the file it finds:
 
 | On disk | Result |
 |---|---|
 | Missing | Created. |
 | Valid | Used as is; never rewritten. |
 | A valid `id`, anything else wrong | The id is kept; the other fields are repaired and written back (a warning is logged). |
-| Written by a newer version (`schema` above 1) | Never rewritten, moved or replaced. Its id is used if it can be read; otherwise the broker runs without an identity. |
+| Written by a newer version (`schema` above 1) | Never rewritten, moved or replaced. Its id is used if it can be read; otherwise the app runs without an identity. |
 | No readable `id` (not JSON, wrong type, wrong format) | Copied to `machine.json.corrupt` and replaced by a new identity. A warning is logged: servers will see a new machine, which has to be chosen again. |
-| Cannot be read or created (permissions, I/O) | The broker keeps running **without** an identity and reports why (`machine_error` in `broker.status`). A pinning server refuses such a broker (below). |
+| Cannot be read or created (permissions, I/O) | The app keeps running **without** an identity and reports why. A pinning server refuses such a machine (below). |
 
 !!! warning "A machine restored from another machine's backup"
     The id is never derived from the hardware, so a cloned disk or a restored backup is the
-    one way two machines end up with the same id. On the copy, stop the broker, delete
+    one way two machines end up with the same id. On the copy, quit the app, delete
     `machine.json`, and start it again: it creates a new identity. Two machines sharing an
     id look like one machine to a server, and the second to connect is refused as a
     duplicate.
 
-## How the source is chosen
+## How the pin is set
 
-Every bus subscribe and every response a broker sends carries two headers:
+Every delivery stream the app opens, and every answer it sends, carries two headers:
 
 | Header | Value |
 |---|---|
 | `X-Shed-Machine-Id` | the machine's `id` |
 | `X-Shed-Machine-Name` | the machine's `name`, percent-encoded UTF-8 |
 
-The server keeps one binding per user. The **first machine to connect for a user is bound**
-(the binding records `first-connect` as who bound it). After that the server answers each
-subscribe as follows:
+The server keeps one pin per user. It is set in one of two ways:
 
-| Answer | `error.code` | When | What the broker does |
+- **Automatically, by the first connecting desktop app.** The first machine to connect for a
+  user is bound (the pin records `first-connect` as who bound it). The app opens a stream to
+  **every server in your shed config**, so you do not choose a server for it to ask: the
+  first of your machines to sign in to a server becomes your source there.
+- **On purpose, by moving it.** **Use this machine** in the app's Preferences, under
+  **Provisioning**, or `shed source use` (the app's IPC op is `source.use`).
+
+**There is no unbind command.** A pin is moved to another of your machines; it is never
+cleared. The one way to discard every pin is for the operator to delete the server's
+`source-bindings.json` (below), after which the next machine to connect for each user is
+bound again.
+
+After that the server answers each connection as follows:
+
+| Answer | `error.code` | When | What the app does |
 |---|---|---|---|
-| `200` (stream) | — | the machine is the user's source | serves requests (`connected`) |
-| `403` | `SOURCE_NOT_BOUND` | another machine is the source; the body names it in `source.machine_id` and `source.machine_name` | state `not-source`; retries on its 1–30 s backoff without enrolling a new certificate |
-| `409` | `SOURCE_DUPLICATE_STREAM` | this machine's id already holds the namespace on this server | state `duplicate`; retries |
-| `403` | `SOURCE_MACHINE_ID_REQUIRED` | the request has no valid machine headers (a broker older than the pin) | state `reconnecting`; retries |
-| `429` | `SOURCE_RATE_LIMITED` | too many new or changed machines for this user lately (burst of 8, one more every 15 s); carries `Retry-After` | state `reconnecting`; retries after `Retry-After` (whole seconds, at most a minute), never sooner than its backoff |
+| `200` (stream) | none | the machine is the user's source | serves requests (`connected`) |
+| `403` | `SOURCE_NOT_BOUND` | another machine is the source; the body names it in `source.machine_id` and `source.machine_name` | state `not_bound`; retries on its 1 to 30 s backoff without enrolling a new certificate |
+| `409` | `SOURCE_DUPLICATE_STREAM` | this machine's id already holds a stream on this server | state `duplicate`; retries |
+| `403` | `SOURCE_MACHINE_ID_REQUIRED` | the request has no valid machine headers | retries |
+| `429` | `SOURCE_RATE_LIMITED` | too many new or changed machines for this user lately (burst of 8, one more every 15 s); carries `Retry-After` | retries after `Retry-After` (whole seconds, at most a minute), never sooner than its backoff |
 
 Matching is by id only. The server also records each machine's name and the fingerprint of
 the key its certificate was issued to, and shows both, but never matches on them. It
 remembers up to 32 machines per user, refused ones included, and forgets the least recently
 seen past that.
 
-A `duplicate` has two usual causes: a state directory copied to another machine, or a reconnect that arrives before the server
-has ended the previous stream. A stream that has gone dead is ended by the server's write
-deadline (15 s), after which the next retry succeeds. No stream ever replaces another.
+A `duplicate` has two usual causes: a state directory copied to another machine, or a
+reconnect that arrives before the server has ended the previous stream. A stream that has
+gone dead is ended by the server's write deadline (15 s), after which the next retry
+succeeds. No stream ever replaces another.
 
-Responses follow the same rule: the server accepts an answer only from the user's bound
-machine, and only to a request it sent that machine under the current binding. An answer
-from any other machine is refused with `403 SOURCE_NOT_BOUND`, and one that matches no
-request the machine was sent with `403 FORBIDDEN`.
+A delivery answer follows the same rule: the server accepts an answer only from the user's
+bound machine, on the stream it asked, and only for a request it sent under the current pin.
+An answer from any other machine or connection is refused with `403`.
 
 A server with credential sources lists `source_binding` in the `features` of
 `GET /api/info`.
 
-The binding lives on the server, in `source-bindings.json` in the backend's state
-directory. A server that starts without that file logs a warning that no bindings exist and
-that the first machine to connect for each user becomes its source; deleting the file on
-purpose is how an operator discards every binding.
+The pin lives on the server, in `source-bindings.json` in the backend's state directory. A
+server that starts without that file logs a warning that no bindings exist and that the
+first machine to connect for each user becomes its source.
 
 ## What the other machines show
 
 A machine that is not the source shows it in these places:
 
-- The broker's log marks the namespace `not-source` and name the source.
-  To move the source here, press **Use this machine** or run this command, which names this
-  machine by its full id:
+- The app's Preferences show the source's name on that server's row, with a **Use this
+  machine** button. A server that cannot be reached when Preferences reads it keeps the row
+  it last showed, marked **cannot reach the server**, and Preferences reads it again a few
+  times; a server that answers but is busy shows **server busy, retrying**. A server older
+  than credential sources has no row.
+- `delivery.status` (IPC) reports that server's stream as `not_bound`, or `duplicate` for a
+  duplicate.
+- From a terminal, `shed source status` names the source and says whether it is connected.
 
-    ```text
-    shed -s devbox source use -- 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60
-    ```
+To move the source to the machine you are on, press **Use this machine** or run this
+command, which names the machine by its full id:
 
-    The full id cannot be ambiguous: two of a user's machines can share a name (the same
-    hostname), and `shed source use` refuses a name that matches more than one machine.
+```text
+shed -s devbox source use -- 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60
+```
 
-- `broker.status` carries `state: "not-source"` and an
-  `active_source` object (`machine_id`, `machine_name`) on the namespace and on the server.
-  See [Configuration → Checking the broker](configuration.md#checking-the-broker).
-- The desktop app's Preferences show the source's name on that server's row, with a
-  **Use this machine** button. A server that cannot be reached when Preferences reads it
-  (it is restarting, or the network is down) keeps the row it last showed, marked
-  **cannot reach the server**, and Preferences reads it again a few times, a little
-  further apart each time; then it waits until the window is shown or focused again. A
-  server older than credential sources has no row, and nor does one that has not been
-  reached since the window opened (there is no last row to keep). A server that answers
-  but is busy shows **server busy, retrying** instead.
-
-A `duplicate` is shown with a message naming the duplicate stream.
+The full id cannot be ambiguous: two of a user's machines can share a name (the same
+hostname), and `shed source use` refuses a name that matches more than one machine.
 
 ## Moving the source
 
@@ -139,22 +151,22 @@ shed -s devbox source use -- 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60
 
 `shed source use` takes a machine's full id, a prefix of its id of at least 8 hex digits, or
 its exact name, as `shed source ls` lists them; put `--` before a name that begins with `-`.
-A machine appears in `shed source ls` only after its broker has tried to connect to that
-server at least once. An admin can act on another user's source with `--user`.
+A machine appears in `shed source ls` only after its app has opened a stream to that server
+at least once. An admin can act on another user's source with `--user`.
 
-From the desktop app: Preferences → Credential broker lists one row per server that supports
+From the desktop app: Preferences → Provisioning lists one row per server that supports
 credential sources, and **Use this machine** makes the machine the app runs on the source
-there. See [Desktop configuration](../desktop/configuration.md#credential-sources).
+there. See [Provisioning](../desktop/provisioning.md).
 
 What a move does:
 
-1. The server records the new binding.
-2. It closes the old machine's streams and drops every request it had sent that machine.
-   An approval still waiting on the old machine is lost: if it is approved there, the answer
-   is refused, and the old machine's audit log records it as `undelivered`.
-3. The new machine starts answering when its broker next subscribes. The desktop app's
-   broker is woken at once by the button; `shed source use` from a terminal is picked up on
-   the broker's next retry, within about 30 seconds.
+1. The server records the new pin.
+2. It closes the old machine's streams and fails every delivery request it had sent that
+   machine. A create that was waiting on the old machine ends as a failed delivery, with the
+   fixed warning naming `shed provision`.
+3. The new machine starts answering when its app next connects. The desktop app is woken at
+   once by the button; `shed source use` from a terminal is picked up on the app's next
+   retry, within about 30 seconds.
 
 The routes behind both are `GET /api/sources` and `POST /api/sources/use` with
 `{"machine_id": "<32 hex>"}` (an admin may add `"user"`). Both need a control-scope
@@ -162,7 +174,7 @@ credential:
 
 | Answer | Code | Meaning |
 |---|---|---|
-| `200` | | the user's binding and machines (`use` answers the same document, after the move) |
+| `200` | | the user's pin and machines (`use` answers the same document, after the move) |
 | `400` | `INVALID_REQUEST` | a malformed body or machine id, or an admin naming a user who is not configured |
 | `403` | `FORBIDDEN` | a script key, a service client, or a non-admin naming another user |
 | `404` | `SOURCE_MACHINE_NOT_FOUND` | no machine with that id has presented itself for the user |
@@ -173,40 +185,27 @@ credential:
 
 - A user may move their own source from any of their keys that is not a script key; an
   admin may also move another configured user's.
-- A **script key** cannot be a source or move one: its certificate is refused on subscribe
-  and respond, and on both source routes, with `403 FORBIDDEN`.
-- A shed owned by a service client gets nothing from any source; the bus is off for it.
-- The remote backend has no in-VM helpers, so its sheds send no credential requests.
+- A **script key** cannot be a source or move one: its certificate is refused on a stream
+  and on both source routes, with `403 FORBIDDEN`.
+- A shed owned by a service client gets nothing from any source: no delivery request is made
+  for it, and the bus is off.
+- With no bound machine, a create asks nothing and warns about nothing.
 
 ## Nothing fails over by itself
 
-The binding changes only when someone moves it. If the source is asleep, off the network or
-not running a broker, the server has no listener for that user and drops each request (and
-logs it); the tool in the shed fails when its own timeout passes (3 seconds for the SSH
-agent and the AWS proxy). Another of the user's machines keeps reporting `not-source` and
-does not take over. Move the source with `shed source use` or the desktop button.
+The pin changes only when someone moves it. If the source is asleep, off the network or not
+running the app, the server has no stream for that user: a create ends with the delivery
+failed as `source_offline` and the fixed warning, and the shed starts regardless. Another of
+the user's machines keeps reporting `not_bound` and does not take over. Move the source with
+`shed source use` or the desktop button, then run `shed provision <name>`.
 
 ## Upgrading
 
-Upgrade servers **first**, then every machine right after (the whole procedure is in the
-[v0.9.0 → v0.10.0 upgrade guide](../upgrades/v0.9.0-to-v0.10.0.md#the-order-servers-first-then-every-machine-right-after)):
-
-- A broker released before the pin (the retired credential daemon, or a desktop app older
-  than 0.10.0) sends no headers, so a pinning server refuses every subscribe and response from it with
-  `403 SOURCE_MACHINE_ID_REQUIRED`, whose message says to install the current shed desktop
-  app. It keeps retrying, but credential forwarding for that machine stops until the app is
-  upgraded.
-- The 0.10.0 app refuses a certificate that names no user, which only a server older than
-  0.10.0 issues, so it cannot broker for such a server.
-- The 0.10.0 app keeps its state in a new directory, so it is a new machine to every server.
-  Where another machine id is your source, move it with **Use this machine** or `shed source
-  use`.
-
-On its first start with credential sources a server has no bindings, so whichever of a
-user's machines connects first becomes the source. Start the intended machine first, or
-check `shed source status` afterwards and move it.
+On its first start with credential sources a server has no pins, so whichever of a user's
+machines connects first becomes the source. Start the intended machine first, or check
+`shed source status` afterwards and move it.
 
 When a user list is added to a server that had none, the first start with the list hands the
-implicit user's binding and remembered machines to the user if exactly one user is
-configured, and drops them if several are; each user's first machine to connect is then
-bound. At every start the records of users no longer configured are dropped.
+implicit user's pin and remembered machines to the user if exactly one user is configured,
+and drops them if several are; each user's first machine to connect is then bound. At every
+start the records of users no longer configured are dropped.

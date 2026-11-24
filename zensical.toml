@@ -39,6 +39,7 @@ nav = [
     { "Upgrades" = [
       { "v0.8.2 → v0.9.0" = "upgrades/v0.8.2-to-v0.9.0.md" },
       { "v0.9.0 → v0.10.0" = "upgrades/v0.9.0-to-v0.10.0.md" },
+      { "v0.10 → v0.11" = "upgrades/v0.10-to-v0.11.md" },
     ] },
   ] },
   { "Tutorials" = [
@@ -53,6 +54,7 @@ nav = [
     { "User Directory" = "guides/user-directory.md" },
     { "Public VPS Deployment" = "guides/vps-deployment.md" },
     { "Orchestrated Sheds" = "guides/orchestrated-sheds.md" },
+    { "Credentials in a Shed" = "guides/credentials-in-a-shed.md" },
   ] },
   { "Reference" = [
     { "CLI" = "reference/cli.md" },
@@ -78,17 +80,12 @@ nav = [
   ] },
   { "Extensions" = [
     { "Architecture" = "extensions/architecture.md" },
-    { "Configuration" = "extensions/configuration.md" },
-    { "SSH Agent" = "extensions/ssh-agent.md" },
-    { "AWS Credentials" = "extensions/aws-credentials.md" },
-    { "Docker Credentials" = "extensions/docker-credentials.md" },
     { "Credential Source" = "extensions/source-binding.md" },
-    { "shed-ext-rc (retired)" = "extensions/rc-helper.md" },
+    { "RC helper (retired)" = "extensions/rc-helper.md" },
     { "roost Provider" = "extensions/roost-provider.md" },
     { "roost Session Hosts" = "extensions/roost-session-hosts.md" },
     { "shed-machine-rc (retired)" = "extensions/shed-machine-rc.md" },
     { "sx (sunset)" = "extensions/sx.md" },
-    { "Security Posture" = "extensions/security-posture.md" },
   ] },
   { "Desktop" = [
     { "Overview" = "desktop/index.md" },
@@ -97,7 +94,6 @@ nav = [
     { "Architecture" = "desktop/architecture.md" },
     { "Rust core" = "desktop/rust-core.md" },
     { "Configuration" = "desktop/configuration.md" },
-    { "Approvals" = "desktop/approvals.md" },
     { "Provisioning" = "desktop/provisioning.md" },
     { "Agents pane" = "desktop/rc-sessions.md" },
     { "Agent lanes" = "desktop/agent-lanes.md" },

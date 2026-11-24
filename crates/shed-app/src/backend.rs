@@ -25,6 +25,10 @@ use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
 
 use crate::auth_modes::AuthModeRegistry;
 
+/// A per-host egress profiles row's error when the server's egress control is off
+/// (its `/api/egress/profiles` answers 501).
+pub const EGRESS_OFF: &str = "egress control is off on this server";
+
 pub struct Backend {
     /// (server_name, client) — shed-core stamps each shed's `host` with the name.
     clients: Vec<(String, Client)>,
@@ -82,7 +86,7 @@ impl Backend {
     }
 
     /// As [`from_env_parts`](Self::from_env_parts), but threads a control-token
-    /// `minter` (the embedded broker's) into every non-mock server's client, so a
+    /// `minter` (the desktop's `shed-source` SSH-bootstrap minter) into every non-mock server's client, so a
     /// secure server mints/refreshes its control credential through it and fails
     /// closed on a mint failure (F6). GTK passes `None` (static-token only).
     ///
@@ -112,7 +116,7 @@ impl Backend {
     ///
     /// The registry is passed in rather than returned because the minter — which
     /// reads it to decide whether to expect a certificate — is constructed
-    /// BEFORE the Backend (the embedded broker's launch order).
+    /// BEFORE the Backend (the desktop's launch order).
     pub fn from_env_parts_with_credentials(
         test_mode: bool,
         mock_base_url: Option<&str>,
@@ -121,6 +125,9 @@ impl Backend {
         modes: Option<&Arc<AuthModeRegistry>>,
         unreachable_hosts: &HashSet<String>,
     ) -> Self {
+        // The mock URL (either form, `crate::mock_url_for`) is a test-mode seam: outside
+        // test mode it is ignored, so a stray variable never redirects a real client.
+        let mock_base_url = if test_mode { mock_base_url } else { None };
         if test_mode && mock_base_url.is_none() {
             return Self {
                 clients: Vec::new(),
@@ -145,8 +152,9 @@ impl Backend {
     }
 
     /// Build clients from an already-parsed config. When `mock_base_url` is set
-    /// (test mode) every server is redirected to that single hermetic mock —
-    /// plain HTTP, no pin, no token — so no real host is touched.
+    /// (test mode) every server is redirected to a hermetic mock — the one it names,
+    /// or the server's own override in it ([`crate::mock_url_for`]) — plain HTTP, no
+    /// pin, no token, so no real host is touched.
     pub fn from_config(config: &ShedConfig, mock_base_url: Option<&str>) -> Self {
         Self::from_config_with_minter(config, mock_base_url, None, &HashSet::new())
     }
@@ -189,14 +197,14 @@ impl Backend {
                         let url = if unreachable_hosts.contains(&s.name) {
                             "http://127.0.0.1:1".to_string()
                         } else {
-                            mock.to_string()
+                            crate::mock_url::mock_url_for(mock, &s.name)
                         };
                         Client::new(url, s.name.clone(), String::new(), None, None)
                     }
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
                         // server is skipped rather than sent plaintext. Secure servers
-                        // mint/refresh their control credential via the broker; on
+                        // mint/refresh their control credential via the minter; on
                         // a mint failure the client sends nothing — never the static
                         // config token (F6).
                         let r = s.resolved_endpoint();
@@ -464,7 +472,7 @@ impl Backend {
             .collect()
     }
 
-    /// Per-host egress profiles (`GET /api/egress/profiles`) for the Egress pane.
+    /// Per-host egress profiles (`GET /api/egress/profiles`) for the System pane.
     /// Like [`system_df`](Self::system_df), a per-host failure is KEPT as an error
     /// row (that host is unreachable or has egress disabled) rather than failing
     /// the call. Concurrent.
@@ -477,6 +485,13 @@ impl Backend {
                     host,
                     profiles,
                     error: None,
+                },
+                // The server answers 501 when its egress control is off: said as
+                // that, not as a bare status.
+                Err(ShedError::BadStatus(501)) => HostEgressProfiles {
+                    host,
+                    profiles: Vec::new(),
+                    error: Some(EGRESS_OFF.to_string()),
                 },
                 Err(e) => HostEgressProfiles {
                     host,
@@ -1225,6 +1240,60 @@ mod tests {
         assert!(!plain.argv.iter().any(|a| a == "-i"));
     }
 
+    /// The mock URL, in either form, is honoured only in test mode: outside it every
+    /// server is reached at its configured endpoint.
+    #[tokio::test]
+    async fn a_mock_url_outside_test_mode_is_ignored() {
+        let shed = |name: &str| format!(r#"{{"sheds":[{{"name":"{name}","status":"running"}}]}}"#);
+        let mock = MockServer::start_async().await;
+        let body = shed("from-mock");
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200).body(body);
+        })
+        .await;
+        let real = MockServer::start_async().await;
+        let body = shed("from-config");
+        real.mock_async(|w, t| {
+            w.method(GET).path("/api/sheds");
+            t.status(200).body(body);
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("shed-app-mockurl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "servers:\n    real:\n        host: 127.0.0.1\n        http_port: {}\ndefault_server: real\n",
+                real.port()
+            ),
+        )
+        .unwrap();
+        let names = |b: Backend| async move {
+            b.list_sheds()
+                .await
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+        };
+        let one = mock.base_url();
+        let per_server = format!("{one},real={one}");
+        for url in [&one, &per_server] {
+            assert_eq!(
+                names(Backend::from_env_parts(false, Some(url), &path)).await,
+                ["from-config"],
+                "{url} redirected a client outside test mode"
+            );
+            assert_eq!(
+                names(Backend::from_env_parts(true, Some(url), &path)).await,
+                ["from-mock"],
+                "{url} in test mode"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn from_env_parts_test_mode_without_mock_builds_no_clients() {
         // Hermeticity: a partial test env must not dial the developer's real hosts.
@@ -1488,6 +1557,24 @@ mod tests {
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.profiles.is_empty());
         assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn egress_profiles_says_when_egress_control_is_off() {
+        let off = MockServer::start_async().await;
+        off.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(501).body(
+                r#"{"error":{"code":"BACKEND_ERROR","message":"egress control is not enabled"}}"#,
+            );
+        })
+        .await;
+        let rows = backend_with(vec![client_at("off", off.base_url())])
+            .egress_profiles()
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].profiles.is_empty());
+        assert_eq!(rows[0].error.as_deref(), Some(EGRESS_OFF));
     }
 
     const THIS_ID: &str = "0123456789abcdef0123456789abcdef";

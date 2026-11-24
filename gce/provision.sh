@@ -12,21 +12,22 @@
 # with it. Any change to what this script lays down that the server relies on
 # is a new layout: raise SHED_LAYOUT here and guest.Layout together.
 #
-# Carried over from firecracker/Dockerfile (base + extensions): the package
-# list, gh, the shed user (uid 1000, passwordless sudo, docker group) and its
-# home, tmux.conf, the prompt, strix/prox/parcel/envsecrets/roost-session/craze. Docker CE is in
-# every variant (the cloud has no `full`). Dropped: the kernel, network-setup,
-# the systemd unit wipe, the transient machine-id, the shed-extensions
-# credential brokers (no broker host on a cloud shed).
+# Carried over from firecracker/Dockerfile: the package list, gh, the shed
+# user (uid 1000, passwordless sudo, docker group) and its home, tmux.conf,
+# the prompt, roost-session and craze (base), strix/prox/parcel/envsecrets
+# (full). Docker CE is in both variants. Not carried over: the kernel,
+# network-setup, the systemd unit wipe, the transient machine-id, and full's
+# mise, Bun and coding agents.
 #
 # Usage:
-#   provision.sh --agent PATH [--variant base|extensions] [--arch amd64|arm64]
-#                [--pins PATH]
+#   provision.sh --agent PATH --pins PATH [--variant base|full] [--arch amd64|arm64]
 #     --agent    the linux shed-agent binary to install
-#     --variant  extensions (default) adds strix, prox, parcel, envsecrets, roost-session, craze
+#     --pins     KEY=value file from scripts/read-guest-pins.sh (the
+#                roost-session and craze pins). This script holds no pin of
+#                its own.
+#     --variant  base installs roost-session and craze; full (default) adds
+#                strix, prox, parcel and envsecrets
 #     --arch     must equal the VM's dpkg architecture (default: the VM's)
-#     --pins     KEY=value file from scripts/read-guest-pins.sh; required for
-#                extensions. This script holds no pin of its own.
 set -euo pipefail
 
 # The guest layout this script lays down (guest.Layout).
@@ -37,7 +38,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { echo "provision: $*" >&2; exit 1; }
 log() { echo "==> provision: $*"; }
 
-variant=extensions
+variant=full
 arch=""
 agent=""
 pins=""
@@ -47,13 +48,13 @@ while [ $# -gt 0 ]; do
     --arch) arch="${2:?}"; shift 2 ;;
     --agent) agent="${2:?}"; shift 2 ;;
     --pins) pins="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
-case "${variant}" in base|extensions) ;; *) die "--variant must be base or extensions, not '${variant}'" ;; esac
+case "${variant}" in base|full) ;; *) die "--variant must be base or full, not '${variant}'" ;; esac
 [ -n "${agent}" ] || die "--agent is required"
 [ -f "${agent}" ] || die "agent binary ${agent} not found"
 
@@ -83,21 +84,19 @@ pin() {
   printf '%s' "${value}" | grep -Eq "${pattern}" || die "pin ${key} missing or malformed in ${pins}"
   printf '%s' "${value}"
 }
-if [ "${variant}" = extensions ]; then
-  [ -n "${pins}" ] || die "--pins is required for --variant extensions"
-  [ -f "${pins}" ] || die "pins file ${pins} not found"
-  ROOST_SESSION_VERSION="$(pin ROOST_SESSION_VERSION '^[0-9]+\.[0-9]+\.[0-9]+$')"
-  ROOST_SESSION_PROTOCOL="$(pin ROOST_SESSION_PROTOCOL '^[0-9]+$')"
-  CRAZE_VERSION="$(pin CRAZE_VERSION '^[0-9]+\.[0-9]+\.[0-9]+$')"
-  case "${arch}" in
-    amd64)
-      ROOST_SESSION_SHA256="$(pin ROOST_SESSION_SHA256_AMD64 '^[0-9a-f]{64}$')"
-      CRAZE_SHA256="$(pin CRAZE_SHA256_AMD64 '^[0-9a-f]{64}$')" ;;
-    arm64)
-      ROOST_SESSION_SHA256="$(pin ROOST_SESSION_SHA256_ARM64 '^[0-9a-f]{64}$')"
-      CRAZE_SHA256="$(pin CRAZE_SHA256_ARM64 '^[0-9a-f]{64}$')" ;;
-  esac
-fi
+[ -n "${pins}" ] || die "--pins is required"
+[ -f "${pins}" ] || die "pins file ${pins} not found"
+ROOST_SESSION_VERSION="$(pin ROOST_SESSION_VERSION '^[0-9]+\.[0-9]+\.[0-9]+$')"
+ROOST_SESSION_PROTOCOL="$(pin ROOST_SESSION_PROTOCOL '^[0-9]+$')"
+CRAZE_VERSION="$(pin CRAZE_VERSION '^[0-9]+\.[0-9]+\.[0-9]+$')"
+case "${arch}" in
+  amd64)
+    ROOST_SESSION_SHA256="$(pin ROOST_SESSION_SHA256_AMD64 '^[0-9a-f]{64}$')"
+    CRAZE_SHA256="$(pin CRAZE_SHA256_AMD64 '^[0-9a-f]{64}$')" ;;
+  arm64)
+    ROOST_SESSION_SHA256="$(pin ROOST_SESSION_SHA256_ARM64 '^[0-9a-f]{64}$')"
+    CRAZE_SHA256="$(pin CRAZE_SHA256_ARM64 '^[0-9a-f]{64}$')" ;;
+esac
 
 export DEBIAN_FRONTEND=noninteractive
 # unattended-upgrades runs on a fresh VM; wait for its dpkg lock, not fail.
@@ -157,7 +156,7 @@ chmod a+r /etc/apt/keyrings/docker.asc
 printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
   "${codename}" > /etc/apt/sources.list.d/docker.sources
 
-if [ "${variant}" = extensions ]; then
+if [ "${variant}" = full ]; then
   # stridelabs serves a BINARY key, so it must be named .gpg (see the note in
   # firecracker/Dockerfile).
   log "adding the stridelabs repository"
@@ -177,32 +176,32 @@ apt_get install -y --no-install-recommends \
 install -m 0755 -d /etc/docker
 install -m 0644 "${here}/daemon.json" /etc/docker/daemon.json
 
-if [ "${variant}" = extensions ]; then
+if [ "${variant}" = full ]; then
   log "installing strix, prox, parcel and envsecrets"
   apt_get install -y --no-install-recommends strix prox parcel envsecrets
-
-  tmpd="$(mktemp -d)"
-  trap 'rm -rf "${tmpd}"' EXIT
-
-  log "installing roost-session ${ROOST_SESSION_VERSION}"
-  curl -fsSL --retry 5 --retry-delay 2 -o "${tmpd}/rs" \
-    "https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}/roost-session-${ROOST_SESSION_VERSION}-linux-${arch}"
-  echo "${ROOST_SESSION_SHA256}  ${tmpd}/rs" | sha256sum -c -
-  install -m 0755 "${tmpd}/rs" /usr/bin/roost-session
-  if ! /usr/bin/roost-session identify | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null; then
-    die "installed roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}"
-  fi
-
-  log "installing craze ${CRAZE_VERSION}"
-  curl -fsSL --retry 5 --retry-delay 2 -o "${tmpd}/craze.tgz" \
-    "https://github.com/charliek/craze/releases/download/v${CRAZE_VERSION}/craze_linux_${arch}.tar.gz"
-  echo "${CRAZE_SHA256}  ${tmpd}/craze.tgz" | sha256sum -c -
-  mkdir "${tmpd}/craze"
-  tar -xzf "${tmpd}/craze.tgz" -C "${tmpd}/craze"
-  install -m 0755 "${tmpd}/craze/craze" /usr/bin/craze
-  got="$(/usr/bin/craze --version)"
-  [ "${got}" = "${CRAZE_VERSION}" ] || die "installed craze reports '${got}', want ${CRAZE_VERSION}"
 fi
+
+tmpd="$(mktemp -d)"
+trap 'rm -rf "${tmpd}"' EXIT
+
+log "installing roost-session ${ROOST_SESSION_VERSION}"
+curl -fsSL --retry 5 --retry-delay 2 -o "${tmpd}/rs" \
+  "https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}/roost-session-${ROOST_SESSION_VERSION}-linux-${arch}"
+echo "${ROOST_SESSION_SHA256}  ${tmpd}/rs" | sha256sum -c -
+install -m 0755 "${tmpd}/rs" /usr/bin/roost-session
+if ! /usr/bin/roost-session identify | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null; then
+  die "installed roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}"
+fi
+
+log "installing craze ${CRAZE_VERSION}"
+curl -fsSL --retry 5 --retry-delay 2 -o "${tmpd}/craze.tgz" \
+  "https://github.com/charliek/craze/releases/download/v${CRAZE_VERSION}/craze_linux_${arch}.tar.gz"
+echo "${CRAZE_SHA256}  ${tmpd}/craze.tgz" | sha256sum -c -
+mkdir "${tmpd}/craze"
+tar -xzf "${tmpd}/craze.tgz" -C "${tmpd}/craze"
+install -m 0755 "${tmpd}/craze/craze" /usr/bin/craze
+got="$(/usr/bin/craze --version)"
+[ "${got}" = "${CRAZE_VERSION}" ] || die "installed craze reports '${got}', want ${CRAZE_VERSION}"
 
 # Security updates stay on: the stock image enables unattended-upgrades for
 # the -security pocket. Write the switch explicitly so the image does not

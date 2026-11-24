@@ -14,8 +14,6 @@ shed-core = { path = "../shed-core" }
 shed-lane = { path = "../shed-lane" }
 shed-roost = { path = "../shed-roost" }
 shed-craze = { path = "../shed-craze" }
-# Default features ONLY — never enable `broker` (keeps `shed-broker` and
-# `saphyr-parser` out of `shed-desktop-core` and default `shed-app`).
 shed-app = { path = "../shed-app" }
 # Plan 039: the source's answers are built from delivery.toml's providers
 # (the runtime that serves them is A6's). Neither crate reaches another
@@ -38,6 +36,13 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 uuid.workspace = true
 
 [dev-dependencies]
+# The cold-launch mint test (`control_mint_tests.rs`): the bootstrap seam
+# (`test-support`), an in-process mTLS server and its throwaway CA.
+shed-source = { path = "../shed-source", features = ["test-support"] }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+base64 = { workspace = true }
 shed-roost = { path = "../shed-roost", features = ["test-support"] }
 shed-lane = { path = "../shed-lane", features = ["test-support"] }
 shed-craze = { path = "../shed-craze", features = ["test-support"] }

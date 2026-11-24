@@ -2,7 +2,7 @@
 
 The desktop app is a person's **credential source**: when a shed is created, or `shed provision` runs, the server asks the app on the person's bound machine for the credentials the shed should hold, and the app answers from what you configured. Nothing is asked per use and nothing is stored by the server. What happens after the answer is on the [Credential delivery](../reference/delivery.md) page; the wire format is the [provision contract](../reference/provision-contract.md).
 
-The app answers only for a server whose credential source is this machine. **Preferences → Provisioning** shows each configured server's source row and **Use this machine** (the same binding `shed source use` makes). The app holds one delivery stream per server and answers each request on its own, with no prompt.
+The app answers only for a server whose credential source is this machine. **Preferences → Provisioning** shows each configured server's source row and **Use this machine** (the same pin `shed source use` makes; there is no unbind, a pin is only moved). The app holds one delivery stream per server and answers each request on its own, with no prompt.
 
 !!! warning "Set `only.servers` on every provider"
     You do not have to choose a server for it to ask: the first machine that connects for you on a server becomes your source there, and the app opens a delivery stream to **every server in your shed config**. Of the [`only` rules](#the-only-rules), only `servers` is checked by the app against the server that actually asked. `backends` and `repos` are matched against what the server wrote in its request, so a dishonest server can satisfy them. A provider that is on with no `only.servers` delivers its items to any configured server that asks. Give each provider you enable an `only.servers` list of the servers you trust with it.
@@ -27,7 +27,7 @@ The section reads and writes `~/.config/shed/delivery.toml`. A settings-file err
 | `envsecrets-login` | `~/.envsecrets/config.yaml` and its passphrase, so the shed pulls secrets for itself. The passphrase comes from a file or from a command. |
 | `files` | Files copied as they are, each with a target, a base (`home`, or `project` for stage 2 after the clone) and a mode (`0600` or `0400`). For static credentials. |
 
-Other sign-ins (a cloud CLI's, a registry's) are not delivered: sign in inside the shed.
+Other sign-ins (a cloud CLI's, a registry's) are not delivered by a provider of their own: sign in inside the shed, or deliver the login file with `files`. See [Credentials in a shed](../guides/credentials-in-a-shed.md), which also states the trade: a usable credential is inside the shed while it runs, and anything there can read it.
 
 ## delivery.toml
 
@@ -95,4 +95,4 @@ Each shed row shows its delivery state: delivered, partial, not delivered, none 
 
 No pane, preview, status, log or IPC answer carries a delivered value, a passphrase or a passphrase command's arguments. Fingerprints are keyed hashes made with a key the app creates once under its state directory (`0600`). The last answers kept for status are redacted: names, targets, sizes and fingerprints only.
 
-IPC ops for all of this (`delivery.status`, `delivery.settings`, `delivery.set`, `delivery.preview`, `shed.delivery`, `shed.provision`, `activity.server_list`) are listed on the [IPC](ipc.md) page. `activity.server_list` reads each server's [activity feed](../reference/api.md#get-apiactivity); the Activity pane itself changes in a later release.
+IPC ops for all of this (`delivery.status`, `delivery.settings`, `delivery.set`, `delivery.preview`, `shed.delivery`, `shed.provision`, `activity.server_list`) are listed on the [IPC](ipc.md) page. `activity.server_list` reads each server's [activity feed](../reference/api.md#get-apiactivity), which the Activity pane shows merged across servers.

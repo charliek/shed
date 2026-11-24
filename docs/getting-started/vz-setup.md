@@ -28,18 +28,18 @@ brew install charliek/tap/shed
 
 This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config (image refs resolve from the server version — no pinned tags to bump on upgrade), and installs `shed-server` inside a signed app bundle (`ShedServer.app`, under `$(brew --prefix)/opt/shed/libexec`). `bin/shed-server` links into the bundle, so the brew service is unchanged. The bundle keeps macOS privacy grants, such as access to an external drive, across upgrades.
 
-For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth), install the [shed desktop app](../desktop/installation.md). It runs the credential broker itself; there is no separate daemon to install.
+To deliver credentials into sheds (an SSH key, a GitHub token, API keys), install the [shed desktop app](../desktop/installation.md). It is your credential source; there is no separate daemon to install.
 
 ### 2. Configure
 
-Edit the server config to enable mounts and extensions:
+Edit the server config to enable mounts:
 
 ```bash
 # Open the config in your editor
 $EDITOR $(brew --prefix)/etc/shed/server.yaml
 ```
 
-Uncomment the `mounts` section to mount tool configs into VMs, and the `extensions` section if you use the desktop app for credential brokering. (The older `credentials` key still works as a fallback when `mounts` is absent, but `mounts` is preferred.)
+Uncomment the `mounts` section to mount tool configs into VMs. (The older `credentials` key still works as a fallback when `mounts` is absent, but `mounts` is preferred.)
 
 ### 3. Start services
 
@@ -122,7 +122,7 @@ needed) and stacks the layers as overlayfs lowers on first boot.
 
 You usually don't need to name them. When `default_image` and
 `image_aliases` are omitted, the server resolves them from its **own
-version** — `ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z` — so
+version** — `ghcr.io/charliek/shed-vz-{base,full}:vX.Y.Z` — so
 the config never carries a version to bump. A `make build` from a clean
 release tag (`git describe` yields `vX.Y.Z`) is release-shaped and gets
 this automatically:
@@ -142,7 +142,6 @@ vz:
   default_image: ghcr.io/charliek/shed-vz-full:v0.6.2
   image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.6.2
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.6.2
     full: ghcr.io/charliek/shed-vz-full:v0.6.2
   pull_policy: missing
 ```
@@ -175,12 +174,11 @@ This builds the `full` variant. Build other variants with `--variant`:
 
 ```bash
 ./scripts/build-vz-rootfs.sh --variant base         # Minimal image
-./scripts/build-vz-rootfs.sh --variant extensions   # Base + credential brokering
 ./scripts/build-vz-rootfs.sh --all                  # All variants
 ```
 
 The script writes directly into the local blob store and advances the
-`base`, `extensions`, and `full` tags. Confirm with `shed image ls`.
+`base` and `full` tags. Confirm with `shed image ls`.
 
 See [Images](../reference/images.md) for details. The OCI image
 store lives under `~/Library/Application Support/shed/vz/` — see

@@ -2,8 +2,8 @@
 //! made once, so the same content gives the same fingerprint on this machine and means
 //! nothing to a server.
 //!
-//! The file is `<state>/delivery/fingerprint.key` (the `<state>` the broker keeps
-//! `broker/machine.json` and `broker/creds` in), mode `0600`, its directory `0700`. It is
+//! The file is `<state>/delivery/fingerprint.key` (the `<state>` holding
+//! `broker/machine.json` and `broker/creds`), mode `0600`, its directory `0700`. It is
 //! created by writing a temporary file in the same directory and LINKING it into place,
 //! which fails if the key exists: two processes starting at once both end with the one
 //! key that won. An existing file that is not exactly 32 bytes, or that others can read,

@@ -67,7 +67,6 @@ PATHS_SERVER=(
   cmd
   internal
   sdk
-  guest
   vz
   firecracker
   build-tools
@@ -78,7 +77,6 @@ PATHS_SERVER=(
   go.sum
   'scripts/build-*-rootfs.sh'
   scripts/build-initramfs.sh
-  scripts/stage-guest-binaries.sh
   scripts/install-input-sha.sh
   .goreleaser.server.yaml
 )
@@ -88,10 +86,9 @@ PATHS_SERVER=(
 #
 # "every crate it links" is the rule. `desktop/tauri/src-tauri/Cargo.toml`
 # takes shed-core, shed-app, shed-lane, shed-roost, shed-craze and
-# shed-desktop-core as plain path-deps (shed-broker through shed-app's
-# `broker` feature; shed-provision and shed-provision-providers, plan 039,
-# through shed-desktop-core; shed-source, plan 039 §3.7, through
-# shed-broker), so a correctness fix in any of them is IN the
+# shed-desktop-core as plain path-deps (shed-provision,
+# shed-provision-providers and shed-source, plan 039, through
+# shed-desktop-core), so a correctness fix in any of them is IN the
 # shipped DMG/.deb and must flag desktop. release-plan.sh and update-version.sh
 # carry the same crates in their desktop lockstep dep lists.
 # (`shed-opencode` was retired in plan 038; `shed-gx`, plan 017's second
@@ -105,7 +102,6 @@ PATHS_DESKTOP=(
   crates/shed-app
   crates/shed-desktop-core
   crates/shedctl
-  crates/shed-broker
   crates/shed-craze
   crates/shed-provision
   crates/shed-provision-providers

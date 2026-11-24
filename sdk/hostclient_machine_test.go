@@ -41,9 +41,8 @@ func serverDecodeName(raw string) (string, bool) {
 }
 
 // TestEncodeMachineNameMatchesTheBroker: the bytes on the wire are the Rust
-// broker's for the same name (crates/shed-broker/src/bus.rs:
-// percent_encode_name_table, the same rows), and the server's decoding gives
-// the name back.
+// source's for the same name (crates/shed-source/src/delivery.rs:
+// percent_encode_name), and the server's decoding gives the name back.
 func TestEncodeMachineNameMatchesTheBroker(t *testing.T) {
 	for _, tc := range []struct{ name, want string }{
 		{"laptop", "laptop"},

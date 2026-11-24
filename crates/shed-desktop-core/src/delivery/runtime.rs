@@ -12,15 +12,14 @@
 //! What was answered is kept, redacted (names, targets, sizes, fingerprints, problems,
 //! and what the server made of it), for [`DeliveryRuntime::status`].
 //!
-//! # Beside the broker (plan 039 PR A)
+//! # Identity and credentials
 //!
-//! The embedded broker keeps running its bus. Both use this machine's one identity
-//! (`<state>/broker/machine.json`, loaded with the same file lock) and, on a secure
-//! server, the same durable credentials-scope store (`<state>/broker/creds`):
+//! This machine's one identity is `<state>/broker/machine.json` and, on a secure server,
+//! the durable credentials-scope store is `<state>/broker/creds` (the paths the retired
+//! embedded broker used, kept so no pin and no certificate is lost):
 //! [`shed_source::credentials::SourceCredentials`] presents whatever certificate is
-//! stored and mints only when the stored one will not do, so the two do not mint twice
-//! for one certificate. Store writes are serialized by the store's own lock, held only
-//! for each write.
+//! stored and mints only when the stored one will not do. Store writes are serialized by
+//! the store's own lock, held only for each write.
 //!
 //! # Test mode
 //!
@@ -67,7 +66,8 @@ pub struct DeliveryOptions {
     pub key_path: PathBuf,
     /// The `known_hosts` the SSH minter pins servers against.
     pub known_hosts: String,
-    /// Test mode: every server at this URL.
+    /// Test mode: every server at this URL, or its own override in it
+    /// ([`shed_app::mock_url_for`]).
     pub mock_base_url: Option<String>,
     /// Test mode: servers pointed at a closed port.
     pub unreachable_hosts: HashSet<String>,
@@ -317,6 +317,17 @@ impl DeliveryRuntime {
         }
     }
 
+    /// Opens `server`'s delivery stream again at once (after "Use this machine" made
+    /// this machine its source). `false` when no stream runs for it.
+    pub fn retry_now(&self, server: &str) -> bool {
+        self.tasks.as_ref().is_some_and(|t| t.restart(server))
+    }
+
+    /// This machine's identity, or why there is none.
+    pub fn machine(&self) -> Result<MachineIdentity, String> {
+        self.machine.clone()
+    }
+
     /// `delivery.status`: this machine, the settings file, each server's stream, and the
     /// recent answers, redacted.
     pub fn status(&self) -> Value {
@@ -453,7 +464,7 @@ fn targets_of(opts: &DeliveryOptions) -> Result<Vec<ServerTarget>, String> {
             t.url = if opts.unreachable_hosts.contains(&t.name) {
                 "http://127.0.0.1:1".into()
             } else {
-                mock.clone()
+                shed_app::mock_url_for(mock, &t.name)
             };
             t.tls_fingerprint = String::new();
             t.ssh_port = 0;
@@ -558,5 +569,33 @@ mod tests {
             ..opts
         };
         assert!(targets_of(&none).unwrap().is_empty());
+    }
+
+    /// The delivery stream mints its credentials-scope certificate over the port its
+    /// target names: a config with a leading `---` and `servers: # comment` (both read
+    /// by the core reader) keeps its explicit port, and an entry with none still has 0.
+    #[test]
+    fn a_marked_and_commented_config_keeps_its_explicit_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        std::fs::write(
+            &cfg,
+            "---\nservers: # the servers\n    a:\n        host: a.example.test\n        ssh_port: 2222\n        api_url: https://a.example.test:18443\n    b:\n        host: b.example.test\n",
+        )
+        .unwrap();
+        let opts = DeliveryOptions {
+            shed_config_path: cfg,
+            settings_path: dir.path().join("delivery.toml"),
+            key_path: dir.path().join("key"),
+            known_hosts: String::new(),
+            mock_base_url: None,
+            unreachable_hosts: Default::default(),
+            reader: DiskReader::new(dir.path(), None),
+            rescan: RESCAN,
+        };
+        let t = targets_of(&opts).unwrap();
+        let port = |n: &str| t.iter().find(|x| x.name == n).map(|x| x.ssh_port);
+        assert_eq!(port("a"), Some(2222));
+        assert_eq!(port("b"), Some(0));
     }
 }

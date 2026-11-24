@@ -200,7 +200,7 @@ func TestShedSpecRoundTrip(t *testing.T) {
 	in := ShedSpec{
 		CreatedAt:  created,
 		Repo:       "https://secret@github.com/o/r.git",
-		Image:      "shed-extensions-v1",
+		Image:      "shed-full-v1",
 		Size:       SizeStandard,
 		Network:    "isolated",
 		LandingDir: "/home/shed/r",
@@ -241,7 +241,7 @@ func TestNewSpec(t *testing.T) {
 	shed := ShedSpec{CreatedAt: time.Unix(1700000000, 0), Network: "open", Repo: "https://u:p@host/o/r.git"}
 	const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
 
-	spec, err := NewSpec(id, shed, []string{key, "  "}, size, DefaultDiskGB, "shed-extensions-v1", 24*time.Hour)
+	spec, err := NewSpec(id, shed, []string{key, "  "}, size, DefaultDiskGB, "shed-full-v1", 24*time.Hour)
 	if err != nil {
 		t.Fatalf("NewSpec: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestNewSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeShedSpec: %v", err)
 	}
-	if decoded.Image != "shed-extensions-v1" || decoded.Size != SizeStandard || decoded.Repo != "https://host/o/r.git" {
+	if decoded.Image != "shed-full-v1" || decoded.Size != SizeStandard || decoded.Repo != "https://host/o/r.git" {
 		t.Errorf("shed-spec = %+v", decoded)
 	}
 
@@ -286,7 +286,7 @@ func TestNewSpec(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			bad, err := NewSpec(id, shed, []string{key}, size, DefaultDiskGB, "shed-extensions-v1", 0)
+			bad, err := NewSpec(id, shed, []string{key}, size, DefaultDiskGB, "shed-full-v1", 0)
 			if err != nil {
 				t.Fatalf("NewSpec: %v", err)
 			}

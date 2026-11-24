@@ -182,7 +182,7 @@ The **Connect API** (`GET /api/sheds/{name}/connect/{port}`) exposes `DialServic
 
 - `shed tunnels` CLI — opens local ports, bridges connections through Connect API
 - SSH port forwarding (`handleDirectTCPIP`) — uses `DialService` directly (same process)
-- Proxy extension (`shed-ext-proxy`) — uses Connect API for reverse proxying
+- A proxy extension built on the bus — can use the Connect API for reverse proxying
 
 **Two primitives for two jobs:**
 

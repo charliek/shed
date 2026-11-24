@@ -348,17 +348,23 @@ func TestDeliveryRedaction(t *testing.T) {
 	surfaces := &redactionSurfaces{log: logs, stateDir: stateDir}
 	machine := refsource.NewMachineID()
 	var evMu sync.Mutex
-	source := func(canned refsource.Canned) func() {
-		// The server drops a stopped source's stream only when it sees the
-		// connection close; a new one before that is a duplicate (409).
+	// The server drops a stopped source's stream only when it sees the
+	// connection close: a new source before that is a duplicate (409), and a
+	// request before that goes to the closing stream (source_disconnected,
+	// not source_offline).
+	dropped := func() {
+		t.Helper()
 		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 			if _, held := reg.DeliveryStream(""); !held {
-				break
+				return
 			}
 			if time.Now().After(deadline) {
 				t.Fatal("the previous source's stream was never dropped")
 			}
 		}
+	}
+	source := func(canned refsource.Canned) func() {
+		dropped()
 		src := startSource(t, ts.URL, refsource.Config{MachineID: machine, Canned: canned, Report: func(e refsource.Event) {
 			b, _ := json.Marshal(e)
 			evMu.Lock()
@@ -448,6 +454,7 @@ func TestDeliveryRedaction(t *testing.T) {
 		t.Fatalf("the refused answer was not refused: %+v", d.Last)
 	}
 	stop()
+	dropped() // the next provision must find no source: source_offline
 
 	// Every way the API shows a shed, as JSON and as a stream.
 	call(http.MethodPost, "/api/sheds/widgets/provision", "", false)

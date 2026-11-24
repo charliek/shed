@@ -604,10 +604,10 @@ Extensions are activated per-VM by listing their namespace names. The agent read
 ```yaml
 extensions:
   enabled:
-    - ssh-agent
-    - aws-credentials
-    - docker-credentials
+    - my-extension
 ```
+
+Shed's images carry no extension manifest of their own, so a namespace named here must come from an image you built. The names `ssh-agent`, `aws-credentials` and `docker-credentials` (the credential helpers removed in v0.11) fail the config load; see the [v0.10 to v0.11 upgrade guide](../upgrades/v0.10-to-v0.11.md).
 
 See [Extensions](extensions.md) for the full guide on the message bus, manifests, SDK, and health reporting.
 
@@ -641,7 +641,7 @@ The `git.extra_known_hosts` list is *additive* — it extends the built-in defau
 `default_image` and `image_aliases` are **optional**. On a release build of
 `shed-server`, when they are unset they are **synthesized from the server's own
 version**: `default_image` becomes `ghcr.io/charliek/shed-<backend>-full:vX.Y.Z`
-and the `base` / `extensions` / `full` aliases resolve to the matching tags. So
+and the `base` / `full` aliases resolve to the matching tags. So
 upgrading `shed-server` moves new sheds to the new images with **no config edit**.
 
 Set them explicitly only to pin a custom or mirrored registry. To track the
@@ -728,7 +728,6 @@ firecracker:
   default_image: ghcr.io/charliek/shed-fc-full:${shed.version}
   image_aliases:
     base: ghcr.io/charliek/shed-fc-base:${shed.version}
-    extensions: ghcr.io/charliek/shed-fc-extensions:${shed.version}
     full: ghcr.io/charliek/shed-fc-full:${shed.version}
   pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
@@ -803,7 +802,6 @@ vz:
   default_image: ghcr.io/charliek/shed-vz-full:${shed.version}
   image_aliases:
     base: ghcr.io/charliek/shed-vz-base:${shed.version}
-    extensions: ghcr.io/charliek/shed-vz-extensions:${shed.version}
     full: ghcr.io/charliek/shed-vz-full:${shed.version}
   pull_policy: missing
   images_dir: ~/Library/Application Support/shed/vz/

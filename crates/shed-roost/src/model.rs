@@ -441,7 +441,7 @@ impl RoostInventory {
 
 /// The capabilities shed **synthesizes** for a roost-backed host.
 ///
-/// roost has no `shed-ext-rc capabilities` to probe: it is not shed's guest
+/// roost has no RC-helper `capabilities` call to probe: it is not shed's guest
 /// agent, it is a terminal multiplexer with agent adapters. So the client states
 /// the contract itself, and states it honestly — for M1 a roost row can be
 /// listed, launched and closed, and nothing else. Everything the RC hub used to

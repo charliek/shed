@@ -24,7 +24,7 @@
 #   --tag T                 $SHED_GCE_BAKE_TAG, else $SHED_GCE_TAG (required):
 #                           the network tag whose firewall rule admits this
 #                           machine on tcp:22
-#   --variant V             extensions (default) or base
+#   --variant V             full (default) or base
 #   --arch A                amd64 (the only architecture baked today)
 #   --agent FILE            linux agent binary (default: make build-agent)
 #   --version V             shed version for the name and label
@@ -55,7 +55,7 @@ log() { echo "==> $*" >&2; }
 print=no
 env_file=""
 project="" zone="" network="" subnet="" tag=""
-variant=extensions
+variant=full
 arch=amd64
 agent=""
 version=""
@@ -112,7 +112,7 @@ tag="${tag:-${SHED_GCE_BAKE_TAG:-${SHED_GCE_TAG:-}}}"
 [ -n "${network}" ] || die "no network: pass --network or set SHED_GCE_NETWORK"
 [ -n "${subnet}" ] || die "no subnet: pass --subnet or set SHED_GCE_SUBNET"
 [ -n "${tag}" ] || die "no network tag: pass --tag or set SHED_GCE_BAKE_TAG (or SHED_GCE_TAG)"
-case "${variant}" in base|extensions) ;; *) die "--variant must be base or extensions" ;; esac
+case "${variant}" in base|full) ;; *) die "--variant must be base or full" ;; esac
 case "${arch}" in amd64) ;; *) die "--arch: only amd64 is baked today" ;; esac
 printf '%s' "${disk_gb}" | grep -Eq '^[0-9]+$' || die "--disk-gb must be a number"
 for l in ${extra_labels[@]+"${extra_labels[@]}"}; do

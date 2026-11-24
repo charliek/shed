@@ -1,7 +1,6 @@
 //! **The app's log file** (#414): one rotating sink for everything this process
 //! says — its own lines, the shed crates' `tracing` events (roost-ipc's only
-//! with `SHED_TAURI_LOG=debug`, see [`filter`]), and the embedded broker's
-//! `BusLog` — so an app launched from Finder, the Dock or a desktop launcher
+//! with `SHED_TAURI_LOG=debug`, see [`filter`]) — so an app launched from Finder, the Dock or a desktop launcher
 //! (whose stderr goes nowhere) still leaves a record.
 //!
 //! * **Where:** macOS `~/Library/Logs/ShedDesktop/shed-desktop.log` (the path the
@@ -559,32 +558,6 @@ impl Drop for EventWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The embedded broker's log
-// ---------------------------------------------------------------------------
-
-/// The embedded broker's `BusLog` (its bus connections, rejections, handler
-/// warnings): every line a `tracing` event with the `shed_broker` target, so it
-/// reaches stderr and the app's file through [`subscriber`] — and the bus's
-/// quiet tier (`debug` — a server still down, retrying) is dropped by
-/// [`filter`], as the daemon drops it, unless `SHED_TAURI_LOG=debug`.
-pub struct BrokerLog;
-
-impl shed_app::BusLog for BrokerLog {
-    fn info(&self, msg: &str) {
-        tracing::info!(target: "shed_broker", "{msg}");
-    }
-    fn warn(&self, msg: &str) {
-        tracing::warn!(target: "shed_broker", "{msg}");
-    }
-    fn debug(&self, msg: &str) {
-        tracing::debug!(target: "shed_broker", "{msg}");
-    }
-    fn error(&self, msg: &str) {
-        tracing::error!(target: "shed_broker", "{msg}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,32 +1077,6 @@ mod tests {
         assert!(line.split(' ').next().unwrap().ends_with('Z'), "{line}");
     }
 
-    /// The embedded broker's lines are `shed_broker` events: stamped like the
-    /// app's own (`<LEVEL> shed_broker: <msg>`), the quiet tier only with debug.
-    #[test]
-    fn the_brokers_lines_land_as_shed_broker_events() {
-        use shed_app::BusLog;
-        for debug in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("app.log");
-            let sink = leak(Sink::new(MAX_BYTES, KEEP, 8));
-            sink.open(Some(&path)).unwrap();
-            tracing::subscriber::with_default(subscriber(sink, debug), || {
-                BrokerLog.warn("SSE connection lost server=mini2");
-                BrokerLog.debug("SSE still down server=mini2");
-            });
-            let got: Vec<String> = lines(&path)
-                .iter()
-                .map(|l| l.split_once(' ').unwrap().1.trim_start().to_string())
-                .collect();
-            let mut want = vec!["WARN shed_broker: SSE connection lost server=mini2"];
-            if debug {
-                want.push("DEBUG shed_broker: SSE still down server=mini2");
-            }
-            assert_eq!(got, want, "debug={debug}");
-        }
-    }
-
     /// By default roost-ipc is off — its warnings and errors too, since they
     /// carry ssh's own stderr — while the shed crates keep INFO and up and other
     /// crates INFO; `SHED_TAURI_LOG=debug` admits roost-ipc, down to DEBUG.
@@ -1146,14 +1093,14 @@ mod tests {
                 tracing::debug!(target: "roost_ipc::client", "debug-roost-ipc");
                 tracing::info!(target: "shed_roost", "info-shed-roost");
                 tracing::info!(target: "shed_desktop_core", "info-shed-desktop-core");
-                tracing::warn!(target: "shed_broker", "warn-shed-broker");
+                tracing::warn!(target: "shed_source", "warn-shed-source");
                 tracing::info!(target: "tauri::app", "info-tauri");
             });
             let text = std::fs::read_to_string(&path).unwrap();
             for kept in [
                 "info-shed-roost",
                 "info-shed-desktop-core",
-                "warn-shed-broker",
+                "warn-shed-source",
                 "info-tauri",
             ] {
                 assert!(text.contains(kept), "debug={debug}: {kept} missing: {text}");
