@@ -19,7 +19,22 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.11.0 — 2026-11-24
+
+**Ships:** server, desktop
+
+v0.11.0 replaces ask-per-use credentials with credential delivery. When a shed is created, the
+server asks your desktop app for the files and environment variables it should have (an SSH
+key, your GitHub token, API keys, an envsecrets login, named files) and writes them into the
+shed, on Firecracker, VZ and cloud sheds alike; `shed provision` delivers again. The three
+credential helpers, the desktop app's Approvals and the `extensions` image are gone: images
+are now `base` and `full`.
+
+**Read the [v0.10 → v0.11 upgrade guide](https://github.com/charliek/shed/blob/v0.11.0/docs/upgrades/v0.10-to-v0.11.md)
+before you upgrade.** A server whose config lists `ssh-agent`, `aws-credentials` or
+`docker-credentials` in `extensions.enabled` does not start, a config or script naming the
+`extensions` image must name `full`, and the server and the desktop app should be upgraded
+together. Sheds you keep still hold the old helpers; the guide says how to switch them off.
 
 - **Desktop: sheds only.** The desktop app no longer reads `machines:` as a host
   list, no longer implies a `localhost` host, and no longer offers LaunchModal,
