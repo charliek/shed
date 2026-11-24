@@ -26,7 +26,11 @@ pub fn capture() -> Result<(Vec<u8>, u32, u32), String> {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("screencapture", &["-x", "-t", "png"])]
     } else {
-        &[("grim", &[]), ("scrot", &[]), ("import", &["-window", "root"])]
+        &[
+            ("grim", &[]),
+            ("scrot", &[]),
+            ("import", &["-window", "root"]),
+        ]
     };
     let mut problems: Vec<String> = Vec::new();
     for (tool, args) in candidates {

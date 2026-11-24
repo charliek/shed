@@ -248,12 +248,18 @@ impl BootstrapRunner for FakeBootstrap {
 
 /// A home with the shed CLI's config naming the server and its pinned SSH endpoint.
 fn home(server: &MtlsServer) -> (tempfile::TempDir, String, String) {
+    home_with(server, "servers:\n")
+}
+
+/// [`home`] with the config's `servers:` line written as `servers` (a leading document
+/// marker, a trailing comment: forms the core reader reads).
+fn home_with(server: &MtlsServer, servers: &str) -> (tempfile::TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
     std::fs::write(
         &config,
         format!(
-            "servers:\n    prod:\n        host: 127.0.0.1\n        ssh_port: {SSH_PORT}\n        api_url: https://localhost:{}\n        tls_cert_fingerprint: {}\n        auth_mode: mtls\n",
+            "{servers}    prod:\n        host: 127.0.0.1\n        ssh_port: {SSH_PORT}\n        api_url: https://localhost:{}\n        tls_cert_fingerprint: {}\n        auth_mode: mtls\n",
             server.port, server.pin
         ),
     )
@@ -273,9 +279,23 @@ fn home(server: &MtlsServer) -> (tempfile::TempDir, String, String) {
 /// issued certificate. The certificate is kept: the next listing does not mint again.
 #[tokio::test]
 async fn a_cold_launch_enrols_over_the_ssh_bootstrap_and_lists_sheds() {
+    cold_launch_enrols("servers:\n").await;
+}
+
+/// The same cold launch from a config with a leading `---` document marker, and from
+/// one whose `servers:` line carries a comment: the core reader reads both, so the
+/// explicit `ssh_port` is the endpoint and the enrolment runs (review of plan 039 PR B:
+/// the line scanner this replaced read port 0 there, "no ssh endpoint").
+#[tokio::test]
+async fn a_cold_launch_reads_a_document_marker_and_a_commented_servers_line() {
+    cold_launch_enrols("---\nservers:\n").await;
+    cold_launch_enrols("# shed\nservers: # the shed servers\n").await;
+}
+
+async fn cold_launch_enrols(servers: &str) {
     let ca = Arc::new(Ca::new());
     let server = mtls_server(&ca).await;
-    let (_dir, config, known_hosts) = home(&server);
+    let (_dir, config, known_hosts) = home_with(&server, servers);
     let runner = Arc::new(FakeBootstrap {
         ca: ca.clone(),
         calls: Mutex::new(Vec::new()),

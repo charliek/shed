@@ -1490,6 +1490,15 @@ impl Client {
         self.get_document(&["api", "sheds", name], &[]).await
     }
 
+    /// `GET /api/egress/{name}` (control scope): the shed's EFFECTIVE egress as the server
+    /// resolves it (`shed egress show`'s document: `enabled`, `profiles`, `port`, `rules`,
+    /// `recent`), undecoded. Unlike the shed document's `egress_profiles` (the explicit
+    /// selection only), `profiles` here includes the server's default profiles a shed
+    /// created without `--egress` runs under.
+    pub async fn egress_shed_status(&self, name: &str) -> Result<serde_json::Value, ApiFailure> {
+        self.get_document(&["api", "egress", name], &[]).await
+    }
+
     /// `GET /api/activity?since=&shed=&limit=` (plan 039 §3.6): one page of the server's
     /// activity feed, newest first, `{events, next}`, undecoded.
     pub async fn activity(
@@ -3275,6 +3284,31 @@ mod tests {
             ""
         );
         let e = c.shed_document("gone").await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn a_sheds_effective_egress_is_read_from_the_egress_route() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/egress/folio");
+                t.status(200)
+                    .body(r#"{"shed":"folio","enabled":true,"profiles":["default"],"port":20001}"#);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/egress/gone");
+                t.status(404)
+                    .body(r#"{"error":{"code":"SHED_NOT_FOUND","message":"no such shed"}}"#);
+            })
+            .await;
+        let c = client(&server);
+        let s = c.egress_shed_status("folio").await.unwrap();
+        assert_eq!(s["profiles"][0], "default");
+        assert_eq!(s["port"], 20001);
+        let e = c.egress_shed_status("gone").await.unwrap_err();
         assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
     }
 

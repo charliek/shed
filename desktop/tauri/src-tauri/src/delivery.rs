@@ -8,7 +8,7 @@
 //! | `delivery.settings` | — | `delivery.toml` as `{path, exists, error, providers}` |
 //! | `delivery.set` | `provider`, `config` (object, or null to remove) | the new settings view |
 //! | `delivery.preview` | `server`, `shed`? | what that shed would get, redacted |
-//! | `shed.delivery` | `server`, `shed` | the shed document's delivery record |
+//! | `shed.delivery` | `server`, `shed` | the shed document's delivery record, and the shed's effective egress |
 //! | `shed.provision` | `server`, `shed` | the provision's progress and its outcome |
 //! | `activity.server_list` | `limit`?, `cursor`?, `shed`? | the servers' activity, merged newest first |
 //!
@@ -131,21 +131,94 @@ pub async fn preview(
 }
 
 /// `shed.delivery`: the delivery record of the shed's document (null for a server
-/// older than delivery, whose document has none).
+/// older than delivery, whose document has none), and the shed's EFFECTIVE egress
+/// (`egress`, see [`effective_egress`]) from `GET /api/egress/{shed}`, which resolves
+/// the server's default profiles a shed created without `--egress` runs under. The
+/// document's own `egress_profiles` is the explicit selection only, so an empty one
+/// says nothing about whether egress is restricted. An egress read that fails leaves
+/// `egress` null and says why in `egress_error`; the delivery record still comes back.
 pub async fn shed_delivery(backend: &Backend, server: &str, shed: &str) -> Result<Value, OpError> {
     shed_param(shed)?;
-    let doc = client(backend, server)?
-        .shed_document(shed)
-        .await
-        .map_err(|e| failure(&e))?;
+    let c = client(backend, server)?;
+    let (doc, status) = tokio::join!(c.shed_document(shed), c.egress_shed_status(shed));
+    let doc = doc.map_err(|e| failure(&e))?;
+    let explicit = doc.get("egress_profiles").cloned().unwrap_or(Value::Null);
+    let (egress, egress_error) = match status {
+        Ok(s) => (effective_egress(&explicit, &s), Value::Null),
+        Err(e) => (Value::Null, Value::String(e.message)),
+    };
     Ok(json!({
         "server": server,
         "shed": shed,
         "delivery": doc.get("delivery").cloned().unwrap_or(Value::Null),
-        // The shed's egress profiles (absent: none assigned), which its detail shows
-        // beside its recent blocks.
-        "egress_profiles": doc.get("egress_profiles").cloned().unwrap_or(Value::Null),
+        // The explicit selection (absent: none, the shed takes the server's default).
+        "egress_profiles": explicit,
+        "egress": egress,
+        "egress_error": egress_error,
     }))
+}
+
+/// A list of non-empty strings off `v` (anything else: none).
+fn names(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A shed's effective egress, read the way `shed egress show` reads it
+/// (`cmd/shed/egress.go:printEgressStatus`), off the shed document's explicit
+/// `egress_profiles` and `GET /api/egress/{shed}`'s `status`:
+///
+/// - `enabled`: the server's egress master switch.
+/// - `restricted`: the shed runs behind the egress proxy — the switch is on and the
+///   shed has a listener port or profiles in force. Off, it is not restricted.
+/// - `profiles`: the profiles in force (empty when not restricted). The server
+///   substitutes its `egress.default` for a shed with no explicit selection.
+/// - `inherited`: those profiles are the server's default, not the shed's own choice.
+/// - `mode`: the composed fall-through (`internal/egress/policy.go`): `audit` when any
+///   profile in force says audit, `enforce` when every one's definition came back and
+///   none does, else null (unknown).
+pub fn effective_egress(explicit: &Value, status: &Value) -> Value {
+    let enabled = status.get("enabled").and_then(Value::as_bool) == Some(true);
+    let port = status.get("port").and_then(Value::as_u64).unwrap_or(0);
+    let mut profiles = names(status.get("profiles"));
+    let restricted = enabled && (port != 0 || !profiles.is_empty());
+    if !restricted {
+        profiles.clear();
+    }
+    let inherited = restricted && !profiles.is_empty() && names(Some(explicit)).is_empty();
+    let rules = status.get("rules").and_then(Value::as_object);
+    let mode_of = |p: &String| {
+        rules
+            .and_then(|r| r.get(p))
+            .filter(|d| d.is_object())
+            .map(|d| d.get("mode").and_then(Value::as_str).unwrap_or(""))
+    };
+    let mode = if profiles.is_empty() {
+        Value::Null
+    } else if profiles
+        .iter()
+        .any(|p| mode_of(p).is_some_and(|m| m.eq_ignore_ascii_case("audit")))
+    {
+        json!("audit")
+    } else if profiles.iter().all(|p| mode_of(p).is_some()) {
+        json!("enforce")
+    } else {
+        Value::Null
+    };
+    json!({
+        "enabled": enabled,
+        "restricted": restricted,
+        "profiles": profiles,
+        "inherited": inherited,
+        "mode": mode,
+    })
 }
 
 /// `shed.provision`: runs `POST /api/sheds/{shed}/provision` and reports its progress
@@ -457,5 +530,79 @@ mod tests {
         for bad in ["", ".a", "-a", "a/b", "a b", "../x", &"a".repeat(65), "é"] {
             assert!(!valid_shed(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn effective_egress_reads_what_the_server_resolved() {
+        let rules = json!({
+            "default": {"mode": "audit", "allow": ["*.github.com"]},
+            "base": {"allow": ["example.test"]},
+        });
+        // Created without --egress: no explicit selection, the server's default in force.
+        let e = effective_egress(
+            &Value::Null,
+            &json!({"shed": "s", "enabled": true, "profiles": ["default"], "port": 20001, "rules": rules}),
+        );
+        assert_eq!(
+            e,
+            json!({"enabled": true, "restricted": true, "profiles": ["default"],
+                   "inherited": true, "mode": "audit"})
+        );
+        // An empty explicit list reads the same as an absent one.
+        assert_eq!(
+            effective_egress(
+                &json!([]),
+                &json!({"enabled": true, "profiles": ["default"], "port": 20001})
+            )["inherited"],
+            true
+        );
+        // An explicit selection is the shed's own; no profile says audit: enforce.
+        let e = effective_egress(
+            &json!(["base"]),
+            &json!({"enabled": true, "profiles": ["base"], "port": 20002, "rules": rules}),
+        );
+        assert_eq!(
+            (e["inherited"].clone(), e["mode"].clone()),
+            (json!(false), json!("enforce"))
+        );
+        // A profile whose definition did not come back: mode unknown.
+        let e = effective_egress(
+            &json!(["base", "gone"]),
+            &json!({"enabled": true, "profiles": ["base", "gone"], "port": 20002, "rules": rules}),
+        );
+        assert_eq!(e["mode"], Value::Null);
+        // Explicit profiles on a stopped shed whose port is not assigned yet: still restricted.
+        assert_eq!(
+            effective_egress(
+                &json!(["base"]),
+                &json!({"enabled": true, "profiles": ["base"]})
+            )["restricted"],
+            true
+        );
+    }
+
+    #[test]
+    fn effective_egress_is_unrestricted_only_when_nothing_applies() {
+        // The switch on, no port and no profiles: egress was off for this shed.
+        let e = effective_egress(&Value::Null, &json!({"shed": "s", "enabled": true}));
+        assert_eq!(
+            e,
+            json!({"enabled": true, "restricted": false, "profiles": [],
+                   "inherited": false, "mode": null})
+        );
+        // The switch off: nothing applies, whatever the shed's metadata still says.
+        let e = effective_egress(
+            &json!(["base"]),
+            &json!({"enabled": false, "profiles": ["base"], "port": 20002}),
+        );
+        assert_eq!(
+            (e["restricted"].clone(), e["profiles"].clone()),
+            (json!(false), json!([]))
+        );
+        // A malformed answer is not read as restricted.
+        assert_eq!(
+            effective_egress(&Value::Null, &json!("nope"))["restricted"],
+            false
+        );
     }
 }

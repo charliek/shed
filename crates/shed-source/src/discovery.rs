@@ -8,15 +8,15 @@
 //! [`ShedConfig`] fills an absent `ssh_port` with 22, which is right for the app's SSH
 //! uses and wrong here: the broker's reader reads it as 0, "no SSH endpoint", and the
 //! minter refuses to bootstrap over a port the config never named. This module keeps
-//! that rule. An entry's `ssh_port` is taken only when a line of the entry names it
-//! explicitly ([`explicit_ssh_ports`]) and that line's value is the port shed-core read;
-//! otherwise it is 0. When the two readers disagree, or the scanner cannot place a line,
-//! the answer is 0: nothing is minted, which fails closed.
+//! that rule. An entry's `ssh_port` is taken only when the entry names it explicitly,
+//! as shed-core's own reader reads the file ([`ShedConfig::explicit_ssh_ports`]: the
+//! same document-marker, comment and quoting rules as [`ShedConfig::parse`], so the two
+//! cannot disagree on a file's form), and that port is the one the entry holds;
+//! otherwise it is 0. A port it is 0 for mints nothing, which fails closed.
 //!
 //! `ShedServerEntry` has no `credentials_token`, so [`ServerTarget::token`] is always
 //! empty here: a source authenticates with its certificate (or nothing, in open mode).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use shed_core::config::{ShedConfig, ShedServerEntry};
@@ -32,7 +32,7 @@ pub fn parse_servers(text: &str) -> Result<Vec<ServerTarget>, String> {
     if let Some(reason) = config.refused {
         return Err(format!("config.yaml is not read: {reason}"));
     }
-    let explicit = explicit_ssh_ports(text);
+    let explicit = ShedConfig::explicit_ssh_ports(text);
     Ok(config
         .servers
         .iter()
@@ -65,7 +65,7 @@ fn target_of(e: &ShedServerEntry, explicit_port: Option<u16>) -> ServerTarget {
         token: String::new(),
         tls_fingerprint: endpoint.pin,
         ssh_host: e.host.clone(),
-        // Only a port both readers agree the entry names.
+        // Only a port the entry names itself.
         ssh_port: match explicit_port {
             Some(p) if p == e.ssh_port => p,
             _ => 0,
@@ -74,126 +74,6 @@ fn target_of(e: &ShedServerEntry, explicit_port: Option<u16>) -> ServerTarget {
         user: e.user.clone(),
         identity_file: e.identity_file.clone(),
     }
-}
-
-/// The entries of `text`'s top-level `servers:` block whose own lines name `ssh_port`,
-/// with the port each names. A line-based scan of the block form the shed CLI writes
-/// (`servers:`, then one indented key per entry, then the entry's keys one level
-/// deeper): an entry key is a plain or quoted key at the block's first indent, and only
-/// a field at that entry's first field indent counts. Anything it cannot place, a value
-/// that is not a port (`0`, a word, a null), or an entry that names it twice, gives no
-/// port for the entry. Comments and blank lines are skipped.
-pub fn explicit_ssh_ports(text: &str) -> HashMap<String, u16> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut out: HashMap<String, Option<u16>> = HashMap::new();
-    let mut in_servers = false;
-    let mut entry_indent: Option<usize> = None;
-    let mut field_indent: Option<usize> = None;
-    let mut entry: Option<String> = None;
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        let content = line.trim_start_matches(' ');
-        if content.is_empty() || content.starts_with('#') {
-            continue;
-        }
-        if content.starts_with('\t') {
-            // Tab indentation is not YAML's; nothing after it is placed.
-            entry = None;
-            continue;
-        }
-        let indent = line.len() - content.len();
-        if indent == 0 {
-            if matches!(content, "---" | "...") {
-                break;
-            }
-            in_servers = split_key(content).is_some_and(|(k, v)| k == "servers" && v.is_empty());
-            entry_indent = None;
-            field_indent = None;
-            entry = None;
-            continue;
-        }
-        if !in_servers {
-            continue;
-        }
-        let entry_at = *entry_indent.get_or_insert(indent);
-        if indent == entry_at {
-            entry = split_key(content).map(|(k, _)| k);
-            field_indent = None;
-            continue;
-        }
-        if indent < entry_at {
-            // Not a shape the CLI writes: stop placing lines.
-            in_servers = false;
-            entry = None;
-            continue;
-        }
-        let Some(name) = entry.as_ref() else { continue };
-        let field_at = *field_indent.get_or_insert(indent);
-        if indent != field_at {
-            continue;
-        }
-        if let Some((key, value)) = split_key(content) {
-            if key == "ssh_port" {
-                let port = port_value(&value);
-                out.entry(name.clone())
-                    .and_modify(|p| *p = None)
-                    .or_insert(port);
-            }
-        }
-    }
-    out.into_iter()
-        .filter_map(|(k, v)| v.map(|p| (k, p)))
-        .collect()
-}
-
-/// A `key: value` line's key (unquoted) and its raw value; `None` when the line is not
-/// one. A plain key ends at the first `:` followed by a space or the line's end.
-fn split_key(content: &str) -> Option<(String, String)> {
-    let (key, rest) = match content.chars().next()? {
-        q @ ('"' | '\'') => {
-            let end = content[1..].find(q)? + 1;
-            let key = &content[1..end];
-            if key.contains('\\') || (q == '\'' && content[end + 1..].starts_with('\'')) {
-                // An escape or a doubled quote: not a key this scan reads exactly.
-                return None;
-            }
-            (key.to_string(), content[end + 1..].strip_prefix(':')?)
-        }
-        _ => {
-            let mut at = None;
-            for (i, _) in content.match_indices(':') {
-                let after = &content[i + 1..];
-                if after.is_empty() || after.starts_with(' ') {
-                    at = Some(i);
-                    break;
-                }
-            }
-            let i = at?;
-            (content[..i].trim_end().to_string(), &content[i + 1..])
-        }
-    };
-    if !(rest.is_empty() || rest.starts_with(' ')) {
-        return None;
-    }
-    Some((key, rest.trim().to_string()))
-}
-
-/// A port value: a plain or quoted run of digits, 1 to 65535, with an optional
-/// ` # comment` after it.
-fn port_value(value: &str) -> Option<u16> {
-    let v = match value.find(" #") {
-        Some(i) => value[..i].trim_end(),
-        None => value,
-    };
-    let v = v
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-        .unwrap_or(v);
-    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    v.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
 #[cfg(test)]
@@ -301,38 +181,85 @@ default_server: named
     }
 
     #[test]
-    fn the_scan_places_only_the_entrys_own_field() {
+    fn only_the_entrys_own_field_is_its_port() {
         let text = "\
 servers:
   a:
     host: a.example.test
     nested:
       ssh_port: 2222
-  b:
-    host: b.example.test
-    ssh_port: 2201
-    ssh_port: 2202
   c:
     host: c.example.test
     ssh_port: ~
   d:
     host: d.example.test
     ssh_port: '2203'
+  w:
+    host: w.example.test
+    ssh_port: twenty-two
 other:
   e:
+    host: e.example.test
     ssh_port: 2204
 ";
-        let ports = explicit_ssh_ports(text);
-        assert_eq!(ports.get("a"), None, "a deeper key is not the entry's");
-        assert_eq!(ports.get("b"), None, "named twice");
-        assert_eq!(ports.get("c"), None, "a null");
-        assert_eq!(ports.get("d"), Some(&2203));
-        assert_eq!(ports.get("e"), None, "not under servers:");
+        let targets = parse_servers(text).unwrap();
+        assert_eq!(
+            by_name(&targets, "a").ssh_port,
+            0,
+            "a deeper key is not the entry's"
+        );
+        assert_eq!(by_name(&targets, "c").ssh_port, 0, "a null");
+        assert_eq!(by_name(&targets, "d").ssh_port, 2203);
+        assert_eq!(by_name(&targets, "w").ssh_port, 0, "not a port");
+        assert!(targets.iter().all(|t| t.name != "e"), "not under servers:");
     }
 
-    /// Where the two readers disagree on the value, the port is 0.
+    /// Review of plan 039 PR B: a config the core reader reads — a leading `---`
+    /// document marker, `servers: # comment`, comments after an entry key and a
+    /// field — keeps its explicit port. (The line scanner this replaced stopped at
+    /// the marker and did not see the commented `servers:`, so a cold launch read
+    /// port 0 and refused to mint "no ssh endpoint".)
     #[test]
-    fn a_port_the_readers_disagree_on_is_none() {
+    fn a_document_marker_and_comments_keep_the_explicit_port() {
+        for text in [
+            "---\nservers:\n    a:\n        host: a.example.test\n        ssh_port: 2222\n",
+            "servers: # the shed servers\n    a:\n        host: a.example.test\n        ssh_port: 2222\n",
+            "--- # cfg\n# header\nservers:   # comment\n    a: # entry\n        host: a.example.test\n        ssh_port: 2222 # port\n    b:\n        host: b.example.test\n",
+        ] {
+            let core = ShedConfig::parse(text);
+            assert!(core.refused.is_none(), "the core reader reads it: {text:?}");
+            assert_eq!(
+                core.servers.iter().find(|e| e.name == "a").map(|e| e.ssh_port),
+                Some(2222),
+                "{text:?}"
+            );
+            let targets = parse_servers(text).unwrap();
+            assert_eq!(by_name(&targets, "a").ssh_port, 2222, "{text:?}");
+            if let Some(b) = targets.iter().find(|t| t.name == "b") {
+                assert_eq!(b.ssh_port, 0, "a missing port still refuses: {text:?}");
+            }
+        }
+    }
+
+    /// The same forms through the resolver the control-token provider and the delivery
+    /// stream both use: the explicit port resolves, a missing one is still 0.
+    #[test]
+    fn the_resolver_reads_a_marked_and_commented_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "---\nservers: # comment\n    a:\n        host: a.example.test\n        ssh_port: 2222\n    b:\n        host: b.example.test\n",
+        )
+        .unwrap();
+        let targets = resolver()(path.to_str().unwrap()).unwrap();
+        assert_eq!(by_name(&targets, "a").ssh_port, 2222);
+        assert_eq!(by_name(&targets, "b").ssh_port, 0);
+    }
+
+    /// A value that is no port is 0.
+    #[test]
+    fn a_port_out_of_range_is_none() {
         let text = "servers:\n    a:\n        host: a.example.test\n        ssh_port: 70000\n";
         assert_eq!(parse_servers(text).unwrap()[0].ssh_port, 0);
     }

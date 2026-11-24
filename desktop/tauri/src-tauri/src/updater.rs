@@ -173,7 +173,9 @@ pub fn configure<R: Runtime>(app: &AppHandle<R>, version: &str) {
     use tauri_plugin_sparkle_updater::SparkleUpdaterExt;
     if let Some(updater) = app.sparkle_updater() {
         if let Err(e) = updater.set_automatically_checks_for_updates(false) {
-            app_warn!("shed-desktop-tauri: sparkle set_automatically_checks_for_updates failed: {e}");
+            app_warn!(
+                "shed-desktop-tauri: sparkle set_automatically_checks_for_updates failed: {e}"
+            );
         }
         if let Err(e) = updater.set_allowed_channels(allowed_channels(version)) {
             app_warn!("shed-desktop-tauri: sparkle set_allowed_channels failed: {e}");
@@ -229,17 +231,35 @@ mod tests {
     #[test]
     fn reason_precedence_linux_wins_even_in_test_mode() {
         // Linux is the apt channel — deterministic regardless of test mode / handle.
-        assert_eq!(updater_reason(UpdaterOs::Linux, false, false), REASON_LINUX_APT);
-        assert_eq!(updater_reason(UpdaterOs::Linux, true, false), REASON_LINUX_APT);
-        assert_eq!(updater_reason(UpdaterOs::Linux, true, true), REASON_LINUX_APT);
+        assert_eq!(
+            updater_reason(UpdaterOs::Linux, false, false),
+            REASON_LINUX_APT
+        );
+        assert_eq!(
+            updater_reason(UpdaterOs::Linux, true, false),
+            REASON_LINUX_APT
+        );
+        assert_eq!(
+            updater_reason(UpdaterOs::Linux, true, true),
+            REASON_LINUX_APT
+        );
     }
 
     #[test]
     fn reason_precedence_macos() {
         // test mode wins over a missing handle; then no handle ⇒ no_bundle; else ok.
-        assert_eq!(updater_reason(UpdaterOs::Macos, true, false), REASON_TEST_MODE);
-        assert_eq!(updater_reason(UpdaterOs::Macos, true, true), REASON_TEST_MODE);
-        assert_eq!(updater_reason(UpdaterOs::Macos, false, false), REASON_NO_BUNDLE);
+        assert_eq!(
+            updater_reason(UpdaterOs::Macos, true, false),
+            REASON_TEST_MODE
+        );
+        assert_eq!(
+            updater_reason(UpdaterOs::Macos, true, true),
+            REASON_TEST_MODE
+        );
+        assert_eq!(
+            updater_reason(UpdaterOs::Macos, false, false),
+            REASON_NO_BUNDLE
+        );
         assert_eq!(updater_reason(UpdaterOs::Macos, false, true), REASON_OK);
     }
 
@@ -252,7 +272,15 @@ mod tests {
             updater_reason(UpdaterOs::Macos, false, false),
             updater_reason(UpdaterOs::Linux, false, true),
         ];
-        assert_eq!(reasons, [REASON_OK, REASON_TEST_MODE, REASON_NO_BUNDLE, REASON_LINUX_APT]);
+        assert_eq!(
+            reasons,
+            [
+                REASON_OK,
+                REASON_TEST_MODE,
+                REASON_NO_BUNDLE,
+                REASON_LINUX_APT
+            ]
+        );
         assert_eq!(reasons.iter().filter(|r| **r == REASON_OK).count(), 1);
     }
 
@@ -262,8 +290,14 @@ mod tests {
         // distinction is the load-bearing contract handed to `set_allowed_channels`
         // (`Some(empty)` = stable-only; a future `None` = unrestricted MUST fail here).
         assert_eq!(allowed_channels("0.7.10"), Some(Vec::<String>::new()));
-        assert_eq!(allowed_channels("0.7.11-rc.1"), Some(vec!["beta".to_string()]));
-        assert_eq!(allowed_channels("1.0.0-beta.2"), Some(vec!["beta".to_string()]));
+        assert_eq!(
+            allowed_channels("0.7.11-rc.1"),
+            Some(vec!["beta".to_string()])
+        );
+        assert_eq!(
+            allowed_channels("1.0.0-beta.2"),
+            Some(vec!["beta".to_string()])
+        );
         // A plain stable version never subscribes to beta — but is still `Some(empty)`.
         assert_eq!(allowed_channels("2.3.4"), Some(Vec::<String>::new()));
     }

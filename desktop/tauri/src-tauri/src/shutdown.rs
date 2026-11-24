@@ -136,6 +136,11 @@ async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<Shutdown>) {
         };
         // Written and flushed before the exit: the sink appends per line.
         app_warn!("shed-desktop-tauri: exiting now (signal {again})");
-        std::process::exit(128 + again);
+        // `_exit`, not `std::process::exit`: this is the escape from a held
+        // shutdown, so the webview and runtime threads are still running, and
+        // the C `atexit` handlers `exit` runs can tear state out from under
+        // them (seen as a SIGSEGV instead of `128 + signo`).
+        // SAFETY: `_exit` takes a plain int and never returns.
+        unsafe { libc::_exit(128 + again) }
     }
 }

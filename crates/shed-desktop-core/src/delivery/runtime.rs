@@ -570,4 +570,32 @@ mod tests {
         };
         assert!(targets_of(&none).unwrap().is_empty());
     }
+
+    /// The delivery stream mints its credentials-scope certificate over the port its
+    /// target names: a config with a leading `---` and `servers: # comment` (both read
+    /// by the core reader) keeps its explicit port, and an entry with none still has 0.
+    #[test]
+    fn a_marked_and_commented_config_keeps_its_explicit_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        std::fs::write(
+            &cfg,
+            "---\nservers: # the servers\n    a:\n        host: a.example.test\n        ssh_port: 2222\n        api_url: https://a.example.test:18443\n    b:\n        host: b.example.test\n",
+        )
+        .unwrap();
+        let opts = DeliveryOptions {
+            shed_config_path: cfg,
+            settings_path: dir.path().join("delivery.toml"),
+            key_path: dir.path().join("key"),
+            known_hosts: String::new(),
+            mock_base_url: None,
+            unreachable_hosts: Default::default(),
+            reader: DiskReader::new(dir.path(), None),
+            rescan: RESCAN,
+        };
+        let t = targets_of(&opts).unwrap();
+        let port = |n: &str| t.iter().find(|x| x.name == n).map(|x| x.ssh_port);
+        assert_eq!(port("a"), Some(2222));
+        assert_eq!(port("b"), Some(0));
+    }
 }

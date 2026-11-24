@@ -1,5 +1,6 @@
-/* A shed's egress, on its detail (plan 039 PR B): the profiles assigned to it (from
-   its document, `shed.delivery`'s `egress_profiles`) and its recent blocks — the
+/* A shed's egress, on its detail (plan 039 PR B): its EFFECTIVE egress (`shed.delivery`'s
+   `egress`, which the server resolved: the profiles in force, the server's default
+   marked as such for a shed created without `--egress`) and its recent blocks — the
    `deny` decisions the app's egress feed kept for THIS incarnation of the shed
    (`egress.recent {server, shed, created_at, blocks: true}`), re-read on every
    `egress-changed` event for its server. A shed deleted and created again under its
@@ -14,7 +15,7 @@ import {
   fetchEgressBlocks, getShedDelivery, inTauri, reportShedEgress,
   type EgressEvent, type Shed,
 } from "@/lib/bridge";
-import { blockTarget, profilesText, readProfiles } from "@/lib/egress";
+import { blockTarget, egressText, readEgress, type EffectiveEgress } from "@/lib/egress";
 
 /** A timestamp as the section shows it (the raw text when it does not parse). */
 function when(ts: string): string {
@@ -25,8 +26,8 @@ function when(ts: string): string {
 
 export function ShedEgressDetail({ shed }: { shed: Shed }) {
   const root = useRef<HTMLDivElement>(null);
-  // undefined: still reading; null: the document could not be read.
-  const [profiles, setProfiles] = useState<string[] | null | undefined>(undefined);
+  // undefined: still reading; null: the shed or its egress status could not be read.
+  const [profiles, setProfiles] = useState<EffectiveEgress | null | undefined>(undefined);
   const [blocks, setBlocks] = useState<EgressEvent[] | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const createdAt = shed.created_at ?? "";
@@ -55,7 +56,7 @@ export function ShedEgressDetail({ shed }: { shed: Shed }) {
   useEffect(() => {
     let live = true;
     void getShedDelivery(shed.host, shed.name).then(
-      (doc) => { if (live) setProfiles(readProfiles(doc?.egress_profiles)); },
+      (doc) => { if (live) setProfiles(readEgress(doc?.egress)); },
       () => { if (live) setProfiles(null); },
     );
     return () => { live = false; };
@@ -106,7 +107,7 @@ export function ShedEgressDetail({ shed }: { shed: Shed }) {
     <div ref={root} className="border-t border-shed-border px-[18px] pb-4 pt-3.5" data-shed-egress-detail={`${shed.host}/${shed.name}`}>
       <div className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[.09em] text-shed-text-muted">Egress</div>
       <div className="text-[12.5px] text-shed-text-secondary" data-egress-profiles>
-        {profiles === undefined ? "Egress profile: reading…" : profilesText(profiles)}
+        {egressText(profiles)}
       </div>
       <div className="mb-1.5 mt-3 font-mono text-[10px] font-semibold uppercase tracking-[.09em] text-shed-text-muted">Recent blocks</div>
       {error ? (

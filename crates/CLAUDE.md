@@ -82,8 +82,9 @@ shedctl (no internal deps)
   (the control-token provider, which resolves servers through an injected
   `ServerResolver`, `discovery::resolver()`; its tests are `controltoken_tests.rs`),
   `target` (`ServerTarget`) and `time` (the RFC3339 helpers). Plan 039 A6 adds the delivery side: `discovery` (the shed CLI config's servers as
-  `ServerTarget`s through shed-core's reader; an entry with no explicit `ssh_port` has
-  port 0, no SSH endpoint, so nothing is minted for it, where shed-core alone reads 22;
+  `ServerTarget`s through shed-core's reader; an entry with no explicit `ssh_port` (as
+  that same reader reads the file, `ShedConfig::explicit_ssh_ports`: no second line
+  scanner) has port 0, no SSH endpoint, so nothing is minted for it, where shed-core alone reads 22;
   `discovery::resolver()` plugs into the control-token provider), `delivery` (the
   delivery stream client: `GET /api/delivery/requests` with the machine headers, the
   stream id kept for the stream's life, each request handed to an `Answerer`, the answer

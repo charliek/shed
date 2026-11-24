@@ -1,16 +1,32 @@
-/* A shed's egress profiles and recent blocks, and the System pane's profile rows
+/* A shed's effective egress and recent blocks, and the System pane's profile rows
  * (`src/lib/egress.ts`, plan 039 PR B), on node's own test runner. */
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { blockTarget, profileSummary, profilesText, readProfiles } from "../dist-test/egress.js";
+import { blockTarget, egressText, profileSummary, readEgress } from "../dist-test/egress.js";
 
-test("a shed's profiles off its document", () => {
-  assert.deepEqual(readProfiles(["default", "", 3, "extra"]), ["default", "extra"]);
-  assert.deepEqual(readProfiles(null), []);
-  assert.equal(profilesText(["default", "extra"]), "Egress profile: default, extra");
-  assert.equal(profilesText([]), "Egress profile: none (egress is not restricted)");
-  assert.match(profilesText(null), /unknown/);
+test("a shed's effective egress", () => {
+  // Created without --egress: the server's default is in force, and marked as such.
+  const inherited = readEgress({ enabled: true, restricted: true, profiles: ["default", "", 3], inherited: true, mode: "audit" });
+  assert.deepEqual(inherited, { enabled: true, restricted: true, profiles: ["default"], inherited: true, mode: "audit" });
+  assert.equal(egressText(inherited), "Egress profile: default (audit), the server's default");
+  // The shed's own selection.
+  assert.equal(
+    egressText(readEgress({ enabled: true, restricted: true, profiles: ["base", "github"], inherited: false, mode: "enforce" })),
+    "Egress profile: base, github (enforce)",
+  );
+  assert.equal(egressText(readEgress({ enabled: true, restricted: true, profiles: ["base"], mode: "weird" })), "Egress profile: base");
+  // "Not restricted" only when nothing applies.
+  assert.equal(egressText(readEgress({ enabled: true, restricted: false, profiles: [] })), "Egress profile: none (egress is not restricted)");
+  assert.equal(egressText(readEgress({ enabled: false, restricted: false })), "Egress profile: none (egress control is off on this server)");
+  // A shed that is not restricted carries no profiles, whatever else the value says.
+  assert.deepEqual(readEgress({ enabled: true, restricted: false, profiles: ["x"], inherited: true }).profiles, []);
+  assert.match(egressText(readEgress({ enabled: true, restricted: true, profiles: [] })), /restricted/);
+  // Unread, and unreadable.
+  assert.equal(readEgress(null), null);
+  assert.equal(readEgress(["default"]), null);
+  assert.match(egressText(null), /unknown/);
+  assert.match(egressText(undefined), /reading/);
 });
 
 test("where a block went", () => {

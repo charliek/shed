@@ -699,7 +699,8 @@ export function previewDelivery(server: string, shed?: string): Promise<Record<s
 }
 
 /** The delivery record of a shed's document (null for a server older than delivery),
- *  and its `egress_profiles` (null: none assigned). */
+ *  its explicit `egress_profiles` (null: none, the server's default applies), and its
+ *  effective `egress` as the server resolved it (null, with `egress_error`: unread). */
 export function getShedDelivery(server: string, shed: string): Promise<Record<string, unknown>> {
   return invokeStrict("shed_delivery", { server, shed });
 }

@@ -6832,7 +6832,12 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
 "#,
             env_bin = real_tool("env").display(),
         );
-        write_staged_script(dir, "exec-ssh", script)
+        let ssh = write_staged_script(dir, "exec-ssh", script);
+        // Settled here, once, for every caller: a step's first exec of a
+        // just-written fake can meet ETXTBSY from a sibling test's fork (see
+        // [`settle_exec`]), seen as a spawn error or a step that never starts.
+        settle_exec(&ssh, &["-O", "exit", "settle"]);
+        ssh
     }
 
     /// Where a utility the rig needs actually lives. A `PATH` lookup will not

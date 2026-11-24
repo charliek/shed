@@ -311,6 +311,52 @@ impl ShedConfig {
     }
 }
 
+impl ShedConfig {
+    /// The server entries of config.yaml's text that name `ssh_port` THEMSELVES, with the
+    /// port each names, read by the same reader as [`ShedConfig::parse`] (the same
+    /// byte-order mark, document marker, comment and quoting rules). [`ShedServerEntry`]
+    /// fills an absent `ssh_port` with 22; a caller that must not act on a port the
+    /// config never named (a credential source's SSH bootstrap) asks this instead.
+    ///
+    /// Left out: an entry whose `ssh_port` is absent, null, not a port (a word, `0`, past
+    /// 65535), or not a scalar; an entry this reader refuses, including one whose `host`
+    /// is present but not a plain string; every entry of a file it refuses whole.
+    pub fn explicit_ssh_ports(text: &str) -> std::collections::HashMap<String, u16> {
+        let mut out = std::collections::HashMap::new();
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        if yaml_lite::file_refusal(text, "servers").is_some() {
+            return out;
+        }
+        let Node::Map(top) = yaml_lite::parse(text) else {
+            return out;
+        };
+        let refused = yaml_lite::refused_entries(text, "servers");
+        if let Some(Node::Map(server_map)) = top.get("servers") {
+            for (name, value) in server_map {
+                let Node::Map(fields) = value else { continue };
+                if refused.contains(name) {
+                    continue;
+                }
+                // `parse` refuses an entry whose `host` is present but not a plain
+                // string (null, `~`, a list or a map): no port for it either.
+                if matches!(fields.get("host"), Some(h) if !matches!(h, Node::Scalar(_))) {
+                    continue;
+                }
+                // The very expression `parse` reads `ssh_port` with, minus its default.
+                let port = fields
+                    .get("ssh_port")
+                    .and_then(Node::as_scalar)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|p| *p != 0);
+                if let Some(p) = port {
+                    out.insert(name.clone(), p);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// What [`ShedServerEntry::user`] holds when config.yaml's `user` is not a plain string (a
 /// list or a map, which no shed CLI writes and Go refuses to load at all). It is no valid
 /// user name (a plain YAML value cannot start with `!`), so a provider held to it refuses
@@ -2220,5 +2266,34 @@ servers:
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_ssh_ports_follow_the_readers_own_rules() {
+        let text = "\u{feff}--- # cfg\n# header\nservers: # comment\n    a: # entry\n        host: a.example.test\n        ssh_port: 2222 # port\n    b:\n        host: b.example.test\n    q:\n        host: q.example.test\n        \"ssh_port\": \"2200\"\n    z:\n        ssh_port: 0\n    n:\n        ssh_port: ~\n    big:\n        ssh_port: 70000\n    bare:\n";
+        let config = ShedConfig::parse(text);
+        assert!(config.refused.is_none());
+        let ports = ShedConfig::explicit_ssh_ports(text);
+        assert_eq!(ports.get("a"), Some(&2222));
+        assert_eq!(ports.get("q"), Some(&2200));
+        for none in ["b", "z", "n", "big", "bare"] {
+            assert_eq!(ports.get(none), None, "{none}");
+        }
+        // The default `parse` fills in for an entry that names none.
+        assert_eq!(by_name(&config, "b").ssh_port, 22);
+        // An entry `parse` refuses for its host names no port either.
+        let hosts = "servers:\n    hn:\n        host:\n        ssh_port: 2222\n    ht:\n        host: ~\n        ssh_port: 2222\n    hm:\n        host:\n            x: y\n        ssh_port: 2222\n    ok:\n        host: ok.example.test\n        ssh_port: 2222\n";
+        let parsed = ShedConfig::parse(hosts);
+        let ports = ShedConfig::explicit_ssh_ports(hosts);
+        for refused in ["hn", "ht", "hm"] {
+            assert_eq!(by_name(&parsed, refused).ssh_port, 0, "{refused}");
+            assert_eq!(ports.get(refused), None, "{refused}");
+        }
+        assert_eq!(ports.get("ok"), Some(&2222));
+        // A file refused whole names no port.
+        assert!(ShedConfig::explicit_ssh_ports(
+            "servers:\n    a: {}\nservers:\n    b:\n        ssh_port: 2\n"
+        )
+        .is_empty());
     }
 }

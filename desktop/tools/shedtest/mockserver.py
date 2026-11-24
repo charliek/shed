@@ -107,6 +107,9 @@ _DELIVERY_ANSWER_RE = re.compile(r"^/api/delivery/requests/([^/]+)$")
 _SHED_DOC_RE = re.compile(r"^/api/sheds/([^/]+)$")
 _PROVISION_RE = re.compile(r"^/api/sheds/([^/]+)/provision$")
 _ACTIVITY_PATH = "/api/activity"
+#: `GET /api/egress/{name}` (`shed egress show`): a shed's EFFECTIVE egress. The literal
+#: `/api/egress/stream` and `/api/egress/profiles` are matched before it, as chi does.
+_EGRESS_SHOW_RE = re.compile(r"^/api/egress/([^/]+)/?$")
 
 #: The contract's `records/accept/delivered.json` record (byte-equal JSON; pinned).
 DELIVERED_RECORD = {
@@ -292,6 +295,10 @@ class MockShedServer:
         self._shutdown = threading.Event()
         self._sse_threads: set[threading.Thread] = set()
         self._egress_hits = 0
+        # `GET /api/egress/{name}`'s server config (`egress.enabled`, `egress.default`):
+        # see `egress_status`. `reset()` restores these.
+        self.egress_enabled = True
+        self.egress_default: list[str] = []
         # Opt-in egress decisions (`egress_events`): None keeps the route's 501
         # (egress unavailable). A list makes the route a 200 SSE stream that writes
         # each decision once, as a `data: {json}` frame (`EgressDecision`), then holds
@@ -401,6 +408,8 @@ class MockShedServer:
             self.provision_should_fail = False
             self.provision_record = DELIVERED_RECORD
             self.provisions = []
+            self.egress_enabled = True
+            self.egress_default = []
             gate, self._provision_gate = self._provision_gate, None
         if gate is not None:
             gate.set()
@@ -477,6 +486,32 @@ class MockShedServer:
             gate, self._provision_gate = self._provision_gate, None
         if gate is not None:
             gate.set()
+
+    def egress_status(self, name: str) -> dict | None:
+        """`GET /api/egress/{name}` as `internal/api/handlers.go:handleEgressShow`
+        resolves it: the shed's explicit `egress_profiles`, and — a shed created with the
+        server default has none but does have a listener (`egress_port`) — the server's
+        `egress_default` in their place; `rules` from the profile fixture. None: no such
+        shed."""
+        shed = self.shed(name)
+        if shed is None:
+            return None
+        with self._lock:
+            enabled, default = self.egress_enabled, list(self.egress_default)
+        profiles = list(shed.get("egress_profiles") or [])
+        port = int(shed.get("egress_port") or 0)
+        if not profiles and port:
+            profiles = default
+        defs = {p["name"]: p["profile"] for p in _EGRESS_FIXTURE}
+        status: dict = {"shed": name, "enabled": enabled}
+        if profiles:
+            status["profiles"] = profiles
+            rules = {p: defs[p] for p in profiles if p in defs}
+            if rules:  # omitempty
+                status["rules"] = rules
+        if port:
+            status["port"] = port
+        return status
 
     def shed(self, name: str) -> dict | None:
         with self._lock:
@@ -1017,6 +1052,14 @@ class MockShedServer:
                         self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
                     else:
                         self._send(200, doc)
+                    return
+                m = _EGRESS_SHOW_RE.match(path)
+                if m and m.group(1) not in ("stream", "profiles"):
+                    status = state.egress_status(unquote(m.group(1)))
+                    if status is None:
+                        self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
+                    else:
+                        self._send(200, status)
                     return
                 if self.path == "/api/sheds":
                     state._await_sheds_release()

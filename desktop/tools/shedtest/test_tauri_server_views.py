@@ -5,7 +5,9 @@ app over two mock servers and one that is down:
 * **Activity** — every configured server's own feed (`GET /api/activity`), merged
   newest first, paged with its cursor ("Load older"), and a server that could not be
   read named above the list;
-* a **shed's detail** — its delivery and its egress: the profiles assigned to it and
+* a **shed's detail** — its delivery and its egress: its EFFECTIVE profiles, read from
+  the mock's `GET /api/egress/{name}` (a shed created without `--egress` shows the
+  server's default, marked as such; "not restricted" only when none applies) and
   its recent blocks, the `deny` decisions pushed through the mock's
   `/api/egress/stream` for THAT incarnation (`shed_created_at`), re-read on
   `egress-changed`; a shed created again under its name shows none of the old
@@ -50,7 +52,8 @@ SECOND = "2026-11-23T11:00:00Z"
 MOCK_SHEDS = [
     {"name": "hello-world", "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu", "status": "running",
      "backend": "firecracker", "cpus": 2, "memory_mb": 4096, "image": "full",
-     "created_at": FIRST, "delivery": DELIVERED_RECORD, "egress_profiles": ["default"]},
+     "created_at": FIRST, "delivery": DELIVERED_RECORD, "egress_profiles": ["default"],
+     "egress_port": 20001},
     {"name": "callbell", "status": "stopped", "backend": "vz", "created_at": "2026-11-19T08:00:00Z"},
 ]
 MOCK2_SHEDS = [
@@ -95,6 +98,9 @@ class Rig:
     mock2: MockShedServer
 
     def reset(self) -> None:
+        for m in (self.mock, self.mock2):
+            with m._lock:
+                m.egress_enabled, m.egress_default = True, []
         self.mock.set_sheds([dict(s) for s in MOCK_SHEDS])
         self.mock2.set_sheds([dict(s) for s in MOCK2_SHEDS])
         with self.mock._lock:
@@ -320,7 +326,7 @@ def test_shed_detail_shows_delivery_and_recent_blocks(r: Rig):
     c = r.c
     c.egress_show(server="mock", shed="hello-world")
     c.wait_until(lambda: c.current_pane() == "sheds", timeout=15, what="pane=sheds")
-    c.wait_until(lambda: _egress(c).get("profiles") == "Egress profile: default",
+    c.wait_until(lambda: _egress(c).get("profiles") == "Egress profile: default (audit)",
                  timeout=20, what="the egress profile")
     c.wait_until(lambda: (c.call("shed_delivery.dump").get("detail") or {}).get("state") == "delivered",
                  timeout=20, what="the delivery detail beside it")
@@ -377,6 +383,39 @@ def test_a_shed_without_a_delivery_record_opens_its_egress_detail(r: Rig):
     assert c.call("shed_delivery.dump").get("detail") is None
     rows = {(x["host"], x["name"]): x for x in c.dashboard_dump()["rows"]}
     assert rows[("mock2", "api-box")]["delivery_badge"] is None
+
+
+def test_a_shed_on_the_server_default_shows_the_default_profile(r: Rig):
+    """A shed created without `--egress` on a server whose `egress.default` is
+    `[default]` has no explicit selection in its document, yet runs behind the
+    default profile: its detail shows that profile, marked as the server's default,
+    never "not restricted". The same shed on a server with egress control off is
+    unrestricted, and says why."""
+    c = r.c
+    with r.mock._lock:
+        r.mock.egress_default = ["default"]
+    inherits = {"name": "inherits", "status": "running", "backend": "firecracker",
+                "created_at": "2026-11-22T08:00:00Z", "egress_port": 20003}
+    r.mock.set_sheds([dict(s) for s in MOCK_SHEDS] + [inherits])
+    c.sheds_refresh()
+    assert "egress_profiles" not in (r.mock.shed("inherits") or {})
+    c.egress_show(server="mock", shed="inherits")
+    c.wait_until(lambda: _egress(c).get("shed") == "inherits"
+                 and _egress(c).get("profiles")
+                 == "Egress profile: default (audit), the server's default",
+                 timeout=20, what="the inherited default profile")
+    assert "not restricted" not in _egress(c)["rendered"], _egress(c)
+    _scroll(c, "shed:mock/inherits")
+    _shot(c, "b4-shed-detail-server-default-egress.png")
+
+    with r.mock._lock:
+        r.mock.egress_enabled = False
+    c.call("ui.close_shed_delivery")
+    c.wait_until(lambda: not _egress(c), timeout=10, what="the detail closed")
+    c.egress_show(server="mock", shed="inherits")
+    c.wait_until(lambda: _egress(c).get("profiles")
+                 == "Egress profile: none (egress control is off on this server)",
+                 timeout=20, what="egress control off on the server")
 
 
 # ---------------------------------------------------------------------------

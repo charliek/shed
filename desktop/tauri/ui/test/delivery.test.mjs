@@ -11,6 +11,7 @@ import {
   draftFromConfig,
   edit,
   formatSize,
+  noServerLimit,
   onlyText,
   provisionResult,
   readDelivery,
@@ -195,6 +196,14 @@ test("not configured: craze's providers on by default", () => {
 test("an only rule in one line", () => {
   assert.equal(onlyText(null), "");
   assert.equal(onlyText({ servers: ["a", "b"], repos: ["x/*"] }), "servers: a, b · repos: x/*");
+});
+
+test("a provider with no servers in its only rule has no server limit", () => {
+  assert.equal(noServerLimit(null), true);
+  assert.equal(noServerLimit({}), true);
+  assert.equal(noServerLimit({ repos: ["x/*"] }), true);
+  assert.equal(noServerLimit({ servers: [] }), true);
+  assert.equal(noServerLimit({ servers: ["a"] }), false);
 });
 
 test("a blank only entry is kept, never dropped into no restriction", () => {

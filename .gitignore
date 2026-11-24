@@ -46,11 +46,6 @@ vendor/
 .env.*.local
 *.pem
 *.key
-# Exception: the committed, throwaway self-signed TLS pair the broker wire harness
-# serves for the secure-bus cells (non-secret; Python `ssl` can't generate one at runtime,
-# so a fixed pair is committed for a stable leaf-DER pin). See tests/broker-wire/README.
-!tests/broker-wire/fixtures/synthetic_bus_cert.pem
-!tests/broker-wire/fixtures/synthetic_bus_key.pem
 # Exception: the directory contract's throwaway test keys (non-secret; made for the
 # fixtures and listed in its manifest). See tests/directory-contract/README.md.
 !tests/directory-contract/v1/fixtures/test-keys/*.pem
@@ -111,9 +106,6 @@ site-build/
 !tests/integration/uv.lock
 # … and the desktop workspace's lockfile is committed too:
 !desktop/uv.lock
-# … and the broker wire harness's lockfile is committed too:
-!tests/broker-wire/uv.lock
 # Python tooling caches for the integration suite
 tests/integration/.pytest_cache/
-tests/broker-wire/.pytest_cache/
 **/__pycache__/
