@@ -103,7 +103,7 @@ func TestManager_ReleaseFreesPort(t *testing.T) {
 }
 
 func TestManager_RemoveKeepsPort(t *testing.T) {
-	lo := freePort(t)
+	lo := freePortPair(t)              // lo and lo+1 both free
 	m := managerWithProxy(t, lo, lo+1) // two-port range
 
 	port, _, err := m.Configure("web", time.Time{}, 0, "", "", []ProfileSpec{{}})

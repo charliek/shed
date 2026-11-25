@@ -25,4 +25,4 @@ pub mod runtime;
 pub mod settings_file;
 
 pub use reader::DiskReader;
-pub use runtime::{DeliveryOptions, DeliveryRuntime};
+pub use runtime::{DeliveryOptions, DeliveryRuntime, PreviewOf};

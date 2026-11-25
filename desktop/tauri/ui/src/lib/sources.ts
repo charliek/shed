@@ -1,9 +1,11 @@
-/* The Preferences window's credential-source rows (plan 035 §3.4): how a read, a
- * move and its read-back are reconciled into what each server's row shows.
+/* The credential-source rows (plan 035 §3.4; the Credentials view's Where part since
+ * plan 040 §3.9): how a read, a move or a stop and its read-back are reconciled into
+ * what each server's row shows.
  *
  * Pure and dependency-free, in the `report.ts` / `laneSettings.ts` shape, so node's
  * own test runner pins it (`test/sources.test.mjs`): `bridge.ts` re-exports the
- * types, `PreferencesWindow.tsx` holds the state and calls these.
+ * types, the Credentials view holds the state and calls these, and `credentials.ts`
+ * decides what each row says.
  *
  * **Every application is per server, and ordered.** Each read is given a sequence
  * number when it is ISSUED, and each move's answer one when it ARRIVES; a server's
@@ -28,7 +30,7 @@
  * restart, the network) keeps the row it last showed, marked unreachable, and asks for
  * a few later reads with growing spacing ([UNREACHABLE_RETRY_MS]); then it stops until
  * the window is shown, focused or reloaded again ([restartRetries]). With no row known
- * yet there is nothing to keep, so none is shown, and the reads are still asked for.
+ * yet the read's own row is shown (unreachable), and the reads are still asked for.
  *
  * **A move's read-back can come too early.** A confirmed move whose read-back shows
  * this machine "not connected" (its delivery stream has not connected yet) asks for one later
@@ -58,9 +60,22 @@ export type SourceRow = {
    *  "unsupported"). Absent from an older backend. */
   unreachable?: boolean;
   error: string | null;
+  /** Who answers (`sources.list`'s kind: `this_machine`, `other_machine`, `service`,
+   *  `nobody`, `unsupported`, `unknown`), when the read said. */
+  kind?: string;
+  /** Where the account service answers: its URL, and `not_delivering` when it does not
+   *  deliver to that server. */
+  url?: string | null;
+  state?: string | null;
+  /** This machine stopped answering on that server ("Stop answering from here"). */
+  paused?: boolean;
+  /** This machine's delivery stream to that server: its state and last error class. */
+  stream?: string | null;
+  stream_error?: string | null;
 };
 
-/** `source_status`: every server's row plus this machine's identity (or why none). */
+/** Every server's row plus this machine's identity (or why none): `source.status`'s
+ *  shape, and what `credentials.ts` reads `sources.list` into. */
 export type SourceStatus = {
   rows: SourceRow[];
   this_machine: SourceMachine | null;
@@ -84,6 +99,10 @@ export type SourcesState = {
   moving: Record<string, SourceRow>;
   /** A refused move's words, per host, until that host's next attempt. */
   errors: Record<string, string>;
+  /** Hosts whose last stop could not be confirmed (the backend's `unverified`, or an
+   *  unbind sent and not read back): Stop stays available there until a confirmed
+   *  answer (a stop or a move); an attempt that fails leaves it, so Stop stays. */
+  unverified?: Record<string, true>;
   /** Reads in a row that found a server unreachable, since the last show, focus or
    *  reload; past [UNREACHABLE_RETRY_MS]'s length no further read is asked for. */
   unreachableTries: number;
@@ -99,6 +118,7 @@ export const EMPTY_SOURCES: SourcesState = {
   meSeq: 0,
   moving: {},
   errors: {},
+  unverified: {},
   unreachableTries: 0,
 };
 
@@ -160,11 +180,11 @@ export function applyRead(
       continue;
     }
     if (r.unreachable) {
-      // Unknown, not unsupported: keep what was last shown, noted. Nothing known yet
-      // means nothing to show.
+      // Unknown, not unsupported: keep what was last shown, noted. With nothing known
+      // yet the row is the read's own (who answers unknown, the server unreachable), so
+      // every configured server has a row.
       const prev = state.rows[r.host];
-      if (!prev) continue;
-      next.rows[r.host] = { ...prev, unreachable: true, busy: false };
+      next.rows[r.host] = prev ? { ...prev, unreachable: true, busy: false } : { ...r, busy: false };
     } else if (r.busy) {
       // The server answered (busy): it is reachable again, whatever was shown before.
       const prev = state.rows[r.host];
@@ -202,11 +222,14 @@ export function restartRetries(state: SourcesState): SourcesState {
   return state.unreachableTries === 0 ? state : { ...state, unreachableTries: 0 };
 }
 
-/** Whether `host`'s "Use this machine" can be pressed: an identity to send, no move
- *  of its own in flight, and this machine not already the source there — the one
- *  rule behind the button's presence, its `disabled`, and the reported `can_use`. */
+/** Whether `host`'s "Answer from here" can be pressed: an identity to send, no move
+ *  of its own in flight, and this machine not already answering there (bound there
+ *  but stopped counts as not answering) — the one rule behind the button's
+ *  `disabled` and the reported `can_use`. */
 export function canUse(state: SourcesState, host: string): boolean {
-  return !!state.thisMachine && !state.moving[host] && !state.rows[host]?.this_machine;
+  const row = state.rows[host];
+  // Bound here but stopped (an uncertain stop): answering again is what undoes it.
+  return !!state.thisMachine && !state.moving[host] && (!row?.this_machine || !!row?.paused);
 }
 
 /** A press: `null` when it cannot start ([canUse]), else the state with the row
@@ -218,9 +241,94 @@ export function beginMove(state: SourcesState, host: string): SourcesState | nul
   delete errors[host];
   return {
     ...state,
-    rows: { ...state.rows, [host]: { ...prev, source: state.thisMachine, this_machine: true, busy: false, unreachable: false, error: null } },
+    rows: {
+      ...state.rows,
+      [host]: {
+        ...prev, source: state.thisMachine, this_machine: true, busy: false, unreachable: false, error: null,
+        kind: "this_machine", url: null, state: null, paused: false, stream: null, stream_error: null,
+      },
+    },
     moving: { ...state.moving, [host]: prev },
     errors,
+  };
+}
+
+/** Whether the last stop on `host` could not be confirmed and can be tried again: the
+ *  server can be reached, and a machine (not the account service) can answer there.
+ *  The one rule behind [canStop] and the view's Stop on such a row. */
+export function stopRetryable(state: SourcesState, host: string): boolean {
+  const row = state.rows[host];
+  return !!state.unverified?.[host] && !!row && !row.unreachable
+    && row.kind !== "service" && row.kind !== "unsupported";
+}
+
+/** Whether `host`'s "Stop answering from here" can be pressed, with no move or stop of
+ *  that row in flight: this machine answers there; another machine does and this one
+ *  has not stopped there; or the last stop there could not be confirmed (try again). */
+export function canStop(state: SourcesState, host: string): boolean {
+  const row = state.rows[host];
+  if (state.moving[host] || !row) return false;
+  // Where another machine answers, this machine can still stop answering there (a pause
+  // only: that machine's binding is never cleared), while the server can be reached.
+  const other = !row.this_machine && !!row.source && row.kind !== "service";
+  // A stop that could not be confirmed can be tried again, paused or not.
+  const retry = stopRetryable(state, host);
+  return row.this_machine || retry || (other && !row.paused && !row.unreachable);
+}
+
+/** A "Stop answering from here" press: `null` when it cannot start ([canStop]), else
+ *  the state with the row showing this machine stopped there — nobody answering where
+ *  this machine did, the other machine kept where it answers — and the row it replaced
+ *  kept for a refusal ([moveFailed]). */
+export function beginStop(state: SourcesState, host: string): SourcesState | null {
+  const prev = state.rows[host];
+  if (!prev || !canStop(state, host)) return null;
+  const errors = { ...state.errors };
+  delete errors[host];
+  const next: SourceRow = prev.this_machine
+    ? {
+        ...prev, source: null, this_machine: false, connected: false, busy: false, unreachable: false,
+        error: null, kind: "nobody", paused: true, stream: null, stream_error: null,
+      }
+    : { ...prev, busy: false, error: null, paused: true, stream: null, stream_error: null };
+  return {
+    ...state,
+    rows: { ...state.rows, [host]: next },
+    moving: { ...state.moving, [host]: prev },
+    errors,
+  };
+}
+
+/** The stop was confirmed: the row keeps what [beginStop] showed, and every read issued
+ *  before `seq` (allocated as the answer arrives) is older than it. */
+export function stopConfirmed(state: SourcesState, host: string, seq: number): SourcesState {
+  const moving = { ...state.moving };
+  delete moving[host];
+  const unverified = { ...(state.unverified ?? {}) };
+  delete unverified[host];
+  return {
+    ...state,
+    unverified,
+    applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
+    moving,
+  };
+}
+
+/** The stop was answered, but the server's binding could not be read afterwards (the
+ *  backend's `unverified`): nothing was sent and this machine stays paused there. The
+ *  row goes back to the binding it showed before (never "nobody", which was not
+ *  confirmed), marked paused, with `note` under it; Stop stays available to try again. */
+export function stopUnverified(state: SourcesState, host: string, seq: number, note: string): SourcesState {
+  const moving = { ...state.moving };
+  const prev = moving[host];
+  delete moving[host];
+  return {
+    ...state,
+    rows: prev ? { ...state.rows, [host]: { ...prev, paused: true } } : state.rows,
+    applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
+    moving,
+    errors: { ...state.errors, [host]: note },
+    unverified: { ...(state.unverified ?? {}), [host]: true },
   };
 }
 
@@ -230,8 +338,11 @@ export function beginMove(state: SourcesState, host: string): SourcesState | nul
 export function moveConfirmed(state: SourcesState, host: string, seq: number, row: SourceRow): SourcesState {
   const moving = { ...state.moving };
   delete moving[host];
+  const unverified = { ...(state.unverified ?? {}) };
+  delete unverified[host];
   return {
     ...state,
+    unverified,
     rows: { ...state.rows, [host]: row },
     applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
     moving,

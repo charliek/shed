@@ -9,7 +9,8 @@ pub mod timefmt;
 
 pub use auth_modes::{AuthModeRegistry, AuthModeState};
 pub use backend::{
-    Backend, HostDiskUsage, HostEgressProfiles, HostFailure, HostFailureKind, HostSource, RcTarget,
-    Reachability, SourceMachineRow,
+    source_error_class, source_error_words, Backend, HostDiskUsage, HostEgressProfiles,
+    HostFailure, HostFailureKind, HostSource, RcTarget, Reachability, SourceMachineRow,
+    SourceServiceRow, SOURCE_ERROR_CLASSES, SOURCE_SERVICE_URL_MAX_BYTES,
 };
 pub use mock_url::mock_url_for;

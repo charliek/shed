@@ -245,6 +245,60 @@ def test_a_request_is_answered_with_every_providers_items(settings):
                                                          "ENVSECRETS_PASSPHRASE"}
 
 
+def test_delivery_recent_lists_the_answers_with_no_value(settings):
+    """`delivery.recent` is the answers this machine gave, newest first: when, the
+    server, the shed, each item by name, target, size and fingerprint, the problems,
+    and what the server made of it. No value or content reaches it."""
+    c = settings
+    first = c.mock.push_delivery_request(shed="first", repo="example/widgets")
+    c.mock.await_delivery_answer(first["id"], timeout=30)
+    second = c.mock.push_delivery_request(shed="second", backend="firecracker")
+    ans = c.mock.await_delivery_answer(second["id"], timeout=30)
+
+    def newest() -> list[dict]:
+        return c.client.call("delivery.recent")["recent"]
+
+    c.client.wait_until(lambda: newest()[0]["outcome"] == {"outcome": "accepted"},
+                        timeout=10, what="the newest answer's outcome")
+    rows = newest()
+    assert [r["request"] for r in rows[:2]] == [second["id"], first["id"]], rows[:2]
+    top = rows[0]
+    assert (top["server"], top["shed"], top["reason"]) == (SERVER, "second", "create"), top
+    assert top["at"].endswith("Z"), top
+    assert top["problems"] == [], top
+    posted = {i["name"]: i for i in ans["body"]["items"]}
+    assert {i["name"] for i in top["items"]} == set(posted), top["items"]
+    for it in top["items"]:
+        assert set(it) <= {"name", "provider", "kind", "stage", "base", "target", "mode",
+                           "size", "fingerprint", "expires_at"}, it
+        assert it["fingerprint"] == posted[it["name"]]["fingerprint"], it
+    shown = json.dumps(rows)
+    for s in SENTINELS:
+        assert s not in shown, s
+    assert rows == c.client.call("delivery.status")["recent"][:len(rows)]
+
+
+def test_delivery_describe_names_every_provider(client):
+    """`delivery.describe` is the providers' descriptors, in the order they are asked:
+    what a form is drawn from (a title, a summary, where the items land, the fields)."""
+    providers = client.call("delivery.describe")["providers"]
+    assert [p["name"] for p in providers] == ["ssh-key", "github", "api-keys",
+                                              "envsecrets-login", "files"]
+    for p in providers:
+        assert p["title"] and p["summary"] and p["lands"], p
+        assert p["fields"], p
+        for f in p["fields"]:
+            assert f["kind"] in ("text", "secret", "file", "path", "switch", "list"), f
+            assert f["place"] in ("machine", "service", "both"), f
+    ssh = providers[0]
+    key_file = next(f for f in ssh["fields"] if f["key"] == "key_file")
+    assert key_file["required"] is True and key_file["place"] == "machine", key_file
+    files = next(p for p in providers if p["name"] == "files")
+    entry = next(f for f in files["fields"] if f["entry"])
+    assert entry["scoped"] is True, entry
+    assert {f["key"] for f in entry["entry"]} >= {"from", "to", "mode"}, entry
+
+
 def test_each_only_rule_is_honoured(settings):
     c = settings
     # Server, backend and repo rules, each on its own provider, set through the op.
@@ -357,6 +411,15 @@ def test_delivery_set_round_trips_and_refuses_without_writing(settings):
             c.client.call("delivery.set", params)
         assert e.value.code == "bad_request", params
         assert "SENTINEL" not in str(e.value), str(e.value)
+    assert c.settings.read_text() == before
+    # A provider cannot be written on without what it needs (plan 040 §3.9): the
+    # fixed class `incomplete`, and the file is left as it was.
+    for provider, config in (("ssh-key", {"enabled": True}),
+                             ("envsecrets-login", {"enabled": True}),
+                             ("files", {"enabled": True, "file": []})):
+        with pytest.raises(ShedError) as e:
+            c.client.call("delivery.set", {"provider": provider, "config": config})
+        assert e.value.code == "incomplete", (provider, e.value)
     assert c.settings.read_text() == before
     # null removes the provider.
     out = c.client.call("delivery.set", {"provider": "files", "config": None})

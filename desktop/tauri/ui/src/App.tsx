@@ -1,11 +1,11 @@
-/* shed desktop — the app shell (Plex reskin). Sidebar + header + the four panes,
+/* shed desktop — the app shell (Plex reskin). Sidebar + header + the five panes,
    over live shed-core data. Nav is driven by clicks AND by the Rust `ui.navigate`
    op (via the `navigate` Tauri event); the rendered pane + a computed-style sample
    are reported back to Rust (useUiBridge) so the harness can assert them over IPC.
    The shared visual vocabulary lives in components/{primitives,dialog}. */
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  Boxes, Sparkles, ScrollText, HardDrive, Box, Plus,
+  Boxes, Sparkles, KeyRound, ScrollText, HardDrive, Box, Plus,
   Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink,
   Moon, Sun, Settings, X, ChevronDown, ChevronRight,
 } from "lucide-react";
@@ -37,6 +37,7 @@ import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstra
 import { DeliveryBadge, ShedDeliveryDetail, provisionRunOf, useShedDelivery, type ShedDeliveryState } from "@/components/ShedDelivery";
 import { readDelivery } from "@/lib/delivery";
 import { ShedEgressDetail } from "@/components/ShedEgress";
+import { CredentialsView, useCredentialSources } from "@/components/CredentialsView";
 import {
   EMPTY_FEED, actorText, appendPage, deliveryText, errorText, outcomeTone, readPage,
   type ActivityFeed,
@@ -73,6 +74,7 @@ function eventTime(ts: string): string {
 const NAV: [Pane, string, typeof Box][] = [
   ["sheds", "Sheds", Boxes],
   ["agents", "Agents", Sparkles],
+  ["credentials", "Credentials", KeyRound],
   ["activity", "Activity", ScrollText],
   ["system", "System", HardDrive],
 ];
@@ -1269,7 +1271,16 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 
 /* ---- shell ---------------------------------------------------------------- */
 export default function App() {
-  const [pane, setPane] = useState<Pane>("sheds");
+  const [pane, setPaneState] = useState<Pane>("sheds");
+  // Each time the Credentials view is navigated to (a click or `ui.navigate`), even
+  // when it is shown already, it reads everything again.
+  const [credentialsShown, setCredentialsShown] = useState(0);
+  const setPane = useCallback((p: Pane) => {
+    setPaneState(p);
+    if (p === "credentials") setCredentialsShown((n) => n + 1);
+  }, []);
+  // Who answers on each server: held here so the last known rows outlive the view.
+  const credentialSources = useCredentialSources(pane === "credentials", credentialsShown);
   // The open shed delivery detail, its `ui.show_shed_delivery` doors, and every
   // shed's Deliver again run (plan 039 A7).
   const shedDelivery = useShedDelivery(setPane);
@@ -1762,13 +1773,14 @@ export default function App() {
               key={id}
               onClick={() => setPane(id)}
               className={cn("nav-item mb-0.5 flex w-full items-center gap-[11px] rounded-[9px] px-[11px] py-2 text-left text-[13.5px] font-semibold", active && "is-active")}
+              data-nav={id}
               style={{
                 background: active ? "color-mix(in srgb, var(--shed-accent) 14%, transparent)" : "transparent",
                 color: active ? "var(--shed-accent)" : "var(--shed-text-secondary)",
               }}
             >
               <Icon size={18} className="flex-none" style={{ color: active ? "var(--shed-accent)" : "var(--shed-text-secondary)" }} />
-              <span className="flex-1">{label}</span>
+              <span className="flex-1" data-nav-label>{label}</span>
               {badge != null && (
                 <span
                   className="rounded-full px-2 py-0.5 font-mono text-[11px] font-semibold leading-none"
@@ -1850,6 +1862,9 @@ export default function App() {
                   }
                 }}
               />
+            )}
+            {pane === "credentials" && (
+              <CredentialsView sources={credentialSources} sheds={sheds} shown={credentialsShown} />
             )}
             {pane === "activity" && <ActivityPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}

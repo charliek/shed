@@ -26,6 +26,7 @@ pub(crate) fn fast() -> Timing {
         answer_timeout: Duration::from_secs(5),
         header_timeout: Duration::from_secs(5),
         refresh_check: Duration::from_secs(60),
+        service_recheck: Duration::from_secs(60),
     }
 }
 
@@ -397,6 +398,7 @@ async fn refusal_fields_outside_the_closed_lists_are_unknown() {
         .contains("SENTINEL"));
     assert_eq!(known_code("not_stream_owner"), "not_stream_owner");
     assert_eq!(known_code("SOURCE_NOT_BOUND"), "SOURCE_NOT_BOUND");
+    assert_eq!(known_code("SOURCE_IS_SERVICE"), "SOURCE_IS_SERVICE");
     assert_eq!(known_code("source_not_bound"), UNKNOWN);
     assert_eq!(known_code(""), "");
     assert_eq!(known_rule("duplicate_target"), "duplicate_target");
@@ -509,6 +511,17 @@ fn refusals_are_classified_by_status_and_code() {
     assert_eq!(
         c(409, r#"{"error":{"code":"SOURCE_DUPLICATE_STREAM"}}"#),
         ErrorClass::Duplicate
+    );
+    assert_eq!(
+        c(
+            409,
+            include_str!("../../../fixtures/sources/source-is-service.json")
+        ),
+        ErrorClass::SourceIsService
+    );
+    assert_eq!(
+        c(403, r#"{"error":{"code":"SOURCE_IS_SERVICE"}}"#),
+        ErrorClass::Forbidden
     );
     assert_eq!(c(409, "{}"), ErrorClass::BadStatus);
     assert_eq!(c(429, ""), ErrorClass::RateLimited);
@@ -826,4 +839,179 @@ async fn a_validated_name_connects_only_to_its_validated_address() {
         &mixed
     )
     .is_err());
+}
+
+/// The `409 SOURCE_IS_SERVICE` body the server answers on every source route for a user
+/// the account service answers for (the shared fixture, `crates/fixtures/sources/`).
+pub(crate) const SOURCE_IS_SERVICE_BODY: &str =
+    include_str!("../../../fixtures/sources/source-is-service.json");
+
+/// A check that answers from a script (then `then`), counting its calls.
+pub(crate) fn scripted_check(
+    script: Vec<ServiceCheck>,
+    then: ServiceCheck,
+) -> (SourceCheck, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+    let counted = calls.clone();
+    let check: SourceCheck = Arc::new(move |t: &ServerTarget| {
+        assert_eq!(t.name, "mini");
+        counted.fetch_add(1, Ordering::SeqCst);
+        let next = script.lock().unwrap().pop_front().unwrap_or(then);
+        Box::pin(async move { next })
+    });
+    (check, calls)
+}
+
+fn run_checked(fake: &Fake, timing: Timing, check: Option<SourceCheck>) -> Running {
+    let client = DeliveryClient::new(&target(&fake.url), machine(), Arc::new(NoCredentials))
+        .unwrap()
+        .with_timing(timing)
+        .with_service_check(check, None);
+    let status = new_status();
+    let (stop, rx) = watch::channel(false);
+    let st = status.clone();
+    let task = tokio::spawn(async move { client.run(Arc::new(Recorder::default()), st, rx).await });
+    Running { status, stop, task }
+}
+
+/// `409 SOURCE_IS_SERVICE` is settled, not a failure: the state says the account
+/// service answers, the class is from the closed list (never the server's words), and
+/// no stream is tried again on the backoff, however short it is.
+#[tokio::test]
+async fn the_account_service_is_a_settled_state_with_no_reconnect() {
+    let fake = Fake::start().await;
+    for _ in 0..20 {
+        fake.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+    }
+    let (check, calls) = scripted_check(Vec::new(), ServiceCheck::Service);
+    let r = run_checked(&fake, fast(), Some(check));
+    r.wait_status("settled on the service", |s| {
+        s.state == StreamState::Service
+    })
+    .await;
+    // Ten floors of the backoff, and then some: not one more attempt.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(fake.streams().len(), 1, "{:?}", fake.streams());
+    let s = r.status();
+    assert_eq!(s.state, StreamState::Service);
+    assert_eq!(s.last_error, Some(ErrorClass::SourceIsService));
+    assert_eq!(s.service_checks, 0, "the timer has not come round");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let shown = serde_json::to_string(&s).unwrap();
+    assert!(shown.contains(r#""state":"service""#), "{shown}");
+    assert!(
+        shown.contains(r#""last_error":"source_is_service""#),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("account service is"),
+        "no server text: {shown}"
+    );
+    // A shutdown while settled ends it at once.
+    assert_eq!(r.stop().await.state, StreamState::Stopped);
+}
+
+/// A settled stream checks on its timer: while the check says the service still
+/// answers, or cannot tell, it stays settled and tries no stream; once it says
+/// otherwise, the stream is opened again at once (from the backoff's floor).
+#[tokio::test]
+async fn a_settled_stream_rechecks_on_its_timer_and_reopens_when_the_service_stops() {
+    let fake = Fake::start().await;
+    fake.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+    let (check, calls) = scripted_check(
+        vec![
+            ServiceCheck::Service,
+            ServiceCheck::Unknown,
+            ServiceCheck::Service,
+        ],
+        ServiceCheck::NotService,
+    );
+    let r = run_checked(
+        &fake,
+        Timing {
+            service_recheck: Duration::from_millis(60),
+            ..fast()
+        },
+        Some(check),
+    );
+    fake.wait_streams(1).await;
+    r.wait_status("connected again", |s| s.state == StreamState::Connected)
+        .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "three that stayed, one that left"
+    );
+    let opened = fake.streams();
+    assert_eq!(opened.len(), 2, "the refused one, then the reopened one");
+    let rested = opened[1].at - opened[0].at;
+    assert!(rested >= Duration::from_millis(4 * 60), "{rested:?}");
+    let s = r.stop().await;
+    assert_eq!(s.service_checks, 4);
+    assert_eq!(s.last_error, None, "the 200 cleared it");
+}
+
+/// With no check (no control-scope client to ask), the timer alone wakes a settled
+/// stream, which tries the stream itself again.
+#[tokio::test]
+async fn with_no_check_the_timer_tries_the_stream_again() {
+    let fake = Fake::start().await;
+    fake.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+    fake.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+    let r = run_checked(
+        &fake,
+        Timing {
+            service_recheck: Duration::from_millis(80),
+            ..fast()
+        },
+        None,
+    );
+    fake.wait_streams(1).await;
+    let opened = fake.streams();
+    assert_eq!(opened.len(), 3);
+    for pair in opened.windows(2) {
+        assert!(
+            pair[1].at - pair[0].at >= Duration::from_millis(80),
+            "{opened:?}"
+        );
+    }
+    assert_eq!(r.stop().await.service_checks, 2);
+}
+
+/// A change of the server list wakes a settled stream at once, long before its timer;
+/// a change from before it settled does not count.
+#[tokio::test]
+async fn a_server_list_change_rechecks_at_once() {
+    let fake = Fake::start().await;
+    fake.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+    let (check, calls) = scripted_check(vec![ServiceCheck::Service], ServiceCheck::NotService);
+    let (list, list_rx) = watch::channel(0u64);
+    list.send_modify(|n| *n += 1);
+    let client = DeliveryClient::new(&target(&fake.url), machine(), Arc::new(NoCredentials))
+        .unwrap()
+        .with_timing(fast())
+        .with_service_check(Some(check), Some(list_rx));
+    let status = new_status();
+    let (stop, rx) = watch::channel(false);
+    let st = status.clone();
+    let task = tokio::spawn(async move { client.run(Arc::new(Recorder::default()), st, rx).await });
+    let r = Running { status, stop, task };
+    r.wait_status("settled", |s| s.state == StreamState::Service)
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the earlier change is not one"
+    );
+    // The first change: the service still answers.
+    list.send_modify(|n| *n += 1);
+    r.wait_status("one check", |s| s.service_checks == 1).await;
+    assert_eq!(r.status().state, StreamState::Service);
+    // The second: it no longer does, and the stream opens.
+    list.send_modify(|n| *n += 1);
+    fake.wait_streams(1).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    r.stop().await;
 }

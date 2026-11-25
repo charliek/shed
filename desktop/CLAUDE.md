@@ -125,6 +125,16 @@ This machine's identity is `<state>/broker/machine.json` and the credentials-sco
 `shed_source::paths::state_dir`, `SHED_BROKER_STATE_DIR` overrides it; the paths are the
 retired broker's, kept so no pin or certificate is lost); that id is the only one
 `source.use` sends (`src/source.rs`), and a move reopens that server's delivery stream.
+The sidebar's **Credentials** view (plan 040 §3.9; Preferences keeps General and Terminal)
+is plain components over `ui/src/lib/credentials.ts`, which holds every decision (row
+states, scope wording, what a form requires, what Check sends; its tests are in the
+explicit list in `ui/package.json`), so a port is a port of that module and a redraw.
+Its forms come from `delivery.describe`'s descriptors. "Stop answering from here" sticks
+through `paused-servers.json` beside `machine.json` (`src/source.rs`; unbind and use are
+serialised per server). A server where the account service answers is a settled state,
+`kind: service`, with no action. IPC for it: `sources.list`, `source.unbind`,
+`delivery.describe`, `delivery.recent`, `credentials.dump`, `sidebar.dump`, `ui.fill_check`,
+`ui.press_check`, `ui.press_source_unbind` (the Preferences provisioning doors and the `source_status` command are gone).
 The egress decision feed (`src/egress.rs`, `shed_desktop_core::egress`) is the other
 long-lived consumer: `egress.recent` / `egress.status` / `egress.server_profiles`. Both
 drain first at shutdown (`Shutdown::set_source_drain`).

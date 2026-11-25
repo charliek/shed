@@ -99,9 +99,21 @@ shedctl (no internal deps)
   in-process fake server, mTLS included), `credentials` (`SourceCredentials`: the
   credentials-scope certificate from the durable store, fenced by its stream task's stop
   signal so a retired task writes nothing), `tasks` (`SourceTasks`: one stream per server, reconciled with the
-  list; `restart` reopens one server's stream at once, after "Use this machine") and
+  list; `restart` reopens one server's stream at once, after "Answer from here") and
   `token_minter` (`SourceTokenMinter`: shed-core's `TokenMinter` over the control-token
   provider, refusing every credential shape but one complete one).
+  Plan 040 adds three things. A `409 SOURCE_IS_SERVICE` on the stream is a **settled
+  state** (the account service answers for that user): no backoff loop; the stream is
+  re-checked through `GET /api/sources` every five minutes and on a server-list change,
+  using the app's control-scope client for the server as configured now, not the
+  start-up clients. A per-server **paused set** (`paused-servers.json` beside
+  `machine.json`, atomic, `0600`; an unreadable file pauses every server and says so)
+  keeps a server's stream from being opened until "Answer from here"; a server that leaves
+  the config keeps its pause (the name is inert), so one added back is still paused. And `unbind`/`use` are **serialised per server**: unbind pauses first, waits
+  for that server's stream task to end, sends the unbind, re-reads the binding and
+  unbinds once more if a late admission re-bound this machine. Provider forms are
+  descriptor-driven (`shed-provision-providers` descriptors through `delivery.describe`),
+  so a new provider or field needs no UI code.
   `minter`'s `CredentialSource` takes a process-wide turn per store, server and scope
   around its mint and store write and re-reads the store first (adopting a fresher
   certificate another source stored), so two sources never mint twice at once; a source whose group was stopped gives up its turn at once.

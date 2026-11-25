@@ -61,7 +61,7 @@ See [The credential source for delivery](#the-credential-source-for-delivery).
 | Part | Where | Role |
 |---|---|---|
 | Rust shell | `desktop/tauri/src-tauri/src/` | The Tauri app: `lib.rs` (setup, the Tauri commands the UI invokes), `ipc.rs` (the control socket and its op dispatch), `delivery.rs` and `source.rs` (the delivery runtime's and the credential-source IPC ops' adapters), `egress.rs` (the egress feed), `tray.rs` (tray menu + macOS popover), `updater.rs` (Sparkle, macOS), thin adapters over `shed-desktop-core` (`ShedHosts`, `ShedCraze`, `ShedLanes`), `termctl.rs` (terminal launch), `prefs.rs` (persisted preferences), `screenshot.rs`, `single_instance.rs`, `shutdown.rs`, `applog.rs` |
-| Web UI | `desktop/tauri/ui/` | React + Vite + TypeScript: the dashboard (`App.tsx`), the Preferences window, the macOS tray popover, and the agent-lane panels. It reports what it rendered back to the shell, which is what the IPC `*.dump` ops answer from |
+| Web UI | `desktop/tauri/ui/` | React + Vite + TypeScript: the dashboard (`App.tsx`, including the Credentials view), the Preferences window (General and Terminal), the macOS tray popover, and the agent-lane panels. It reports what it rendered back to the shell, which is what the IPC `*.dump` ops answer from |
 | Shared core | `crates/` | `shed-lane` (lane contract, RC DTOs, slash menu), `shed-core` (protocol, config), `shed-roost` (roost client; the only `roost-ipc` crate), `shed-app` (`Backend`), `shed-desktop-core` (shed-only hosts, craze and lanes, the delivery runtime, the egress feed), `shed-source` (machine identity, certificate store, control-token minting and the delivery stream client), `shed-provision` and `shed-provision-providers` (the delivery contract and the five providers), `shed-craze` (the lane adapter) — see [Rust core](rust-core.md) |
 | `shedctl` | `crates/shedctl/` | A headless CLI for the control socket — see [shedctl](cli.md) |
 | Bundled openers | `desktop/Resources/bin/` | `shed-open-ghostty` and `shed-open-roost.py`, the terminal presets' launch scripts, shipped as app resources |
@@ -85,7 +85,7 @@ whole list.
 | Disk usage | `GET /api/system/df` | the **System** pane (per-host totals + entries) |
 | Lifecycle | `POST /api/sheds/{name}/start\|stop\|reset`, `DELETE /api/sheds/{name}` | |
 | Create | `POST /api/sheds` with `Accept: text/event-stream` | **SSE** stream: `progress…` → `complete` / `error` |
-| Credential sources | `GET /api/sources`, `POST /api/sources/use` | Preferences' source rows and **Use this machine**; a plain `404` means the server predates them (see [Machine identity and the credential source](#machine-identity-and-the-credential-source)) |
+| Credential sources | `GET /api/sources`, `POST /api/sources/use` | the Credentials view's **Answer from here**; `POST /api/sources/unbind` for **Stop answering from here**; a plain `404` means the server predates them (see [Machine identity and the credential source](#machine-identity-and-the-credential-source)) |
 | Activity | `GET /api/activity` | the **Activity** pane: every configured server's events, merged newest first |
 | Egress | `GET /api/egress/stream`, the egress profile routes | a shed's recent blocks in its detail; the profiles listed in **System** |
 
@@ -101,7 +101,7 @@ The app never exposes a server further.
 
 ### The credential source for delivery
 
-The app runs one delivery stream per configured server (`shed-source`, built on the machine identity and certificate store, which keep their paths from earlier releases). The server asks the stream's machine, the user's bound one, for a shed's credentials; the app answers with `shed-provision` and the five providers from `delivery.toml`, re-read for each request. The answer is built and sent with no prompt. The app starts with the stream and stops with it: quitting the app stops delivery, so credentials are delivered only while the app is running. The app turns on launch at login the first time it starts (see [Installation](installation.md#credential-source)). See [Provisioning](provisioning.md) and [Credential delivery](../reference/delivery.md).
+The app runs one delivery stream per configured server (`shed-source`, built on the machine identity and certificate store, which keep their paths from earlier releases). The server asks the stream's machine, the user's bound one, for a shed's credentials; the app answers with `shed-provision` and the five providers from `delivery.toml`, re-read for each request. The answer is built and sent with no prompt. The app starts with the stream and stops with it: quitting the app stops delivery, so credentials are delivered only while the app is running. The app turns on launch at login the first time it starts (see [Installation](installation.md#credential-source)). See [Credentials](credentials.md) and [Credential delivery](../reference/delivery.md).
 
 - **Multi-server:** one app holds a stream per server; requests carry the server so identical shed names on different servers do not collide, and the `only.servers` rule is judged against the server a request came in on.
 - **No approvals:** earlier releases embedded a credential broker and an approval gate (Touch ID, a Linux polkit prompt, an Approvals pane). They are gone: a delivered credential is inside the shed while it runs, usable by anything there. See [Credentials in a shed](../guides/credentials-in-a-shed.md#the-trade).
@@ -119,11 +119,11 @@ The app loads the identity when it starts. An identity it cannot load does not s
 runs without one (a server with credential sources then refuses it) and
 `source.status.this_machine_error` says why.
 
-Preferences → Provisioning shows this machine's name and, per server, the source and a
-**Use this machine** button (see [Configuration → Credential sources](configuration.md#credential-sources)).
+The sidebar's Credentials view shows this machine's name and, per server, who answers and an
+**Answer from here** or **Stop answering from here** button (see [Configuration → Credential sources](configuration.md#credential-sources)).
 The button calls `POST /api/sources/use` with this machine's own id over the app's ordinary
 control-scope client, then reopens the delivery stream so it connects at once. The same
-calls are the IPC ops `source.status` and `source.use`.
+calls are the IPC ops `sources.list`, `source.use` and `source.unbind`.
 
 ### The shed CLI config
 
@@ -132,8 +132,7 @@ shed-desktop reads the **same config the `shed` CLI manages** — `~/.shed/confi
 no YAML dependency), reading `servers:` (name → `host`, `http_port`, `ssh_port`, and the
 secure-server fields) and `default_server`. It does not read or write a `machines:` block.
 The CLI keeps any `machines:` block it finds and preserves it as an opaque YAML subtree on save (formatting and indentation may be normalized on re-encode). To add or remove
-hosts, use the `shed` CLI; the app reflects the change on its next poll (the Preferences →
-Hosts section is a read-only mirror). A missing config degrades to an empty host list, never
+hosts, use the `shed` CLI; the app reflects the change on its next poll . A missing config degrades to an empty host list, never
 a crash.
 
 ### The control socket (shedctl + the harness)
@@ -201,8 +200,9 @@ exits on its own once its 60-second `ControlPersist` lapses.
 | What | Where | Notes |
 |---|---|---|
 | Preferences | `prefs.json` in the app config dir: macOS `~/Library/Application Support/ai.stridelabs.ShedDesktop/`, Linux `${XDG_CONFIG_HOME:-~/.config}/ai.stridelabs.shed-desktop/` | terminal preset + template, and whether the launch-at-login default was applied. See [Configuration](configuration.md). |
-| Delivery settings | `delivery.toml` in `~/.config/shed/` | the five providers and their `only` rules; read again for every request. See [Provisioning](provisioning.md). |
+| Delivery settings | `delivery.toml` in `~/.config/shed/` | the five providers and their `only` rules; read again for every request. See [Credentials](credentials.md). |
 | Control socket + lock | `$XDG_RUNTIME_DIR/shed-tauri.{sock,lock}`, else `/tmp/shed-tauri-<uid>/` | `SHED_TAURI_SOCKET` moves the socket; the lock sits beside it. |
+| Paused servers | `broker/paused-servers.json` beside `machine.json` (`0600`) | the servers this machine was told to stop answering on; an unreadable file pauses every server. See [Credentials](credentials.md#where). |
 | Machine identity | `broker/machine.json` in the state directory: macOS `~/Library/Application Support/shed/`, Linux `$XDG_DATA_HOME/shed/` else `~/.local/share/shed/` | Created on first use. `SHED_BROKER_STATE_DIR` moves the directory. See [Credential Source](../extensions/source-binding.md#machine-identity). |
 | Client certificates | `broker/creds/credentials/<server>/` in the same directory | The app's client certificate and key per server (`0600`). |
 | Log | macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`; Linux `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log` | The Tauri app's own lines and the shed crates' `tracing` events (INFO and up, including the delivery streams' connects, drops and refusals such as `not_bound` and `duplicate`, each naming its `server=`), every line stamped `<RFC 3339 UTC> <LEVEL>` and also written to stderr. `SHED_TAURI_LOG=debug` raises the shed crates to DEBUG and adds roost-ipc's events, which are off without it. Rotates at 5 MiB, keeping `.log.1`–`.log.3`. The file is private (`0600`, under your own directories; those the app creates are `0700`) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's own stderr. `SHED_TAURI_LOG_FILE` overrides the path, which must name a regular file: a symlink there is refused, never followed, as is a FIFO or a device. `identify.log_path` reports the file in use (`null` when file logging is off — a destination that cannot be opened, or a failed write, falls back to stderr only, said once). Opened only once the single-instance lock is held, so a second launch that raises the running app never writes it; a launch whose lock check fails carries on with stderr only. A dev build run beside the installed app (a different `SHED_TAURI_SOCKET`) shares this default path; set `SHED_TAURI_LOG_FILE` to keep them apart. |
@@ -217,7 +217,7 @@ The UI and the IPC socket see only names, targets, sizes and fingerprints, never
 value.
 
 A delivery answer is built without a prompt for any configured server that asks, so the
-`only.servers` rule of each provider is the control that matters (see [Provisioning](provisioning.md#the-only-rules)). The app adds no remote attack surface: it makes outbound HTTP/UDS connections and serves one local
+`only.servers` rule of each provider is the control that matters (see [Credentials](credentials.md#the-only-rules)). The app adds no remote attack surface: it makes outbound HTTP/UDS connections and serves one local
 `0600` socket. Sparkle auto-update authenticity rests on an **EdDSA
 signature** over each release, independent of Apple notarization (see
 [RELEASING](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md)).

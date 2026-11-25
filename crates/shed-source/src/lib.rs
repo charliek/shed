@@ -34,6 +34,7 @@ pub mod discovery;
 pub mod machine;
 pub mod minter;
 pub mod paths;
+pub mod paused;
 pub mod target;
 pub mod tasks;
 pub mod time;

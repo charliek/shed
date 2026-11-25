@@ -688,7 +688,7 @@ A script key cannot use these commands. Machine names come from the machines,
 so every output is escaped for the terminal. Against a server older than
 v0.10.0 the commands say the server does not support credential sources.
 `shed source status` reads the server; it does not say whether the machine you
-run it on is the source (the desktop app's Preferences and the `source.status` IPC op do).
+run it on is the source (the desktop app's Credentials view does; the `source.status` IPC op remains for the test harness).
 
 ## Egress Control
 

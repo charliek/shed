@@ -25,7 +25,12 @@ got them. These cells speak HTTP to the mock directly (no app), as two machines:
 * the move's refusal codes are the server's own (an unconfirmed move is 500
   INTERNAL_ERROR);
 * `pause()` / `resume()` take the server down and back on the same port, ending
-  every stream (and so failing its pending requests).
+  every stream (and so failing its pending requests);
+* for a user the account service answers for (plan 040 §3.2) every source route —
+  the stream, an answer, a move, an unbind — is `409 SOURCE_IS_SERVICE` with the
+  shared fixture's body, and when it stops, the first machine to connect is bound;
+* an unbind forgets the binding and the remembered machines and ends the streams, and
+  the first machine to connect next is bound again (the server's first-connect rule).
 """
 
 from __future__ import annotations
@@ -101,6 +106,20 @@ def _use(mock, machine_id) -> tuple[int, dict]:
     body = json.loads(r.read())
     c.close()
     return r.status, body
+
+
+def _unbind(mock, body: object = None) -> tuple[int, object]:
+    c = _conn(mock)
+    raw = b"" if body is None else json.dumps(body).encode()
+    c.request("POST", "/api/sources/unbind", body=raw,
+              headers={"Content-Type": "application/json"})
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    try:
+        return r.status, json.loads(data)
+    except ValueError:
+        return r.status, data.decode()
 
 
 def _get(mock, path: str) -> dict:
@@ -275,5 +294,76 @@ def test_a_service_source_serves_the_shared_shapes(state):
         assert _get(mock, "/api/sources") == want
         assert want["binding"]["delivery"][0]["kind"] == "service"
         assert SOURCE_IS_SERVICE_BODY["error"]["code"] == "SOURCE_IS_SERVICE"
+    finally:
+        mock.stop()
+
+
+def test_every_source_route_refuses_a_service_user_then_first_connect_binds():
+    """While the account service answers for the user, the stream, an answer, a move
+    and an unbind are each `409 SOURCE_IS_SERVICE` with the shared body, and a stream
+    that was live when it began ends. When it stops, no machine is bound: the first
+    stream is admitted and bound."""
+    from mockserver import SOURCE_IS_SERVICE_BODY
+    mock = MockShedServer()
+    mock.start()
+    try:
+        mock.arm_source(DESK, "desk")
+        c_live, live = _stream(mock, DESK, "desk")
+        assert live.status == 200
+        mock.serve_service_source()
+        _wait(lambda: not mock._dlv_live, "the live stream ended")
+        c_live.close()
+        for mid in (DESK, LAPTOP):
+            c, refused = _stream(mock, mid, "m")
+            assert refused.status == 409, refused.status
+            assert json.loads(refused.read()) == SOURCE_IS_SERVICE_BODY
+            c.close()
+        assert _answer(mock, DESK, "ab" * 16, "cd" * 16) == (409, SOURCE_IS_SERVICE_BODY)
+        assert _use(mock, DESK) == (409, SOURCE_IS_SERVICE_BODY)
+        assert _unbind(mock) == (409, SOURCE_IS_SERVICE_BODY)
+        assert mock.source_unbind_requests() == [{}]
+        doc = _get(mock, "/api/sources")
+        assert doc["binding"]["delivery"][0]["kind"] == "service", doc
+
+        mock.stop_service_source()
+        assert _get(mock, "/api/sources")["binding"] is None
+        c, admitted = _stream(mock, LAPTOP, "laptop")
+        assert admitted.status == 200, admitted.status
+        assert mock.source_bound() == LAPTOP
+        c.close()
+    finally:
+        mock.stop()
+
+
+def test_an_unbind_forgets_the_source_and_the_next_machine_is_bound(armed):
+    mock = armed
+    c_live, live = _stream(mock, DESK, "desk")
+    assert live.status == 200
+    status, body = _unbind(mock)
+    assert status == 200, body
+    assert body == {"user": "mock-user", "unbound": True,
+                    "previous": {"id": DESK, "name": "desk"}, "forgotten_machines": 1}
+    assert mock.source_bound() is None
+    _wait(lambda: not mock._dlv_live, "the user's stream ended")
+    c_live.close()
+    assert _get(mock, "/api/sources") == {"user": "mock-user", "binding": None, "machines": []}
+    # Nothing left to clear: a success that changed nothing.
+    assert _unbind(mock, {}) == (200, {"user": "mock-user", "unbound": False,
+                                       "previous": None, "forgotten_machines": 0})
+    assert _unbind(mock, {"machine_id": DESK})[0] == 400
+    # First-connect: the next machine's stream is admitted and bound.
+    c, admitted = _stream(mock, LAPTOP, "laptop")
+    assert admitted.status == 200
+    assert mock.source_bound() == LAPTOP
+    c.close()
+    assert len(mock.source_unbind_requests()) == 3
+
+
+def test_an_unarmed_server_has_no_unbind_route():
+    mock = MockShedServer()
+    mock.start()
+    try:
+        status, body = _unbind(mock)
+        assert (status, body) == (404, "404 page not found\n")
     finally:
         mock.stop()

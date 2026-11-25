@@ -95,11 +95,11 @@ starts, it turns on **launch at login**, so credentials keep being delivered whe
 are logged in (they are delivered only while the app is running). The first of your
 machines to connect to a server becomes your credential source there. The app only knows servers in `~/.shed/config.yaml`, so run `shed server add` from the next step first if you have not.
 
-Open **Preferences → Provisioning** from the menu-bar dropdown. Turn on the providers you want
+Open **Credentials** in the app's sidebar. Turn on the providers you want
 (`ssh-key`, `github`, `api-keys`, `envsecrets-login`, `files`) and give each an `only.servers`
-rule naming the servers you trust with it. The **Preview** shows what a shed would get, with
+rule naming the servers you trust with it. **Check** shows what a shed would get, with
 sizes and fingerprints and never a value. Nothing is delivered until you turn a provider on.
-See [Desktop provisioning](../desktop/provisioning.md) and
+See [Desktop credentials](../desktop/credentials.md) and
 [Credentials in a shed](../guides/credentials-in-a-shed.md), including what it means that a
 usable credential is inside the shed while it runs.
 

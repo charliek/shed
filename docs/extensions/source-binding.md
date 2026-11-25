@@ -87,8 +87,8 @@ The server keeps one pin per user. It is set in one of two ways:
   user is bound (the pin records `first-connect` as who bound it). The app opens a stream to
   **every server in your shed config**, so you do not choose a server for it to ask: the
   first of your machines to sign in to a server becomes your source there.
-- **On purpose, by moving it.** **Use this machine** in the app's Preferences, under
-  **Provisioning**, or `shed source use` (the app's IPC op is `source.use`).
+- **On purpose, by moving it.** **Use this machine** in the app's
+  [Credentials view](../desktop/credentials.md), or `shed source use` (the app's IPC op is `source.use`).
 
 A pin can also be **cleared** with `shed source unbind` (see [Clearing the
 source](#clearing-the-source)); the next machine to connect is then bound, as the first one
@@ -130,11 +130,9 @@ first machine to connect for each user becomes its source.
 
 A machine that is not the source shows it in these places:
 
-- The app's Preferences show the source's name on that server's row, with a **Use this
-  machine** button. A server that cannot be reached when Preferences reads it keeps the row
-  it last showed, marked **cannot reach the server**, and Preferences reads it again a few
-  times; a server that answers but is busy shows **server busy, retrying**. A server older
-  than credential sources has no row.
+- The app's [Credentials view](../desktop/credentials.md) shows the source's name for each
+  server, with an **Answer from here** button. A server older than credential sources has a
+  row that says so, with no action.
 - `delivery.status` (IPC) reports that server's stream as `not_bound`, or `duplicate` for a
   duplicate.
 - From a terminal, `shed source status` names the source and says whether it is connected.
@@ -165,9 +163,9 @@ its exact name, as `shed source ls` lists them; put `--` before a name that begi
 A machine appears in `shed source ls` only after its app has opened a stream to that server
 at least once. An admin can act on another user's source with `--user`.
 
-From the desktop app: Preferences → Provisioning lists one row per server that supports
+From the desktop app: the Credentials view lists each server that supports
 credential sources, and **Use this machine** makes the machine the app runs on the source
-there. See [Provisioning](../desktop/provisioning.md).
+there. See [Credentials](../desktop/credentials.md).
 
 What a move does:
 

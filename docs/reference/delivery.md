@@ -45,7 +45,7 @@ A bound machine that is not connected ends the delivery at once as `source_offli
 
 A person does not have to bind a machine on purpose: the **first machine that connects** for a user (the desktop app, signed in to that server) becomes the user's source. The desktop app opens a delivery stream to **every server in its shed config**, and answers each request without a prompt. So with a provider enabled, any server in that config can ask for that provider's items.
 
-A provider's `only` rules (in the app's `delivery.toml`, see [Provisioning](../desktop/provisioning.md#the-only-rules)) are what narrow this, and they do not all protect the same way:
+A provider's `only` rules (in the app's `delivery.toml`, see [Provisioning](../desktop/credentials.md#the-only-rules)) are what narrow this, and they do not all protect the same way:
 
 | Rule | Judged by | Holds against a dishonest server |
 |---|---|---|

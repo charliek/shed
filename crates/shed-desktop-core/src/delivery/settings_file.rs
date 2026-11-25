@@ -325,6 +325,12 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
         }
         _ => return Err(bad("config is not an object or null")),
     };
+    if let Some(why) = incomplete(&new) {
+        return Err((
+            "incomplete".to_string(),
+            format!("{provider} cannot be on: {why}"),
+        ));
+    }
     match provider {
         "ssh-key" => settings.ssh_key = new.ssh_key,
         "github" => settings.github = new.github,
@@ -333,6 +339,56 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
         _ => settings.files = new.files,
     }
     write(path, settings.to_toml().as_bytes()).map_err(|e| ("write_failed".to_string(), e))
+}
+
+/// The commands building an answer from `s` runs on this machine, by name: `gh` (the
+/// github provider, when on) and `passphrase_command` (envsecrets-login, when on with a
+/// command). What the Credentials view's Check says before it runs, and what
+/// `delivery.preview` holds a Check to.
+pub fn commands_run(s: &Settings) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if s.github.as_ref().is_some_and(|p| p.enabled) {
+        out.push("gh");
+    }
+    if s.envsecrets_login
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.passphrase_command.is_some())
+    {
+        out.push("passphrase_command");
+    }
+    out
+}
+
+/// Why a provider of `s` that is on could deliver nothing, in fixed words, or `None`:
+/// the descriptors' required machine fields, and what each provider needs to read
+/// anything (the Credentials view's form holds the same rules, so a provider can be
+/// turned on only once they are met). A provider that is off may be incomplete.
+fn incomplete(s: &Settings) -> Option<&'static str> {
+    if s.ssh_key
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.key_file.is_none())
+    {
+        return Some("the key file is required");
+    }
+    if s.api_keys
+        .as_ref()
+        .is_some_and(|p| p.enabled && !p.craze_providers && p.env_files.is_empty())
+    {
+        return Some("craze's providers.toml or an env file is required");
+    }
+    if s.envsecrets_login
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.passphrase_file.is_none() && p.passphrase_command.is_none())
+    {
+        return Some("a passphrase file or a passphrase command is required");
+    }
+    if s.files
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.files.is_empty())
+    {
+        return Some("at least one file is required");
+    }
+    None
 }
 
 /// An exclusive `flock` on `<settings>.lock` beside the settings file, held until drop.
@@ -446,6 +502,102 @@ mod tests {
             .iter()
             .find(|p| p["name"] == name)
             .unwrap()
+    }
+
+    /// A provider is written on only when it could deliver: its required fields are
+    /// there. Each incomplete one is refused with the fixed class `incomplete` and the
+    /// file is left as it was; written off, the same table is accepted.
+    #[test]
+    fn a_provider_is_written_on_only_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.toml");
+        set(&path, "github", &json!({"enabled": true})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for (provider, config, why) in [
+            (
+                "ssh-key",
+                json!({"enabled": true}),
+                "the key file is required",
+            ),
+            (
+                "ssh-key",
+                json!({"enabled": true, "sign_commits": true}),
+                "the key file is required",
+            ),
+            (
+                "api-keys",
+                json!({"enabled": true, "craze_providers": false}),
+                "craze's providers.toml or an env file is required",
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true}),
+                "a passphrase file or a passphrase command is required",
+            ),
+            (
+                "files",
+                json!({"enabled": true, "file": []}),
+                "at least one file is required",
+            ),
+            (
+                "files",
+                json!({"enabled": true}),
+                "at least one file is required",
+            ),
+        ] {
+            let e = set(&path, provider, &config).unwrap_err();
+            assert_eq!(e.0, "incomplete", "{provider} {config}");
+            assert_eq!(e.1, format!("{provider} cannot be on: {why}"));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{provider}: nothing written"
+            );
+            let mut off = config.clone();
+            off["enabled"] = json!(false);
+            set(&path, provider, &off).unwrap_or_else(|e| panic!("{provider} off: {e:?}"));
+            set(&path, provider, &Value::Null).unwrap();
+        }
+        for (provider, config) in [
+            (
+                "ssh-key",
+                json!({"enabled": true, "key_file": "~/.ssh/id_ed25519"}),
+            ),
+            ("api-keys", json!({"enabled": true})),
+            (
+                "api-keys",
+                json!({"enabled": true, "craze_providers": false, "env_files": ["~/k.env"]}),
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true, "passphrase_file": "~/p"}),
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true, "passphrase_command": ["pass", "x"]}),
+            ),
+            (
+                "files",
+                json!({"enabled": true, "file": [{"from": "~/a", "to": "a"}]}),
+            ),
+        ] {
+            set(&path, provider, &config).unwrap_or_else(|e| panic!("{provider}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_commands_a_check_runs() {
+        let s = |t: &str| Settings::parse(t).unwrap();
+        assert!(commands_run(&s("")).is_empty());
+        assert_eq!(commands_run(&s("[github]\nenabled = true\n")), ["gh"]);
+        assert!(commands_run(&s("[github]\nenabled = false\n")).is_empty());
+        let env = "[envsecrets-login]\nenabled = true\npassphrase_command = [\"pass\"]\n";
+        assert_eq!(
+            commands_run(&s(&format!("[github]\nenabled = true\n{env}"))),
+            ["gh", "passphrase_command"]
+        );
+        let file = "[envsecrets-login]\nenabled = true\npassphrase_file = \"~/p\"\n";
+        assert!(commands_run(&s(file)).is_empty());
     }
 
     #[test]
@@ -563,7 +715,12 @@ mod tests {
         .unwrap();
         let e = load(&path).settings.unwrap().envsecrets_login.unwrap();
         assert_eq!(e.passphrase_command.unwrap(), vec!["other".to_string()]);
-        set(&path, "envsecrets-login", &json!({"enabled": true})).unwrap();
+        set(
+            &path,
+            "envsecrets-login",
+            &json!({"enabled": true, "passphrase_file": "~/p"}),
+        )
+        .unwrap();
         assert!(load(&path)
             .settings
             .unwrap()
@@ -597,7 +754,7 @@ mod tests {
                 "envsecrets-login",
                 json!({"enabled": true, "passphrase_file": "~/p"}),
             ),
-            ("files", json!({"enabled": true})),
+            ("files", json!({"enabled": false})),
         ];
         for _ in 0..5 {
             std::thread::scope(|scope| {
@@ -667,8 +824,9 @@ mod tests {
         let path = dir.path().join("delivery.toml");
         for d in describe() {
             for f in d.machine_fields() {
+                // Off: one field alone need not make the provider complete.
                 let config = json!({
-                    "enabled": true,
+                    "enabled": false,
                     "only": {"backends": ["vz"]},
                     f.key: sample(f),
                 });

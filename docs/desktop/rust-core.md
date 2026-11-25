@@ -11,7 +11,7 @@ re-implementing it per language. Its consumers:
 - **shed-mobile** — the phone client, which takes `shed-core` as a git dependency and calls
   it from Dart through flutter_rust_bridge (FRB);
 - **`shed-source`** — the machine identity, certificate store, control-token minting and the delivery stream client the desktop app's source runtime is built on (extracted from the credential broker the app embedded before v0.11);
-- **`shed-provision`** and **`shed-provision-providers`** — the provision contract's documents and the five providers (`ssh-key`, `github`, `api-keys`, `envsecrets-login`, `files`); pure, no async runtime and no HTTP client. See [Provisioning](provisioning.md).
+- **`shed-provision`** and **`shed-provision-providers`** — the provision contract's documents and the five providers (`ssh-key`, `github`, `api-keys`, `envsecrets-login`, `files`); pure, no async runtime and no HTTP client. See [Credentials](credentials.md).
 
 ## Layout
 
