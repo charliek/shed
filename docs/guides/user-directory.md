@@ -397,6 +397,10 @@ accurate.
 A server the service has disabled keeps its list until the trust time ends,
 and logs `directory: SERVER DISABLED: ...`.
 
+## Credentials from the service
+
+The account service can also be where a listed user's credentials come from: the server asks it, not a machine of theirs, when they create a shed or run `shed provision`. It needs no extra server configuration. A local admin keeps the machine they pinned. See [Credentials from the account service](credentials-from-the-account-service.md), and note that upgrading switches off pinned machines for the listed users.
+
 ## Keeping the local admin on a backup key
 
 This is for a person who is both a user in the service's list (`pat`, say)

@@ -3156,15 +3156,17 @@ def _make_recipe(target: str) -> tuple[str, str]:
 def test_the_directory_target_builds_then_runs_the_module_against_no_other_server():
     deps, recipe = _make_recipe("test-integration-directory")
     # The host check first, then everything the world runs from bin/.
-    assert deps.split() == ["check-directory-itest-host", "build", "directory-ref"]
-    assert "uv run pytest -v test_directory.py $(PYTEST_ARGS)" in recipe
+    assert deps.split() == ["check-directory-itest-host", "build", "directory-ref", "provision-ref"]
+    assert "uv run pytest -v $(DIRECTORY_ITEST_FILES) $(PYTEST_ARGS)" in recipe
+    files = re.search(r"^DIRECTORY_ITEST_FILES \?= (.*)$", (dc.REPO_ROOT / "Makefile").read_text(), re.MULTILINE)
+    assert files and files.group(1).split() == ["test_directory.py", "test_delivery_hosted.py"]
     assert 'PATH="$(CURDIR)/bin:$$PATH"' in recipe
     assert "SHED_DIRECTORY_ITEST=1" in recipe and 'SHED_BIN_DIR="$(CURDIR)/bin"' in recipe
     # Every server variable of the rest of the suite is set empty.
     conftest_src = (INTEGRATION_DIR / "conftest.py").read_text()
     names = set(re.findall(r'os\.environ\.get\(\s*"(SHED_(?:VZ|FC)_[A-Z_]+|SHED_REMOTE_SERVER)"', conftest_src))
     assert names >= {"SHED_VZ_SERVER", "SHED_FC_HOST", "SHED_FC_SERVER", "SHED_REMOTE_SERVER"}, names
-    for name in names | {"SHED_ITEST_SOURCE"}:
+    for name in names | {"SHED_ITEST_SOURCE", "SHED_ITEST_DIRECTORY_CONTROL", "SHED_ITEST_DIRECTORY_LOG"}:
         assert re.search(rf"^\s*{name}= \\$", recipe, re.MULTILINE), f"{name} is not set empty"
     _, check = _make_recipe("check-directory-itest-host")
     assert '"$$(uname -s)" != "Linux"' in check and "exit 1" in check
@@ -3228,6 +3230,7 @@ def test_the_server_config_is_a_directory_server_on_the_test_drivers(tmp_path):
     assert (remote["provider"], remote["transport"], remote["allow_test_drivers"]) == ("fake", "local", True)
     assert remote["agent_dir"] == str(tmp_path / "agent") and remote["agent_install"] == "never"
     assert remote["firewall"]["source_ranges"]
+    assert remote["limits"] == {"max_running": 8, "max_sheds": 12}
     # The local admin can be named in a list: the reference server serves no
     # reserved name (it refuses the whole list), and `localadmin` is not one.
     reserved = _go_reserved_names()
@@ -5483,3 +5486,210 @@ def test_delivery_activity_paging():
         dlv.page_all(lambda since: {"events": [{"id": "x"}], "next": "c" + str(since)})
     with pytest.raises(AssertionError, match="cursor"):
         dlv.page_all(lambda since: {"events": [{"id": since or "first"}], "next": "same"})
+
+
+# ----------------------------------------------------------------------------
+# The account service's deliveries (fixtures/directory.py; plan 040 §6)
+# ----------------------------------------------------------------------------
+
+
+def test_the_delivery_words_match_the_servers():
+    root = dc.REPO_ROOT
+    dlv_go = (root / "internal" / "directory" / "refserver" / "deliveries.go").read_text()
+    assert f'DeliveryCallLine = "{dfx.DELIVERY_CALL}"' in dlv_go
+    assert 's.logf("%s", DeliveryCallLine)' in dlv_go
+    modes = re.findall(r'^\tMode[A-Za-z]+ = "([a-z]*)"$', dlv_go, re.MULTILINE)
+    assert sorted(modes) == sorted(dfx.DELIVERY_MODES)
+    m = re.search(r"^type Delivery struct \{\n(.*?)^\}", dlv_go, re.MULTILINE | re.DOTALL)
+    assert m and set(re.findall(r'json:"([a-z_0-9]+)', m.group(1))) == dfx.DELIVERY_MEMBERS
+    assert f'"{dfx.NO_SOURCE}"' in dlv_go
+    _, _, scope = dfx.TOKEN_REQUEST_DELIVERY_SCOPE.partition("scope=")
+    assert dfx.TOKEN_REQUEST_DELIVERY_SCOPE.startswith(dfx.TOKEN_REQUEST)
+    assert f'scopeDeliveries = {scope}' in dlv_go
+    hosted = (root / "internal" / "delivery" / "hosted.go").read_text()
+    assert f'%q%s: {dfx.ASKING_THE_SERVICE}, deadline %s"' in hosted
+    assert 'for shed %q%s: ' + dfx.ASKING_THE_SERVICE in hosted
+    serve = (root / "cmd" / "shed-server" / "serve.go").read_text()
+    assert dfx.BINDING_REMOVED.replace('"{user}"', "%q") in serve
+
+
+def test_the_hosted_cases_words_match_the_servers():
+    import test_delivery_hosted as tdh
+
+    types = (dc.REPO_ROOT / "internal" / "config" / "types.go").read_text()
+    assert f'SourceIsServiceMessage = "{tdh.SOURCE_IS_SERVICE_TEXT}"' in types
+    source = (dc.REPO_ROOT / "cmd" / "shed" / "source.go").read_text()
+    assert tdh.NOT_DELIVERING_TEXT + ":" in source
+    provision = (dc.REPO_ROOT / "cmd" / "shed" / "provision.go").read_text()
+    assert '" from the account service"' in provision
+    directory = (dc.REPO_ROOT / "internal" / "config" / "directory.go").read_text()
+    assert tdh.SCRIPT_KEY_REFUSED + "; remove script: true" in directory
+
+
+def test_delivery_entries_and_the_document():
+    items = [{"name": "k"}]
+    assert dfx.delivery_answer(items, [{"code": "x"}]) == {"items": items, "problems": [{"code": "x"}]}
+    assert dfx.delivery_status(500, "INTERNAL", "boom") == {
+        "mode": "status", "status": 500, "body": {"error": {"code": "INTERNAL", "message": "boom"}}}
+    assert dfx.delivery_status(418, text="") == {"mode": "status", "status": 418, "text": ""}
+    assert dfx.delivery_status(302, headers={"Location": "x"}) == {"mode": "status", "status": 302,
+                                                                   "headers": {"Location": "x"}}
+    b = dfx.delivery_body(b'{"id":"0123"}', 200)
+    assert b["mode"] == "body" and base64.b64decode(b["body_base64"]) == b'{"id":"0123"}'
+    doc = json.loads(dfx.deliveries_document({"ada": dfx.NO_SOURCE, "bob": {"mode": "silent"}}))
+    assert doc == {"ada": "NO_SOURCE", "bob": {"mode": "silent"}}
+    for bad in ("no_source", 3, {"mode": "loud"}, {"items": {}}, {"mode": "status"}, {"mode": "status", "status": 99},
+                {"extra": 1}, {"mode": "body", "body_base64": "!!"}):
+        assert dfx.delivery_problems(bad), bad
+        with pytest.raises(ValueError, match="would refuse"):
+            dfx.deliveries_document({"ada": bad})
+
+
+def test_what_could_be_accepted():
+    safe = [dfx.NO_SOURCE, {"mode": "silent"}, dfx.delivery_status(500, "INTERNAL"),
+            dfx.delivery_status(404, "NO_SOURCE"), dfx.delivery_status(302, headers={"Location": "x"}),
+            dfx.delivery_status(599), dfx.delivery_body(b"{}", 422)]
+    risky = [dfx.delivery_answer([]), {"mode": "late"}, {"mode": "echo"}, {"mode": "oversize"},
+             {"mode": "truncated", "items": [{"name": "k"}]}, dfx.delivery_body(b"{}"),
+             {"mode": "body", "body_base64": ""}, dfx.delivery_status(200, text="{}"),
+             {"mode": "status", "status": 200}, dfx.delivery_status(204), dfx.delivery_status(103),
+             dfx.delivery_status(100, text="{}"), dfx.delivery_body(b"{}", 101)]
+    assert [dfx.may_be_accepted(e) for e in safe] == [False] * len(safe)
+    assert [dfx.may_be_accepted(e) for e in risky] == [True] * len(risky)
+
+
+def test_the_deliveries_control_files_and_the_local_guard(tmp_path):
+    log = ["2026/11/25 10:00:00 delivery call",
+           '2026/11/25 10:00:00 token request: scope="deliveries:request"',
+           '2026/11/25 10:00:01 token request: scope="directory:read"',
+           "2026/11/25 10:00:02 delivery call", "2026/11/25 10:00:02 deliveries refused: x"]
+    local = dfx.DeliveriesControl(tmp_path, lambda: "\n".join(log), local=True)
+    assert local.counts() == (2, 1)
+    with pytest.raises(ValueError, match="local harness"):
+        local.set({"ada": dfx.NO_SOURCE, "bob": dfx.delivery_answer([])})
+    assert not (tmp_path / "deliveries.json").exists(), "a refused set wrote the file"
+    local.set({"ada": dfx.NO_SOURCE, "bob": {"mode": "silent"}})
+    p = tmp_path / "deliveries.json"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and json.loads(p.read_text())["ada"] == "NO_SOURCE"
+    local.clear()
+    assert not p.exists()
+    real = dfx.DeliveriesControl(tmp_path, lambda: "", local=False)
+    real.set({"ada": dfx.delivery_answer([{"name": "k"}])})
+    assert json.loads(p.read_text()) == {"ada": {"items": [{"name": "k"}], "problems": []}}
+    real.deny(["srv_a", "srv_b"])
+    assert (tmp_path / "no-deliveries").read_text() == "srv_a\nsrv_b\n"
+    real.deny([])
+    assert not (tmp_path / "no-deliveries").exists()
+    real.outage(True)
+    assert (tmp_path / "outage").exists()
+    real.outage(False)
+    assert not (tmp_path / "outage").exists()
+    # The world's reference server holds the guard.
+    ref = dfx.RefServer(tmp_path / "bin", tmp_path, tmp_path, tmp_path)
+    assert ref.deliveries.local is True
+    assert dfx.count_lines("a\nx delivery call y\ndelivery call\n", dfx.DELIVERY_CALL) == 2
+
+
+def test_hosted_skip_reason_and_control(tmp_path):
+    full = {"SHED_ITEST_SOURCE": "directory", "SHED_ITEST_DIRECTORY_CONTROL": str(tmp_path),
+            "SHED_ITEST_DIRECTORY_LOG": str(tmp_path / "ref.err"), "SHED_IMAGE_HAS_DELIVERY": "fc, remote"}
+    assert dfx.hosted_skip_reason("fc", full) is None
+    assert dfx.hosted_skip_reason("remote", full) is None
+    assert dfx.hosted_skip_reason(None, full) is None
+    assert "SHED_IMAGE_HAS_DELIVERY does not list vz" in dfx.hosted_skip_reason("vz", full)
+    assert "SHED_ITEST_SOURCE=directory" in dfx.hosted_skip_reason("fc", {**full, "SHED_ITEST_SOURCE": ""})
+    assert "real backends only" in dfx.hosted_skip_reason(None, {**full, "SHED_DIRECTORY_ITEST": "1"})
+    for var in ("SHED_ITEST_DIRECTORY_CONTROL", "SHED_ITEST_DIRECTORY_LOG"):
+        assert var in dfx.hosted_skip_reason("fc", {**full, var: " "})
+    ctl = dfx.hosted_control(full)
+    assert ctl.local is False and ctl.control == tmp_path
+    with pytest.raises(AssertionError, match="cannot be read"):
+        ctl.calls()
+    (tmp_path / "ref.err").write_text("2026/11/25 10:00:00 delivery call\n")
+    assert ctl.calls() == 1
+    with pytest.raises(AssertionError, match="not a directory"):
+        dfx.hosted_control({**full, "SHED_ITEST_DIRECTORY_CONTROL": str(tmp_path / "none")})
+
+
+def test_the_world_config_edits():
+    cfg = dfx.server_config(http_port=1, https_port=2, ssh_port=3, state_dir=Path("/s"), issuer="http://127.0.0.1:9",
+                            admin_key="ssh-ed25519 AAAA", agent_dir=Path("/a"))
+    before = json.dumps(cfg, sort_keys=True)
+    two = dfx.with_local_admin(cfg, "pat", "ssh-ed25519 BBBB")
+    assert two["auth"]["users"]["pat"] == {"admin": True, "keys": [{"key": "ssh-ed25519 BBBB", "label": "itest"}]}
+    script = dfx.with_local_admin(two, dfx.LOCAL_ADMIN, "ssh-ed25519 CCCC", label="s", script=True)
+    assert script["auth"]["users"][dfx.LOCAL_ADMIN]["keys"][-1] == {"key": "ssh-ed25519 CCCC", "label": "s",
+                                                                    "script": True}
+    assert len(script["auth"]["users"][dfx.LOCAL_ADMIN]["keys"]) == 2
+    assert "pat" not in dfx.without_local_admin(two, "pat")["auth"]["users"]
+    with pytest.raises(KeyError):
+        dfx.without_local_admin(cfg, "pat")
+    svc = dfx.with_service_client(cfg, "itest", "itest-svc-")
+    assert svc["auth"]["clients"]["itest"]["policy"]["name_prefix"] == "itest-svc-"
+    assert json.dumps(cfg, sort_keys=True) == before, "an edit changed the config it was given"
+
+
+def test_the_hosted_module_skips_everything_under_plain_test_integration():
+    # Collected as `make test-integration` collects it: the local cases skip
+    # (no SHED_DIRECTORY_ITEST) and the real-backend ones skip saying what to
+    # set, before any fixture runs.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SHED_DIRECTORY_ITEST", "SHED_BIN_DIR", "SHED_ITEST_SOURCE")}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+                        "test_delivery_hosted.py"], cwd=INTEGRATION_DIR, capture_output=True, text=True, timeout=120,
+                       env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "passed" not in r.stdout and "failed" not in r.stdout and "error" not in r.stdout.lower(), r.stdout
+    assert "run make test-integration-directory" in r.stdout and "SHED_ITEST_SOURCE=directory" in r.stdout, r.stdout
+
+
+def test_problem_messages_are_taken_out_only_where_a_record_shows_them():
+    s = "sntl"
+    probs = [{"provider": "github", "code": "signed_out", "message": f"m {s}"}]
+    rec = {"name": "x", "delivery": {"state": "delivered", "last": {"outcome": "accepted", "problems": probs}}}
+    out = dlv.without_problem_messages(json.dumps(rec), probs)
+    assert s not in out and '"code": "signed_out"' in out and '"state": "delivered"' in out
+    # The same text anywhere else stays and is found.
+    for elsewhere in ({**rec, "note": s}, {"delivery": {"last": {"problems": [], "failure": {"reason": s}}}},
+                      {"delivery": {"problems": [{"message": s}]}}, [rec, {"message": s}]):
+        assert s in dlv.without_problem_messages(json.dumps(elsewhere), probs), elsewhere
+    text = ("Delivery:  delivered\nProblems the source reported:\n  github: signed_out: m sntl\n"
+            "Owed:      none sntl\n")
+    assert dlv.without_problem_messages(text, probs) == (
+        "Delivery:  delivered\nProblems the source reported:\n  github: signed_out: \nOwed:      none sntl\n")
+    # Only the expected rows' messages: another row in the block, a row
+    # outside the block, and a changed row keep their text.
+    for leak in ("Problems the source reported:\n  github: signed_out: m sntl\n  Debug: raw response: sntl\n",
+                 "Problems the source reported:\n  github: signed_out: m sntl x\n",
+                 "Problems the source reported:\n  gh: signed_out: m sntl\n",
+                 "  github: signed_out: m sntl\n",
+                 "Problems the source reported:\nother\n  github: signed_out: m sntl\n"):
+        assert s in dlv.without_problem_messages(leak, probs), leak
+    assert dlv.without_problem_messages('{"a": 1}\n{"b": "sntl"}\n', probs).count("sntl") == 1  # JSON lines: kept
+    cli = (dc.REPO_ROOT / "cmd" / "shed" / "provision.go").read_text()
+    assert f'fmt.Fprintln(out, "{dlv.PROBLEMS_HEADER}")' in cli
+    assert 'fmt.Fprintf(out, "  %s: %s: %s\\n", safe(p.Provider), safe(p.Code), safe(p.Message))' in cli
+
+
+def test_the_live_refuse_selection_needs_the_whole_fixture_language():
+    sel = dlv.select_refuse_fixtures(dlv.load_refuse_fixtures())
+    assert sel, "no live refuse fixture"
+    forms = {k for f in sel for k in json.loads(f.path.read_text()) if k in ("answer_text", "answer_base64", "fill")}
+    assert forms >= {"answer_text", "fill"}, forms
+
+
+def test_render_answer_fixture_is_the_reference_sources(tmp_path):
+    binary = dlv.ref_source_binary()
+    if not binary.is_file():
+        pytest.skip(f"{binary} is not built (make provision-ref)")
+    refuse = dlv.REFUSE_DIR
+    text = dlv.render_answer_fixture(refuse / "duplicate-member-escaped.json")
+    assert text == json.loads((refuse / "duplicate-member-escaped.json").read_text())["answer_text"].encode()
+    big = dlv.render_answer_fixture(refuse / "file-too-large.json")
+    doc = json.loads(big)
+    assert any(len(base64.b64decode(i.get("content", ""))) > 1 << 20 for i in doc["items"])
+    assert dlv.render_answer_fixture(refuse / "not-json-empty.json") == b""
+    with pytest.raises(AssertionError, match="rendering"):
+        dlv.render_answer_fixture(tmp_path / "none.json")
+    with pytest.raises(AssertionError, match="missing"):
+        dlv.render_answer_fixture(refuse / "bad-provider.json", binary=tmp_path / "absent")

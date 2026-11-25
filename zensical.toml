@@ -52,6 +52,7 @@ nav = [
     { "Security Configuration" = "guides/security-configuration.md" },
     { "Multi-user Server" = "guides/multi-user-server.md" },
     { "User Directory" = "guides/user-directory.md" },
+    { "Credentials from the Account Service" = "guides/credentials-from-the-account-service.md" },
     { "Public VPS Deployment" = "guides/vps-deployment.md" },
     { "Orchestrated Sheds" = "guides/orchestrated-sheds.md" },
     { "Credentials in a Shed" = "guides/credentials-in-a-shed.md" },

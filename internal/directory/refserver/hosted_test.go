@@ -516,3 +516,31 @@ func TestDeliveryDeadlineAfterTheBody(t *testing.T) {
 		})
 	}
 }
+
+// TestDeliveryCallIsLogged: every POST /v1/deliveries logs DeliveryCallLine
+// once, a call refused at its token included, and nothing else does (the
+// integration suite counts the line).
+func TestDeliveryCallIsLogged(t *testing.T) {
+	s := newWorld(t)
+	var logged []string
+	s.srv.logf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	count := func() int {
+		n := 0
+		for _, l := range logged {
+			if l == DeliveryCallLine {
+				n++
+			}
+		}
+		return n
+	}
+	if rec := s.post(pathDeliveries, "application/json", "{}"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a call with no token: %d", rec.Code)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("one call logged %d delivery call lines: %q", n, logged)
+	}
+	s.directory("Bearer " + s.signBearer(s.bearerParts(srvA)))
+	if n := count(); n != 1 {
+		t.Fatalf("a directory request logged a delivery call line: %q", logged)
+	}
+}

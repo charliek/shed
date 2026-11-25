@@ -1158,3 +1158,89 @@ def page_all(fetch: Callable[[Optional[str]], dict], *, max_pages: int = 1000) -
 
 def rm_tree(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------
+# The hosted source (test_delivery_hosted.py)
+# ----------------------------------------------------------------------------
+
+
+def render_answer_fixture(path: Path, binary: Optional[Path] = None, timeout: float = 60) -> bytes:
+    """An answer fixture's body as the fixture language renders it (its
+    `answer`, `answer_text` or `answer_base64`, with its `fill`), raw bytes
+    preserved, answering the fixtures' own request id: rendered by the
+    reference source itself (`shed-provision-ref --render-fixture`,
+    refsource.AnswerFixture.Body), never again here."""
+    binary = binary or ref_source_binary()
+    if not (binary.is_file() and os.access(binary, os.X_OK)):
+        raise AssertionError(f"{binary} is missing: run `make provision-ref` (or set SHED_PROVISION_REF)")
+    r = subprocess.run([str(binary), "--render-fixture", str(path)], capture_output=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise AssertionError(f"rendering {path.name}: exit {r.returncode}: {r.stderr.decode(errors='replace')[-400:]}")
+    return r.stdout
+
+
+# The CLI's block of a record's problems (cmd/shed/provision.go): the header,
+# then one indented "provider: code: message" line each.
+PROBLEMS_HEADER = "Problems the source reported:"
+
+
+def _drop_problem_messages(obj):
+    """`obj` with the `message` of every problem of every `last.problems`
+    removed (the one place a record may show a problem's message), and
+    nothing else changed."""
+    if isinstance(obj, list):
+        return [_drop_problem_messages(v) for v in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        if k == "last" and isinstance(v, dict) and isinstance(v.get("problems"), list):
+            v = dict(v)
+            v["problems"] = [{pk: pv for pk, pv in p.items() if pk != "message"} if isinstance(p, dict) else p
+                             for p in v["problems"]]
+        out[k] = _drop_problem_messages(v)
+    return out
+
+
+def without_problem_messages(text: str, problems: Sequence[Mapping]) -> str:
+    """`text` with exactly the places a record shows one of `problems`'s
+    messages taken out: in JSON (one document), each
+    `last.problems[*].message`; in the CLI's text, the message portion of
+    each row of its problems block that is one of `problems`
+    ("  provider: code: message"). Every other line, after the header
+    included, is kept as it was, so a message copied anywhere else is still
+    found."""
+    try:
+        doc = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        doc = None
+    if isinstance(doc, (dict, list)):
+        return json.dumps(_drop_problem_messages(doc))
+    rows = {f"  {p['provider']}: {p['code']}: {p['message']}": f"  {p['provider']}: {p['code']}: "
+            for p in problems}
+    out, inside = [], False
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if body.strip() == PROBLEMS_HEADER:
+            inside = True
+            out.append(line)
+            continue
+        if inside and body in rows:
+            out.append(rows[body] + line[len(body):])
+            continue
+        inside = inside and body.startswith("  ")
+        out.append(line)
+    return "".join(out)
+
+
+def read_server_file(files: ServerFiles, path: str) -> str:
+    """One file of the server's (on its host, as root, when that is not this
+    one)."""
+    if files.ssh_host is None:
+        return Path(path).read_bytes().decode("utf-8", errors="replace")
+    r = _ssh(files.ssh_host, f"sudo -n cat {shlex.quote(path)}")
+    if r.returncode != 0:
+        raise AssertionError(f"cannot read {files.ssh_host}:{path} (exit {r.returncode}): {r.stderr.strip()[-300:]!r}")
+    return r.stdout

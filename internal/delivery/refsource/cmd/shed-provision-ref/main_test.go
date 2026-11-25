@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charliek/shed/internal/delivery/refsource"
 )
 
 func TestRunRefusesBadFlags(t *testing.T) {
@@ -88,5 +90,33 @@ func TestRunOnce(t *testing.T) {
 	}
 	if got := strings.Join(kinds, ","); got != "stream,request,answer,end" {
 		t.Errorf("events %s", got)
+	}
+}
+
+// TestRunRenderFixture: --render-fixture prints the fixture's body as the
+// fixture language renders it (refsource.AnswerFixture.Body), for each of
+// its three answer forms and a fill, and nothing else.
+func TestRunRenderFixture(t *testing.T) {
+	dir := "../../../../../tests/provision-contract/v2/fixtures/answers/refuse"
+	for _, name := range []string{"duplicate-member-escaped", "file-too-large", "bad-provider"} {
+		path := filepath.Join(dir, name+".json")
+		f, err := refsource.LoadAnswerFixture(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := f.Body(refsource.FixtureRequestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out, errb bytes.Buffer
+		if err := run(context.Background(), []string{"--render-fixture", path}, &out, &errb); err != nil {
+			t.Fatalf("%s: %v (%s)", name, err, errb.String())
+		}
+		if !bytes.Equal(out.Bytes(), want) {
+			t.Fatalf("%s: printed %d bytes, want the fixture's %d", name, out.Len(), len(want))
+		}
+	}
+	if err := run(context.Background(), []string{"--render-fixture", filepath.Join(dir, "none.json")}, io.Discard, io.Discard); err == nil {
+		t.Fatal("a missing fixture rendered")
 	}
 }

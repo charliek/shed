@@ -1,6 +1,8 @@
 # Credential delivery
 
-When a shed is created, and when its user runs `shed provision`, shed-server asks that person's **credential source** (the shed desktop app on the machine they bound with **Use this machine** or `shed source use`) for the files and environment variables the shed should hold: an SSH key, a GitHub token, API keys, an envsecrets login, named files. The source answers, the server checks the answer, and the shed's agent writes it into the shed. The shed keeps working from those files afterwards; nothing is asked per use.
+When a shed is created, and when its user runs `shed provision`, shed-server asks that person's **credential source** for the files and environment variables the shed should hold: an SSH key, a GitHub token, API keys, an envsecrets login, named files. The source answers, the server checks the answer, and the shed's agent writes it into the shed. The shed keeps working from those files afterwards; nothing is asked per use.
+
+A credential source is one of two things: a **machine source** (the shed desktop app on the machine the person bound with **Use this machine** or `shed source use`) or, on a server that takes its users from an [account service](../guides/user-directory.md), the **account service** itself, for the users it lists. [Who is asked](#who-is-asked) says which.
 
 The documents and the transport are specified in [The provision contract](provision-contract.md). This page says what the server does with them. For what to deliver and what that costs, see [Credentials in a shed](../guides/credentials-in-a-shed.md).
 
@@ -20,8 +22,19 @@ Delivery is never done in the background and never retried by the server. A fail
 
 The server asks the source of the **shed's user**, and only that user can cause a delivery: they created the shed, or they run `shed provision` on it. An admin cannot provision another user's shed.
 
+Which source is asked depends on the server's own configuration and on the shed user's name, and on nothing else (not on whether the account service is reachable, nor on who made the request):
+
+| Server | The shed's user | Source |
+|---|---|---|
+| not a directory server | any name | the pinned machine |
+| a directory server (`auth.directory`) | a name in the local-admin set | the pinned machine |
+| a directory server | any other name | the account service, and nothing else |
+
+A directory user is never asked through a machine, and there is **no fallback**: when the account service has nothing for them or cannot be reached, the delivery is `not_applicable` or fails with a reason below, and no pinned machine is tried. The same rule applies to a create, a `shed provision`, a delayed cloud create and a resumed one. See [Credentials from the account service](../guides/credentials-from-the-account-service.md) for what the service does with the request.
+
 No request is made, and the state is `not_applicable` with no warning, when:
 
+- the user is a directory user and the account service has no source for them on this server (it answers `NO_SOURCE`), does not offer delivery, or does not let this server ask. The server remembers a refusal of delivery or of the server for five minutes, and asks again after that, or after `shed users refresh` or a new enrolment;
 - the user has no bound machine: none was bound with `shed source use`, and no machine has connected as their source yet (the first that does is bound; see [below](#what-limits-a-sources-answers)). Such a person sees the behaviour that existed before delivery;
 - the shed was created by a service client, or the create used a script key (`shed provision` with a script key, or by a service client, is refused with `403`);
 - the shed was restored from a snapshot.
@@ -103,7 +116,7 @@ The server keeps a record per shed and returns it in the shed document as `deliv
 |---|---|
 | `state` | `none`, `not_applicable`, `delivered`, `partial` or `not_delivered` |
 | `steps` | the four steps, each with a state and, for `skipped` and `failed`, a reason |
-| `last` | the last attempt: its time, `create` or `provision`, its outcome, the failure if any, and the machine that was asked |
+| `last` | the last attempt: its time, `create` or `provision`, its outcome, the failure if any, and the source that was asked (`kind` `machine` with its id and name, or `service`) |
 | `items` | each item the shed holds or was sent: name, provider, stage, kind, target (a path or a variable name), a fingerprint, when it expires, when it was written, and its result |
 | `expired` | the names of items whose `expires_at` has passed (the shed document, not the contract's record) |
 | `owed` | the steps that are owed, in the order they run (the shed document) |
@@ -132,10 +145,11 @@ Credentials were not delivered (image_too_old). Recreate the shed from a current
 
 | Reason | Meaning |
 |---|---|
-| `source_offline` | a machine is bound but not connected |
-| `source_timeout` | no answer within `delivery.timeout` |
-| `source_disconnected` | the source's stream ended before it answered |
-| `answer_refused` | the answer broke a contract rule (the rule is recorded) |
+| `source_offline` | a machine is bound but not connected; or the account service could not be reached or was busy (`429`, `5xx`) |
+| `source_timeout` | no answer within `delivery.timeout`; or the account service did not answer in time |
+| `source_disconnected` | the source's stream ended before it answered; or the account service's reply ended before it was complete |
+| `source_refused` | the account service refused this server or its request (its sign-in was refused, or it answered with a status the contract treats as a refusal). Never given for a machine |
+| `answer_refused` | the answer broke a contract rule (the rule is recorded), including a reply that echoes the token or assertion the server presented (`echoes_credential`) |
 | `write_failed` | an item could not be written (the item's name and a closed result are recorded) |
 | `image_too_old` | the shed's image has an agent that cannot take items |
 
@@ -162,11 +176,25 @@ The files are plain files. They are in snapshots and on a stopped cloud shed's d
 
 The server never records, logs or returns a delivered value: not in the record, the log, the audit log, the activity feed, an API response or an error. The record's `fingerprint` is a keyed hash that lets a person tell two deliveries apart, not a hash of the value anyone can check.
 
+For a hosted source the same holds on the server's side of the call: the text of anything the account service sends back (an error's message, a token error's description, a redirect target, a body that does not parse) is classified and dropped, and a reply that contains the token or assertion the server presented is refused. The server's token request and the call carry no value, only the request document.
+
 It does not cover:
 
+- **What the account service holds.** It stores and sends the values; see [Security](security.md#a-hosted-credential-source).
 - **A repository's own output.** The clone's and the install hook's output (a hook that prints `$TOKEN`) is the repository's, not delivery's.
 - **What the source chooses to send.** A fingerprint and a problem message come from the source; the contract bounds them but a source decides their text.
 - **The shed's disk and environment.** The value is in the shed, readable by the shed user and by anything running as it, including coding agents.
+
+## Where a shed's user came from
+
+A shed is owned by a name, and on a directory server the same name can move between the local-admin set and the account service. Each shed therefore records, at create, whether its user was `local` or `directory` (its `user_origin`), on Firecracker, VZ and remote alike. A delivery to a shed (a create's, or `shed provision`) is checked against the user's origin now, before any source is chosen:
+
+| Status | Code | When |
+|---|---|---|
+| `409` | `SHED_ORIGIN_CHANGED` | the shed's recorded origin differs from the current origin of its user's name. Nothing is requested and the record is unchanged. Create a new shed. |
+| `409` | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin, which only happens when the one-time stamp below could not be saved. No delivery is made until a start stamps it. |
+
+A shed made before this behaviour has no recorded origin. The **first start** of a server that knows it decides, once, each such shed's origin from that start's configuration and records the decision in `<state_dir>/delivery/origin-migration.json`. Every later start stamps an unstamped shed only from that file, never from the current configuration, so a name that moves afterwards does not change what was decided. Do not edit or delete the file.
 
 ## Old images
 

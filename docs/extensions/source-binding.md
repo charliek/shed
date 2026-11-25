@@ -17,6 +17,17 @@ This page covers how a machine identifies itself, how the pin is set, what the o
 machines show, and how to move it. The server side of the same rules is in
 [Security](../reference/security.md); the commands are in the [CLI reference](../reference/cli.md).
 
+## Users the account service answers for
+
+On a server that takes its users from an [account service](../guides/user-directory.md), a user the service lists has **no binding**: the account service is their credential source, and no machine answers for them there. Local admins, named in the server's own config, keep a pin as described on this page.
+
+- At start, a directory server removes every binding whose user is not a local admin, and logs each removal. Nothing recreates one: a first connection from such a user's machine is not bound, and every route that would bind, move or clear a pin answers `409 SOURCE_IS_SERVICE`. That covers `shed source use` and `unbind`, the bus's listener routes and the delivery stream and answer routes.
+- The source routes judge the **target** user. An admin's `?user=` names the user they act on, so an admin asking about a directory user gets the service document, not their own.
+- `GET /api/sources` answers `machines: []` and a service entry in the delivery slot; `shed source status` says the account service answers. See [the API](../reference/api.md#get-apisources).
+- A name that moves into the local-admin set later never meets a pin made while it was a directory user, because none was made.
+
+See [Credentials from the account service](../guides/credentials-from-the-account-service.md).
+
 ## Machine identity
 
 Each machine that runs the shed desktop app keeps an identity in one file. One machine is one

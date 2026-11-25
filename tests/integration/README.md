@@ -91,11 +91,14 @@ tests they would have run, not the whole session.
 | `SHED_PROVISION_REF`   | `bin/test/shed-provision-ref`                      | The provision contract's reference source, which `test_delivery.py` runs as the itest users' machine (`make provision-ref` builds it). |
 | `SHED_DELIVERY_REFUSE_ALL` | _unset_                                         | `1` sends every live-runnable refuse fixture of the provision contract in `test_delivery.py`'s refusal case, instead of one per rule. |
 | `SHED_DELIVERY_OLD_IMAGE` | _unset_                                          | An image alias that boots a published image (an agent below protocol 2), so `test_delivery.py`'s `image_too_old` case runs on a backend `SHED_IMAGE_HAS_DELIVERY` lists. Without it the case runs only where that gate is unset. |
+| `SHED_ITEST_DIRECTORY_CONTROL` | _unset_                                    | The control directory of the reference account service the run started (`shed-directory-ref --control`), under `SHED_ITEST_SOURCE=directory`. `test_delivery_hosted.py` writes its `deliveries.json` (and `outage`) there. Unset, the writing hosted-delivery cases skip. |
+| `SHED_ITEST_DIRECTORY_LOG` | _unset_                                        | The file that reference server's standard error goes to: `test_delivery_hosted.py` counts its `delivery call` and token-request lines. Unset, the writing hosted-delivery cases skip. |
+| `SHED_HOSTED_V011_SHED` | _unset_                                           | A shed `itest-alice` made on a v0.11 server binary before the server was upgraded to this build (same state): `test_delivery_hosted.py`'s case 8 lists it and delivers to it. Unset, that case skips. |
 | `SHED_VZ_DEV_AUDIT_LOG`, `SHED_VZ_DEV_STATE_DIRS`, `SHED_FC_DEV_AUDIT_LOG`, `SHED_FC_DEV_STATE_DIRS`, `SHED_REMOTE_AUDIT_LOG`, `SHED_REMOTE_STATE_DIRS`, `SHED_REMOTE_DEV_DIR` | the dev servers' own | Where `test_delivery.py`'s sentinel sweep reads each dev server's audit log and state directories (comma lists). Defaults: the Mac dev server's directory above `vz.instance_dir` and its `state_dir`; `/var/lib/shed-dev/firecracker/audit.jsonl`, its directory and the `state` directory beside it (on `SHED_FC_HOST`); `~/.shed/dev-remote/remote` and `state`. |
 | `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
 | `SHED_ITEST_SOURCE`    | `config`                                           | Where the users cases' server takes its users from: `config` (`auth.users`) or `directory` (an account service; the run started the server with `render-directory`'s auth block). See [Named users](#named-users-authusers). |
-| `SHED_DIRECTORY_ITEST` | _unset_                                            | `1` runs `test_directory.py`; set, with `SHED_BIN_DIR` (the built `bin/`), by `make test-integration-directory` only. Unset, the module skips. |
+| `SHED_DIRECTORY_ITEST` | _unset_                                            | `1` runs `test_directory.py` and the local cases of `test_delivery_hosted.py`; set, with `SHED_BIN_DIR` (the built `bin/`), by `make test-integration-directory` only. Unset, they skip. |
 | `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the itest user list and tells `test-integration-dev-fc`/`-remote` so; empty means no user list (one implicit user). |
 
 ## Fixtures
@@ -662,8 +665,10 @@ make test-integration-directory                         # the whole module, abou
 make test-integration-directory PYTEST_ARGS="-k rates"  # one case
 ```
 
-The target builds `bin/` and the directory contract's reference server
-(`bin/test/shed-directory-ref`), then runs `test_directory.py` with `bin/`
+The target builds `bin/`, the directory contract's reference server
+(`bin/test/shed-directory-ref`) and the provision contract's reference
+source, then runs `test_directory.py` (and `test_delivery_hosted.py`'s local
+cases) with `bin/`
 first on `PATH`, `SHED_DIRECTORY_ITEST=1`, `SHED_BIN_DIR` and every other
 server variable of the suite set empty. Under any other target the module
 skips, saying to run `make test-integration-directory`. Not in CI; its
@@ -868,6 +873,58 @@ read has a positive control, so a sweep of the wrong file fails instead of
 passing.
 
     cd tests/integration && uv run pytest -v -rs test_delivery.py
+
+## The account service as a credential source (`test_delivery_hosted.py`)
+
+On a server whose users come from an account service, a directory user's
+credentials come from the service (the provision contract's hosted source,
+`POST /v1/deliveries`) and from nothing else; a local admin keeps the machine
+they pinned (plan 040). The account service is the directory contract's
+reference server, told what to answer through its control directory
+(`fixtures/directory.py: DeliveriesControl`): `deliveries.json` (per person:
+canned items, `NO_SOURCE`, or a failure mode), `no-deliveries` (the servers
+that may not ask) and `outage`. It logs one `delivery call` line per call,
+which the cases count with its token-request lines.
+
+The module has two halves, split by whether a case writes into a shed:
+
+- **Cases 2, 5 and 7 write nothing** and run in the self-managed harness of
+  `test_directory.py` (`make test-integration-directory`, which now also
+  builds the reference source; only this module:
+  `make test-integration-directory DIRECTORY_ITEST_FILES=test_delivery_hosted.py`,
+  about three minutes). There a shed is a `shed-agent` on this host whose
+  `apply-items` would write into the home of the user running the tests, so
+  the harness refuses to serve anything the server could accept. `NO_SOURCE`,
+  a server refused at the token request and at the call, the five-minute
+  memory and `shed users refresh` clearing it; who is asked as a name moves
+  between the local admins and the directory (the binding removed at start,
+  every source, delivery-stream and listener route `409 SOURCE_IS_SERVICE`,
+  for the user and for an admin naming them), a create whose caller left,
+  the routes after the trust time ended; a service client's and another
+  user's shed asking nothing, and a script key on a local admin refused at
+  config load. `409 SHED_ORIGIN_CHANGED` for a shed made before a move is
+  not here: the harness's fake provider loses its instances at the restart
+  that moves the name.
+- **Cases 1, 3, 4, 6 and 8 write into a VM** and run on real backends only,
+  on `users_env` under `SHED_ITEST_SOURCE=directory`, with
+  `SHED_ITEST_DIRECTORY_CONTROL` and `SHED_ITEST_DIRECTORY_LOG` naming the
+  run's reference server and `SHED_IMAGE_HAS_DELIVERY` listing the backend;
+  otherwise they skip saying what to set. The reference server runs on the
+  host that runs pytest; a server on another host reaches it on its own
+  loopback through `ssh -R` (plain HTTP to a directory is loopback only).
+  Case 8 also needs `SHED_HOSTED_V011_SHED`. On `[remote]` only case 1, the
+  create and the healthy provision of case 3, and the sweep run (two VMs).
+  The sweep reads the same server files as `test_delivery.py`'s (the
+  variables above).
+
+Every case is listed in the module's docstring. With the server's choice of
+source forced to local, case 1 would fail; there is no switch for that in
+the server, and the Go test in `internal/delivery` that forces it is the
+negative control.
+
+    cd tests/integration && SHED_ITEST_SOURCE=directory \
+      SHED_ITEST_DIRECTORY_CONTROL=/path/to/control SHED_ITEST_DIRECTORY_LOG=/path/to/ref.err \
+      SHED_IMAGE_HAS_DELIVERY=fc uv run pytest -v -rs test_delivery_hosted.py
 
 ## Remote backend (cloud sheds)
 

@@ -112,7 +112,13 @@ test-integration-units:
 # two cases waiting out a two-minute trust time. Narrow it with
 # PYTEST_ARGS, e.g.
 #   make test-integration-directory PYTEST_ARGS="-k rates"
-test-integration-directory: check-directory-itest-host build directory-ref
+# It also runs the hosted-delivery cases that write nothing
+# (test_delivery_hosted.py: plan 040's cases 2, 5 and 7, with the provision
+# contract's reference source as a local admin's machine); the cases there
+# that write into a shed skip (they run on real backends only). One module:
+#   make test-integration-directory DIRECTORY_ITEST_FILES=test_delivery_hosted.py
+DIRECTORY_ITEST_FILES ?= test_directory.py test_delivery_hosted.py
+test-integration-directory: check-directory-itest-host build directory-ref provision-ref
 	cd tests/integration && uv sync && \
 	  PATH="$(CURDIR)/bin:$$PATH" \
 	  SHED_DIRECTORY_ITEST=1 \
@@ -128,7 +134,9 @@ test-integration-directory: check-directory-itest-host build directory-ref
 	  SHED_FC_DEV_LOG_PATH= \
 	  SHED_REMOTE_SERVER= \
 	  SHED_ITEST_SOURCE= \
-	  uv run pytest -v test_directory.py $(PYTEST_ARGS)
+	  SHED_ITEST_DIRECTORY_CONTROL= \
+	  SHED_ITEST_DIRECTORY_LOG= \
+	  uv run pytest -v $(DIRECTORY_ITEST_FILES) $(PYTEST_ARGS)
 
 check-directory-itest-host:
 	@if [ "$$(uname -s)" != "Linux" ]; then \

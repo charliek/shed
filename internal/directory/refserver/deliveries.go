@@ -41,6 +41,9 @@ const (
 	// the request's deadline, so a client that never gives up does not hold
 	// a handler for ever.
 	silentHold = time.Minute
+	// DeliveryCallLine is logged once for every POST /v1/deliveries, before
+	// anything of it is read (the integration suite counts it).
+	DeliveryCallLine = "delivery call"
 )
 
 // The delivery modes (DeliveryInputs.Delivery).
@@ -263,6 +266,10 @@ func parseDeliveryRequest(b []byte) (deliveryRequest, error) {
 // request, the deadline, then one read of the server's record, its grant
 // and the person's source, and answers as that source says.
 func (s *Server) handleDeliveries(w http.ResponseWriter, r *http.Request) {
+	// One fixed line per call, before anything is checked: what a test
+	// counts to show a server did, or did not, ask (nothing of the request
+	// is in it).
+	s.logf("%s", DeliveryCallLine)
 	now := s.now()
 	clientID, scopes, err := s.verifyBearer(r, now)
 	if err != nil {

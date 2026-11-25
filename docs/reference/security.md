@@ -926,6 +926,23 @@ over pinned TLS or pinned-host-key SSH.
 - **The audit log is on by default in `mtls` mode** and records delivery and lifecycle events (states, reasons, the source machine, item names, results and fingerprints, never a value or a target). `audit.enabled: false` turns it off.
 - **The writer is bounded.** The agent writes without following a symbolic link at any step, refuses a directory on another file system than the home, and the server trusts none of its output beyond a closed list of results. A hostile shed can misreport its own delivery and nothing more.
 
+### A hosted credential source
+
+On a server that takes its users from an [account service](../guides/user-directory.md), delivery to a directory user is answered by the service itself ([Credentials from the account service](../guides/credentials-from-the-account-service.md)). It is a different trade from a person's own machine, and the page states it plainly.
+
+| Party | What it can see |
+|---|---|
+| The account service | Every value it stores and sends. It also sees, per request, the shed's name, backend and repository as the server states them, the person's name and the server it is talking to (known from its token). |
+| The server | The values in transit, in memory for the create or provision, as for a machine source. It never stores or logs them. It also holds a key that signs it in to the service, and can ask for any listed person. |
+| The shed | The values written into it, as plain files and environment variables, readable by everything running as the shed user. |
+
+- **The service becomes a store of usable credentials.** Whoever controls its running host, or its sealed storage and key together, can read every stored value. What limits this is how the service protects its data (sealed rows and dumps, values that can be written but not read back through a route) and what people choose to store. Store a key made for sheds and a fine-grained, expiring token, not a personal one.
+- **A server that may ask can ask for anyone the service holds values for**, for a shed that does not exist, and the service answers without a prompt. The controls are the service's: which servers may ask, a person's opt-out, and its audit rows. A newly enrolled server that may ask can receive each person's values on its first request.
+- **A scope on backend or repo trusts the server.** A rule at the service that narrows what is sent by the shed's backend or repository is judged against the request the server wrote, so a dishonest server satisfies it. A scope by server is the one the service checks itself: it knows the server from the token.
+- **There is no fallback.** A directory user is never asked through a machine, so a pinned machine cannot be used to reach a directory user's sheds, and a service outage ends in a recorded failure, not another source.
+- **Nothing the service sends as text is kept.** An error message, a token error description, a redirect target or an unparseable body is classified and dropped, and a reply that holds the token or assertion the server presented is refused.
+- **A name that changes sets is a different person.** Each shed records whether its user was local or from the directory; a delivery after the name moved is refused (`SHED_ORIGIN_CHANGED`), so one person's credentials do not go into a shed another person of that name made.
+
 ## Credential bus
 
 The credential bus carries messages between a shed and a listener on a machine
@@ -960,7 +977,7 @@ one user, so one machine answers every shed.
 
 ### One machine answers for each user
 
-Each user has one **credential source** per server: the machine whose
+Each user has one **credential source** per server (for a user the account service answers for there is none: see [A hosted credential source](#a-hosted-credential-source)): the machine whose
 subscriptions the server takes and whose answers it accepts. The **first
 machine to connect for a user becomes it.** Any other machine of that user is
 refused, told which machine is the source, and keeps retrying on its usual
