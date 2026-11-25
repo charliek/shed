@@ -907,7 +907,7 @@ func walkDeliveryRoute(t *testing.T, s *Server, router http.Handler, be *userFak
 	defer s.plugins.UnregisterDelivery(st)
 	done := make(chan delivery.Result, 1)
 	go func() {
-		res, err := s.delivery.Request(context.Background(), delivery.Params{
+		res, err := s.delivery.Request(context.Background(), delivery.Params{Origin: delivery.OriginLocal,
 			Reason: delivery.ReasonCreate, User: "alice",
 			Shed: delivery.RequestShed{Name: "box", ID: "boxid", Backend: delivery.BackendFirecracker},
 		})

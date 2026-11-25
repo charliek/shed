@@ -28,7 +28,7 @@ func deliveredRecord() *delivery.Record {
 		},
 		Last: &delivery.Last{At: "2026-11-23T10:00:00Z", Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeAccepted,
 			Failure:  &delivery.Failure{Reason: delivery.ReasonWriteFailed, Item: "github", Result: delivery.ResultIsDirectory},
-			Source:   &delivery.Source{Kind: delivery.SourceKindMachine, MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"},
+			Source:   &delivery.RecordSource{Kind: delivery.SourceKindMachine, MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"},
 			Problems: []delivery.Problem{{Provider: "api-keys", Code: "missing_input", Message: "no providers.toml"}}},
 		Items: []delivery.RecordItem{
 			{Name: "ssh-key", Provider: "ssh-key", Stage: 1, Kind: delivery.KindFile, Base: delivery.BaseHome, Target: ".ssh/id_ed25519", Fingerprint: "k1", WrittenAt: "2026-11-23T10:00:02Z", Result: delivery.ResultOK},
@@ -73,6 +73,19 @@ func TestListDeliveryColumn(t *testing.T) {
 	renderShedDetails(&buf, withOne[2:], false)
 	if !strings.Contains(buf.String(), "Delivery:       partial (owed: stage2, install)") {
 		t.Fatalf("shed list -vv:\n%s", buf.String())
+	}
+}
+
+// TestProvisionStatusFromTheService: a delivery the account service answered
+// is printed as from it.
+func TestProvisionStatusFromTheService(t *testing.T) {
+	at := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	rec := deliveredRecord()
+	rec.Last.Source = delivery.ServiceSource()
+	var buf bytes.Buffer
+	renderDeliveryStatus(&buf, &config.Shed{Name: "widgets", LandingDir: "/home/shed/widgets", Delivery: config.NewShedDelivery(rec, at)})
+	if !strings.Contains(buf.String(), "Last:      2026-11-23T10:00:00Z (create) accepted from the account service\n") {
+		t.Fatalf("--status:\n%s", buf.String())
 	}
 }
 

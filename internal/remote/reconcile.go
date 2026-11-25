@@ -363,6 +363,7 @@ func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(s
 	case label == r.Shed.User && r.Shed.Owner == "":
 	case r.Shed.User == "" && r.Shed.Owner == "":
 		r.Shed.User = label
+		r.UserOrigin = b.deliverySvc.Origin(label)
 		changed = true
 		note("shed %s had no user on record and its instance is labelled %s=%s; recording that user", r.Shed.Name, provider.LabelUser, label)
 	default:
@@ -606,10 +607,13 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 			NetworkProfile: spec.Network,
 			Arch:           inst.Arch,
 		},
-		Env:   id.Env,
-		Zone:  inst.Zone,
-		Ref:   inst.Ref,
-		Ready: true,
+		// Where its user came from, by the configuration now: the shed
+		// has no user until a label names one, which stamps it again.
+		UserOrigin: b.deliverySvc.Origin(""),
+		Env:        id.Env,
+		Zone:       inst.Zone,
+		Ref:        inst.Ref,
+		Ready:      true,
 		// Its history is not known: nothing is marked done that the
 		// server did not see. Every step skipped, delivery none.
 		Delivery:   delivery.AdoptedRecord(),

@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/source"
 )
 
 // minSourceIDPrefix is the shortest id prefix `shed source use` accepts.
@@ -160,6 +161,13 @@ func sourceError(what, server string, err error) error {
 	return fmt.Errorf("%s on %s: %s", what, server, termSafe(err.Error()))
 }
 
+// sourceIsServiceError is the refusal of `shed source use` and `unbind` for
+// a user the account service answers for on server: the server's own
+// SOURCE_IS_SERVICE text, the service's URL, and what that means here.
+func sourceIsServiceError(server string, svc *config.SourceRef, what string) error {
+	return fmt.Errorf("on %s, %s (%s): %s; nothing changed", server, config.SourceIsServiceMessage, termSafe(svc.URL), what)
+}
+
 // sourceWho names whose sources a command shows, in a sentence.
 func sourceWho() string {
 	if sourceUserFlag == "" {
@@ -179,6 +187,10 @@ func runSourceLs(cmd *cobra.Command, args []string) error {
 	}
 	if jsonFlag {
 		return writeTermJSON(cmd.OutOrStdout(), resp)
+	}
+	if svc := resp.Service(); svc != nil {
+		renderServiceStatus(cmd.OutOrStdout(), server, svc)
+		return nil
 	}
 	renderSources(cmd.OutOrStdout(), server, *resp)
 	return nil
@@ -216,6 +228,9 @@ func runSourceUse(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return sourceError("list credential sources", server, err)
 	}
+	if svc := before.Service(); svc != nil {
+		return sourceIsServiceError(server, svc, "nothing to move")
+	}
 	m, err := resolveSourceMachine(before.Machines, args[0])
 	if err != nil {
 		return fmt.Errorf("%w\nnothing changed on %s", err, server)
@@ -250,6 +265,14 @@ func runSourceUnbind(cmd *cobra.Command, args []string) error {
 	client, server, err := sourceClient()
 	if err != nil {
 		return err
+	}
+	// The document first: a user the account service answers for has no
+	// binding to clear. A server too old to answer it is asked to unbind as
+	// before, and refuses or answers for itself.
+	if before, err := client.ListSources(sourceUserFlag); err == nil {
+		if svc := before.Service(); svc != nil {
+			return sourceIsServiceError(server, svc, "nothing to clear")
+		}
 	}
 	resp, err := client.UnbindSource(sourceUserFlag)
 	if err != nil {
@@ -384,8 +407,29 @@ func yesNo(b bool) string {
 type sourceStatus struct {
 	Server string `json:"server"`
 	User   string `json:"user"`
-	// Source is null when no machine is the source yet.
+	// Source is null when no machine is the source yet, and for a user the
+	// account service answers for.
 	Source *sourceStatusMachine `json:"source"`
+	// Service is set when the account service answers for the user on this
+	// server (no machine does).
+	Service *sourceStatusService `json:"service,omitempty"`
+}
+
+// sourceStatusService is the account service as `shed source status
+// --json` names it: its URL, and whether it is delivering to this server
+// (false for five minutes after it refused the server deliveries).
+type sourceStatusService struct {
+	URL        string `json:"url"`
+	Delivering bool   `json:"delivering"`
+}
+
+// renderServiceStatus says that the account service answers for the user on
+// server, and whether it is delivering to it.
+func renderServiceStatus(w io.Writer, server string, svc *config.SourceRef) {
+	fmt.Fprintf(w, "Credential source for %s on %s: the account service (%s); no machine answers here.\n", sourceWho(), server, termSafe(svc.URL))
+	if svc.State == source.StateNotDelivering {
+		fmt.Fprintln(w, "The account service is not delivering credentials to this server: deliveries are not applicable (asked again after five minutes, or after 'shed users refresh').")
+	}
 }
 
 type sourceStatusMachine struct {
@@ -408,6 +452,14 @@ func runSourceStatus(cmd *cobra.Command, args []string) error {
 		return sourceError("read the credential source", server, err)
 	}
 	st := sourceStatus{Server: server, User: resp.User}
+	if svc := resp.Service(); svc != nil {
+		st.Service = &sourceStatusService{URL: svc.URL, Delivering: svc.State != source.StateNotDelivering}
+		if jsonFlag {
+			return writeTermJSON(cmd.OutOrStdout(), st)
+		}
+		renderServiceStatus(cmd.OutOrStdout(), server, svc)
+		return nil
+	}
 	if id := resp.Binding.MachineID(); id != "" {
 		m, ok := findSourceMachine(resp.Machines, id)
 		if !ok {

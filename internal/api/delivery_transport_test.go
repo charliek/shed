@@ -177,7 +177,7 @@ func (h *deliveryHarness) ask(p delivery.Params) <-chan delivery.Result {
 }
 
 func aliceShed(name string) delivery.Params {
-	return delivery.Params{Reason: delivery.ReasonCreate, User: "alice", Shed: delivery.RequestShed{
+	return delivery.Params{Origin: delivery.OriginLocal, Reason: delivery.ReasonCreate, User: "alice", Shed: delivery.RequestShed{
 		Name: name, ID: "id" + strings.ReplaceAll(name, "-", ""), Backend: delivery.BackendFirecracker,
 		Repo: &delivery.RequestRepo{URL: "git@git.example.test:example/" + name + ".git", Name: "example/" + name}, ProjectDir: "/home/shed/" + name,
 	}}
@@ -344,7 +344,7 @@ func TestDeliveryTransportRefuseFixtures(t *testing.T) {
 		req := loadRequestFixture(t, f.Request)
 		src := startSource(t, h.srv.URL, refsource.Config{Client: alice, MachineID: machine, Refuse: f})
 		src.next("stream")
-		ch := h.ask(delivery.Params{Reason: req.Reason, User: "alice", Shed: req.Shed})
+		ch := h.ask(delivery.Params{Origin: delivery.OriginLocal, Reason: req.Reason, User: "alice", Shed: req.Shed})
 		src.next("request")
 		ans := src.next("answer")
 		res := waitResult(t, ch)

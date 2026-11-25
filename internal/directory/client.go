@@ -74,12 +74,23 @@ type Client struct {
 	key           ed25519.PrivateKey
 	organization  string
 	hc            *http.Client
-	now           func() time.Time
-	rand          io.Reader
+	// dhc is the hosted source's client (Deliver): no response-header
+	// timeout, a 5 s connect bound, every call bounded by its caller's
+	// context. The pull's hc is not touched.
+	dhc  *http.Client
+	now  func() time.Time
+	rand io.Reader
 
 	mu         sync.Mutex
 	token      string
 	tokenUntil time.Time
+	// The delivery token (scope deliveries:request), cached apart from the
+	// pull's under the same rules, with the assertion that got it (a reply
+	// that echoes either is refused); dflight is the token request in
+	// flight, which concurrent first deliveries share.
+	dtoken, dassertion string
+	dtokenUntil        time.Time
+	dflight            *deliveryFlight
 }
 
 // NewClient returns a Client for an enrolled server.
@@ -107,7 +118,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	dhc, err := newHTTPClient(transportConfig{
+		issuer: e.Issuer, allowPlainHTTP: cfg.AllowPlainHTTP, rootCAs: cfg.RootCAs, base: cfg.baseTransport, forDelivery: true,
+	})
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
+		dhc:           dhc,
 		clientID:      e.ClientID,
 		issuer:        e.Issuer,
 		tokenEndpoint: e.TokenEndpoint,
@@ -356,6 +374,13 @@ func (c *Client) sendToken(ctx context.Context, assertion string) (string, time.
 // string, token_type bearer (any case), expires_in a positive integer, and
 // scope, when present, holding directory:read.
 func decodeTokenAnswer(body []byte) (string, time.Duration, error) {
+	return decodeToken(body, directoryScope, false)
+}
+
+// decodeToken reads a token endpoint's 200 for scope: as decodeTokenAnswer
+// says, with scope, when present (and, with scopeRequired, it must be),
+// holding the scope asked for.
+func decodeToken(body []byte, want string, scopeRequired bool) (string, time.Duration, error) {
 	obj, err := parseDocument(body)
 	if err != nil {
 		return "", 0, err
@@ -378,10 +403,14 @@ func decodeTokenAnswer(body []byte) (string, time.Duration, error) {
 		return "", 0, errors.New("expires_in is not a positive integer")
 	}
 	// No member is named twice, so scope is present exactly when one finds it.
-	if v, present := obj.one("scope"); present {
+	v, present := obj.one("scope")
+	if !present && scopeRequired {
+		return "", 0, errors.New("no scope")
+	}
+	if present {
 		scope, ok := rawString(v)
-		if !ok || !slices.Contains(strings.Split(scope, " "), directoryScope) {
-			return "", 0, fmt.Errorf("scope does not include %s", directoryScope)
+		if !ok || !slices.Contains(strings.Split(scope, " "), want) {
+			return "", 0, fmt.Errorf("scope does not include %s", want)
 		}
 	}
 	return tok, time.Duration(min(secs, int64(maxTokenReuse/time.Second))) * time.Second, nil

@@ -40,9 +40,23 @@ type fakeLocal struct {
 	loads    int
 	// onLoad, when set, runs at each load (under the lock), with its count.
 	onLoad func(n int)
+	// origin is the shed's recorded user origin.
+	origin string
 }
 
 func (f *fakeLocal) LockShed(name string) func() { return f.locks.Acquire(name) }
+
+// originOrLocal is the shed's recorded origin: local unless the test set
+// one, or "none" for a shed that has none.
+func (f *fakeLocal) originOrLocal() string {
+	switch f.origin {
+	case "":
+		return delivery.OriginLocal
+	case "none":
+		return ""
+	}
+	return f.origin
+}
 
 func (f *fakeLocal) Halting(name string) bool { return f.halting.Raised(name) }
 
@@ -66,7 +80,7 @@ func (f *fakeLocal) LoadShed(_ context.Context, name string, mintID bool) (*Loca
 	cp := *f.shed
 	cp.ID = f.id
 	return &LocalShed{
-		Shed: &cp, ID: f.id, Record: f.rec.Clone(), ResetGen: f.gen,
+		Shed: &cp, ID: f.id, Record: f.rec.Clone(), ResetGen: f.gen, Origin: f.originOrLocal(),
 		Request:  config.DeliveryRequestShed(name, f.id, delivery.BackendFirecracker, f.repo, "", f.projectDir),
 		Repo:     f.repo,
 		CloneEnv: f.cloneEnv,
@@ -119,6 +133,36 @@ func TestLocalProvisionRules(t *testing.T) {
 		defer release()
 		if _, err := provision(f, nil, &busy); !errors.Is(err, config.ErrProvisionBusySentinel) {
 			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("a shed whose user's origin changed is refused before anything runs", func(t *testing.T) {
+		sh := running()
+		sh.User = "ada"
+		f := &fakeLocal{shed: sh, id: "abc", origin: delivery.OriginLocal}
+		svc := delivery.NewService(deliverytest.NewSource(), time.Second)
+		svc.SetOrigin(func(string) string { return delivery.OriginDirectory })
+		var busy lockmap.NamedMutexMap
+		if _, err := provision(f, svc, &busy); !errors.Is(err, delivery.ErrShedOriginChanged) {
+			t.Fatalf("err = %v, want ErrShedOriginChanged", err)
+		}
+		if len(f.saved) != 0 {
+			t.Fatalf("%d records saved", len(f.saved))
+		}
+		if release, ok := busy.TryAcquire("box"); !ok {
+			t.Fatal("the refused provision kept the shed's slot")
+		} else {
+			release()
+		}
+	})
+	t.Run("a shed with no recorded origin is refused: it fails closed", func(t *testing.T) {
+		f := &fakeLocal{shed: running(), id: "abc", origin: "none"}
+		svc := delivery.NewService(deliverytest.NewSource(), time.Second)
+		var busy lockmap.NamedMutexMap
+		if _, err := provision(f, svc, &busy); !errors.Is(err, delivery.ErrShedOriginUnknown) {
+			t.Fatalf("err = %v, want ErrShedOriginUnknown", err)
+		}
+		if len(f.saved) != 0 {
+			t.Fatalf("%d records saved", len(f.saved))
 		}
 	})
 	t.Run("a shed from before delivery gets an id and a record", func(t *testing.T) {
@@ -396,3 +440,38 @@ func TestCreateDeliveryEndsWhenTheShedIsReset(t *testing.T) {
 		}
 	})
 }
+
+// TestProvisionStoppedBeforeItsWriteIsShedEnded: a directory user's
+// provision whose shed is stopped once its answer is in (here, at the load
+// its first step makes) writes nothing and reports ErrShedEnded, the cause,
+// not a bare cancellation (so the API answers 409, not 500).
+func TestProvisionStoppedBeforeItsWriteIsShedEnded(t *testing.T) {
+	src := deliverytest.NewSource()
+	svc := delivery.NewService(src, 5*time.Second)
+	svc.SetOrigin(func(string) string { return delivery.OriginDirectory })
+	svc.SetHosted(answeringHosted{})
+	agent := deliverytest.NewAgent()
+	f := &fakeLocal{shed: running(), id: "abc", writer: agent, projectDir: "/home/shed/box", origin: delivery.OriginDirectory}
+	f.onLoad = func(n int) {
+		if n == 2 {
+			svc.EndShed("box", "abc")
+		}
+	}
+	var busy lockmap.NamedMutexMap
+	if _, err := provision(f, svc, &busy); !errors.Is(err, delivery.ErrShedEnded) {
+		t.Fatalf("provision = %v, want ErrShedEnded", err)
+	}
+	if len(agent.Writes()) != 0 || len(f.saved) != 0 {
+		t.Fatalf("wrote %d, saved %d", len(agent.Writes()), len(f.saved))
+	}
+}
+
+// answeringHosted answers every request with an accepted, empty answer.
+type answeringHosted struct{}
+
+func (answeringHosted) Deliver(_ context.Context, request []byte) (delivery.HostedStatus, []byte) {
+	req, _ := delivery.ParseRequest(request)
+	return delivery.HostedAnswer, []byte(`{"version":2,"id":"` + req.ID + `","items":[{"name":"e","provider":"p","kind":"env","variable":"E","value":"v","fingerprint":"f"}],"problems":[]}`)
+}
+
+func (answeringHosted) NotDelivering() bool { return false }

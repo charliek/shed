@@ -32,9 +32,14 @@
 //     WriterInput (one stage, with NewWriterInput, Marshal and the
 //     writer's own strict ParseWriterInput), WriterLine, the exit codes
 //     and the env file's name.
-//   - Service: the server's delivery. Request asks a user's source for a
-//     shed's bundle over the pin (Pin, Stream: internal/plugin's registry
-//     admits the machine and holds its stream) and waits for the answer;
+//   - Service: the server's delivery. Request chooses the user's Source by
+//     where the user comes from (SetOrigin: the server's static
+//     configuration), takes the shared admission (one request per shed,
+//     eight per user) and asks it: the machine source over the pin (Pin,
+//     Stream: internal/plugin's registry admits the machine and holds its
+//     stream), or the hosted source, the account service (Hosted:
+//     internal/directory's Runtime, late-bound by SetHosted), and waits for
+//     the answer;
 //     Claim judges an answer's binding and body for the transport (the
 //     pending-request table, table.go); Write writes one stage of an
 //     accepted bundle into a shed through its agent (Agent). A bundle is

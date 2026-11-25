@@ -95,6 +95,14 @@ type Record struct {
 	// knows no source would be asked, and runs its clone and hooks.
 	ScriptKey bool `json:"script_key,omitempty"`
 
+	// UserOrigin is where the shed's user came from when it was created:
+	// "local" (a server with no directory, or a local admin) or "directory"
+	// (a person of the account service), by the rule of plan 040 section
+	// 3.2. A delivery to the shed is refused (SHED_ORIGIN_CHANGED) when it
+	// is not the current origin of the user's name. A shed from before it
+	// is stamped once, at the server's first start that knows it.
+	UserOrigin string `json:"user_origin,omitempty"`
+
 	// Address is the last address the cloud reported; AddressAt is when.
 	Address   string    `json:"address,omitempty"`
 	AddressAt time.Time `json:"address_at,omitempty"`

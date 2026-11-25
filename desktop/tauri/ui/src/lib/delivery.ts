@@ -36,7 +36,9 @@ export interface DeliveryLast {
   reason: string;
   outcome: string;
   failure: { reason: string; rule: string | null; item: string | null; result: string | null } | null;
-  source: { machine_id: string; machine_name: string } | null;
+  /** The source asked: `kind` is `machine` (with its id and name) or `service` (the account
+   * service, with neither). */
+  source: { kind: string; machine_id: string; machine_name: string } | null;
   problems: DeliveryProblem[];
 }
 
@@ -103,7 +105,9 @@ function readLast(v: unknown): DeliveryLast | null {
     failure: f
       ? { reason: str(f.reason) ?? "", rule: str(f.rule), item: str(f.item), result: str(f.result) }
       : null,
-    source: src ? { machine_id: str(src.machine_id) ?? "", machine_name: str(src.machine_name) ?? "" } : null,
+    source: src
+      ? { kind: str(src.kind) ?? "", machine_id: str(src.machine_id) ?? "", machine_name: str(src.machine_name) ?? "" }
+      : null,
     problems: Array.isArray(o.problems)
       ? o.problems.map(readProblem).filter((p): p is DeliveryProblem => p !== null)
       : [],

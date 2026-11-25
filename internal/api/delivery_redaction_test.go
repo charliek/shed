@@ -96,7 +96,8 @@ func (b *redactionBackend) run(ctx context.Context, name string, reason delivery
 	b.mu.Unlock()
 	r := &delivery.Run{
 		Service: b.svc, Reason: reason,
-		Params:  delivery.Params{User: sh.User, Shed: config.DeliveryRequestShed(name, sh.ID, delivery.BackendFirecracker, sh.Repo, "", sh.LandingDir)},
+		Params: delivery.Params{User: sh.User, Shed: config.DeliveryRequestShed(name, sh.ID, delivery.BackendFirecracker, sh.Repo, "", sh.LandingDir),
+			Origin: b.svc.Origin(sh.User)}, // stamped at create
 		HasRepo: sh.Repo != "", Prior: prior, Host: b.host(name), Report: backend.DeliveryProgress(ctx),
 	}
 	_, err := r.Execute(ctx)

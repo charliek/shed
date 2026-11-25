@@ -13,6 +13,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
@@ -74,6 +75,9 @@ type job struct {
 	// one. Never stored, like deliver.
 	actor    audit.Identity
 	hasActor bool
+	// ticket is the create's delivery admission (delivery.Service.Admit),
+	// taken when the create request admitted the job. Never stored.
+	ticket delivery.Ticket
 
 	// fastWindow and fastErr are guarded by Backend.mu. While fastWindow is
 	// true the create handler has not answered yet, and a failure is its to

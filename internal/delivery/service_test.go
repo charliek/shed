@@ -569,15 +569,36 @@ func TestRequestLimits(t *testing.T) {
 		}
 	}
 
-	// With eight waiting and none freeing, a ninth times out unsent.
+	// With the user's slots taken and none freeing, one more times out
+	// unsent. The held request is claimed (an answer's body is on its way),
+	// so it keeps its slot past its own deadline (claimGrace) and cannot
+	// free it as the blocked request's deadline fires, whatever the two
+	// deadlines are.
 	setVar(t, &maxActivePerUser, 1)
 	held := requestAsync(svc, params("ada", "h0"))
-	st.next(t)
+	oh := st.next(t)
+	hc, err := svc.Claim(oh.ID, owner(st, "ada"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	blocked := requestAsync(svc, params("ada", "h1"))
 	if r := resultOf(t, blocked); r.Reason != ReasonSourceTimeout || r.RequestID != "" {
 		t.Fatalf("a request that never had a slot = %+v, want source_timeout unsent", r)
 	}
-	resultOf(t, held)
+	select {
+	case o := <-st.out:
+		t.Fatalf("the blocked request was sent (%s)", o.ID)
+	default:
+	}
+	if _, err := hc.Judge(answerBody(oh.ID, "")); err != nil {
+		t.Fatal(err)
+	}
+	if r := resultOf(t, held); r.Outcome != OutcomeAccepted {
+		t.Fatalf("held = %+v", r)
+	}
+	if sheds, ofUser := svc.admission.inFlight("ada"); sheds != 0 || ofUser != 0 {
+		t.Fatalf("slots held after every request ended: %d sheds, %d of ada's", sheds, ofUser)
+	}
 }
 
 // TestRememberedOutcomes: an answered or expired outcome is kept at least
@@ -589,8 +610,8 @@ func TestRememberedOutcomes(t *testing.T) {
 	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	tb := newTable(func(string, string, uint64) bool { return true }, clock)
 	add := func(id, shed string) *entry {
-		e := &entry{id: id, user: "ada", machine: SourceMachine{MachineID: testMachine}, serial: testSerial, stream: "s", done: make(chan struct{}), shedID: shed, deadline: now.Add(time.Hour)}
-		if _, err := tb.add(e); err != nil {
+		e := &entry{id: id, user: "ada", machine: SourceMachine{MachineID: testMachine}, serial: testSerial, stream: "s", done: make(chan struct{}), deadline: now.Add(time.Hour)}
+		if err := tb.add(e); err != nil {
 			t.Fatal(err)
 		}
 		return e

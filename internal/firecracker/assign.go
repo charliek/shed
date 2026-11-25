@@ -40,6 +40,9 @@ func (c *Client) AssignUser(ctx context.Context, name string, req config.AssignS
 		return nil, err
 	}
 	meta.User = req.User
+	// The shed is now this user's: where they come from, by the
+	// configuration now.
+	meta.UserOrigin = c.serverCfg.UserOrigin(req.User)
 	// Durable before it is acknowledged and before the bus route moves: an
 	// assignment cannot be undone, so one lost to a power loss could later
 	// be given to someone else. A failed sync fails the assignment and

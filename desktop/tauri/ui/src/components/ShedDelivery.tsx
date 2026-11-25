@@ -286,7 +286,11 @@ export function ShedDeliveryDetail({ shed, rec, prov, onDeliver }: {
           <Label>Last delivery</Label>
           <div className="text-[12.5px] text-shed-text" data-delivery-last>
             {[when(last.at), last.reason, last.outcome].filter(Boolean).join(" · ")}
-            {last.source?.machine_name ? ` · from ${last.source.machine_name}` : ""}
+            {last.source?.kind === "service"
+              ? " · from the account service"
+              : last.source?.machine_name
+                ? ` · from ${last.source.machine_name}`
+                : ""}
           </div>
           {last.failure && (
             <div className="mt-1 text-[12px] font-medium text-shed-danger" data-delivery-failure>

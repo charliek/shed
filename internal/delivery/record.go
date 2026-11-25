@@ -166,12 +166,12 @@ type Step struct {
 
 // Last is the last delivery: when, why, and what became of it.
 type Last struct {
-	At       string    `json:"at"`
-	Reason   Reason    `json:"reason"`
-	Outcome  Outcome   `json:"outcome"`
-	Failure  *Failure  `json:"failure,omitempty"`
-	Source   *Source   `json:"source,omitempty"`
-	Problems []Problem `json:"problems,omitempty"`
+	At       string        `json:"at"`
+	Reason   Reason        `json:"reason"`
+	Outcome  Outcome       `json:"outcome"`
+	Failure  *Failure      `json:"failure,omitempty"`
+	Source   *RecordSource `json:"source,omitempty"`
+	Problems []Problem     `json:"problems,omitempty"`
 }
 
 // Failure is why the last delivery failed: the reason, with the rule an
@@ -201,21 +201,21 @@ const (
 	SourceKindService SourceKind = "service"
 )
 
-// Source is the source a record says was asked: its kind and, for a
+// RecordSource is the source a record says was asked: its kind and, for a
 // machine, the machine's id and name.
-type Source struct {
+type RecordSource struct {
 	Kind        SourceKind `json:"kind"`
 	MachineID   string     `json:"machine_id,omitempty"`
 	MachineName string     `json:"machine_name,omitempty"`
 }
 
 // Record is the record's form of a machine source.
-func (m SourceMachine) Record() *Source {
-	return &Source{Kind: SourceKindMachine, MachineID: m.MachineID, MachineName: m.MachineName}
+func (m SourceMachine) Record() *RecordSource {
+	return &RecordSource{Kind: SourceKindMachine, MachineID: m.MachineID, MachineName: m.MachineName}
 }
 
 // ServiceSource is the record's form of a hosted source.
-func ServiceSource() *Source { return &Source{Kind: SourceKindService} }
+func ServiceSource() *RecordSource { return &RecordSource{Kind: SourceKindService} }
 
 // RecordItem is one delivered item as the record keeps it: never its
 // content or value.
@@ -565,7 +565,7 @@ func parseLast(n *node) (*Last, *Refusal) {
 		if r := checkObject(sn, sw, sourceMembers, []string{"kind"}, sourceKinds); r != nil {
 			return nil, r
 		}
-		s := &Source{Kind: SourceKind(sn.get("kind").text)}
+		s := &RecordSource{Kind: SourceKind(sn.get("kind").text)}
 		if s.Kind != SourceKindMachine && s.Kind != SourceKindService {
 			return nil, refuse(RuleBadSource, sw+".kind")
 		}

@@ -15,7 +15,9 @@ import (
 // The hosted fixtures (CONTRACT.md, "Hosted exchanges" and "Hosted
 // replies"), held to their closed languages here. The exchanges run against
 // the reference account service in internal/directory/refserver; a server's
-// classification of the replies is its hosted client's test.
+// classification of the replies, through its hosted client and this
+// package's hosted source, is internal/directory's
+// TestHostedRepliesClassified.
 
 // hostedReply is one reply of a hosted/replies fixture.
 type hostedReply struct {

@@ -111,6 +111,9 @@ func (b *Backend) AssignUser(ctx context.Context, name string, req config.Assign
 			return nil, err
 		}
 		r.Shed.User = req.User
+		// The shed is now this user's: where they come from, by the
+		// configuration now.
+		r.UserOrigin = b.deliverySvc.Origin(req.User)
 		b.saveLocked(r)
 		b.busUserChangedLocked(r)
 	}

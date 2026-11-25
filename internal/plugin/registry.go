@@ -374,6 +374,9 @@ type Registry struct {
 	// by SetBindings, before any listener registers; read under mu, or
 	// through pin().
 	bindings source.Bindings
+	// serviceUser reports the users the account service answers for
+	// (SetServiceUsers): never admitted, bound or moved to a machine.
+	serviceUser func(user string) bool
 	// deliveries is each user's delivery stream (delivery.go), at most one.
 	deliveries map[string]*DeliveryStream
 	// closed is set by Close: nothing registers from then on.

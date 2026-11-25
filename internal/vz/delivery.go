@@ -111,6 +111,7 @@ func (c *Client) LoadShed(ctx context.Context, name string, mintID bool) (*orche
 		Record:   meta.Delivery,
 		ResetGen: meta.ResetGen,
 		Request:  requestShed(meta),
+		Origin:   meta.UserOrigin,
 		Repo:     meta.Repo,
 		CloneEnv: cloneEnv,
 		Writer:   agent,

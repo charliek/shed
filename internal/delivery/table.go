@@ -27,9 +27,9 @@ import (
 // A claim consumes the request: from then on it ends accepted or refused,
 // whatever the body turns out to be.
 //
-// Limits: one active request per shed (a second for the same shed id is
-// refused, ErrShedPending) and maxActivePerUser per user (a request beyond
-// them waits for a slot, within its own deadline; see Service.Request).
+// The limits (one request in flight per shed, maxActivePerUser per user)
+// are not the table's: they are the Service's admission (admission.go),
+// shared by both sources and taken before a source is asked.
 
 // The answer refusals of the table, in the order they are checked.
 var (
@@ -38,10 +38,6 @@ var (
 	ErrAlreadyAnswered = errors.New("the delivery request was answered already")
 	ErrDeadlinePassed  = errors.New("the delivery request's deadline has passed")
 )
-
-// ErrShedPending is returned by Service.Request when a request for the same
-// shed id is already waiting for its answer.
-var ErrShedPending = errors.New("a delivery request for this shed is already waiting for its answer")
 
 // ClaimStatus is the status and code the transport answers a claim refusal
 // with; ok is false for an error that is not one.
@@ -59,13 +55,9 @@ func ClaimStatus(err error) (status int, code string, ok bool) {
 	return 0, "", false
 }
 
-// maxActivePerUser is how many requests one user may have waiting at once.
 // maxRemembered bounds how many ended outcomes are kept, whatever their
-// age. Vars so tests can change them.
-var (
-	maxActivePerUser = 8
-	maxRemembered    = 4096
-)
+// age. A var so tests can change it.
+var maxRemembered = 4096
 
 type entryState int
 
@@ -99,11 +91,10 @@ type entry struct {
 	serial   string
 	stream   string
 	done     <-chan struct{}
-	shedID   string
 	deadline time.Time
 
 	state   entryState
-	active  bool // counted against the shed and user limits
+	active  bool // waiting or claimed: not yet ended
 	endedAt time.Time
 	// result receives the judgement of a claim, once.
 	result chan judged
@@ -112,12 +103,8 @@ type entry struct {
 type table struct {
 	mu      sync.Mutex
 	entries map[string]*entry
-	sheds   map[string]*entry // active, by shed id
-	users   map[string]int    // active, by user
 	// ended is the ids whose outcomes are remembered, oldest first.
-	ended []string
-	// freed is closed, and replaced, whenever an active request ends.
-	freed   chan struct{}
+	ended   []string
 	current func(user, machine string, gen uint64) bool
 	now     func() time.Time
 }
@@ -125,54 +112,28 @@ type table struct {
 func newTable(current func(user, machine string, gen uint64) bool, now func() time.Time) *table {
 	return &table{
 		entries: map[string]*entry{},
-		sheds:   map[string]*entry{},
-		users:   map[string]int{},
-		freed:   make(chan struct{}),
 		current: current,
 		now:     now,
 	}
 }
 
-// errUserFull is add's refusal of a request beyond the user's limit; the
-// caller waits on the freed channel it returns with it.
-var errUserFull = errors.New("the user has as many delivery requests waiting as they may")
-
-// add makes e waiting and active, within the limits. On errUserFull it
-// returns the channel that is closed when a slot may have freed.
-func (t *table) add(e *entry) (<-chan struct{}, error) {
+// add makes e waiting and active. The caller holds e's admission (the
+// shed's and the user's slots).
+func (t *table) add(e *entry) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sweepLocked()
-	if t.sheds[e.shedID] != nil {
-		return nil, ErrShedPending
-	}
-	if t.users[e.user] >= maxActivePerUser {
-		return t.freed, errUserFull
-	}
 	if _, taken := t.entries[e.id]; taken {
-		return nil, errors.New("delivery: request id collision")
+		return errors.New("delivery: request id collision")
 	}
 	e.state, e.active = stateWaiting, true
 	e.result = make(chan judged, 1)
 	t.entries[e.id] = e
-	t.sheds[e.shedID] = e
-	t.users[e.user]++
-	return nil, nil
+	return nil
 }
 
-// releaseLocked ends e's place in the limits.
-func (t *table) releaseLocked(e *entry) {
-	if !e.active {
-		return
-	}
-	e.active = false
-	delete(t.sheds, e.shedID)
-	if t.users[e.user]--; t.users[e.user] <= 0 {
-		delete(t.users, e.user)
-	}
-	close(t.freed)
-	t.freed = make(chan struct{})
-}
+// releaseLocked marks e ended.
+func (t *table) releaseLocked(e *entry) { e.active = false }
 
 // rememberLocked ends e in a remembered state.
 func (t *table) rememberLocked(e *entry, st entryState) {

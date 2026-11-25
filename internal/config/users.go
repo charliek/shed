@@ -8,6 +8,8 @@ import (
 
 	gossh "golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
+
+	"github.com/charliek/shed/internal/delivery"
 )
 
 // UsersConfigured reports whether the server has a user list (auth.users with
@@ -15,6 +17,23 @@ import (
 // user, an admin.
 func (c *ServerConfig) UsersConfigured() bool {
 	return c.Auth != nil && len(c.Auth.Users) > 0
+}
+
+// UserOrigin is where a user name comes from, by the static configuration
+// alone (plan 040, section 3.2): on a directory server (auth.directory) a
+// name in the local-admin set (auth.users) is delivery.OriginLocal and every
+// other name delivery.OriginDirectory; on any other server every name is
+// local. It reads no lookup, trust state or caller, so its answer is the
+// same for every request and does not change when a directory's trust time
+// ends. The implicit user ("") is local.
+func (c *ServerConfig) UserOrigin(name string) string {
+	if c == nil || !c.DirectoryConfigured() || name == "" {
+		return delivery.OriginLocal
+	}
+	if _, local := c.Auth.Users[name]; local {
+		return delivery.OriginLocal
+	}
+	return delivery.OriginDirectory
 }
 
 // UserNames returns the configured user names, sorted.
