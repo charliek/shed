@@ -556,12 +556,14 @@ Delivers the shed's credentials again and finishes whatever its create left owed
 | 404 | `SHED_NOT_FOUND` | no such shed, or one the caller may not see |
 | 409 | `SHED_NOT_RUNNING` | the shed is not running |
 | 409 | `PROVISION_IN_PROGRESS` | a provision, or a remote job, is already running for the shed |
+| 409 | `SHED_ORIGIN_CHANGED` | the shed's user's name has moved between the server's local admins and the account service since the shed was made. Fixed message; nothing is requested. See [Credential delivery](delivery.md#where-a-sheds-user-came-from) |
+| 409 | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin yet (it is stamped at the server's next start). Fixed message |
 
 A failed delivery is a progress warning, `Credentials were not delivered (<reason>). Run: shed provision <name>`, not an error status.
 
 ### Delivery routes
 
-The server's channel to a person's credential source; the wire format is the [provision contract](provision-contract.md). Both routes need the `credentials` scope and the machine headers, and are refused for service clients and script keys.
+The server's channel to a person's credential source; the wire format is the [provision contract](provision-contract.md). Both routes are the machine source's. They need the `credentials` scope and the machine headers, and are refused for service clients and script keys, and with `409 SOURCE_IS_SERVICE` for a user the account service answers for. A hosted source has no route on the server: the server calls the service.
 
 | Route | Purpose |
 |---|---|
@@ -1581,10 +1583,44 @@ read as one moment's state.
 | `machines[].key_fingerprint` | The key the machine's certificate was enrolled with (empty in open mode) |
 | `machines[].connected`, `namespaces` | Whether it holds a subscription now, and for which request types |
 
+For a user the account service answers for (a directory user on a server with `auth.directory`), the document has no machine and no pin: `machines` is `[]`, and the delivery slot holds one service entry. The user is the target user, so an admin's `?user=` is judged by that user's name.
+
+```json
+{
+  "user": "ada",
+  "binding": {
+    "delivery": [{"kind": "service", "url": "https://accounts.example.test"}],
+    "signing": []
+  },
+  "machines": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `binding.delivery[].kind` | `service` here; `machine` for a pinned machine (then `id` is present) |
+| `binding.delivery[].url` | The account service's URL, as the server's `auth.directory.url` has it |
+| `binding.delivery[].state` | Absent normally. `not_delivering` while the server remembers, for up to five minutes, that the service does not offer delivery or does not let this server ask |
+
+The members are additive: a client that reads only `machine` entries ignores a `service` one.
+
 **Errors:** `400 INVALID_REQUEST` (`?user` twice, or an unknown user named by
 an admin), `403 FORBIDDEN`, `503 SOURCE_BUSY` with `Retry-After` (the user's
 records were being changed or saved for more than 2 s; retry), `503
 PLUGINS_DISABLED` (the server has no credential bus).
+
+### The service refusal: `409 SOURCE_IS_SERVICE`
+
+For a user the account service answers for, `POST /api/sources/use`, `POST /api/sources/unbind`, `GET /api/delivery/requests`, `POST /api/delivery/requests/{id}` and the listener routes under `/api/plugins/listeners` answer `409` with one fixed body, judged by the target user:
+
+```json
+{
+  "error": {
+    "code": "SOURCE_IS_SERVICE",
+    "message": "the account service is this user's credential source on this server: no machine answers here"
+  }
+}
+```
 
 ### POST /api/sources/use
 

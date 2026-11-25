@@ -200,7 +200,7 @@ def test_a_request_is_answered_with_every_providers_items(settings):
     ans = c.mock.await_delivery_answer(req["id"], timeout=30)
     assert ans["stream"] == stream["id"]
     assert ans["machine_id"] == c.machine_id
-    assert ans["body"]["version"] == 1 and ans["body"]["id"] == req["id"]
+    assert ans["body"]["version"] == 2 and ans["body"]["id"] == req["id"]
     assert ans["body"]["problems"] == [], ans["body"]["problems"]
     items = _items(ans)
     want = {

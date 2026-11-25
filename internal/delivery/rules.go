@@ -12,7 +12,11 @@ type Rule string
 
 // The rules, in the order ParseAnswer checks them (the contract's order).
 const (
-	RuleBodyTooLarge      Rule = "body_too_large"
+	RuleBodyTooLarge Rule = "body_too_large"
+	// RuleEchoesCredential is a hosted source's reply that holds the bearer
+	// token or the assertion the server presented (contract section 3b).
+	// Only the hosted transport judges it; ParseAnswer never does.
+	RuleEchoesCredential  Rule = "echoes_credential"
 	RuleNotJSON           Rule = "not_json"
 	RuleDuplicateMember   Rule = "duplicate_member"
 	RuleNullValue         Rule = "null_value"
@@ -63,7 +67,7 @@ const (
 
 // Rules is every rule, in the contract's order.
 var Rules = []Rule{
-	RuleBodyTooLarge, RuleNotJSON, RuleDuplicateMember, RuleNullValue,
+	RuleBodyTooLarge, RuleEchoesCredential, RuleNotJSON, RuleDuplicateMember, RuleNullValue,
 	RuleUnknownMember, RuleMissingMember, RuleWrongType, RuleUnsupportedVer,
 	RuleBadID, RuleIDMismatch, RuleTooManyItems, RuleTooManyProblems,
 	RuleBadKind, RuleWrongKindMember, RuleBadName, RuleBadProvider,

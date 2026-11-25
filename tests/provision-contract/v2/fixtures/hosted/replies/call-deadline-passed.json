@@ -1,0 +1,24 @@
+{
+  "name": "call-deadline-passed",
+  "description": "410 DEADLINE_PASSED: source_timeout.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 410,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "DEADLINE_PASSED",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_timeout"
+  }
+}

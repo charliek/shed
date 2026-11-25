@@ -1,0 +1,21 @@
+{
+  "name": "token-rate-limited",
+  "description": "429 temporarily_unavailable: source_offline.",
+  "request": "create-repo",
+  "token": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "30"
+    },
+    "body": {
+      "error": "temporarily_unavailable",
+      "error_description": "fixed text"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

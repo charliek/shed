@@ -59,19 +59,22 @@ const (
 	ReasonSourceOffline      StepReason = "source_offline"
 	ReasonSourceTimeout      StepReason = "source_timeout"
 	ReasonSourceDisconnected StepReason = "source_disconnected"
-	ReasonAnswerRefused      StepReason = "answer_refused"
-	ReasonWriteFailed        StepReason = "write_failed"
-	ReasonImageTooOld        StepReason = "image_too_old"
-	ReasonCloneFailed        StepReason = "clone_failed"
-	ReasonProjectDirExists   StepReason = "project_dir_exists"
-	ReasonHookFailed         StepReason = "hook_failed"
+	// ReasonSourceRefused is a hosted source that refused the server or its
+	// request (contract section 3b); a machine source never does.
+	ReasonSourceRefused    StepReason = "source_refused"
+	ReasonAnswerRefused    StepReason = "answer_refused"
+	ReasonWriteFailed      StepReason = "write_failed"
+	ReasonImageTooOld      StepReason = "image_too_old"
+	ReasonCloneFailed      StepReason = "clone_failed"
+	ReasonProjectDirExists StepReason = "project_dir_exists"
+	ReasonHookFailed       StepReason = "hook_failed"
 )
 
 // StepReasons is every StepReason, in the contract's order.
 var StepReasons = []StepReason{
 	ReasonNotApplicable, ReasonFromSnapshot, ReasonAdopted, ReasonNoItems,
 	ReasonNoRepo, ReasonLocalDir, ReasonNoProjectDir, ReasonNoHook, ReasonNoProvision,
-	ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected,
+	ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonSourceRefused,
 	ReasonAnswerRefused, ReasonWriteFailed, ReasonImageTooOld,
 	ReasonCloneFailed, ReasonProjectDirExists, ReasonHookFailed,
 }
@@ -86,7 +89,7 @@ var (
 		StepInstall: {ReasonNoHook, ReasonNoProvision, ReasonFromSnapshot, ReasonAdopted},
 	}
 	failReasons = map[string][]StepReason{
-		StepStage1:  {ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonAnswerRefused, ReasonWriteFailed},
+		StepStage1:  {ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonSourceRefused, ReasonAnswerRefused, ReasonWriteFailed},
 		StepClone:   {ReasonCloneFailed, ReasonProjectDirExists},
 		StepStage2:  {ReasonWriteFailed},
 		StepInstall: {ReasonHookFailed},
@@ -96,7 +99,7 @@ var (
 // FailureReasons are the reasons a delivery fails, as the warning names
 // them.
 var FailureReasons = []StepReason{
-	ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected,
+	ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonSourceRefused,
 	ReasonAnswerRefused, ReasonWriteFailed, ReasonImageTooOld,
 }
 
@@ -163,12 +166,12 @@ type Step struct {
 
 // Last is the last delivery: when, why, and what became of it.
 type Last struct {
-	At       string         `json:"at"`
-	Reason   Reason         `json:"reason"`
-	Outcome  Outcome        `json:"outcome"`
-	Failure  *Failure       `json:"failure,omitempty"`
-	Source   *SourceMachine `json:"source,omitempty"`
-	Problems []Problem      `json:"problems,omitempty"`
+	At       string        `json:"at"`
+	Reason   Reason        `json:"reason"`
+	Outcome  Outcome       `json:"outcome"`
+	Failure  *Failure      `json:"failure,omitempty"`
+	Source   *RecordSource `json:"source,omitempty"`
+	Problems []Problem     `json:"problems,omitempty"`
 }
 
 // Failure is why the last delivery failed: the reason, with the rule an
@@ -181,11 +184,38 @@ type Failure struct {
 	Result ItemResult `json:"result,omitempty"`
 }
 
-// SourceMachine is the machine a request went to.
+// SourceMachine is a machine source's identity: the machine a request
+// went to.
 type SourceMachine struct {
 	MachineID   string `json:"machine_id"`
 	MachineName string `json:"machine_name"`
 }
+
+// SourceKind is the kind of source a record names.
+type SourceKind string
+
+const (
+	// SourceKindMachine is a machine source (contract section 3a).
+	SourceKindMachine SourceKind = "machine"
+	// SourceKindService is a hosted source, the account service (section 3b).
+	SourceKindService SourceKind = "service"
+)
+
+// RecordSource is the source a record says was asked: its kind and, for a
+// machine, the machine's id and name.
+type RecordSource struct {
+	Kind        SourceKind `json:"kind"`
+	MachineID   string     `json:"machine_id,omitempty"`
+	MachineName string     `json:"machine_name,omitempty"`
+}
+
+// Record is the record's form of a machine source.
+func (m SourceMachine) Record() *RecordSource {
+	return &RecordSource{Kind: SourceKindMachine, MachineID: m.MachineID, MachineName: m.MachineName}
+}
+
+// ServiceSource is the record's form of a hosted source.
+func ServiceSource() *RecordSource { return &RecordSource{Kind: SourceKindService} }
 
 // RecordItem is one delivered item as the record keeps it: never its
 // content or value.
@@ -271,7 +301,7 @@ const (
 	RuleBadOutcome       Rule = "bad_outcome"
 	RuleBadFailure       Rule = "bad_failure"
 	RuleBadRule          Rule = "bad_rule"
-	RuleBadMachine       Rule = "bad_machine"
+	RuleBadSource        Rule = "bad_source"
 	RuleBadResult        Rule = "bad_result"
 	RuleStateMismatch    Rule = "state_mismatch"
 )
@@ -280,7 +310,7 @@ const (
 // order.
 var RecordRules = []Rule{
 	RuleUnexpectedMember, RuleEmptyList, RuleBadState, RuleBadStepState, RuleBadReason,
-	RuleBadLastReason, RuleBadOutcome, RuleBadFailure, RuleBadRule, RuleBadMachine,
+	RuleBadLastReason, RuleBadOutcome, RuleBadFailure, RuleBadRule, RuleBadSource,
 	RuleBadResult, RuleStateMismatch,
 }
 
@@ -295,8 +325,8 @@ var (
 	lastKinds      = map[string]nodeKind{"at": kindString, "reason": kindString, "outcome": kindString, "failure": kindObject, "source": kindObject, "problems": kindArray}
 	failureMembers = []string{"reason", "rule", "item", "result"}
 	failureKinds   = map[string]nodeKind{"reason": kindString, "rule": kindString, "item": kindString, "result": kindString}
-	sourceMembers  = []string{"machine_id", "machine_name"}
-	sourceKinds    = map[string]nodeKind{"machine_id": kindString, "machine_name": kindString}
+	sourceMembers  = []string{"kind", "machine_id", "machine_name"}
+	sourceKinds    = map[string]nodeKind{"kind": kindString, "machine_id": kindString, "machine_name": kindString}
 	rItemMembers   = []string{"name", "provider", "stage", "kind", "base", "target", "fingerprint", "expires_at", "written_at", "result"}
 	rItemRequired  = []string{"name", "provider", "stage", "kind", "target", "fingerprint", "result"}
 	rItemKinds     = map[string]nodeKind{"name": kindString, "provider": kindString, "stage": kindNumber, "kind": kindString, "base": kindString, "target": kindString, "fingerprint": kindString, "expires_at": kindString, "written_at": kindString, "result": kindString}
@@ -448,7 +478,7 @@ func parseLast(n *node) (*Last, *Refusal) {
 	if !ValidTime(l.At) {
 		return nil, refuse(RuleBadTime, "last.at")
 	}
-	if l.Reason != ReasonCreate && l.Reason != ReasonProvision {
+	if !ValidReason(l.Reason) {
 		return nil, refuse(RuleBadLastReason, "last.reason")
 	}
 	var allowed []StepReason
@@ -458,7 +488,7 @@ func parseLast(n *node) (*Last, *Refusal) {
 	case OutcomeRefused:
 		allowed = []StepReason{ReasonAnswerRefused}
 	case OutcomeNoAnswer:
-		allowed = []StepReason{ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected}
+		allowed = []StepReason{ReasonSourceOffline, ReasonSourceTimeout, ReasonSourceDisconnected, ReasonSourceRefused}
 	case OutcomeNotRequested:
 		allowed = []StepReason{ReasonImageTooOld}
 	default:
@@ -515,22 +545,48 @@ func parseLast(n *node) (*Last, *Refusal) {
 		l.Failure = f
 	}
 
-	// source: required when an answer came.
-	if l.Outcome == OutcomeAccepted || l.Outcome == OutcomeRefused {
+	// source, by the outcome (the contract's table "Outcomes"): required
+	// when an answer came, and with source_refused (only a hosted source
+	// refuses); absent when no request was made; otherwise optional (a
+	// machine source as in version 1, a hosted one whenever it was chosen).
+	refusedBySource := l.Failure != nil && l.Failure.Reason == ReasonSourceRefused
+	switch {
+	case l.Outcome == OutcomeAccepted || l.Outcome == OutcomeRefused || refusedBySource:
 		if r := presence(n, where, "source", true); r != nil {
+			return nil, r
+		}
+	case l.Outcome == OutcomeNotRequested:
+		if r := presence(n, where, "source", false); r != nil {
 			return nil, r
 		}
 	}
 	if sn := n.get("source"); sn != nil {
-		if r := checkObject(sn, "last.source", sourceMembers, sourceMembers, sourceKinds); r != nil {
+		const sw = "last.source"
+		if r := checkObject(sn, sw, sourceMembers, []string{"kind"}, sourceKinds); r != nil {
 			return nil, r
 		}
-		s := &SourceMachine{MachineID: sn.get("machine_id").text, MachineName: sn.get("machine_name").text}
-		if !ValidID(s.MachineID) {
-			return nil, refuse(RuleBadMachine, "last.source.machine_id")
+		s := &RecordSource{Kind: SourceKind(sn.get("kind").text)}
+		if s.Kind != SourceKindMachine && s.Kind != SourceKindService {
+			return nil, refuse(RuleBadSource, sw+".kind")
 		}
-		if s.MachineName == "" || len(s.MachineName) > 63 || hasControl(s.MachineName) {
-			return nil, refuse(RuleBadMachine, "last.source.machine_name")
+		if refusedBySource && s.Kind != SourceKindService {
+			return nil, refuse(RuleBadSource, sw+".kind")
+		}
+		isMachine := s.Kind == SourceKindMachine
+		if r := presence(sn, sw, "machine_id", isMachine); r != nil {
+			return nil, r
+		}
+		if r := presence(sn, sw, "machine_name", isMachine); r != nil {
+			return nil, r
+		}
+		if isMachine {
+			s.MachineID, s.MachineName = sn.get("machine_id").text, sn.get("machine_name").text
+			if !ValidID(s.MachineID) {
+				return nil, refuse(RuleBadSource, sw+".machine_id")
+			}
+			if s.MachineName == "" || len(s.MachineName) > 63 || hasControl(s.MachineName) {
+				return nil, refuse(RuleBadSource, sw+".machine_name")
+			}
 		}
 		l.Source = s
 	}

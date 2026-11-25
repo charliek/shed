@@ -1,0 +1,25 @@
+{
+  "name": "bad-variable-mixed-case",
+  "description": "Ld_PRELOAD in mixed case: refused by the alphabet.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "Ld_PRELOAD",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_variable"
+  }
+}

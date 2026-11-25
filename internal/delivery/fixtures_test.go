@@ -15,14 +15,14 @@ import (
 	"github.com/charliek/shed/internal/delivery/refsource"
 )
 
-// v1 is the version 1 contract, from this package's directory.
-var v1 = filepath.Join("..", "..", "tests", "provision-contract", "v1")
+// v2 is the version 2 contract, from this package's directory.
+var v2 = filepath.Join("..", "..", "tests", "provision-contract", "v2")
 
-// jsonFiles lists the .json files directly under v1/<dir>, by their paths
-// under v1/, and fails when there are none.
+// jsonFiles lists the .json files directly under v2/<dir>, by their paths
+// under v2/, and fails when there are none.
 func jsonFiles(t *testing.T, dir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(v1, filepath.FromSlash(dir)))
+	entries, err := os.ReadDir(filepath.Join(v2, filepath.FromSlash(dir)))
 	if err != nil {
 		t.Fatalf("list %s: %v", dir, err)
 	}
@@ -42,7 +42,7 @@ func jsonFiles(t *testing.T, dir string) []string {
 // file's.
 func loadAnswerFixture(t *testing.T, rel string) *refsource.AnswerFixture {
 	t.Helper()
-	f, err := refsource.LoadAnswerFixture(filepath.Join(v1, filepath.FromSlash(rel)))
+	f, err := refsource.LoadAnswerFixture(filepath.Join(v2, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatalf("%s: %v", rel, err)
 	}
@@ -145,7 +145,9 @@ func TestRefuseFixtures(t *testing.T) {
 		})
 	}
 	for _, rule := range delivery.Rules {
-		if rule != delivery.RuleBodyTooLarge && !covered[rule] {
+		// body_too_large is generated (TestBodyTooLarge), and an echoed
+		// credential exists only on the hosted transport.
+		if rule != delivery.RuleBodyTooLarge && rule != delivery.RuleEchoesCredential && !covered[rule] {
 			t.Errorf("no refuse fixture for %s", rule)
 		}
 	}
@@ -184,7 +186,7 @@ func TestFixturesAnswerAnyRequest(t *testing.T) {
 // TestBodyTooLarge: a body over 6 MiB is refused under body_too_large
 // (413), whatever it holds. Generated, not stored.
 func TestBodyTooLarge(t *testing.T) {
-	body := append([]byte(`{"version":1,"id":"`+refsource.FixtureRequestID+`","items":[],"problems":[],"x":"`),
+	body := append([]byte(`{"version":2,"id":"`+refsource.FixtureRequestID+`","items":[],"problems":[],"x":"`),
 		bytes.Repeat([]byte("a"), delivery.MaxBodyBytes)...)
 	body = append(body, `"}`...)
 	req := &delivery.Request{ID: refsource.FixtureRequestID}
@@ -331,7 +333,7 @@ func TestRecordRefuseFixtures(t *testing.T) {
 func TestStreamFixtures(t *testing.T) {
 	for _, rel := range jsonFiles(t, "fixtures/stream") {
 		t.Run(filepath.Base(rel), func(t *testing.T) {
-			tr, err := refsource.LoadTranscript(filepath.Join(v1, filepath.FromSlash(rel)))
+			tr, err := refsource.LoadTranscript(filepath.Join(v2, filepath.FromSlash(rel)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -381,7 +383,7 @@ func TestStreamFixtures(t *testing.T) {
 // strictDecode decodes a fixture with no member outside v.
 func strictDecode(t *testing.T, rel string, v any) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(v1, filepath.FromSlash(rel)))
+	raw, err := os.ReadFile(filepath.Join(v2, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,35 @@
+{
+  "name": "source-refused-without-source",
+  "description": "source_refused with no source: only a hosted source refuses, so the source {kind: service} is required.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "source_refused"
+      },
+      "clone": {
+        "state": "failed",
+        "reason": "clone_failed"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "no_answer",
+      "failure": {
+        "reason": "source_refused"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "missing_member"
+  }
+}

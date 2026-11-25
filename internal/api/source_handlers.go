@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/source"
 )
@@ -80,12 +81,78 @@ func (s *Server) sourceTarget(w http.ResponseWriter, own string, admin bool, nam
 		writeError(w, http.StatusForbidden, config.ErrForbidden, "only an admin can see or move another user's credential source")
 		return "", false
 	}
+	// A directory user by the static rule is the account service's
+	// whether or not the live list holds them now (it does not after the
+	// directory's trust time ends): judged before the lookup, so the answer
+	// does not depend on the directory's state.
+	if config.ValidUserName(named) && s.serviceUser(named) {
+		return named, true
+	}
 	if !s.configuredUser(named) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest,
 			fmt.Sprintf("no user named %q is configured on this server (auth.users)", named))
 		return "", false
 	}
 	return named, true
+}
+
+// serviceUser reports whether the account service answers for user on this
+// server: a directory user (any name but a local admin's, on a directory
+// server), by the server's static configuration (plan 040, section 3.2).
+func (s *Server) serviceUser(user string) bool {
+	return s.cfg.UserOrigin(user) == delivery.OriginDirectory
+}
+
+// refuseServiceTarget is refuseServiceUser for the target of a delivery or
+// listener route: the user an admin names with ?user=, or the caller.
+func (s *Server) refuseServiceTarget(w http.ResponseWriter, r *http.Request, caller string) bool {
+	if named := r.URL.Query()["user"]; len(named) > 0 {
+		for _, u := range named {
+			if s.refuseServiceUser(w, u) {
+				return true
+			}
+		}
+	}
+	return s.refuseServiceUser(w, caller)
+}
+
+// refuseServiceUser answers 409 SOURCE_IS_SERVICE, with its one fixed
+// message, and reports true when user is a directory user: no machine is
+// bound, moved to, streamed to or answered from for them, on any route.
+func (s *Server) refuseServiceUser(w http.ResponseWriter, user string) bool {
+	if !s.serviceUser(user) {
+		return false
+	}
+	writeError(w, http.StatusConflict, config.ErrSourceIsService, config.SourceIsServiceMessage)
+	return true
+}
+
+// serviceSourcesDocument is GET /api/sources for a directory user: no
+// machine, no signing slot, and one delivery entry naming the account
+// service, with "state": "not_delivering" while the service has refused this
+// server deliveries (the five-minute memory). Its shape is pinned by
+// crates/fixtures/sources/service*.json.
+type serviceSourcesDocument struct {
+	User    string `json:"user"`
+	Binding struct {
+		Delivery []config.SourceRef `json:"delivery"`
+		Signing  []config.SourceRef `json:"signing"`
+	} `json:"binding"`
+	Machines []config.SourceMachine `json:"machines"`
+}
+
+func (s *Server) serviceSources(user string) serviceSourcesDocument {
+	ref := config.SourceRef{Kind: source.KindService}
+	if s.cfg.DirectoryConfigured() {
+		ref.URL = s.cfg.Auth.Directory.Issuer()
+	}
+	if s.delivery != nil && s.delivery.NotDelivering() {
+		ref.State = source.StateNotDelivering
+	}
+	doc := serviceSourcesDocument{User: user, Machines: []config.SourceMachine{}}
+	doc.Binding.Delivery = []config.SourceRef{ref}
+	doc.Binding.Signing = []config.SourceRef{}
+	return doc
 }
 
 // sourceBindings returns the bus's source bindings, answering 503 and
@@ -163,6 +230,10 @@ func sourceRefs(refs []source.Ref) []config.SourceRef {
 // could mix the two sides. A client that goes away while waiting is
 // answered nothing.
 //
+// For a directory user (the target, which for an admin's ?user= is the
+// user named) the answer is the account service's document
+// (serviceSourcesDocument), read from no binding.
+//
 //	403 FORBIDDEN         a script key, a service client, or a user who is not
 //	                      an admin naming another user
 //	400 INVALID_REQUEST   an admin naming a user who is not configured, or
@@ -185,6 +256,12 @@ func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
 	}
 	user, ok := s.sourceTarget(w, own, admin, want)
 	if !ok {
+		return
+	}
+	if s.serviceUser(user) {
+		// The target's source is the account service: no machine's binding
+		// is read, or exists.
+		writeJSON(w, http.StatusOK, s.serviceSources(user))
 		return
 	}
 	if s.sourceBindings(w) == nil {
@@ -230,6 +307,8 @@ func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
 //	403 FORBIDDEN                 as for GET /api/sources
 //	404 SOURCE_MACHINE_NOT_FOUND  no machine with that id has presented
 //	                              itself for the user
+//	409 SOURCE_IS_SERVICE         the target user is a directory user: the
+//	                              account service answers for them
 //	500 INTERNAL_ERROR            the move was not confirmed: the store could
 //	                              not save it. The source in use is unchanged
 //	                              for now, but a save that failed late may
@@ -247,7 +326,7 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, ok := s.sourceTarget(w, own, admin, req.User)
-	if !ok {
+	if !ok || s.refuseServiceUser(w, user) {
 		return
 	}
 	if !source.ValidMachineID(req.MachineID) {
@@ -263,6 +342,8 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 	res, err := s.plugins.Move(r.Context(), user, req.MachineID, by)
 	if err != nil {
 		switch {
+		case errors.Is(err, plugin.ErrSourceIsService):
+			writeError(w, http.StatusConflict, config.ErrSourceIsService, config.SourceIsServiceMessage)
 		case errors.Is(err, source.ErrUnknownMachine):
 			writeError(w, http.StatusNotFound, config.ErrSourceMachineNotFound,
 				fmt.Sprintf("no machine with id %s has presented itself for %s on this server; 'shed source ls' lists those that have",
@@ -303,6 +384,7 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 //	400 INVALID_REQUEST   the body, or an admin naming a user who is not
 //	                      configured
 //	403 FORBIDDEN         as for GET /api/sources
+//	409 SOURCE_IS_SERVICE the target user is a directory user
 //	500 INTERNAL_ERROR    the store could not save it: the source in use is
 //	                      unchanged for now, but a save that failed late may
 //	                      still take effect when the server restarts
@@ -318,7 +400,7 @@ func (s *Server) handleUnbindSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, ok := s.sourceTarget(w, own, admin, req.User)
-	if !ok {
+	if !ok || s.refuseServiceUser(w, user) {
 		return
 	}
 	if s.sourceBindings(w) == nil {

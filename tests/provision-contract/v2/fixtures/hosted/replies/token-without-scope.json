@@ -1,0 +1,22 @@
+{
+  "name": "token-without-scope",
+  "description": "A 200 with no scope member: the delivery token must name its scope. source_refused.",
+  "request": "create-repo",
+  "token": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Pragma": "no-cache"
+    },
+    "body": {
+      "access_token": "opaque-delivery-token",
+      "token_type": "bearer",
+      "expires_in": 600
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

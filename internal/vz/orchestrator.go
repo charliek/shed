@@ -326,6 +326,8 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		FromSnapshot:   req.FromSnapshot,
 		Owner:          req.Owner,
 		User:           req.User,
+		// Where the user came from, by the configuration now.
+		UserOrigin: b.c.serverCfg.UserOrigin(req.User),
 		// Always explicit for a new shed; nil (a non-API caller) is "all".
 		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
 		NetworkProfile: config.NetworkProfileOpen,

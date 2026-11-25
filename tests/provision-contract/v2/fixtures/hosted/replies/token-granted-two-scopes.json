@@ -1,0 +1,32 @@
+{
+  "name": "token-granted-two-scopes",
+  "description": "A granted token whose scope names two scopes, one of them deliveries:request: proceed.",
+  "request": "create-repo",
+  "token": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Pragma": "no-cache"
+    },
+    "body": {
+      "access_token": "opaque-delivery-token",
+      "token_type": "Bearer",
+      "expires_in": 600,
+      "scope": "directory:read deliveries:request"
+    }
+  },
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "accept/typical"
+    }
+  ],
+  "expect": {
+    "result": "accepted"
+  }
+}

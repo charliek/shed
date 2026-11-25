@@ -1,0 +1,20 @@
+{
+  "name": "call-id-mismatch",
+  "description": "A 200 answering another request: answer_refused, rule id_mismatch.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "refuse/id-mismatch"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "answer_refused",
+    "rule": "id_mismatch"
+  }
+}

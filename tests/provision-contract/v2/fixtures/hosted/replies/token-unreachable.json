@@ -1,0 +1,12 @@
+{
+  "name": "token-unreachable",
+  "description": "The token endpoint refuses the connection: source_offline.",
+  "request": "create-repo",
+  "token": {
+    "unreachable": true
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

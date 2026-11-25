@@ -160,3 +160,53 @@ func jsonInt(raw json.RawMessage) (int64, bool) {
 	v, err := n.Int64()
 	return v, err == nil
 }
+
+// unpairedSurrogate reports whether raw, a document checkStrictJSON took,
+// holds a \u escape of a UTF-16 surrogate that is not one half of a
+// high-then-low pair. Go's decoder would replace one with U+FFFD; the
+// contracts refuse it, never repair it.
+func unpairedSurrogate(raw []byte) bool {
+	hex := func(i int) (rune, bool) {
+		if i+6 > len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+			return 0, false
+		}
+		var r rune
+		for _, c := range raw[i+2 : i+6] {
+			switch {
+			case c >= '0' && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case c >= 'a' && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	for i := 0; i < len(raw); {
+		if raw[i] != '\\' {
+			i++
+			continue
+		}
+		r, ok := hex(i)
+		if !ok {
+			i += 2 // another escape, \\ among them
+			continue
+		}
+		switch {
+		case r >= 0xD800 && r <= 0xDBFF:
+			lo, ok := hex(i + 6)
+			if !ok || lo < 0xDC00 || lo > 0xDFFF {
+				return true
+			}
+			i += 12
+		case r >= 0xDC00 && r <= 0xDFFF:
+			return true
+		default:
+			i += 6
+		}
+	}
+	return false
+}

@@ -1,0 +1,14 @@
+{
+  "name": "call-silent",
+  "description": "Nothing before the deadline: source_timeout.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "silent": true
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_timeout"
+  }
+}

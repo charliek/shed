@@ -435,7 +435,7 @@ shed provision <name> [flags]
 | `--status` | | `false` | Print the shed's delivery record instead of provisioning: its state, each step, the last delivery and the delivered items (names, targets and fingerprints, never values). With `--json`, the record. |
 | `--timeout` | | `10m` | Timeout for the provision |
 
-The shed must be running, and only its own user may provision it (an admin may not provision another user's shed; script keys and service clients are refused). It asks your credential source (the machine bound with [`shed source use`](#shed-source)) for a bundle, then runs stage 1, the clone, stage 2 and the install hook in that order, each only if it is owed or failed; the delivered files are written again whenever your source answers. On a shed whose create finished, this is a re-delivery and nothing else. An existing project directory is never removed. A failure prints `Credentials were not delivered (<reason>). Run: shed provision <name>`. Nothing is written when no answer is accepted (the source was offline or timed out, or the answer was refused), but a write failure can leave the items before the failed one written. A shed whose image is too old to take a delivery prints `Credentials were not delivered (image_too_old). Recreate the shed from a current image.` instead: its stages are skipped, so its clone and install hook still run. Run `shed provision <name> --status` to see what the shed holds and what is owed. See [Credential delivery](delivery.md).
+The shed must be running, and only its own user may provision it (an admin may not provision another user's shed; script keys and service clients are refused). It asks your credential source for a bundle: on a server with an account service, for a user who is not a local admin, the account service; otherwise the machine bound with [`shed source use`](#shed-source). Then it runs stage 1, the clone, stage 2 and the install hook in that order, each only if it is owed or failed; the delivered files are written again whenever your source answers. On a shed whose create finished, this is a re-delivery and nothing else. An existing project directory is never removed. A failure prints `Credentials were not delivered (<reason>). Run: shed provision <name>`. Nothing is written when no answer is accepted (the source was offline or timed out, or the answer was refused), but a write failure can leave the items before the failed one written. A shed whose image is too old to take a delivery prints `Credentials were not delivered (image_too_old). Recreate the shed from a current image.` instead: its stages are skipped, so its clone and install hook still run. Run `shed provision <name> --status` to see what the shed holds and what is owed; its `Last:` line says who answered, `from <machine>` or `from the account service`. A delivery to a shed whose user's name has moved between the local admins and the account service since the shed was made is refused with `SHED_ORIGIN_CHANGED` (and a shed with no recorded origin with `SHED_ORIGIN_UNKNOWN`); create a new shed. See [Credential delivery](delivery.md#where-a-sheds-user-came-from). See [Credential delivery](delivery.md).
 
 On a Firecracker or VZ shed created before delivery existed with `--no-provision`, `shed provision` runs the install hook: the server kept no record of that flag for such a shed (the remote backend did). See [Sheds created before delivery](delivery.md#sheds-created-before-delivery).
 
@@ -612,9 +612,9 @@ older than 'shed users status')`.
 
 ### shed source
 
-A server sends your sheds' credential requests (SSH agent, Docker and AWS
-helpers) to one of your machines only: your **credential source** on that
-server. The first of your machines to connect becomes it; the others are
+A server sends your sheds' credential requests to one of your machines only:
+your **credential source** on that server (on a server that takes its users from an account
+service, the exception is below). The first of your machines to connect becomes it; the others are
 refused, keep retrying and name the source. See [Security › One machine
 answers for each user](security.md#one-machine-answers-for-each-user).
 
@@ -669,6 +669,16 @@ Cleared the credential source for you on my-server (it was machine "desktop" (fe
 Forgot 2 machines; each is listed again when it next connects.
 The first of your machines to connect next becomes the source: a desktop app that is still running reconnects within about 30 s, and its machine becomes the source again.
 ```
+
+For a user the account service answers for (a directory user on a server with `auth.directory`), there is no pin and no machine. `shed source status` says so, `shed source ls` lists no machines, and `shed source use` and `shed source unbind` refuse and change nothing, because the document they fetch first names the service as the source:
+
+```text
+$ shed source status
+Credential source for you on my-server: the account service (https://accounts.example.test); no machine answers here.
+The account service is not delivering credentials to this server: deliveries are not applicable (asked again after five minutes, or after 'shed users refresh').
+```
+
+The second line appears only while the server remembers that the service does not deliver to it. `use` and `unbind` exit non-zero and print the server's fixed message (`the account service is this user's credential source on this server: no machine answers here`) with the service's URL; the CLI prints no error code. The API answers the same routes (`POST /api/sources/use`, `POST /api/sources/unbind`) with `409 SOURCE_IS_SERVICE`. With `--user`, an admin sees the same for another user, judged by that user's name. See [Credentials from the account service](../guides/credentials-from-the-account-service.md).
 
 `shed source status` lists in parentheses the bus namespaces the source holds,
 when it holds any (`connected (ssh-agent)`); a source connected by its

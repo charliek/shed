@@ -1,0 +1,24 @@
+{
+  "name": "call-no-source-lowercase",
+  "description": "404 with the code no_source: codes are compared exactly, so not NO_SOURCE. source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "no_source",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

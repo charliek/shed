@@ -29,7 +29,7 @@ const PARTIAL = {
   },
   last: {
     at: "2026-11-23T10:00:00Z", reason: "provision", outcome: "accepted",
-    source: { machine_id: "a".repeat(32), machine_name: "laptop" },
+    source: { kind: "machine", machine_id: "a".repeat(32), machine_name: "laptop" },
     problems: [{ provider: "ssh-key", code: "passphrase", message: "the key has a passphrase" }],
   },
   items: [
@@ -57,7 +57,13 @@ test("a record decodes defensively", () => {
   assert.equal(r.items[1].target, "");
   assert.equal(r.last.problems[0].code, "passphrase");
   assert.equal(r.last.source.machine_name, "laptop");
+  assert.equal(r.last.source.kind, "machine");
   assert.equal(r.withheld, false);
+});
+
+test("a source's kind is read: the account service has no machine", () => {
+  const r = readDelivery({ ...PARTIAL, last: { ...PARTIAL.last, source: { kind: "service" } } });
+  assert.deepEqual(r.last.source, { kind: "service", machine_id: "", machine_name: "" });
 });
 
 test("only the server's marker withholds a record", () => {

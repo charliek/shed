@@ -1,0 +1,11 @@
+{
+  "name": "duplicate-member-item",
+  "description": "name named twice in one item.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"a\",\"name\":\"b\",\"provider\":\"p\",\"kind\":\"env\",\"variable\":\"KEY\",\"value\":\"v\",\"fingerprint\":\"f\"}],\"problems\":[]}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_member"
+  }
+}

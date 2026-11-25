@@ -1,0 +1,102 @@
+{
+  "name": "too-many-problems",
+  "description": "17 problems.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "m"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "too_many_problems"
+  }
+}

@@ -751,7 +751,7 @@ func (p *Provider) SetLabels(ctx context.Context, ref provider.Ref, labels map[s
 
 // ClaimLabel implements provider.Provider. The check and the write are made
 // under the fake's lock, so they are one.
-func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string) error {
+func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string, also map[string]string) error {
 	// The same validation as the gce client's, made before anything is read
 	// as it is there: a key that is a valid label (lowercase first), never an
 	// identity label, a non-empty valid value; and, below, at most 64 labels
@@ -766,6 +766,9 @@ func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value 
 	if value == "" || !provider.ValidLabelValue(value) {
 		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label %s has an invalid value %q", key, value)
 	}
+	if err := checkAlso(string(OpClaimLabel), key, also); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpClaimLabel, ref); err != nil {
@@ -777,18 +780,23 @@ func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value 
 	}
 	switch cur := in.inst.Labels[key]; cur {
 	case value:
-		return nil
+		if alsoInPlace(in.inst.Labels, also) {
+			return nil
+		}
 	case "":
 	default:
 		return provider.Errorf(provider.ErrLabelTaken, string(OpClaimLabel), "%s has %s=%q", ref, key, cur)
 	}
-	if _, ok := in.inst.Labels[key]; !ok && len(in.inst.Labels)+1 > 64 {
+	merged := maps.Clone(in.inst.Labels)
+	if merged == nil {
+		merged = make(map[string]string)
+	}
+	merged[key] = value
+	maps.Copy(merged, also)
+	if len(merged) > 64 {
 		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "an instance takes at most 64 labels")
 	}
-	if in.inst.Labels == nil {
-		in.inst.Labels = make(map[string]string)
-	}
-	in.inst.Labels[key] = value
+	in.inst.Labels = merged
 	p.labelWrites++
 	return p.appliedErrLocked(OpClaimLabel)
 }
@@ -999,4 +1007,30 @@ func clone(inst provider.Instance) provider.Instance {
 
 func ctxErr(ctx context.Context, op Op) error {
 	return &provider.Error{Op: string(op), Err: ctx.Err()}
+}
+
+// checkAlso validates ClaimLabel's also: keys under the claim's own rules
+// (never an identity label, nor the claimed key), valid values.
+func checkAlso(op, key string, also map[string]string) error {
+	for k, v := range also {
+		switch {
+		case k == "" || !provider.ValidLabelValue(k) || k[0] < 'a' || k[0] > 'z':
+			return provider.Errorf(provider.ErrInvalid, op, "label key %q is not valid", k)
+		case k == key || k == provider.LabelSchema || k == provider.LabelEnv || k == provider.LabelID:
+			return provider.Errorf(provider.ErrInvalid, op, "label %s cannot be written with a claim", k)
+		case !provider.ValidLabelValue(v):
+			return provider.Errorf(provider.ErrInvalid, op, "label %s has an invalid value %q", k, v)
+		}
+	}
+	return nil
+}
+
+// alsoInPlace reports whether every label of also already has its value.
+func alsoInPlace(labels, also map[string]string) bool {
+	for k, v := range also {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
 }

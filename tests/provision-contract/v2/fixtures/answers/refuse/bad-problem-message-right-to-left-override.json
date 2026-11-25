@@ -1,0 +1,22 @@
+{
+  "name": "bad-problem-message-right-to-left-override",
+  "description": "A problem message holding U+202E, which would show its text reversed: not printable.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "file \u202etxt.exe"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_problem_message"
+  }
+}

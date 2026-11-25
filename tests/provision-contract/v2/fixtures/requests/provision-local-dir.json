@@ -1,0 +1,18 @@
+{
+  "name": "provision-local-dir",
+  "description": "shed provision on a shed with a host directory.",
+  "request": {
+    "version": 2,
+    "id": "89abcdef0123456789abcdef01234567",
+    "reason": "provision",
+    "deadline": "2026-11-23T10:00:30Z",
+    "user": "ada",
+    "shed": {
+      "name": "widgets",
+      "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "backend": "vz",
+      "local_dir": "widgets",
+      "project_dir": "/home/shed/widgets"
+    }
+  }
+}

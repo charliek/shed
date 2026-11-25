@@ -12,6 +12,12 @@
 //	                   [--silent] [--delay <duration>] [--twice]
 //	                   [--second-connection] [--answer-machine-id <hex>]
 //	                   [--answer-cert <pem> --answer-key <pem>] [--once]
+//	shed-provision-ref --render-fixture <file>
+//
+// --render-fixture prints an answer fixture's body (the fixture language's
+// answer, answer_text or answer_base64, with its fill), answering the
+// fixtures' own request id, and exits: what a harness sends as the body of
+// a reply it plays itself (the integration suite's hosted cases).
 //
 // --answer-cert answers with another certificate but the stream's own
 // machine and stream ids; --answer-machine-id names another machine;
@@ -47,6 +53,7 @@ const usage = `usage: shed-provision-ref --server <url> [--cert <pem> --key <pem
                           [--silent] [--delay <duration>] [--twice]
                           [--second-connection] [--answer-machine-id <hex>]
                           [--answer-cert <pem> --answer-key <pem>] [--once]
+       shed-provision-ref --render-fixture <file>
 `
 
 func main() {
@@ -84,12 +91,25 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	answerCert := fs.String("answer-cert", "", "answer with this client certificate instead, naming the stream's machine and stream ids (with --answer-key)")
 	answerKey := fs.String("answer-key", "", "the answer certificate's private key (PEM)")
 	once := fs.Bool("once", false, "exit when the first stream ends")
+	render := fs.String("render-fixture", "", "print this answer fixture's body (for the fixtures' request id) and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		fs.Usage()
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if *render != "" {
+		f, err := refsource.LoadAnswerFixture(*render)
+		if err != nil {
+			return err
+		}
+		body, err := f.Body(refsource.FixtureRequestID)
+		if err != nil {
+			return err
+		}
+		_, err = stdout.Write(body)
+		return err
 	}
 
 	client, err := httpClient(*certFile, *keyFile, *caFile)

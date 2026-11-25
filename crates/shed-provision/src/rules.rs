@@ -38,6 +38,7 @@ macro_rules! rules {
 
 rules! {
     BodyTooLarge => "body_too_large",
+    EchoesCredential => "echoes_credential",
     NotJson => "not_json",
     DuplicateMember => "duplicate_member",
     NullValue => "null_value",
@@ -93,7 +94,7 @@ rules! {
     BadOutcome => "bad_outcome",
     BadFailure => "bad_failure",
     BadRule => "bad_rule",
-    BadMachine => "bad_machine",
+    BadSource => "bad_source",
     BadResult => "bad_result",
     StateMismatch => "state_mismatch",
     BadValue => "bad_value",
@@ -101,8 +102,9 @@ rules! {
 
 /// Every answer rule, in the order the contract checks them. These are the
 /// rules that travel.
-pub const ANSWER_RULES: [Rule; 47] = [
+pub const ANSWER_RULES: [Rule; 48] = [
     Rule::BodyTooLarge,
+    Rule::EchoesCredential,
     Rule::NotJson,
     Rule::DuplicateMember,
     Rule::NullValue,
@@ -162,7 +164,7 @@ pub const RECORD_RULES: [Rule; 12] = [
     Rule::BadOutcome,
     Rule::BadFailure,
     Rule::BadRule,
-    Rule::BadMachine,
+    Rule::BadSource,
     Rule::BadResult,
     Rule::StateMismatch,
 ];

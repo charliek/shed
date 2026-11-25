@@ -52,6 +52,10 @@ type transportConfig struct {
 	// base replaces the transport under the issuer and redirect rules. Tests
 	// in this package only.
 	base http.RoundTripper
+	// forDelivery makes the hosted source's client: no response-header
+	// timeout (a delivery may take until its deadline, which its context
+	// carries) and a connect bound of deliveryConnectTimeout.
+	forDelivery bool
 }
 
 // newHTTPClient returns the HTTP client the contract's requests go through,
@@ -84,6 +88,10 @@ func newHTTPClient(cfg transportConfig) (*http.Client, error) {
 		IdleConnTimeout:        90 * time.Second,
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	if cfg.forDelivery {
+		tr.ResponseHeaderTimeout = 0
+		dialer.Timeout = deliveryConnectTimeout
+	}
 	switch u.Scheme {
 	case "https":
 		tr.Proxy = http.ProxyFromEnvironment

@@ -19,6 +19,20 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+**Ships:** server, desktop
+
+The account service becomes a credential source for the users it lists, and the provision contract moves to version 2.
+
+**Upgrade note.** On a server with `auth.directory`, a pinned machine **stops delivering to directory users the moment the server is upgraded**, and their bindings there are removed at start (each is logged). Put their values into the account service first, then upgrade the servers and the desktop apps together. Local admins keep their pinned machine.
+
+- **Provision contract version 2 (a flag day with the desktop app).** `tests/provision-contract/v2/` replaces v1. It adds the hosted source (section 3b: a separate token request for `deliveries:request` and one `POST /v1/deliveries` per request), the reasons `create`, `provision`, `start` and `refresh`, the problem codes `timed_out` and `expired`, `last.source.kind` (`machine` or `service`), the failure reason `source_refused`, and the rule `echoes_credential`. A v0.11 desktop app cannot read a version 2 request, so move the server and the app together.
+- **The account service as a source.** For a user from the directory list, a create or `shed provision` asks the account service and nothing else, with no fallback to a machine. The choice is made from the server's configuration alone. Text the service sends back is classified and dropped, never logged or stored. No configuration is added.
+- **Directory users have no binding.** `GET /api/sources` answers a `{kind: service, url}` entry (with `state: not_delivering` while the service is remembered not to deliver here); the other source routes answer `409 SOURCE_IS_SERVICE`. `shed source status`, `use` and `unbind` and `shed provision --status` say "the account service".
+- **Shed origin.** A shed records whether its user was local or from the directory. A delivery after the name has moved between the sets is `409 SHED_ORIGIN_CHANGED` (`SHED_ORIGIN_UNKNOWN` for a shed with no record). Sheds from before are stamped once at the first start, recorded in `<state_dir>/delivery/origin-migration.json`.
+- Docs: a new guide, [Credentials from the account service](docs/guides/credentials-from-the-account-service.md); the delivery, security, CLI and API references.
+
 ## v0.11.0 — 2026-11-24
 
 **Ships:** server, desktop

@@ -634,7 +634,7 @@ func TestClaimLabelRechecksOnEveryAttempt(t *testing.T) {
 		in.labels[provider.LabelUser] = "alice"
 		in.labelFP = f.fingerprint()
 	}
-	if err := c.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); !errors.Is(err, provider.ErrLabelTaken) {
+	if err := c.ClaimLabel(ctx, ref, provider.LabelUser, "bob", nil); !errors.Is(err, provider.ErrLabelTaken) {
 		t.Fatalf("ClaimLabel after another writer = %v, want ErrLabelTaken", err)
 	}
 	if !raced {

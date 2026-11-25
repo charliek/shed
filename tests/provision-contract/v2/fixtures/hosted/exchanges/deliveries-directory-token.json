@@ -1,0 +1,57 @@
+{
+  "name": "deliveries-directory-token",
+  "description": "A token with the scope directory:read only (signed by the harness, see `token`): the delivery call is 403 INSUFFICIENT_SCOPE.",
+  "before": [
+    {
+      "sources.set": "ada"
+    }
+  ],
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/v1/deliveries",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": {
+      "version": 2,
+      "id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "reason": "create",
+      "deadline": "2026-11-16T06:00:30Z",
+      "user": "ada",
+      "shed": {
+        "name": "widgets",
+        "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+        "backend": "remote",
+        "repo": {
+          "url": "git@git.example.test:example/widgets.git",
+          "name": "example/widgets"
+        },
+        "project_dir": "/home/shed/widgets"
+      }
+    }
+  },
+  "response": {
+    "status": 403,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": {
+        "code": "INSUFFICIENT_SCOPE",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

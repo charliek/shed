@@ -1050,7 +1050,7 @@ func TestApplyItemsEnvAtMax(t *testing.T) {
 	t.Run("exactly the maximum", func(t *testing.T) {
 		l := newLayout(t)
 		items := build(delivery.MaxEnvFileBytes)
-		body, err := json.Marshal(delivery.Answer{Version: 1, ID: req.ID, Items: items})
+		body, err := json.Marshal(delivery.Answer{Version: delivery.Version, ID: req.ID, Items: items})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1080,7 +1080,7 @@ func TestApplyItemsEnvAtMax(t *testing.T) {
 	t.Run("one byte more", func(t *testing.T) {
 		l := newLayout(t)
 		items := build(delivery.MaxEnvFileBytes + 1)
-		body, err := json.Marshal(delivery.Answer{Version: 1, ID: req.ID, Items: items})
+		body, err := json.Marshal(delivery.Answer{Version: delivery.Version, ID: req.ID, Items: items})
 		if err != nil {
 			t.Fatal(err)
 		}

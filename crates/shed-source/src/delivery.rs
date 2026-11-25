@@ -1,5 +1,5 @@
 //! The delivery stream client (plan 039 §3.1 and §3.7, commit 2): one machine source's
-//! side of the provision contract's transport (`tests/provision-contract/v1/CONTRACT.md`,
+//! side of the provision contract's transport (`tests/provision-contract/v2/CONTRACT.md`,
 //! section 3) against one shed-server.
 //!
 //! * `GET /api/delivery/requests` with the machine headers and the credential the

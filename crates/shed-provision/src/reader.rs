@@ -184,3 +184,22 @@ pub trait Reader {
         }
     }
 }
+
+/// A [`Reader`] that refuses every read and every command: what a host that
+/// holds a provider's inputs itself (and reads nothing) passes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoReader;
+
+impl Reader for NoReader {
+    fn home(&self) -> &Path {
+        Path::new("/")
+    }
+
+    fn read_file(&self, _path: &Path, _limit: usize) -> Result<FileData, ReadError> {
+        Err(ReadError::Denied)
+    }
+
+    fn run(&self, _command: &Command) -> Result<CommandOutput, RunError> {
+        Err(RunError::Failed)
+    }
+}

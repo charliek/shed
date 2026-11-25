@@ -906,10 +906,25 @@ func (b *SourceBinding) MachineID() string {
 	return b.Signing[0].ID
 }
 
-// SourceRef names what a binding slot points at: a machine, by its id.
+// Service is the account service when it is the user's credential source
+// (the first delivery entry is of kind "service"), nil otherwise.
+func (r *SourcesResponse) Service() *SourceRef {
+	if r == nil || r.Binding == nil || len(r.Binding.Delivery) == 0 || r.Binding.Delivery[0].Kind != "service" {
+		return nil
+	}
+	ref := r.Binding.Delivery[0]
+	return &ref
+}
+
+// SourceRef names what a binding slot points at: a machine, by its id; or,
+// in the delivery slot of a directory user's document, the account service
+// ({"kind": "service", "url": <the directory's URL>}, with "state":
+// "not_delivering" while it has refused this server deliveries).
 type SourceRef struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
+	Kind  string `json:"kind"`
+	ID    string `json:"id,omitempty"`
+	URL   string `json:"url,omitempty"`
+	State string `json:"state,omitempty"`
 }
 
 // SourceMachine is one machine that has presented itself for a user.
@@ -1481,6 +1496,22 @@ const (
 	// ErrProvisionInProgress (409): a provision of the shed is already
 	// running, or its create or a remote job is still at work.
 	ErrProvisionInProgress = "PROVISION_IN_PROGRESS"
+	// ErrShedOriginChanged (409): `shed provision` (or a create's delivery)
+	// on a shed whose user's name has moved between this server's local
+	// admins and the account service since the shed was made: the person of
+	// that name now is not the one who made it, so no delivery is made and
+	// nothing is requested. The message is ShedOriginChangedMessage.
+	ErrShedOriginChanged = "SHED_ORIGIN_CHANGED"
+	// ErrShedOriginUnknown (409): `shed provision` (or a create's delivery)
+	// on a shed with no record of where its user came from: one made before
+	// it whose one-time stamp at start-up could not be saved. It fails
+	// closed until a start stamps it. The message is
+	// ShedOriginUnknownMessage.
+	ErrShedOriginUnknown = "SHED_ORIGIN_UNKNOWN"
+	// ShedOriginUnknownMessage is ErrShedOriginUnknown's one fixed message.
+	ShedOriginUnknownMessage = "this shed has no record of where its user came from: no credentials are delivered to it until the server records one (at its next start for a shed made before this version) or an admin assigns it"
+	// ShedOriginChangedMessage is ErrShedOriginChanged's one fixed message.
+	ShedOriginChangedMessage = "this shed's user was a different principal when it was created (the name moved between this server's local admins and the account service): no credentials are delivered to it; create a new shed"
 	// ErrExecLimit (429) means the shed already runs
 	// exec.max_concurrent_per_shed HTTPS execs.
 	ErrExecLimit = "EXEC_LIMIT"
@@ -1556,11 +1587,19 @@ const (
 	// source on this server; the body's top-level "source" object
 	// ({"machine_id","machine_name"}) names the machine that is.
 	ErrSourceNotBound = "SOURCE_NOT_BOUND"
+	// ErrSourceIsService (409) means the target user's credentials come from
+	// the account service on this server (a directory user): no machine
+	// answers, binds or holds a stream for them. The message is
+	// SourceIsServiceMessage. The body is pinned by
+	// crates/fixtures/sources/source-is-service.json.
+	ErrSourceIsService = "SOURCE_IS_SERVICE"
 	// ErrSourceDuplicateStream (409) means the user's source machine already
 	// holds a subscription to the namespace (another process with the same
 	// machine id, or a stream not yet reaped). Retryable for a broker that
 	// sends a machine id; only such a broker can get it.
 	ErrSourceDuplicateStream = "SOURCE_DUPLICATE_STREAM"
+	// SourceIsServiceMessage is ErrSourceIsService's one fixed message.
+	SourceIsServiceMessage = "the account service is this user's credential source on this server: no machine answers here"
 	// ErrSourceRateLimited (429, with Retry-After) means the user has made
 	// too many admissions that change the source records (a new machine id,
 	// a changed name or key fingerprint) lately. Retryable.

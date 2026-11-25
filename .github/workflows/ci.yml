@@ -525,7 +525,7 @@ jobs:
         # it (lane conformance, FakeRoost). shed-opencode was retired in plan 038.
         # shed-craze's recipe (real hub, SHED_CRAZE_REQUIRE) is the next step.
         # shed-provision and shed-provision-providers (plan 039): the first's
-        # tests read tests/provision-contract/v1 from the checkout. shed-source
+        # tests read tests/provision-contract/v2 from the checkout. shed-source
         # (plan 039 §3.7): the machine identity, credential store and minter
         # extracted from the retired broker; its state-dir and flock paths differ
         # on Linux.

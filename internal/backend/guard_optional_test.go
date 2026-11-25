@@ -47,6 +47,7 @@ var optionalInterfaces = map[string]string{
 	"CountingLister":         optionalServer,
 	"CountingSnapshotLister": optionalServer,
 	"SnapshotStamper":        optionalServer,
+	"OriginStamper":          optionalServer,
 }
 
 // optionalTypes maps each classified interface to its type, for the method
@@ -62,6 +63,7 @@ var optionalTypes = map[string]reflect.Type{
 	"CountingLister":         reflect.TypeOf((*CountingLister)(nil)).Elem(),
 	"CountingSnapshotLister": reflect.TypeOf((*CountingSnapshotLister)(nil)).Elem(),
 	"SnapshotStamper":        reflect.TypeOf((*SnapshotStamper)(nil)).Elem(),
+	"OriginStamper":          reflect.TypeOf((*OriginStamper)(nil)).Elem(),
 }
 
 // declaredInterfaces returns the exported interface types declared in this

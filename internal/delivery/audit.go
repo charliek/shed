@@ -53,7 +53,7 @@ func runActor(ctx context.Context, p Params) audit.Identity {
 }
 
 // auditOutcome is rec as a delivery event carries it: the states, reasons,
-// the source machine, and each item's name and result with the fingerprint
+// the source (its kind, and for a machine its id and name), and each item's name and result with the fingerprint
 // the source chose; never a target, content or value, and of the problems
 // only how many there were.
 func auditOutcome(rec *Record, reason Reason, interrupted bool) audit.DeliveryOutcome {
@@ -74,7 +74,7 @@ func auditOutcome(rec *Record, reason Reason, interrupted bool) audit.DeliveryOu
 			out.Failure = &audit.DeliveryFailure{Reason: string(f.Reason), Rule: string(f.Rule), Item: f.Item, Result: string(f.Result)}
 		}
 		if src := last.Source; src != nil {
-			out.Source = &audit.DeliverySource{MachineID: src.MachineID, MachineName: src.MachineName}
+			out.Source = &audit.DeliverySource{Kind: string(src.Kind), MachineID: src.MachineID, MachineName: src.MachineName}
 		}
 		out.Problems = len(last.Problems)
 	}

@@ -195,6 +195,28 @@ WORLD_PRIVATE_KEY_FILES = (
 # The one file of the world that is meant to hold the enrolment code: the
 # reference server's codes (it reads the code from there).
 WORLD_CODE_FILES = ("control/codes",)
+# The account service's deliveries (plan 040; the provision contract's
+# hosted source): the reference server's own words (test_fixture_units checks
+# each is still in the code). It logs DELIVERY_CALL once for every
+# POST /v1/deliveries, before it reads anything of it
+# (internal/directory/refserver/deliveries.go DeliveryCallLine), and a token
+# request for the delivery scope as TOKEN_REQUEST_DELIVERY_SCOPE.
+DELIVERY_CALL = "delivery call"
+TOKEN_REQUEST_DELIVERY_SCOPE = 'token request: scope="deliveries:request"'
+# A person's entry in deliveries.json that says the service has no source
+# for them (404 NO_SOURCE); a person missing from the file has none either.
+NO_SOURCE = "NO_SOURCE"
+# The modes of an entry (refserver ModeAnswer ... ModeBody) and the members
+# an entry may carry (refserver Delivery).
+DELIVERY_MODES = ("", "silent", "late", "status", "oversize", "truncated", "echo", "body")
+DELIVERY_MEMBERS = frozenset({"mode", "items", "problems", "status", "headers", "body", "text", "body_base64"})
+# The shed-server's line for each hosted request it sends
+# (internal/delivery/hosted.go hostedSource.Ask); the shed's name follows.
+ASKING_THE_SERVICE = "asking the account service"
+# The server's line for each binding it removes at start on a directory
+# server (cmd/shed-server/serve.go).
+BINDING_REMOVED = 'Credential source: removed the binding of "{user}": the account service answers for this user'
+
 # A private key in PEM form, raw or JSON-escaped: the header and the start of
 # its body.
 _PRIVATE_PEM = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\\n|\\r|\r|\n)+[A-Za-z0-9+/=]{40}")
@@ -307,6 +329,9 @@ def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: 
             # serve runs <agent_dir>/shed-agent-linux-<arch>.
             "agent_dir": str(agent_dir),
             "agent_install": "never",
+            # Room for the hosted-delivery cases, which make several sheds
+            # (the default lets two run).
+            "limits": {"max_running": 8, "max_sheds": 12},
             # Static mode needs a source; a documentation address, which the
             # fake provider's rule is made to match.
             "firewall": {"mode": "static", "source_ranges": ["192.0.2.10/32"]},
@@ -794,6 +819,236 @@ def has_option(argv: Sequence[str], flag: str, value: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
+# The account service's deliveries: deliveries.json and no-deliveries
+# ----------------------------------------------------------------------------
+
+
+def delivery_answer(items: Sequence[Mapping], problems: Sequence[Mapping] = ()) -> dict:
+    """An entry answering 200 with these canned items and problems (the
+    service substitutes the request's id)."""
+    return {"items": [dict(i) for i in items], "problems": [dict(p) for p in problems]}
+
+
+def delivery_status(status: int, code: Optional[str] = None, message: str = "error",
+                    headers: Optional[Mapping[str, str]] = None, text: Optional[str] = None) -> dict:
+    """An entry answering `status`: with a `/v1` error body `{"error": {code,
+    message}}` when `code` is given, else with `text` as the raw body, else
+    with no body."""
+    d: dict = {"mode": "status", "status": int(status)}
+    if headers:
+        d["headers"] = dict(headers)
+    if code is not None:
+        d["body"] = {"error": {"code": code, "message": message}}
+    elif text is not None:
+        d["text"] = text
+    return d
+
+
+def delivery_body(body: bytes, status: int = 200) -> dict:
+    """An entry answering `status` with these bytes, the answer fixtures' id
+    replaced by the request's (a refuse fixture's answer, sent as it is)."""
+    return {"mode": "body", "status": int(status), "body_base64": base64.b64encode(body).decode("ascii")}
+
+
+def delivery_problems(entry) -> list[str]:
+    """What the reference server would refuse in one person's entry (its
+    `decodeDelivery`): NO_SOURCE, or an object of the known members with a
+    known mode, lists that are lists, and a status from 100 to 599 for the
+    status mode. Empty when it is an entry."""
+    if entry == NO_SOURCE:
+        return []
+    if not isinstance(entry, Mapping):
+        return [f"{entry!r} is neither {NO_SOURCE!r} nor an object"]
+    problems = []
+    extra = sorted(set(entry) - DELIVERY_MEMBERS)
+    if extra:
+        problems.append(f"unknown members {extra}")
+    mode = entry.get("mode", "")
+    if mode not in DELIVERY_MODES:
+        problems.append(f"mode {mode!r} is not one of {DELIVERY_MODES}")
+    for k in ("items", "problems"):
+        if k in entry and not isinstance(entry[k], list):
+            problems.append(f"{k} is not a list")
+    if mode == "status" and not (isinstance(entry.get("status"), int) and 100 <= entry["status"] <= 599):
+        problems.append("the status mode needs a status from 100 to 599")
+    if "body_base64" in entry:
+        try:
+            base64.b64decode(str(entry["body_base64"]), validate=True)
+        except ValueError:
+            problems.append("body_base64 is not base64")
+    return problems
+
+
+def may_be_accepted(entry) -> bool:
+    """Whether the server could accept what this entry answers, and so have
+    the shed's agent write a bundle. Conservative: only NO_SOURCE (404),
+    silence, and a status or body mode whose status is 300 to 599 are sure
+    never to end in a 2xx. Everything else may: canned items and a late
+    answer; an echo, an oversize body, a truncated body (its status is 200)
+    and a fixture body, refused only by the server's own checks, which a
+    case may be testing; and a 1xx status, after which Go's server sends a
+    200 with the body."""
+    if entry == NO_SOURCE:
+        return False
+    mode = entry.get("mode", "")
+    if mode == "silent":
+        return False
+    if mode in ("status", "body"):
+        status = entry.get("status") or 200
+        return not (isinstance(status, int) and 300 <= status <= 599)
+    return True
+
+
+def deliveries_document(entries: Mapping[str, object]) -> bytes:
+    """deliveries.json for `entries` (user name to entry). Raises ValueError
+    naming every entry the reference server would refuse."""
+    bad = [f"{user}: {'; '.join(p)}" for user, p in ((u, delivery_problems(e)) for u, e in entries.items()) if p]
+    if bad:
+        raise ValueError("deliveries.json entries the reference server would refuse: " + " | ".join(bad))
+    return json.dumps(dict(entries), indent=1, sort_keys=True).encode() + b"\n"
+
+
+def count_lines(log: str, line: str) -> int:
+    """How many lines of `log` hold `line` (a timestamp may lead them)."""
+    return sum(1 for ln in log.splitlines() if line in ln)
+
+
+class DeliveriesControl:
+    """The reference server's delivery controls in its control directory:
+    `deliveries.json` (each person's source), `no-deliveries` (the servers
+    that may not ask) and `outage`, and its log, read for the calls it got
+    (`DELIVERY_CALL`) and the token requests for the delivery scope.
+
+    `local` is the self-managed harness's guard: there a shed is a
+    shed-agent on this host whose `apply-items` writes into the home of the
+    user running the tests, so no entry that the server could accept may be
+    written (`may_be_accepted`): such a write raises ValueError before the
+    file is touched."""
+
+    def __init__(self, control: Path, log: Callable[[], str], *, local: bool) -> None:
+        self.control, self._log, self.local = Path(control), log, local
+
+    def set(self, entries: Mapping[str, object]) -> None:
+        """Serve `entries` (user name to entry) from the next call on."""
+        if self.local:
+            risky = sorted(u for u, e in entries.items() if may_be_accepted(e))
+            if risky:
+                raise ValueError(f"the local harness may not serve an answer the server could accept (it would "
+                                 f"be written into this host's home): {risky}")
+        write_private(self.control / "deliveries.json", deliveries_document(entries))
+
+    def clear(self) -> None:
+        """No source for anyone (no deliveries.json)."""
+        (self.control / "deliveries.json").unlink(missing_ok=True)
+
+    def deny(self, client_ids: Sequence[str]) -> None:
+        """These servers may not ask for deliveries (an empty list: every
+        server may)."""
+        path = self.control / "no-deliveries"
+        if client_ids:
+            write_private(path, "".join(f"{c}\n" for c in client_ids).encode())
+        else:
+            path.unlink(missing_ok=True)
+
+    def outage(self, on: bool) -> None:
+        path = self.control / "outage"
+        if on:
+            write_private(path, b"")
+        else:
+            path.unlink(missing_ok=True)
+
+    def log(self) -> str:
+        return self._log()
+
+    def calls(self) -> int:
+        """The POST /v1/deliveries the service has had."""
+        return count_lines(self._log(), DELIVERY_CALL)
+
+    def token_requests(self) -> int:
+        """The token requests for the delivery scope it has had."""
+        return count_lines(self._log(), TOKEN_REQUEST_DELIVERY_SCOPE)
+
+    def counts(self) -> tuple[int, int]:
+        return self.calls(), self.token_requests()
+
+
+def hosted_skip_reason(backend: Optional[str], environ: Mapping[str, str] = os.environ) -> Optional[str]:
+    """Why the writing hosted-delivery cases (1, 3, 4, 6, 8 of plan 040 §6)
+    cannot run against `backend` (`vz`, `fc`, `remote`; None: any backend,
+    the image gate not read), or None. They write into a shed, so they run
+    only on a real backend whose image takes delivered items, under the
+    directory source, with the reference server the run started as the
+    account service and its control directory and log named."""
+    source = environ.get("SHED_ITEST_SOURCE", "").strip() or "config"
+    if environ.get("SHED_DIRECTORY_ITEST", "") == "1":
+        return ("the writing hosted-delivery cases run against real backends only: the self-managed harness's "
+                "shed-agent writes into this host's home (run them under SHED_ITEST_SOURCE=directory)")
+    if source != "directory":
+        return ("the hosted-delivery cases need a server whose users come from the reference account service: "
+                "set SHED_ITEST_SOURCE=directory (tests/integration/README.md)")
+    for var in ("SHED_ITEST_DIRECTORY_CONTROL", "SHED_ITEST_DIRECTORY_LOG"):
+        if not environ.get(var, "").strip():
+            return (f"{var} is not set: name the reference server's control directory and the file its standard "
+                    f"error goes to (tests/integration/README.md)")
+    listed = {b.strip() for b in environ.get("SHED_IMAGE_HAS_DELIVERY", "").split(",") if b.strip()}
+    if backend is not None and backend not in listed:
+        return (f"SHED_IMAGE_HAS_DELIVERY does not list {backend}: its image's agent cannot take delivered items "
+                f"(rebuild it from this branch and list it)")
+    return None
+
+
+def hosted_control(environ: Mapping[str, str] = os.environ) -> DeliveriesControl:
+    """The control of the reference server a run started
+    (`SHED_ITEST_DIRECTORY_CONTROL`, its standard error in
+    `SHED_ITEST_DIRECTORY_LOG`): not the local harness's, so it serves
+    anything."""
+    control = Path(environ["SHED_ITEST_DIRECTORY_CONTROL"]).expanduser()
+    log = Path(environ["SHED_ITEST_DIRECTORY_LOG"]).expanduser()
+    if not control.is_dir():
+        raise AssertionError(f"SHED_ITEST_DIRECTORY_CONTROL={control} is not a directory")
+
+    def read() -> str:
+        try:
+            return log.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise AssertionError(f"SHED_ITEST_DIRECTORY_LOG={log} cannot be read: {e}") from e
+
+    return DeliveriesControl(control, read, local=False)
+
+
+def with_local_admin(cfg: Mapping, name: str, pub: str, *, label: str = "itest", script: bool = False) -> dict:
+    """A copy of a world's server config with `name` in the local-admin set
+    (auth.users beside auth.directory, where every user is an admin), holding
+    the key `pub`, added to its keys when it is there already."""
+    out = json.loads(json.dumps(cfg))
+    users = out["auth"].setdefault("users", {})
+    u = users.setdefault(name, {"admin": True, "keys": []})
+    k: dict = {"key": pub, "label": label}
+    if script:
+        k["script"] = True
+    u["keys"].append(k)
+    return out
+
+
+def without_local_admin(cfg: Mapping, name: str) -> dict:
+    """A copy of a world's server config with `name` out of the local-admin
+    set (raises KeyError when it is not there)."""
+    out = json.loads(json.dumps(cfg))
+    del out["auth"]["users"][name]
+    return out
+
+
+def with_service_client(cfg: Mapping, name: str, prefix: str) -> dict:
+    """A copy of a world's server config with a service client `name` whose
+    sheds' names start with `prefix`."""
+    out = json.loads(json.dumps(cfg))
+    out["auth"].setdefault("clients", {})[name] = {
+        "cert_max_ttl": "24h", "policy": {"name_prefix": prefix, "max_sheds": 2, "max_age": "2h"},
+    }
+    return out
+
+
+# ----------------------------------------------------------------------------
 # A counting relay
 # ----------------------------------------------------------------------------
 
@@ -1093,6 +1348,8 @@ class RefServer:
         self.issuer = ""
         self.out = logs / "ref.out"
         self.err = logs / "ref.err"
+        # The world is the local harness: nothing it serves may be accepted.
+        self.deliveries = DeliveriesControl(control, self.log, local=True)
 
     def start(self, timeout: float = 20) -> None:
         with self.out.open("wb") as out, self.err.open("wb") as err:
@@ -1578,6 +1835,20 @@ class World:
         self.admin = self.identity(LOCAL_ADMIN, admin_key)
         self.admin.add_server()
         shutil.copyfile(self.admin.known_hosts, self.known_hosts)
+        self.wait_state("trusted", 60)
+
+    def config(self) -> dict:
+        """The server's config as written now."""
+        return yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+
+    def reconfigure(self, cfg: Mapping) -> None:
+        """Write `cfg` as the server's config, check it, restart the server
+        with it, and wait for the list to be trusted again (the server keeps
+        its state directory, so every CLI entry stays good)."""
+        write_private(self.config_path, yaml.safe_dump(dict(cfg), sort_keys=False).encode())
+        r = self.server.run("config-validate")
+        assert r.returncode == 0, f"config-validate: {r.stdout}{r.stderr}"
+        self.server.restart()
         self.wait_state("trusted", 60)
 
     # -- keys, identities, the list ---------------------------------------

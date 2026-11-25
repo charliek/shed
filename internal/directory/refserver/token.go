@@ -94,7 +94,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "the client did not authenticate with a JWT assertion", 0)
 		return
 	}
-	scopes, ok := parseScope(form.Get("scope"))
+	scopes, ok := parseScope(form.Get("scope"), s.offersDeliveries())
 	if !ok {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "the scope is malformed or names a scope this service lacks", 0)
 		return
@@ -116,6 +116,20 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		s.logf("token refused: client_id is not the assertion's")
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "the client could not be authenticated", 0)
 		return
+	}
+	if containsString(scopes, scopeDeliveries) {
+		// The grant is read on every request for the scope; a server that
+		// may not ask gets invalid_scope, and its assertion is not spent.
+		denied, err := s.inputs.(DeliveryInputs).DeliveriesDenied(a.clientID)
+		if err != nil {
+			s.logf("token: the delivery grant lookup failed")
+			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "the service could not look the server up", 0)
+			return
+		}
+		if denied {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "the scope is malformed or names a scope this service lacks", 0)
+			return
+		}
 	}
 	if !s.ledger.spend(a.clientID, a.jti, a.exp, now) {
 		s.logf("token refused: the assertion of %s was presented before", a.clientID)
@@ -162,9 +176,18 @@ func anyNonEmpty(vals []string) bool {
 	return false
 }
 
-// parseScope reads the scope parameter: absent is every scope the service
-// has; sent, scope tokens separated by single spaces, each one it has.
-func parseScope(scope string) ([]string, bool) {
+// offersDeliveries reports whether the service delivers credentials: its
+// inputs say who may ask and what each person's source holds.
+func (s *Server) offersDeliveries() bool {
+	_, ok := s.inputs.(DeliveryInputs)
+	return ok
+}
+
+// parseScope reads the scope parameter: absent (or sent empty) is
+// directory:read alone, never the delivery scope, whatever the server may
+// ask for; sent, scope tokens separated by single spaces, each one the
+// service has (deliveries:request only when it offers delivery).
+func parseScope(scope string, deliveries bool) ([]string, bool) {
 	if scope == "" {
 		return []string{scopeDirectory}, true
 	}
@@ -172,7 +195,7 @@ func parseScope(scope string) ([]string, bool) {
 	seen := map[string]bool{}
 	var out []string
 	for _, t := range toks {
-		if t != scopeDirectory {
+		if t != scopeDirectory && (t != scopeDeliveries || !deliveries) {
 			return nil, false
 		}
 		if !seen[t] {

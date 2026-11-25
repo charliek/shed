@@ -217,7 +217,7 @@ func TestEnvTooLarge(t *testing.T) {
 		if got := EnvFileSize(items); got != tt.size {
 			t.Fatalf("built %d bytes, want %d", got, tt.size)
 		}
-		body, err := json.Marshal(Answer{Version: 1, ID: req.ID, Items: items})
+		body, err := json.Marshal(Answer{Version: Version, ID: req.ID, Items: items})
 		if err != nil {
 			t.Fatal(err)
 		}

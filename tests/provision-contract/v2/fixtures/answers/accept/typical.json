@@ -1,0 +1,79 @@
+{
+  "name": "typical",
+  "description": "A full answer: an SSH key pair, a gh hosts file that expires, a git config, an API key as an env variable, and a stage 2 file in the project directory.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "ssh-key",
+        "provider": "ssh-key",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/id_ed25519",
+        "mode": "0600",
+        "content": "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KVEhJUyBJUyBBIEZJWFRVUkUsIE5PVCBBIEtFWQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K",
+        "fingerprint": "k3y-fp_01"
+      },
+      {
+        "name": "ssh-key.pub",
+        "provider": "ssh-key",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/id_ed25519.pub",
+        "mode": "0644",
+        "content": "c3NoLWVkMjU1MTkgQUFBQUZJWFRVUkVOT1RBS0VZIGZpeHR1cmVAZXhhbXBsZS50ZXN0Cg==",
+        "fingerprint": "k3y-fp_01"
+      },
+      {
+        "name": "github",
+        "provider": "github",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".config/gh/hosts.yml",
+        "mode": "0600",
+        "content": "Z2l0aHViLmV4YW1wbGUudGVzdDoKICAgIG9hdXRoX3Rva2VuOiBmaXh0dXJlLXRva2VuLW5vdC1hLXRva2VuCiAgICB1c2VyOiBhZGEKICAgIGdpdF9wcm90b2NvbDogc3NoCg==",
+        "fingerprint": "gh-fp-1",
+        "expires_at": "2026-12-23T10:00:00Z"
+      },
+      {
+        "name": "git-config",
+        "provider": "bundle",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".config/git/config",
+        "mode": "0600",
+        "content": "W3VzZXJdCgluYW1lID0gQWRhCgllbWFpbCA9IGFkYUBleGFtcGxlLnRlc3QK",
+        "fingerprint": "git-fp-1"
+      },
+      {
+        "name": "example-api-key",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "EXAMPLE_API_KEY",
+        "value": "fixture-value-not-a-key",
+        "fingerprint": "api-fp-1"
+      },
+      {
+        "name": "project-env",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": ".envrc",
+        "mode": "0600",
+        "content": "RVhBTVBMRT0xCg==",
+        "fingerprint": "proj-fp-1"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

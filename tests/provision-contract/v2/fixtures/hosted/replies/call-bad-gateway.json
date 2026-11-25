@@ -1,0 +1,24 @@
+{
+  "name": "call-bad-gateway",
+  "description": "502 with an error object: any 5xx is source_offline.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 502,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "BAD_GATEWAY",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

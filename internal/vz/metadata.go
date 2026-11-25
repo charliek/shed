@@ -152,6 +152,14 @@ type Metadata struct {
 	// it was delivering to is gone. Additive: the metadata version is
 	// unchanged.
 	ResetGen uint64 `json:"reset_gen,omitempty"`
+
+	// UserOrigin is where the shed's user came from when it was created:
+	// "local" (a server with no directory, or a local admin) or "directory"
+	// (a person of the account service), by the rule of plan 040 section
+	// 3.2. A delivery to the shed is refused (SHED_ORIGIN_CHANGED) when it
+	// is not the current origin of the user's name. A shed from before it
+	// is stamped once, at the server's first start that knows it.
+	UserOrigin string `json:"user_origin,omitempty"`
 }
 
 const metadataFilename = "metadata.json"
@@ -189,6 +197,7 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 	if meta.Version < MetadataVersion {
 		return nil, fmt.Errorf("%w (shed=%q, version=%d)", ErrLegacyMetadata, name, meta.Version)
 	}
+	delivery.NormalizeLegacy(meta.Delivery, data)
 
 	return &meta, nil
 }

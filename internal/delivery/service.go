@@ -23,7 +23,19 @@ import (
 type Service struct {
 	pin     Pin
 	timeout time.Duration
-	table   *table
+	// table is the machine source's pending requests, whose answers are
+	// bound to the stream they went out on.
+	table *table
+	// admission is the limits every request is held to, whichever source
+	// answers it.
+	admission *admission
+	// origin tells where a user name comes from (SetOrigin).
+	origin func(user string) string
+	// hosted is the account service, late-bound (SetHosted).
+	hosted atomic.Pointer[hostedHolder]
+	// inflight is the cancel of every hosted request in flight (EndShed,
+	// Close).
+	inflight cancels
 	// audit is the server's audit log, where each run's outcome is written
 	// (nil: none).
 	audit atomic.Pointer[audit.Log]
@@ -41,9 +53,10 @@ func (s *Service) SetAuditLog(l *audit.Log) {
 // connected source's answer (delivery.timeout).
 func NewService(pin Pin, timeout time.Duration) *Service {
 	return &Service{
-		pin:     pin,
-		timeout: timeout,
-		table:   newTable(pin.DeliveryCurrent, time.Now),
+		pin:       pin,
+		timeout:   timeout,
+		table:     newTable(pin.DeliveryCurrent, time.Now),
+		admission: newAdmission(),
 	}
 }
 
@@ -72,18 +85,25 @@ type Params struct {
 	ServiceClient bool
 	ScriptKey     bool
 	FromSnapshot  bool
+
+	// Origin is the shed's recorded user origin (user_origin, stamped at
+	// create: OriginLocal or OriginDirectory), "" for a shed that has none.
+	// A delivery to a shed whose origin is not its user's current one
+	// (ErrShedOriginChanged), or that has none (ErrShedOriginUnknown), is
+	// refused before anything is asked.
+	Origin string
 }
 
 // Applicable reports whether a delivery for p would ask a source: false for
 // a shed created by a service client, a create with a script key, a
-// snapshot restore, and a user with no bound machine (each not_applicable,
-// with no warning).
+// snapshot restore, and a local user with no bound machine (each
+// not_applicable, with no warning); true for every directory user. It has no
+// side effect and makes no network call.
 func (s *Service) Applicable(p Params) bool {
 	if s == nil || p.ServiceClient || p.ScriptKey || p.FromSnapshot {
 		return false
 	}
-	_, ok := s.pin.DeliveryBound(p.User)
-	return ok
+	return s.source(p).Applicable(p)
 }
 
 // Result is what became of one Request.
@@ -94,14 +114,15 @@ type Result struct {
 	Outcome Outcome
 	// Reason is "" for an accepted answer; not_applicable when no request
 	// was made and none was due (no warning); otherwise the failure:
-	// source_offline, source_timeout, source_disconnected or
-	// answer_refused.
+	// source_offline, source_timeout, source_disconnected, source_refused
+	// or answer_refused.
 	Reason StepReason
 	// Rule is the rule an answer broke (answer_refused only).
 	Rule Rule
-	// Source is the machine the request went to, or the bound machine
-	// that was not connected. Nil when no machine was asked.
-	Source *SourceMachine
+	// Source is the source asked, as the record names it: the machine the
+	// request went to, the bound machine that was not connected, or the
+	// account service. Nil when no source was asked.
+	Source *RecordSource
 	// At is when the delivery ended.
 	At time.Time
 	// Bundle is the accepted answer (accepted only).
@@ -192,26 +213,26 @@ var sentHook func(id string)
 // of the plan decides:
 //
 //   - a shed created by a service client, a create with a script key, a
-//     snapshot restore, and a user with no bound machine: no request,
-//     not_applicable (no warning);
-//   - a bound machine that does not hold its delivery stream: no request,
-//     source_offline, at once;
-//   - otherwise the request is sent on the stream and waited for, up to
-//     the timeout: the accepted bundle, or source_timeout,
-//     source_disconnected (the stream ended, or the binding moved), or
-//     answer_refused with the rule.
+//     snapshot restore: no request, not_applicable (no warning);
+//   - the user's source (Service.source: the pinned machine, or for a
+//     directory user the account service) not applicable (a local user with
+//     no bound machine): no request, not_applicable;
+//   - otherwise the request is admitted (one per shed, maxActivePerUser per
+//     user, whichever the source) and the source asked (Source.Ask), up to
+//     the deadline.
 //
-// A request beyond the user's limit of waiting requests waits for a slot
-// within the same timeout (source_timeout when none frees). The error is
-// for what is not a delivery outcome: params that make no valid request,
-// a request for a shed that already has one waiting (ErrShedPending), and
-// ctx ending first (ctx's error; the request is then dropped).
+// A request beyond the user's limit waits for a slot within the same
+// deadline (source_timeout when none frees). The error is for what is not a
+// delivery outcome: params that make no valid request, a request for a shed
+// that already has one in flight (ErrShedPending), ctx ending first (ctx's
+// error; the request is then dropped), and for a hosted request its shed's
+// stop or delete (ErrShedEnded) or the shutdown (ErrServiceClosed).
 func (s *Service) Request(ctx context.Context, p Params) (Result, error) {
 	if p.ServiceClient || p.ScriptKey || p.FromSnapshot {
 		return Result{Outcome: OutcomeNotRequested, Reason: ReasonNotApplicable, At: time.Now().UTC()}, nil
 	}
-	bound, ok := s.pin.DeliveryBound(p.User)
-	if !ok {
+	src := s.source(p)
+	if !src.Applicable(p) {
 		return Result{Outcome: OutcomeNotRequested, Reason: ReasonNotApplicable, At: time.Now().UTC()}, nil
 	}
 	deadline := deadlineAfter(time.Now(), s.timeout)
@@ -232,77 +253,66 @@ func (s *Service) Request(ctx context.Context, p Params) (Result, error) {
 	if _, refusal := ParseRequest(line); refusal != nil {
 		return Result{}, fmt.Errorf("delivery request for shed %q is not a valid request: %w", p.Shed.Name, refusal)
 	}
+	if _, hosted := src.(hostedSource); hosted {
+		// A hosted request, from its wait for a slot to the end of its call,
+		// ends at a stop or delete of its shed and at the shutdown.
+		var stop func()
+		ctx, stop = s.inflight.watch(ctx, shedKey(p.Shed.Name, p.Shed.ID))
+		defer stop()
+	}
+	if err := ended(ctx); err != nil {
+		// Ended before it began: nothing is asked.
+		return Result{}, err
+	}
 
-	var e *entry
-	var st Stream
-	for {
-		var connected bool
-		st, connected = s.pin.DeliveryStream(p.User)
-		if !connected {
-			src := bound
-			log.Printf("delivery: request for shed %q%s not sent: its source, machine %s (%q), is not connected",
-				p.Shed.Name, forUser(p.User), src.MachineID, src.MachineName)
-			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceOffline, Source: &src, At: time.Now().UTC()}, nil
-		}
-		e = &entry{
-			id: req.ID, req: req, user: p.User, machine: st.Machine(), gen: st.Generation(),
-			serial: st.Serial(), stream: st.ID(), done: st.Done(), shedID: p.Shed.ID, deadline: deadline,
-		}
-		freed, err := s.table.add(e)
+	release, err := s.admit(ctx, src, p, deadline)
+	if err != nil || release == nil {
 		if err == nil {
-			break
+			log.Printf("delivery: request for shed %q%s not sent: the user had %d requests waiting until its deadline",
+				p.Shed.Name, forUser(p.User), maxActivePerUser)
+			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceTimeout, Source: src.Named(p), At: time.Now().UTC()}, nil
+		}
+		return Result{}, err
+	}
+	defer release()
+
+	res, err := src.Ask(ctx, Asked{Params: p, Request: req, Line: line, Deadline: deadline})
+	if err != nil {
+		return Result{}, err
+	}
+	if res.RequestID != "" {
+		log.Printf("delivery: request %s for shed %q%s: %s", res.RequestID, p.Shed.Name, forUser(p.User), res.describe())
+	}
+	return res, nil
+}
+
+// admit takes the request's admission, waiting for a user slot until the
+// deadline. It returns the release; a nil release with no error is a
+// request that had no slot by its deadline. The error is ErrShedPending,
+// or ctx's end.
+func (s *Service) admit(ctx context.Context, src Source, p Params, deadline time.Time) (func(), error) {
+	for {
+		release, freed, err := s.admission.take(p.Shed.ID, p.User)
+		if err == nil {
+			return release, nil
 		}
 		if !errors.Is(err, errUserFull) {
-			return Result{}, fmt.Errorf("delivery request for shed %q: %w", p.Shed.Name, err)
+			return nil, err
 		}
 		timer := time.NewTimer(time.Until(deadline))
 		select {
 		case <-freed:
 			timer.Stop()
-		case <-st.Done():
-			// Looked up again: offline, or the stream that replaced it.
-			timer.Stop()
 		case <-timer.C:
-			src := st.Machine()
-			log.Printf("delivery: request for shed %q%s not sent: the user had %d requests waiting until its deadline",
-				p.Shed.Name, forUser(p.User), maxActivePerUser)
-			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceTimeout, Source: &src, At: time.Now().UTC()}, nil
+			return nil, nil
 		case <-ctx.Done():
 			timer.Stop()
-			return Result{}, ctx.Err()
+			if err := ended(ctx); err != nil {
+				return nil, err
+			}
+			return nil, ctx.Err()
 		}
 	}
-
-	src := st.Machine()
-	res := Result{RequestID: req.ID, Source: &src}
-	id := req.ID
-	if !st.Offer(Outgoing{ID: id, Line: line, Live: func() bool { return s.table.live(id) }}) {
-		s.table.endUnanswered(e, false)
-		log.Printf("delivery: request %s for shed %q%s: the stream of machine %s (%q) is not taking requests",
-			id, p.Shed.Name, forUser(p.User), src.MachineID, src.MachineName)
-		res.Outcome, res.Reason, res.At = OutcomeNoAnswer, ReasonSourceDisconnected, time.Now().UTC()
-		return res, nil
-	}
-	log.Printf("delivery: request %s (%s) for shed %q%s sent to machine %s (%q), deadline %s",
-		id, p.Reason, p.Shed.Name, forUser(p.User), src.MachineID, src.MachineName, req.Deadline)
-	if sentHook != nil {
-		sentHook(id)
-	}
-
-	j, how, err := s.wait(ctx, e)
-	res.At = time.Now().UTC()
-	switch {
-	case err != nil:
-		return Result{}, err
-	case how != "":
-		res.Outcome, res.Reason = OutcomeNoAnswer, how
-	case j.answer != nil:
-		res.Outcome, res.Bundle = OutcomeAccepted, &Bundle{answer: j.answer}
-	default:
-		res.Outcome, res.Reason, res.Rule = OutcomeRefused, ReasonAnswerRefused, j.rule
-	}
-	log.Printf("delivery: request %s for shed %q%s: %s", id, p.Shed.Name, forUser(p.User), res.describe())
-	return res, nil
 }
 
 // describe is a log line's account of a result: no value, ever.

@@ -1,0 +1,35 @@
+{
+  "name": "not-requested-with-source",
+  "description": "No request was made, yet a source is recorded.",
+  "record": {
+    "state": "not_applicable",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "not_applicable"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "not_applicable"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested",
+      "source": {
+        "kind": "service"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "unexpected_member"
+  }
+}

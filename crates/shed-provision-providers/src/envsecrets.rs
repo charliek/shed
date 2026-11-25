@@ -9,15 +9,23 @@
 //! an optional ` # comment`), and anything else about the file is left to
 //! envsecrets. A config with no `passphrase_env`, or no `gcs_credentials`
 //! (which would leave envsecrets to the person's own Google sign-in, which
-//! is never copied), is a problem and nothing is delivered.
+//! is never copied), is a problem and nothing is delivered. On a machine
+//! the config is judged before the passphrase is read, so a bad config runs
+//! no passphrase command; [`build`] judges it again for a host that holds
+//! the inputs itself.
+
+use std::fmt;
 
 use shed_provision::{
-    check_value, check_variable, Base, Command, Context, Contribution, Draft, EnvItem, FileItem,
-    ItemBody, Mode, Only, ProblemCode, Provider, Reader, Rule, Stage,
+    check_value, check_variable, Base, Command, Context, Contribution, Mode, ProblemCode, Reader,
+    Rule,
 };
 
-use crate::common::{one_line, read_setting_file, run};
+use crate::common::{
+    desktop_provider, env_draft, file_draft, gathered, one_line, read_setting_file, run, Redacted,
+};
 use crate::settings::EnvsecretsLoginSettings;
+use crate::Gathered;
 
 /// The provider's name.
 pub const NAME: &str = "envsecrets-login";
@@ -31,18 +39,29 @@ const MAX_CONFIG_BYTES: usize = 64 << 10;
 /// The most a passphrase file may hold.
 const MAX_PASSPHRASE_BYTES: usize = 16 << 10;
 
-/// The `envsecrets-login` provider.
-#[derive(Debug, Clone)]
-pub struct EnvsecretsLogin {
-    settings: EnvsecretsLoginSettings,
+/// What the provider delivers from.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Inputs {
+    /// The envsecrets config, byte for byte.
+    pub config: Vec<u8>,
+    /// Its passphrase.
+    pub passphrase: String,
 }
 
-impl EnvsecretsLogin {
-    /// The provider for these settings.
-    pub fn new(settings: EnvsecretsLoginSettings) -> EnvsecretsLogin {
-        EnvsecretsLogin { settings }
+impl fmt::Debug for Inputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inputs")
+            .field("config", &Redacted(self.config.len()))
+            .field("passphrase", &Redacted(self.passphrase.len()))
+            .finish()
     }
 }
+
+desktop_provider!(
+    /// The `envsecrets-login` provider.
+    EnvsecretsLogin,
+    EnvsecretsLoginSettings
+);
 
 /// A top-level key's value, by the strict pattern: `None` when the key is
 /// absent, `Some(Err(()))` when it is there but not in the pattern, or named
@@ -108,160 +127,169 @@ fn value_message(rule: Rule) -> String {
     format!("the passphrase breaks the env rule {rule}; it was not delivered")
 }
 
-impl Provider for EnvsecretsLogin {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn only(&self) -> Option<&Only> {
-        self.settings.only.as_ref()
-    }
-
-    fn provide(&self, _ctx: &Context<'_>, reader: &dyn Reader) -> Contribution {
-        let config = match read_setting_file(
-            reader,
-            &format!("~/{CONFIG}"),
-            MAX_CONFIG_BYTES,
-            "~/.envsecrets/config.yaml",
-        ) {
-            Ok(f) => f,
-            Err(c) => return c,
-        };
-        let Ok(text) = std::str::from_utf8(&config.bytes) else {
-            return Contribution::problem(
+/// The config's `passphrase_env`, when the config is one this provider
+/// delivers: text, a `passphrase_env` that names a variable a shed may have,
+/// and one base64 `gcs_credentials`. Otherwise the problem.
+fn check_config(config: &[u8]) -> Result<&str, Contribution> {
+    let Ok(text) = std::str::from_utf8(config) else {
+        return Err(Contribution::problem(
+            ProblemCode::Unreadable,
+            "the envsecrets config is not UTF-8 text",
+        ));
+    };
+    let variable = match flat_key(text, "passphrase_env") {
+        None => {
+            return Err(Contribution::problem(
+                ProblemCode::MissingInput,
+                "the envsecrets config has no passphrase_env",
+            ))
+        }
+        Some(Err(())) => {
+            return Err(Contribution::problem(
                 ProblemCode::Unreadable,
-                "the envsecrets config is not UTF-8 text",
-            );
-        };
-        let variable =
-            match flat_key(text, "passphrase_env") {
-                None => {
-                    return Contribution::problem(
-                        ProblemCode::MissingInput,
-                        "the envsecrets config has no passphrase_env",
-                    )
-                }
-                Some(Err(())) => return Contribution::problem(
+                "the envsecrets config's passphrase_env is not one plain value on its own line",
+            ))
+        }
+        Some(Ok(v)) => v,
+    };
+    if let Some(rule) = check_variable(variable) {
+        return Err(Contribution::problem(
+            ProblemCode::Unreadable,
+            format!("the envsecrets config's passphrase_env breaks the variable rule {rule}"),
+        ));
+    }
+    match flat_key(text, "gcs_credentials") {
+        None => Err(Contribution::problem(
+            ProblemCode::MissingInput,
+            "the envsecrets config has no gcs_credentials; your own Google sign-in is never copied",
+        )),
+        Some(Ok(v)) if base64_text(v) => Ok(variable),
+        Some(_) => Err(Contribution::problem(
+            ProblemCode::Unreadable,
+            "the envsecrets config's gcs_credentials is not one base64 value on its own line",
+        )),
+    }
+}
+
+/// Reads `~/.envsecrets/config.yaml`, judges it, and only then reads the
+/// passphrase from `passphrase_file` or runs `passphrase_command`. Stops at
+/// the first problem.
+pub fn gather(
+    settings: &EnvsecretsLoginSettings,
+    ctx: &Context<'_>,
+    reader: &dyn Reader,
+) -> Gathered<Inputs> {
+    gathered(read_both(settings, ctx, reader))
+}
+
+fn read_both(
+    settings: &EnvsecretsLoginSettings,
+    ctx: &Context<'_>,
+    reader: &dyn Reader,
+) -> Result<Inputs, Contribution> {
+    let config = read_setting_file(
+        ctx,
+        reader,
+        &format!("~/{CONFIG}"),
+        MAX_CONFIG_BYTES,
+        "~/.envsecrets/config.yaml",
+    )?;
+    check_config(&config.bytes)?;
+    let passphrase = match (&settings.passphrase_file, &settings.passphrase_command) {
+        (Some(file), _) => {
+            let f = read_setting_file(
+                ctx,
+                reader,
+                file,
+                MAX_PASSPHRASE_BYTES,
+                "envsecrets-login.passphrase_file",
+            )?;
+            one_line(&f.bytes).map(str::to_string).ok_or_else(|| {
+                Contribution::problem(
                     ProblemCode::Unreadable,
-                    "the envsecrets config's passphrase_env is not one plain value on its own line",
-                ),
-                Some(Ok(v)) => v,
+                    "envsecrets-login.passphrase_file is not UTF-8 text",
+                )
+            })?
+        }
+        (None, Some(argv)) => {
+            let Some((program, args)) = argv.split_first() else {
+                return Err(Contribution::problem(
+                    ProblemCode::MissingInput,
+                    "envsecrets-login.passphrase_command is empty",
+                ));
             };
-        if let Some(rule) = check_variable(variable) {
-            return Contribution::problem(
-                ProblemCode::Unreadable,
-                format!("the envsecrets config's passphrase_env breaks the variable rule {rule}"),
-            );
-        }
-        match flat_key(text, "gcs_credentials") {
-            None => {
-                return Contribution::problem(
-                    ProblemCode::MissingInput,
-                    "the envsecrets config has no gcs_credentials; your own Google sign-in is never copied",
-                )
+            let cmd = Command::new(program.clone(), args.iter().cloned());
+            let out = run(ctx, reader, &cmd, "envsecrets-login.passphrase_command")?;
+            if !out.success() {
+                return Err(Contribution::problem(
+                    ProblemCode::CommandFailed,
+                    "envsecrets-login.passphrase_command failed",
+                ));
             }
-            Some(Ok(v)) if base64_text(v) => {}
-            Some(_) => {
-                return Contribution::problem(
-                    ProblemCode::Unreadable,
-                    "the envsecrets config's gcs_credentials is not one base64 value on its own line",
+            one_line(&out.stdout).map(str::to_string).ok_or_else(|| {
+                Contribution::problem(
+                    ProblemCode::CommandFailed,
+                    "envsecrets-login.passphrase_command printed something that is not UTF-8 text",
                 )
-            }
+            })?
         }
+        (None, None) => {
+            return Err(Contribution::problem(
+                ProblemCode::MissingInput,
+                "set envsecrets-login.passphrase_file or passphrase_command",
+            ))
+        }
+    };
+    Ok(Inputs {
+        config: config.bytes,
+        passphrase,
+    })
+}
 
-        let passphrase = match (
-            &self.settings.passphrase_file,
-            &self.settings.passphrase_command,
-        ) {
-            (Some(file), _) => {
-                let f = match read_setting_file(
-                    reader,
-                    file,
-                    MAX_PASSPHRASE_BYTES,
-                    "envsecrets-login.passphrase_file",
-                ) {
-                    Ok(f) => f,
-                    Err(c) => return c,
-                };
-                match one_line(&f.bytes) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return Contribution::problem(
-                            ProblemCode::Unreadable,
-                            "envsecrets-login.passphrase_file is not UTF-8 text",
-                        )
-                    }
-                }
-            }
-            (None, Some(argv)) => {
-                let Some((program, args)) = argv.split_first() else {
-                    return Contribution::problem(
-                        ProblemCode::MissingInput,
-                        "envsecrets-login.passphrase_command is empty",
-                    );
-                };
-                let cmd = Command::new(program.clone(), args.iter().cloned());
-                let out = match run(reader, &cmd, "envsecrets-login.passphrase_command") {
-                    Ok(o) => o,
-                    Err(c) => return c,
-                };
-                if !out.success() {
-                    return Contribution::problem(
-                        ProblemCode::CommandFailed,
-                        "envsecrets-login.passphrase_command failed",
-                    );
-                }
-                match one_line(&out.stdout) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return Contribution::problem(
-                            ProblemCode::CommandFailed,
-                            "envsecrets-login.passphrase_command printed something that is not UTF-8 text",
-                        )
-                    }
-                }
-            }
-            (None, None) => {
-                return Contribution::problem(
-                    ProblemCode::MissingInput,
-                    "set envsecrets-login.passphrase_file or passphrase_command",
-                )
-            }
-        };
-        if let Some(rule) = check_value(&passphrase) {
-            return Contribution::problem(ProblemCode::Unreadable, value_message(rule));
-        }
-        let variable = variable.to_string();
-        Contribution {
-            items: vec![
-                Draft {
-                    name: format!("{NAME}.config"),
-                    body: ItemBody::File(FileItem {
-                        stage: Stage::One,
-                        base: Base::Home,
-                        path: CONFIG.into(),
-                        mode: Mode::M0600,
-                        content: config.bytes,
-                    }),
-                    expires_at: None,
-                },
-                Draft {
-                    name: format!("{NAME}.passphrase"),
-                    body: ItemBody::Env(EnvItem {
-                        variable,
-                        value: passphrase,
-                    }),
-                    expires_at: None,
-                },
-            ],
-            ..Contribution::default()
-        }
+/// The config and the passphrase as the env item its `passphrase_env`
+/// names, once both are judged.
+pub fn build(inputs: &Inputs, _ctx: &Context<'_>) -> Contribution {
+    let variable = match check_config(&inputs.config) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    if let Some(rule) = check_value(&inputs.passphrase) {
+        return Contribution::problem(ProblemCode::Unreadable, value_message(rule));
+    }
+    Contribution {
+        items: vec![
+            file_draft(
+                &format!("{NAME}.config"),
+                Base::Home,
+                CONFIG,
+                Mode::M0600,
+                &inputs.config,
+            ),
+            env_draft(&format!("{NAME}.passphrase"), variable, &inputs.passphrase),
+        ],
+        ..Contribution::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_judges_the_config_and_debug_shows_no_value() {
+        let i = Inputs {
+            config: b"passphrase_env: X_PASS\n".to_vec(),
+            passphrase: "SENTINEL-pass".into(),
+        };
+        let c = build(&i, &Context::preview(0));
+        assert!(c.items.is_empty());
+        assert_eq!(c.problems[0].code, ProblemCode::MissingInput);
+        let shown = format!("{i:?}");
+        assert!(
+            !shown.contains("SENTINEL") && !shown.contains("X_PASS"),
+            "{shown}"
+        );
+    }
 
     #[test]
     fn the_strict_line_pattern() {

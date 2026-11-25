@@ -94,6 +94,29 @@ type worldInputs struct {
 	codes    map[string]Code
 	disabled map[string]bool
 	fail     bool
+	// The hosted source's world (sources.set, deliveries.deny): every
+	// person's source, and the servers that may not ask.
+	sources map[string]Delivery
+	denied  map[string]bool
+}
+
+func (w *worldInputs) DeliveriesDenied(clientID string) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fail {
+		return false, fmt.Errorf("lookups.fail")
+	}
+	return w.denied[clientID], nil
+}
+
+func (w *worldInputs) Delivery(user string) (Delivery, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fail {
+		return Delivery{}, false, fmt.Errorf("lookups.fail")
+	}
+	d, ok := w.sources[user]
+	return d, ok, nil
 }
 
 func (w *worldInputs) Users() ([]User, error) {
@@ -136,12 +159,16 @@ type exStep struct {
 		Path    string            `json:"path"`
 		Headers map[string]string `json:"headers"`
 		Body    json.RawMessage   `json:"body"`
+		// BodyBytes is a hosted exchange's: a padded body of that length.
+		BodyBytes *int `json:"body_bytes"`
 	} `json:"request"`
 	Response struct {
 		Status  int                `json:"status"`
 		Headers map[string]*string `json:"headers"`
 		Body    json.RawMessage    `json:"body"`
 		Text    *string            `json:"text"`
+		// Answer is a hosted exchange's: the 200 judged as an answer.
+		Answer json.RawMessage `json:"answer"`
 	} `json:"response"`
 }
 
@@ -252,6 +279,13 @@ type scenario struct {
 	last     string // the previous assertion, for reuse
 	server   string // the scenario's server, for limits.exhaust directory
 	token    string // the bound {{access_token}}
+	dtoken   string // the bound {{delivery_token}}
+	// hosted is a hosted exchange (the provision contract's): its own
+	// members, set-up steps and placeholder are allowed, and canned is the
+	// items sources.set gives a person.
+	hosted   bool
+	canned   json.RawMessage
+	sent     []byte // the step's request body, for an answer's judgement
 	listGen  int
 	versions map[int]string
 	jtiSeq   int
@@ -266,7 +300,8 @@ func (h *harness) newScenario(t *testing.T, ex *exchange) *scenario {
 		t.Fatal(err)
 	}
 	s := &scenario{t: t, h: h, name: ex.Name, clock: clock, versions: map[int]string{}}
-	s.in = &worldInputs{users: w.Users, codes: map[string]Code{}, disabled: map[string]bool{}}
+	s.in = &worldInputs{users: w.Users, codes: map[string]Code{}, disabled: map[string]bool{},
+		sources: map[string]Delivery{}, denied: map[string]bool{}}
 	s.srv, err = New(Config{
 		Issuer:       w.Issuer,
 		Organization: w.Organization,
@@ -386,6 +421,19 @@ func (s *scenario) before(steps []map[string]json.RawMessage) {
 				s.in.mu.Lock()
 				s.in.fail = true
 				s.in.mu.Unlock()
+			case "sources.set", "deliveries.deny":
+				if !s.hosted {
+					s.t.Fatalf("the set-up step %q is the provision contract's, not this one's", name)
+				}
+				var who string
+				mustDecode(s.t, raw, &who)
+				s.in.mu.Lock()
+				if name == "sources.set" {
+					s.in.sources[who] = Delivery{Items: s.canned}
+				} else {
+					s.in.denied[s.serverID(who)] = true
+				}
+				s.in.mu.Unlock()
 			case "limits.exhaust":
 				var kind string
 				mustDecode(s.t, raw, &kind)
@@ -409,6 +457,11 @@ func (s *scenario) limitCaller(kind string) (string, error) {
 	switch limitKind(kind) {
 	case limitEnroll, limitToken:
 		return strings.Split(callerAddr, ":")[0], nil
+	case limitDeliveries:
+		if !s.hosted {
+			return "", fmt.Errorf("the delivery limit is the provision contract's")
+		}
+		fallthrough
 	case limitDirectory:
 		if s.server == "" {
 			return "", fmt.Errorf("the directory limit, but no step names the scenario's server")
@@ -632,7 +685,16 @@ func (s *scenario) accessToken(raw json.RawMessage) string {
 func (s *scenario) request(st *exStep, assertion string) *http.Request {
 	var body io.Reader
 	raw := st.Request.Body
+	if st.Request.BodyBytes != nil && (!s.hosted || raw != nil) {
+		s.t.Fatalf("body_bytes is a hosted exchange's, instead of body")
+	}
+	s.sent = nil
 	switch {
+	case st.Request.BodyBytes != nil:
+		n := *st.Request.BodyBytes
+		pad := n - len(`{"pad":""}`)
+		s.sent = []byte(`{"pad":"` + strings.Repeat("a", pad) + `"}`)
+		body = bytes.NewReader(s.sent)
 	case raw == nil || string(raw) == "null":
 	case raw[0] == '"':
 		var str string
@@ -640,7 +702,8 @@ func (s *scenario) request(st *exStep, assertion string) *http.Request {
 		str = strings.ReplaceAll(str, "{{assertion}}", assertion)
 		body = strings.NewReader(s.resolve(str))
 	default:
-		body = strings.NewReader(s.resolve(string(raw)))
+		s.sent = []byte(s.resolve(string(raw)))
+		body = bytes.NewReader(s.sent)
 	}
 	req := httptest.NewRequest(st.Request.Method, st.Request.Path, body)
 	req.RemoteAddr = callerAddr
@@ -650,6 +713,12 @@ func (s *scenario) request(st *exStep, assertion string) *http.Request {
 				s.t.Fatal("{{access_token}} is used before it is bound")
 			}
 			v = strings.ReplaceAll(v, "{{access_token}}", s.token)
+		}
+		if strings.Contains(v, "{{delivery_token}}") {
+			if s.dtoken == "" {
+				s.t.Fatal("{{delivery_token}} is used before it is bound")
+			}
+			v = strings.ReplaceAll(v, "{{delivery_token}}", s.dtoken)
 		}
 		req.Header.Set(k, s.resolve(v))
 	}
@@ -696,6 +765,11 @@ func (s *scenario) step(i int, st *exStep) {
 		}
 	}
 	switch {
+	case st.Response.Answer != nil:
+		if !s.hosted || res.StatusCode != http.StatusOK || st.Request.Path != pathDeliveries {
+			t.Fatalf("%s: answer is a hosted exchange's, on a 200 of %s", where, pathDeliveries)
+		}
+		s.judgeAnswer(where, st.Response.Answer, got)
 	case st.Response.Text != nil:
 		if string(got) != *st.Response.Text {
 			t.Errorf("%s: body %q, want %q", where, got, *st.Response.Text)
@@ -901,15 +975,21 @@ func (s *scenario) placeholder(where, name string, got any) {
 		}
 		s.versions[s.listGen] = str
 	case "access_token":
-		s.checkAccessToken(where, str)
+		s.checkAccessToken(where, str, scopeDirectory)
 		s.token = str
+	case "delivery_token":
+		if !s.hosted {
+			t.Errorf("%s: {{delivery_token}} is the provision contract's placeholder", where)
+		}
+		s.checkAccessToken(where, str, scopeDeliveries)
+		s.dtoken = str
 	default:
 		t.Errorf("%s: {{%s}} is not a placeholder the contract names", where, name)
 	}
 }
 
 // checkAccessToken holds an issued token to the {{access_token}} rule.
-func (s *scenario) checkAccessToken(where, tok string) {
+func (s *scenario) checkAccessToken(where, tok, scope string) {
 	t := s.t
 	parts := strings.Split(tok, ".")
 	if len(parts) != 3 {
@@ -953,7 +1033,7 @@ func (s *scenario) checkAccessToken(where, tok string) {
 	if c.Iss != issuer || c.Sub != s.current || c.ClientID != s.current {
 		t.Errorf("%s: iss %q sub %q client_id %q, want %q and %q", where, c.Iss, c.Sub, c.ClientID, issuer, s.current)
 	}
-	if !reflect.DeepEqual(c.Aud, []string{issuer + "/v1"}) || c.Gty != "client_credentials" || !reflect.DeepEqual(c.Scp, []string{"directory:read"}) {
+	if !reflect.DeepEqual(c.Aud, []string{issuer + "/v1"}) || c.Gty != "client_credentials" || !reflect.DeepEqual(c.Scp, []string{scope}) {
 		t.Errorf("%s: aud %v gty %q scp %v", where, c.Aud, c.Gty, c.Scp)
 	}
 	if c.Nbf != c.Iat || c.Exp-c.Iat != 600 {

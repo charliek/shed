@@ -1,0 +1,26 @@
+{
+  "name": "wrong-kind-member-env-stage",
+  "description": "An env item carrying stage: env items are stage 1 always and have no stage member.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "v",
+        "fingerprint": "fp-k",
+        "stage": 1
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "wrong_kind_member"
+  }
+}

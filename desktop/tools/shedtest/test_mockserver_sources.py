@@ -84,7 +84,7 @@ def _read_request(resp) -> dict:
 
 def _answer(mock, machine_id: str, rid: str, stream: str) -> tuple[int, dict]:
     c = _conn(mock)
-    c.request("POST", f"/api/delivery/requests/{rid}", body=b'{"version":1,"items":[]}',
+    c.request("POST", f"/api/delivery/requests/{rid}", body=b'{"version":2,"items":[]}',
               headers={MACHINE_ID_HEADER: machine_id, MACHINE_NAME_HEADER: "m",
                        DELIVERY_STREAM_HEADER: stream, "Content-Type": "application/json"})
     r = c.getresponse()
@@ -258,3 +258,22 @@ def test_pause_takes_the_server_down_and_ends_every_stream(armed):
     c.close()
     assert mock.base_url == url, "the same port"
     assert _get(mock, "/api/sources")["binding"] is not None
+
+
+@pytest.mark.parametrize("state", ["", "not_delivering"])
+def test_a_service_source_serves_the_shared_shapes(state):
+    """A directory user's `GET /api/sources` is the shared fixture (`crates/fixtures/
+    sources/`, which the server's API tests and shed-core read too): the account service
+    in the delivery slot, with `not_delivering` when the server says so, and no machine."""
+    from mockserver import (SERVICE_NOT_DELIVERING_DOCUMENT, SERVICE_SOURCE_DOCUMENT,
+                            SOURCE_IS_SERVICE_BODY)
+    mock = MockShedServer()
+    mock.start()
+    try:
+        mock.serve_service_source(state)
+        want = SERVICE_NOT_DELIVERING_DOCUMENT if state else SERVICE_SOURCE_DOCUMENT
+        assert _get(mock, "/api/sources") == want
+        assert want["binding"]["delivery"][0]["kind"] == "service"
+        assert SOURCE_IS_SERVICE_BODY["error"]["code"] == "SOURCE_IS_SERVICE"
+    finally:
+        mock.stop()

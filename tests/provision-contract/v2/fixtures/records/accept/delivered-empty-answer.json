@@ -1,0 +1,38 @@
+{
+  "name": "delivered-empty-answer",
+  "description": "An answer with no items and no problems: nothing to write, every step settled.",
+  "record": {
+    "state": "delivered",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "no_items"
+      },
+      "clone": {
+        "state": "skipped",
+        "reason": "no_repo"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "no_project_dir"
+      },
+      "install": {
+        "state": "skipped",
+        "reason": "no_hook"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "accepted",
+      "source": {
+        "kind": "machine",
+        "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+        "machine_name": "ada-laptop"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

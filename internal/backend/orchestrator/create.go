@@ -307,7 +307,7 @@ func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequ
 	// one at a time (never across the wait for a source). The caller runs
 	// the pending delivery once it has released the lock.
 	return shed, &PendingDelivery{
-		svc: b.DeliveryService(), name: req.Name, shed: shed,
+		svc: b.DeliveryService(), name: req.Name, shed: shed, ticket: b.DeliveryService().Admit(req.Name, shed.ID),
 		scriptKey: req.ScriptKey, fromSnapshot: pre.IsFromSnapshot(), noProvision: req.NoProvision,
 		// The baseline every step is checked against, taken here, under
 		// the create's lock: the shed's id, creation time and reset
@@ -331,6 +331,7 @@ type PendingDelivery struct {
 	shed                                 *config.Shed
 	scriptKey, fromSnapshot, noProvision bool
 	base                                 runBase
+	ticket                               delivery.Ticket
 	clone                                func(ctx context.Context, ls *LocalShed) delivery.Step
 	hooks                                func(ctx context.Context, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool)
 }
@@ -352,7 +353,7 @@ func (p *PendingDelivery) Run(ctx context.Context, lb LocalBackend) *config.Shed
 	r := &LocalRun{
 		lb: lb, svc: p.svc, name: p.name, reason: delivery.ReasonCreate, first: ls,
 		scriptKey: p.scriptKey, fromSnapshot: p.fromSnapshot, noProvision: p.noProvision,
-		base: &p.base, clone: p.clone, hooks: p.hooks,
+		base: &p.base, clone: p.clone, hooks: p.hooks, ticket: p.ticket,
 	}
 	shed, err := r.Run(ctx)
 	if err != nil {

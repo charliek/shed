@@ -111,6 +111,9 @@ func (s *Server) handleListListeners(w http.ResponseWriter, r *http.Request) {
 		refuseBusCaller(w)
 		return
 	}
+	if s.refuseServiceTarget(w, r, user) {
+		return
+	}
 	if s.plugins == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"listeners": []any{}})
 		return
@@ -139,6 +142,9 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := busCaller(r)
 	if !ok {
 		refuseBusCaller(w)
+		return
+	}
+	if s.refuseServiceTarget(w, r, user) {
 		return
 	}
 	if refuseScriptKey(w, r) {
@@ -179,6 +185,8 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 			writeSourceNotBound(w, notBound.Bound)
 		case errors.As(err, &throttled):
 			writeAdmissionThrottled(w, throttled.RetryAfter)
+		case errors.Is(err, plugin.ErrSourceIsService):
+			writeError(w, http.StatusConflict, config.ErrSourceIsService, config.SourceIsServiceMessage)
 		case errors.Is(err, plugin.ErrDuplicateStream):
 			writeDuplicateStream(w, namespace)
 		case errors.Is(err, plugin.ErrBindingStore):
@@ -384,6 +392,9 @@ func (s *Server) handlePluginRespond(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := busCaller(r)
 	if !ok {
 		refuseBusCaller(w)
+		return
+	}
+	if s.refuseServiceTarget(w, r, user) {
 		return
 	}
 	if refuseScriptKey(w, r) {

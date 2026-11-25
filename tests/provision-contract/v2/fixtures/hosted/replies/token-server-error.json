@@ -1,0 +1,19 @@
+{
+  "name": "token-server-error",
+  "description": "500 server_error: source_offline.",
+  "request": "create-repo",
+  "token": {
+    "status": 500,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "error": "server_error"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

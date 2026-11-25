@@ -17,15 +17,15 @@ import (
 // Delivery on a cloud shed: the create job's tracked steps and `shed
 // provision`, both through delivery.Run.
 //
-// The record's steps are saved after each. A create resumed after a server
-// restart (or a cloud read that failed) has lost its bundle and asks no
-// source (N3). When a source would be asked for the shed, it runs no step and
-// leaves what it had not recorded done or skipped owed for `shed provision`.
-// When none would be (a service client's shed, a script key's create, a user
-// with no bound machine), it runs the steps still owed: the stages are
-// skipped not_applicable and the clone and install hook run, as a create
-// before delivery resumed them. A resumed job never retries a step recorded
-// failed.
+// The record's steps are saved after each, stage 1's outcome before any
+// later step starts. A create resumed after a server restart (or a cloud
+// read that failed) has lost its bundle and reads its record only (plan 040,
+// section 3.3): it asks no source and probes nothing, and never rewrites a
+// step already recorded. With stage 1 not recorded it runs nothing, and
+// `shed provision` finishes the shed. With stage 1 recorded the clone runs
+// if it is owed, stage 2 is skipped when stage 1 was not applicable and
+// stays owed otherwise (and so does the install hook). A resumed job never
+// retries a step recorded failed.
 
 var _ backend.Provisioner = (*Backend)(nil)
 
@@ -33,22 +33,54 @@ var _ backend.Provisioner = (*Backend)(nil)
 // the start-up pass. nil leaves every delivery not applicable.
 func (b *Backend) SetDelivery(s *delivery.Service) { b.deliverySvc = s }
 
+// HoldResumes makes every create resumed by the start-up pass wait, before
+// its delivery steps, until ReleaseResumes: shed-server calls it before
+// Reconcile, and ReleaseResumes once the origin migration
+// (backend.MigrateUserOrigins) has run, so a create from before user_origin
+// is resumed with its shed's origin recorded. Unset, nothing waits.
+func (b *Backend) HoldResumes() {
+	b.resumeGate = make(chan struct{})
+}
+
+// ReleaseResumes lets the held resumed creates run (HoldResumes). It may be
+// called more than once.
+func (b *Backend) ReleaseResumes() {
+	if b.resumeGate != nil {
+		b.resumeOnce.Do(func() { close(b.resumeGate) })
+	}
+}
+
 // requestShed is rec's shed as a delivery request names it.
 func requestShed(rec *state.Record) delivery.RequestShed {
 	return config.DeliveryRequestShed(rec.Shed.Name, rec.Shed.ID, delivery.BackendRemote, rec.Shed.Repo, "", rec.Shed.LandingDir)
 }
 
 // createSteps runs a create's tracked steps. The job the create request
-// started runs them (j.deliver); a resumed one runs those still owed only
-// when no source would be asked (resumable). It returns errSuperseded when
-// the job's context ended or the shed went.
+// started runs them (j.deliver); a resumed one runs those its record allows
+// (delivery.Run with Resumed). It returns errSuperseded when the job's
+// context ended or the shed went.
 func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, agent *vmutil.AgentClient, owned bool) error {
+	if !j.deliver && b.resumeGate != nil {
+		// A resumed create waits for the start-up's origin migration (a
+		// record from before user_origin is stamped by it), so its steps
+		// are judged with the shed's origin, never refused for lack of one
+		// and the shed marked ready with its work skipped.
+		select {
+		case <-b.resumeGate:
+		case <-ctx.Done():
+			return errSuperseded
+		}
+		if rec = b.snapshot(j.name, j.id); rec == nil {
+			return errSuperseded
+		}
+	}
 	owner, user := ownership(rec)
 	params := delivery.Params{
 		User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "", ScriptKey: rec.ScriptKey,
+		Origin: rec.UserOrigin,
 	}
 	resumed := !j.deliver
-	if resumed && !b.resumable(rec, params) {
+	if resumed && stageOneOwed(rec) {
 		// A record from before delivery: its old flags say what ran.
 		if rec.Delivery == nil {
 			steps := rec.LegacySteps()
@@ -63,7 +95,7 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 				}
 			})
 		}
-		b.logf("remote: create of shed %s resumed: its delivery is not asked for again; owed steps are finished by `shed provision %s`", j.name, j.name)
+		b.logf("remote: create of shed %s resumed: its delivery was not decided before it stopped, so no step runs; `shed provision %s` finishes it", j.name, j.name)
 		return nil
 	}
 	repo := j.repoURL
@@ -74,7 +106,7 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 		ctx = audit.WithActor(ctx, j.actor)
 	}
 	if resumed {
-		b.logf("remote: create of shed %s resumed: no source is asked for it, so its owed steps run", j.name)
+		b.logf("remote: create of shed %s resumed: its recorded delivery stands; the steps it allows run", j.name)
 	}
 	h := &remoteHost{
 		b: b, name: j.name, id: j.id, agent: agent, rec: rec, owner: owner, user: user,
@@ -87,6 +119,7 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 		HasRepo:     rec.Shed.Repo != "",
 		NoProvision: rec.NoProvision,
 		Resumed:     resumed,
+		Ticket:      j.ticket,
 		Prior:       rec.Delivery,
 		Initial:     rec.LegacySteps(),
 		Host:        h,
@@ -102,21 +135,10 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 	return nil
 }
 
-// resumable reports whether a resumed create runs its owed steps: when no
-// source would be asked for the shed now (delivery not applicable), and its
-// stage 1 is owed or was skipped as not applicable. A stage 1 that a source
-// was asked for at the create (done, failed, or skipped for another reason)
-// leaves the rest for `shed provision`, as a shed whose source would be
-// asked does.
-func (b *Backend) resumable(rec *state.Record, p delivery.Params) bool {
-	if b.deliverySvc.Applicable(p) {
-		return false
-	}
-	if rec.Delivery == nil || rec.Delivery.Steps == nil {
-		return true
-	}
-	s := rec.Delivery.Steps.Stage1
-	return s.State == delivery.StepOwed || (s.State == delivery.StepSkipped && s.Reason == delivery.ReasonNotApplicable)
+// stageOneOwed reports whether rec's stage 1 is not recorded yet (a record
+// from before delivery counts as owed: its stage 1 never ran).
+func stageOneOwed(rec *state.Record) bool {
+	return rec.Delivery == nil || rec.Delivery.Steps == nil || rec.Delivery.Steps.Stage1.State == delivery.StepOwed
 }
 
 // BeginProvision admits `shed provision` on a running cloud shed
@@ -143,17 +165,26 @@ func (b *Backend) BeginProvision(ctx context.Context, name string) (backend.Prov
 		err = fmt.Errorf("%w: %s is %s; try again when it has settled", config.ErrProvisionBusySentinel, name, r.Shed.Status)
 	case r.Shed.Status != config.StatusRunning:
 		err = fmt.Errorf("%w: %s is %s; start it first", config.ErrShedNotRunningSentinel, name, r.Shed.Status)
+	default:
+		// A shed whose user's name has changed origin since it was made is
+		// refused before anything is asked (409 SHED_ORIGIN_CHANGED).
+		_, user := ownership(r)
+		err = b.deliverySvc.CheckOrigin(user, r.UserOrigin)
 	}
 	var rec *state.Record
+	var ticket delivery.Ticket
 	if err == nil {
 		rec = r.Clone()
+		// The run's admission, under the lock a stop or delete takes to
+		// end it.
+		ticket = b.deliverySvc.Admit(name, rec.Shed.ID)
 	}
 	b.mu.Unlock()
 	if err != nil {
 		release()
 		return nil, err
 	}
-	return &remoteRun{b: b, name: name, rec: rec, release: release}, nil
+	return &remoteRun{b: b, name: name, rec: rec, release: release, ticket: ticket}, nil
 }
 
 // ProvisionShed is BeginProvision, Run and Release in one call.
@@ -168,6 +199,8 @@ type remoteRun struct {
 	rec     *state.Record
 	release func()
 	once    sync.Once
+	// ticket is the run's admission, taken with the provisioning slot.
+	ticket delivery.Ticket
 }
 
 func (r *remoteRun) Release() { r.once.Do(r.release) }
@@ -188,9 +221,11 @@ func (r *remoteRun) Run(ctx context.Context) (*config.Shed, error) {
 		Reason:  delivery.ReasonProvision,
 		Params: delivery.Params{
 			User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "",
+			Origin: rec.UserOrigin,
 		},
 		HasRepo:     rec.Shed.Repo != "",
 		NoProvision: rec.NoProvision,
+		Ticket:      r.ticket,
 		Prior:       rec.Delivery,
 		Initial:     rec.LegacySteps(),
 		Host:        h,
@@ -231,8 +266,10 @@ type remoteHost struct {
 var errDeliveryEnded = errors.New("the shed stopped, changed hands or is changing")
 
 func (h *remoteHost) Step(ctx context.Context, fn func(ctx context.Context) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx.Err() != nil {
+		// Its cause, so a run its shed's stop or delete ended reports
+		// that (ErrShedEnded), not a bare cancellation.
+		return context.Cause(ctx)
 	}
 	defer h.b.stepLocks.Acquire(h.name)()
 	h.b.mu.Lock()
