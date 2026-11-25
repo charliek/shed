@@ -613,7 +613,7 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 		b.mu.Unlock()
 		return errSuperseded
 	}
-	b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+	b.reconcileUserLocked(r, inst.Labels, b.logNote)
 	b.commitCreatedLocked(r, inst) // saves r
 	status := r.Shed.Status
 	b.mu.Unlock()
@@ -703,7 +703,7 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 		}
 		r.Address = inst.Address
 		r.AddressAt = now
-		b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+		b.reconcileUserLocked(r, inst.Labels, b.logNote)
 	})
 }
 

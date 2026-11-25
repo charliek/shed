@@ -183,13 +183,14 @@ func members(raw json.RawMessage, allowed, required []string) (map[string]json.R
 // written again here: this package imports no shed package). Anything else
 // is errNotARequest.
 //
-// It checks the document's structure and these value rules, not every text
-// rule of the contract's conventions: an unpaired UTF-16 surrogate escape,
-// which Go's decoder replaces, is not detected. Its tests hold that every
-// request it refuses is one the contract's parser refuses too.
+// It checks the document's structure and these value rules, and refuses an
+// unpaired UTF-16 surrogate escape (which Go's decoder would repair) as the
+// contract's parser does; it does not check every text rule of the
+// contract's conventions. Its tests hold that every request it refuses is
+// one the contract's parser refuses too.
 func parseDeliveryRequest(b []byte) (deliveryRequest, error) {
 	var none deliveryRequest
-	if checkStrictJSON(b, 16) != nil {
+	if checkStrictJSON(b, 16) != nil || unpairedSurrogate(b) {
 		return none, errNotARequest
 	}
 	top := []string{"version", "id", "reason", "deadline", "user", "shed"}

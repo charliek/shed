@@ -88,11 +88,15 @@ func (b *Backend) AssignUser(ctx context.Context, name string, req config.Assign
 	if assignVerifiedHook != nil {
 		assignVerifiedHook(name)
 	}
-	if err := b.prov.ClaimLabel(ctx, ref, provider.LabelUser, req.User); err != nil {
+	// The user and the origin they now have, in one label update (one
+	// fingerprint check): no reader of the instance ever sees the new user
+	// with another origin. The origin is the evidence an adoption recovers.
+	origin := b.deliverySvc.Origin(req.User)
+	if err := b.prov.ClaimLabel(ctx, ref, provider.LabelUser, req.User, map[string]string{provider.LabelUserOrigin: origin}); err != nil {
 		if errors.Is(err, provider.ErrLabelTaken) {
 			return nil, fmt.Errorf("%w: the instance of shed %s is labelled for another user: %w", config.ErrShedAssignedSentinel, name, err)
 		}
-		return nil, fmt.Errorf("assign %s: writing its %s label: %w", name, provider.LabelUser, mapRefusal(err))
+		return nil, fmt.Errorf("assign %s: writing its %s and %s labels: %w", name, provider.LabelUser, provider.LabelUserOrigin, mapRefusal(err))
 	}
 	if assignLabelledHook != nil {
 		assignLabelledHook(name)
@@ -104,18 +108,21 @@ func (b *Backend) AssignUser(ctx context.Context, name string, req config.Assign
 		b.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s (deleted while it was being assigned)", config.ErrShedNotFoundSentinel, name)
 	}
-	if _, user := ownership(r); user != req.User {
-		// A read of the instance may have taken the label's user already.
-		if err := backend.CheckAssignable(b.shedOf(r), req); err != nil {
-			b.mu.Unlock()
-			return nil, err
+	if _, user := ownership(r); user != req.User || r.UserOrigin != origin {
+		// A read of the instance may have taken the label's user (and
+		// origin) already.
+		if user != req.User {
+			if err := backend.CheckAssignable(b.shedOf(r), req); err != nil {
+				b.mu.Unlock()
+				return nil, err
+			}
 		}
-		r.Shed.User = req.User
-		// The shed is now this user's: where they come from, by the
-		// configuration now.
-		r.UserOrigin = b.deliverySvc.Origin(req.User)
+		// The user and their origin, together, as the labels hold them.
+		r.Shed.User, r.UserOrigin = req.User, origin
 		b.saveLocked(r)
-		b.busUserChangedLocked(r)
+		if user != req.User {
+			b.busUserChangedLocked(r)
+		}
 	}
 	shed := b.shedOf(r)
 	b.mu.Unlock()

@@ -27,6 +27,15 @@ const (
 	// OriginDirectory is every other name on a directory server: the
 	// account service answers, and nothing else.
 	OriginDirectory = "directory"
+	// OriginUnknown is the recorded origin of a shed recovered with no
+	// evidence of where its user came from (a cloud VM adopted, or a lost
+	// user restored, from an instance with no origin label). Unlike an
+	// empty origin (a record v0.11 wrote, which the start-up migration
+	// fills from the first start's recorded decision) it is never filled
+	// by the migration or by a later read of the instance; only an explicit
+	// assignment replaces it. A delivery to such a shed is refused
+	// (ErrShedOriginUnknown).
+	OriginUnknown = "unknown"
 )
 
 // ErrShedOriginChanged refuses a delivery to a shed whose recorded user
@@ -42,7 +51,7 @@ var ErrShedOriginChanged = errors.New("the shed's user is no longer the one who 
 // nothing until a start stamps it, so no principal's credentials can reach
 // a shed whose maker is not known. Nothing is requested and the record is
 // unchanged.
-var ErrShedOriginUnknown = errors.New("the shed has no record yet of where its user came from (it is recorded at the server's next start); no delivery is made to it until then")
+var ErrShedOriginUnknown = errors.New("the shed has no record of where its user came from; no delivery is made to it until the server records one (at its next start for a shed made before this version) or an admin assigns it")
 
 // Source is who answers a delivery request: the user's bound machine (the
 // machine source, the contract's section 3a) or the account service (the
@@ -101,7 +110,7 @@ func (s *Service) Origin(user string) string {
 // recorded origin (ErrShedOriginUnknown): it fails closed.
 func (s *Service) CheckOrigin(user, recorded string) error {
 	switch recorded {
-	case "":
+	case "", OriginUnknown:
 		return ErrShedOriginUnknown
 	case s.Origin(user):
 		return nil

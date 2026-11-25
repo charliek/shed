@@ -33,6 +33,23 @@ var _ backend.Provisioner = (*Backend)(nil)
 // the start-up pass. nil leaves every delivery not applicable.
 func (b *Backend) SetDelivery(s *delivery.Service) { b.deliverySvc = s }
 
+// HoldResumes makes every create resumed by the start-up pass wait, before
+// its delivery steps, until ReleaseResumes: shed-server calls it before
+// Reconcile, and ReleaseResumes once the origin migration
+// (backend.MigrateUserOrigins) has run, so a create from before user_origin
+// is resumed with its shed's origin recorded. Unset, nothing waits.
+func (b *Backend) HoldResumes() {
+	b.resumeGate = make(chan struct{})
+}
+
+// ReleaseResumes lets the held resumed creates run (HoldResumes). It may be
+// called more than once.
+func (b *Backend) ReleaseResumes() {
+	if b.resumeGate != nil {
+		b.resumeOnce.Do(func() { close(b.resumeGate) })
+	}
+}
+
 // requestShed is rec's shed as a delivery request names it.
 func requestShed(rec *state.Record) delivery.RequestShed {
 	return config.DeliveryRequestShed(rec.Shed.Name, rec.Shed.ID, delivery.BackendRemote, rec.Shed.Repo, "", rec.Shed.LandingDir)
@@ -43,6 +60,20 @@ func requestShed(rec *state.Record) delivery.RequestShed {
 // (delivery.Run with Resumed). It returns errSuperseded when the job's
 // context ended or the shed went.
 func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, agent *vmutil.AgentClient, owned bool) error {
+	if !j.deliver && b.resumeGate != nil {
+		// A resumed create waits for the start-up's origin migration (a
+		// record from before user_origin is stamped by it), so its steps
+		// are judged with the shed's origin, never refused for lack of one
+		// and the shed marked ready with its work skipped.
+		select {
+		case <-b.resumeGate:
+		case <-ctx.Done():
+			return errSuperseded
+		}
+		if rec = b.snapshot(j.name, j.id); rec == nil {
+			return errSuperseded
+		}
+	}
 	owner, user := ownership(rec)
 	params := delivery.Params{
 		User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "", ScriptKey: rec.ScriptKey,

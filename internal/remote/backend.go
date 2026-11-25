@@ -173,7 +173,11 @@ type Backend struct {
 	// delivery). stepLocks holds a provision's step in hand against a stop
 	// or a delete of the shed (by name); provisioning holds one provision
 	// per shed.
-	deliverySvc  *delivery.Service
+	deliverySvc *delivery.Service
+	// resumeGate, when set (HoldResumes), holds a resumed create's steps
+	// until it is closed (ReleaseResumes). Set before Reconcile.
+	resumeGate   chan struct{}
+	resumeOnce   sync.Once
 	stepLocks    lockmap.NamedMutexMap
 	provisioning lockmap.NamedMutexMap
 	// halting is raised by a stop or a delete of the shed while it waits

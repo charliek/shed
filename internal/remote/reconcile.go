@@ -234,7 +234,7 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 			r.Ref = inst.Ref
 			b.saveLocked(r)
 		}
-		if b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], note) {
+		if b.reconcileUserLocked(r, inst.Labels, note) {
 			b.saveLocked(r)
 		}
 		if r.Job == state.JobCreate && !r.Ready && inst.ShedState() == provider.ShedStateReady {
@@ -345,7 +345,8 @@ func (b *Backend) abandonedCreate(inst provider.Instance) bool {
 // (noteInstance, resumeCommitted, reconcileUserFromLocked). A save that fails
 // leaves the record in memory as decided, and the next read decides again
 // from the label.
-func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(string, ...any)) bool {
+func (b *Backend) reconcileUserLocked(r *state.Record, labels map[string]string, note func(string, ...any)) bool {
+	label := labels[provider.LabelUser]
 	before := busIdentity(r)
 	defer func() {
 		if after := busIdentity(r); after.User != before.User {
@@ -361,9 +362,24 @@ func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(s
 		note("shed %s: its instance is labelled %s=%q, which is not a valid user name; only an admin can reach it until the label is corrected",
 			r.Shed.Name, provider.LabelUser, label)
 	case label == r.Shed.User && r.Shed.Owner == "":
+		// The same user: the origin label must agree with the record's
+		// too. A known origin that disagrees with the label's fails closed
+		// (unknown: no delivery), never taken from either side, since the
+		// two are only ever written together (create, and assignment in
+		// one label update). An instance with no origin label, or a record
+		// that is unknown or from before origins, is left as it is.
+		if o := labels[provider.LabelUserOrigin]; provider.ValidUserOrigin(o) && provider.ValidUserOrigin(r.UserOrigin) && o != r.UserOrigin {
+			note("shed %s is recorded with user origin %q and its instance is labelled %s=%q; it gets no delivery until it is recreated",
+				r.Shed.Name, r.UserOrigin, provider.LabelUserOrigin, o)
+			r.UserOrigin = delivery.OriginUnknown
+			changed = true
+		}
 	case r.Shed.User == "" && r.Shed.Owner == "":
 		r.Shed.User = label
-		r.UserOrigin = b.deliverySvc.Origin(label)
+		// Its origin only from the instance's label (what the create or an
+		// assignment wrote); with none it is not known, and the shed gets
+		// no delivery: never inferred from the configuration of the day.
+		r.UserOrigin = originEvidence(labels[provider.LabelUserOrigin])
 		changed = true
 		note("shed %s had no user on record and its instance is labelled %s=%s; recording that user", r.Shed.Name, provider.LabelUser, label)
 	default:
@@ -379,6 +395,16 @@ func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(s
 		changed = true
 	}
 	return changed
+}
+
+// originEvidence is the recorded origin an instance's origin label gives:
+// the label's when it is one, otherwise unknown (never empty, which is a
+// v0.11 record's, nor inferred from the configuration).
+func originEvidence(label string) string {
+	if provider.ValidUserOrigin(label) {
+		return label
+	}
+	return delivery.OriginUnknown
 }
 
 // busSync is the application of a shed's reported user to its bus route,
@@ -562,7 +588,7 @@ func (b *Backend) reconcileUserFromLocked(r *state.Record, inst provider.Instanc
 	if inst.Labels[provider.LabelID] != r.Shed.ID || inst.Labels[provider.LabelEnv] != b.cfg.Environment || schemaOf(inst) != nil {
 		return false
 	}
-	return b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+	return b.reconcileUserLocked(r, inst.Labels, b.logNote)
 }
 
 // reconcileUserRead is reconcileUserFromLocked under b.mu, for the shed's
@@ -607,9 +633,11 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 			NetworkProfile: spec.Network,
 			Arch:           inst.Arch,
 		},
-		// Where its user came from, by the configuration now: the shed
-		// has no user until a label names one, which stamps it again.
-		UserOrigin: b.deliverySvc.Origin(""),
+		// Where its user came from: only from the instance's own label,
+		// the evidence its create wrote. None is recorded as unknown (the
+		// shed gets no delivery, and the start-up migration never fills
+		// it), never the configuration of the day.
+		UserOrigin: originEvidence(id.UserOrigin),
 		Env:        id.Env,
 		Zone:       inst.Zone,
 		Ref:        inst.Ref,

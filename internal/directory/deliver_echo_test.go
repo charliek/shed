@@ -111,17 +111,24 @@ func TestDeliveryEchoInDecodedContent(t *testing.T) {
 	}
 }
 
-// TestDelivery410ByStatusAlone: a 410 is source_timeout whatever its body:
-// none, HTML, JSON that does not parse, or another code.
+// TestDelivery410ByStatusAlone: a 410 is source_timeout when its code is
+// DEADLINE_PASSED or its body is not an error object (none, HTML, JSON that
+// does not parse: the status alone); a 410 with another code is unlisted,
+// source_refused.
 func TestDelivery410ByStatusAlone(t *testing.T) {
-	for _, body := range []string{"", "<html>gone</html>", `{"error":`, `{"error":{"code":"GONE","message":"x"}}`} {
+	for body, want := range map[string]delivery.HostedStatus{
+		"":                                     delivery.HostedTimeout,
+		"<html>gone</html>":                    delivery.HostedTimeout,
+		`{"error":`:                            delivery.HostedTimeout,
+		`{"error":{"code":"DEADLINE_PASSED"}}`: delivery.HostedTimeout,
+		`{"error":{"code":"GONE","message":"x"}}`: delivery.HostedRefused,
+	} {
 		c := echoService(t, func(w http.ResponseWriter, _, _ string) {
 			w.WriteHeader(http.StatusGone)
 			fmt.Fprint(w, body)
 		})
-		if st, _, _ := c.Deliver(context.Background(), fixtureRequestLine(t)); st != delivery.HostedTimeout {
-			t.Fatalf("410 with body %q = %s, want timeout", body, st)
+		if st, _, _ := c.Deliver(context.Background(), fixtureRequestLine(t)); st != want {
+			t.Fatalf("410 with body %q = %s, want %s", body, st, want)
 		}
 	}
-
 }

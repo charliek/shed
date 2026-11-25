@@ -941,7 +941,7 @@ On a server that takes its users from an [account service](../guides/user-direct
 - **A scope on backend or repo trusts the server.** A rule at the service that narrows what is sent by the shed's backend or repository is judged against the request the server wrote, so a dishonest server satisfies it. A scope by server is the one the service checks itself: it knows the server from the token.
 - **There is no fallback.** A directory user is never asked through a machine, so a pinned machine cannot be used to reach a directory user's sheds, and a service outage ends in a recorded failure, not another source.
 - **Nothing the service sends as text is kept.** An error message, a token error description, a redirect target or an unparseable body is classified and dropped, and a reply that holds the token or assertion the server presented is refused.
-- **A name that changes sets is a different person.** Each shed records whether its user was local or from the directory; a delivery after the name moved is refused (`SHED_ORIGIN_CHANGED`), so one person's credentials do not go into a shed another person of that name made.
+- **A name that changes sets is a different person.** Each shed records whether its user was local or from the directory; a delivery after the name moved is refused (`SHED_ORIGIN_CHANGED`), so one person's credentials do not go into a shed another person of that name made. On the remote backend the origin is also the VM's `shed_user_origin` label, and it is trusted when a VM is adopted or a lost user restored, so whoever can write the cloud project's instance labels is inside the trusted control plane.
 
 ## Credential bus
 

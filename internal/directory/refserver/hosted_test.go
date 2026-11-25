@@ -423,8 +423,24 @@ func TestDeliveryRequestParseAgreesOnMembers(t *testing.T) {
 		"project_dir dot dot":    `"shed":{"name":"w","id":"q6c3","backend":"vz","project_dir":"/home/../etc"}`,
 		"project_dir trailing /": `"shed":{"name":"w","id":"q6c3","backend":"vz","project_dir":"/home/shed/"}`,
 		"project_dir backslash":  `"shed":{"name":"w","id":"q6c3","backend":"vz","project_dir":"/home\\shed"}`,
+		// Malformed text, refused and never repaired (the decoder would
+		// make each U+FFFD).
+		"name unpaired high surrogate": `"shed":{"name":"\ud800","id":"q6c3","backend":"vz"}`,
+		"name lone low surrogate":      `"shed":{"name":"a\udc00","id":"q6c3","backend":"vz"}`,
+		"name surrogates reversed":     `"shed":{"name":"\udc00\ud800","id":"q6c3","backend":"vz"}`,
+		"name high then another":       `"shed":{"name":"\ud800\u0041","id":"q6c3","backend":"vz"}`,
 	}
 	shedAt := strings.Index(base, `"shed":`)
+	// A pair, and an escaped backslash before a u, are text: taken.
+	for _, shed := range []string{`"shed":{"name":"\ud83d\ude00","id":"q6c3","backend":"vz"}`, `"shed":{"name":"a\\ud800","id":"q6c3","backend":"vz"}`} {
+		body := []byte(base[:shedAt] + shed + "}")
+		if _, r := delivery.ParseRequest(body); r != nil {
+			t.Fatalf("%s: the contract's parser refuses it: %v", shed, r)
+		}
+		if _, err := parseDeliveryRequest(body); err != nil {
+			t.Errorf("%s: refused: %v", shed, err)
+		}
+	}
 	for name, shed := range cases {
 		body := []byte(base[:shedAt] + shed + "}")
 		if _, r := delivery.ParseRequest(body); r == nil {

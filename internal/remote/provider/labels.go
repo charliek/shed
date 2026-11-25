@@ -30,6 +30,13 @@ const (
 	// same as empty. The server writes it on every new instance. A shed
 	// never carries both a non-empty owner and a non-empty user.
 	LabelUser = "shed_user"
+	// LabelUserOrigin is where the shed's user came from when the shed was
+	// made (or given its user): "local" or "directory" (plan 040, section
+	// 3.2). Added to SchemaVersion "1" without changing it: an instance
+	// labelled before it carries none, and absent means not known. It is the
+	// durable evidence a server adopting the instance recovers the shed's
+	// origin from; it is never inferred from the configuration of the day.
+	LabelUserOrigin = "shed_user_origin"
 	// LabelState is the lifecycle marker; see ShedState. It is on the
 	// instance only, not its disk.
 	LabelState = "shed_state"
@@ -115,6 +122,9 @@ type Identity struct {
 	// User is the person the shed belongs to, or "" for the implicit
 	// user. Read from LabelUser; an instance without that label has none.
 	User string
+	// UserOrigin is LabelUserOrigin: "local", "directory", or "" when the
+	// instance carries none (or another value): not known.
+	UserOrigin string
 }
 
 // Validate checks that every field can be a label and that the instance name
@@ -131,9 +141,14 @@ func (i Identity) Validate() error {
 		return Errorf(ErrInvalid, "", "owner %q cannot be a label", i.Owner)
 	case !ValidLabelValue(i.User):
 		return Errorf(ErrInvalid, "", "user %q cannot be a label", i.User)
+	case i.UserOrigin != "" && !ValidUserOrigin(i.UserOrigin):
+		return Errorf(ErrInvalid, "", "user origin %q is not local or directory", i.UserOrigin)
 	}
 	return nil
 }
+
+// ValidUserOrigin reports whether s is a LabelUserOrigin value.
+func ValidUserOrigin(s string) bool { return s == "local" || s == "directory" }
 
 // InstanceName returns the cloud name for this shed's instance.
 func (i Identity) InstanceName() string { return InstanceName(i.Env, i.ID) }
@@ -141,7 +156,7 @@ func (i Identity) InstanceName() string { return InstanceName(i.Env, i.ID) }
 // Labels returns the label set for an instance in the given lifecycle state.
 // It holds every key but LabelLayout.
 func (i Identity) Labels(state ShedState) map[string]string {
-	return map[string]string{
+	l := map[string]string{
 		LabelSchema: SchemaVersion,
 		LabelEnv:    i.Env,
 		LabelID:     i.ID,
@@ -150,6 +165,10 @@ func (i Identity) Labels(state ShedState) map[string]string {
 		LabelUser:   i.User,
 		LabelState:  string(state),
 	}
+	if i.UserOrigin != "" {
+		l[LabelUserOrigin] = i.UserOrigin
+	}
+	return l
 }
 
 // IdentityFromLabels reads an Identity back from an instance's labels. It
@@ -166,6 +185,10 @@ func IdentityFromLabels(labels map[string]string) (Identity, error) {
 		Name:  labels[LabelName],
 		Owner: labels[LabelOwner],
 		User:  labels[LabelUser],
+	}
+	// Only a known value is evidence; any other reads as not known.
+	if o := labels[LabelUserOrigin]; ValidUserOrigin(o) {
+		id.UserOrigin = o
 	}
 	if err := id.Validate(); err != nil {
 		return Identity{}, err

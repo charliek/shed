@@ -234,7 +234,7 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 		b.mu.Unlock()
 		return // a request got there first
 	}
-	if !gone && b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote) {
+	if !gone && b.reconcileUserLocked(r, inst.Labels, b.logNote) {
 		b.saveLocked(r)
 	}
 	switch {

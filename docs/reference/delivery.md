@@ -192,7 +192,7 @@ A shed is owned by a name, and on a directory server the same name can move betw
 | Status | Code | When |
 |---|---|---|
 | `409` | `SHED_ORIGIN_CHANGED` | the shed's recorded origin differs from the current origin of its user's name. Nothing is requested and the record is unchanged. Create a new shed. |
-| `409` | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin, which only happens when the one-time stamp below could not be saved. No delivery is made until a start stamps it. |
+| `409` | `SHED_ORIGIN_UNKNOWN` | the shed has no known origin: the one-time stamp below could not be saved (no delivery until a start stamps it), or it is a cloud shed recovered from a VM with no origin label, recorded `unknown` (no delivery until it is recreated; see [Remote backend › Server restarts](remote-backend.md#server-restarts)). |
 
 A shed made before this behaviour has no recorded origin. The **first start** of a server that knows it decides, once, each such shed's origin from that start's configuration and records the decision in `<state_dir>/delivery/origin-migration.json`. Every later start stamps an unstamped shed only from that file, never from the current configuration, so a name that moves afterwards does not change what was decided. Do not edit or delete the file.
 

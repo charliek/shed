@@ -750,7 +750,7 @@ func (c *Client) SetLabels(ctx context.Context, ref provider.Ref, labels map[str
 // check and the write are one: a write that another writer beat is refused by
 // the cloud (the fingerprint has changed), and the next attempt reads the
 // instance, and checks the label, again.
-func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string) error {
+func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string, also map[string]string) error {
 	if key == "" || !provider.ValidLabelValue(key) || key[0] < 'a' || key[0] > 'z' {
 		return provider.Errorf(provider.ErrInvalid, "claim_label", "label key %q is not valid", key)
 	}
@@ -761,6 +761,16 @@ func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value st
 	if value == "" || !provider.ValidLabelValue(value) {
 		return provider.Errorf(provider.ErrInvalid, "claim_label", "label %s has an invalid value %q", key, value)
 	}
+	for k, v := range also {
+		switch {
+		case k == "" || !provider.ValidLabelValue(k) || k[0] < 'a' || k[0] > 'z':
+			return provider.Errorf(provider.ErrInvalid, "claim_label", "label key %q is not valid", k)
+		case k == key || k == provider.LabelSchema || k == provider.LabelEnv || k == provider.LabelID:
+			return provider.Errorf(provider.ErrInvalid, "claim_label", "label %s cannot be written with a claim", k)
+		case !provider.ValidLabelValue(v):
+			return provider.Errorf(provider.ErrInvalid, "claim_label", "label %s has an invalid value %q", k, v)
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		zone, g, err := c.mine(ctx, "claim_label", ref)
 		if err != nil {
@@ -768,7 +778,15 @@ func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value st
 		}
 		switch cur := g.Labels[key]; cur {
 		case value:
-			return nil
+			inPlace := true
+			for k, v := range also {
+				if g.Labels[k] != v {
+					inPlace = false
+				}
+			}
+			if inPlace {
+				return nil
+			}
 		case "":
 		default:
 			return provider.Errorf(provider.ErrLabelTaken, "claim_label", "%s has %s=%q", ref, key, cur)
@@ -778,6 +796,7 @@ func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value st
 			merged = map[string]string{}
 		}
 		merged[key] = value
+		maps.Copy(merged, also)
 		if len(merged) > 64 {
 			return provider.Errorf(provider.ErrInvalid, "claim_label", "an instance takes at most 64 labels")
 		}

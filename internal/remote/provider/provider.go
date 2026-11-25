@@ -248,7 +248,14 @@ type Provider interface {
 	// value is ErrLabelTaken and nothing is written. A value it already has
 	// is success with nothing written. LabelSchema, LabelEnv and LabelID
 	// cannot be claimed (ErrInvalid). It completes before it returns.
-	ClaimLabel(ctx context.Context, ref Ref, key, value string) error
+	//
+	// also are labels written in the same update as the claim, and only
+	// when it succeeds (keys under the same rules, values valid label
+	// values): the claim and they land together or not at all, under the
+	// one fingerprint check, so no reader ever sees the claimed value
+	// without them. With key already value and also already in place,
+	// nothing is written.
+	ClaimLabel(ctx context.Context, ref Ref, key, value string, also map[string]string) error
 
 	// SetMetadata sets the given instance metadata keys and leaves the
 	// others alone. An empty value removes the key. It completes before it

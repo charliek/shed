@@ -867,3 +867,142 @@ func TestRemoteCreateStoppedDuringBootAsksNothing(t *testing.T) {
 		t.Fatalf("the account service was asked %d times for a shed stopped during its boot", n)
 	}
 }
+
+// TestRemoteAdoptionRecoversOriginOnlyFromEvidence: a shed whose record is
+// lost is adopted with the user origin its create wrote on the instance
+// (shed_user_origin), never with the configuration of the day: pat's shed,
+// made while pat was a directory user, stays directory after pat became a
+// local admin (so a provision is refused, SHED_ORIGIN_CHANGED); a shed whose
+// instance carries no origin (made before the label) is not known
+// (SHED_ORIGIN_UNKNOWN). A record that lost its user takes the label's user
+// with the label's origin, or none.
+func TestRemoteAdoptionRecoversOriginOnlyFromEvidence(t *testing.T) {
+	e, _, _ := deliveryEnv(t)
+	var patLocal atomic.Bool
+	e.b.deliverySvc.SetOrigin(func(u string) string {
+		if u == "pat" && !patLocal.Load() {
+			return delivery.OriginDirectory
+		}
+		return delivery.OriginLocal
+	})
+	e.createFor("pats", "pat")
+	e.createFor("legacy", "bob")
+	e.createFor("forged", "carol")
+	if got, _ := e.labelOf("pats", provider.LabelUserOrigin); got != delivery.OriginDirectory {
+		t.Fatalf("the create labelled the origin %q, want directory", got)
+	}
+	legacy := e.ref("legacy")
+	e.prov.Seed(func() provider.Instance {
+		inst, err := e.prov.Get(context.Background(), legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delete(inst.Labels, provider.LabelUserOrigin)
+		return inst
+	}())
+	forged := e.ref("forged")
+	e.prov.Seed(func() provider.Instance {
+		inst, err := e.prov.Get(context.Background(), forged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inst.Labels[provider.LabelUserOrigin] = "bogus"
+		return inst
+	}())
+
+	// The record store is lost, and pat is now a local admin.
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.dir); err != nil {
+		t.Fatal(err)
+	}
+	patLocal.Store(true)
+	e.b = e.open()
+	e.settled("pats")
+	e.settled("legacy")
+	e.settled("forged")
+	// Then, as serve does after the first cloud list, the origin migration
+	// on a fresh state directory (no recorded decision yet): it fills only
+	// the empty origins of v0.11 records, never an unknown one.
+	path := filepath.Join(t.TempDir(), backend.OriginMigrationDir, backend.OriginMigrationFile)
+	if _, err := backend.MigrateUserOrigins(ctxT(t), e.b, path, func(string) string { return delivery.OriginLocal }, time.Now(), t.Logf); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if got := e.storedRecord("pats").UserOrigin; got != delivery.OriginDirectory {
+		t.Fatalf("adopted origin of pat's shed = %q, want directory (its label's)", got)
+	}
+	for _, name := range []string{"legacy", "forged"} {
+		if got := e.storedRecord(name).UserOrigin; got != delivery.OriginUnknown {
+			t.Fatalf("adopted origin of %s (no or a bad label) after the migration = %q, want unknown", name, got)
+		}
+	}
+	if _, err := e.b.ProvisionShed(ctxT(t), "forged"); !errors.Is(err, delivery.ErrShedOriginUnknown) {
+		t.Fatalf("provision of a shed with a bad origin label = %v, want ErrShedOriginUnknown", err)
+	}
+	if _, err := e.b.ProvisionShed(ctxT(t), "pats"); !errors.Is(err, delivery.ErrShedOriginChanged) {
+		t.Fatalf("provision of pat's old shed = %v, want ErrShedOriginChanged", err)
+	}
+	if _, err := e.b.ProvisionShed(ctxT(t), "legacy"); !errors.Is(err, delivery.ErrShedOriginUnknown) {
+		t.Fatalf("provision of a shed with no evidence = %v, want ErrShedOriginUnknown", err)
+	}
+
+	// A record that lost its user: the user and its origin come back from
+	// the labels, not from today's configuration.
+	id := e.settledID("pats")
+	e.b.update("pats", id, func(r *state.Record) { r.Shed.User, r.UserOrigin = "", delivery.OriginLocal })
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e.b = e.open()
+	e.settled("pats")
+	if r := e.storedRecord("pats"); r.Shed.User != "pat" || r.UserOrigin != delivery.OriginDirectory {
+		t.Fatalf("restored user %q origin %q, want pat and directory", r.Shed.User, r.UserOrigin)
+	}
+}
+
+// TestRemoteResumeWaitsForTheOriginMigration: the upgrade race. A create a
+// v0.11 server left with stage 1 recorded not applicable and its clone owed
+// (and no user_origin) is resumed by the new server's start-up pass; it is
+// not run, nor the shed marked ready, before the origin migration has
+// stamped it; once it has, the resumed create finishes its owed clone and
+// install hook.
+func TestRemoteResumeWaitsForTheOriginMigration(t *testing.T) {
+	e, g, src := deliveryEnv(t)
+	g.hold("clone")
+	go func() {
+		_, _ = e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "box", Repo: testRepo, User: "bob"})
+	}()
+	g.waitAt(t, "clone")
+	id := e.settledID("box")
+	// What v0.11 left: stage 1 not applicable, the rest owed, no origin.
+	e.b.update("box", id, func(r *state.Record) {
+		d := delivery.NewRecord()
+		d.Steps.Stage1 = delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNotApplicable}
+		d.Last = &delivery.Last{At: delivery.FormatTime(time.Now()), Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeNotRequested}
+		d.State = delivery.DeriveState(d)
+		r.Delivery, r.UserOrigin = d, ""
+	})
+	prev := e.seams
+	e.seams = func(b *Backend) { prev(b); b.HoldResumes() }
+	e.restart()
+
+	time.Sleep(200 * time.Millisecond)
+	if r := e.storedRecord("box"); r.Job == "" || r.Shed.Status == config.StatusRunning || r.Delivery.Steps.Clone.State != delivery.StepOwed {
+		t.Fatalf("before the migration: job %q status %s clone %s; want the create held", r.Job, r.Shed.Status, r.Delivery.Steps.Clone.State)
+	}
+	if _, err := e.b.StampUserOrigins(ctxT(t), func(backend.OriginShed) (string, bool) { return delivery.OriginLocal, true }); err != nil {
+		t.Fatal(err)
+	}
+	e.b.ReleaseResumes()
+	if got := e.settled("box"); got.Status != config.StatusRunning {
+		t.Fatalf("settled %q", got.Status)
+	}
+	e.idle()
+	if got := stepsOf(e.storedRecord("box").Delivery); got != "skipped/not_applicable done skipped/not_applicable done" {
+		t.Fatalf("after the migration: %s", got)
+	}
+	if len(src.Requests()) != 0 {
+		t.Fatal("a resumed create asked a source")
+	}
+}

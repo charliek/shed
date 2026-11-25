@@ -268,6 +268,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// waitBackendReady blocks until the backend may serve shed routes
 	// (remote only: its first complete list of the cloud; nil otherwise).
 	var waitBackendReady func(context.Context) error
+	// releaseResumes lets the creates the start-up pass resumed run their
+	// delivery steps, once the origin migration has run (remote only; a
+	// no-op otherwise).
+	releaseResumes := func() {}
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -314,6 +318,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
 			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
 		rb.SetDelivery(deliveryService)
+		// Creates resumed by the start-up pass wait for the origin
+		// migration below (stampUserOrigins).
+		rb.HoldResumes()
+		releaseResumes = rb.ReleaseResumes
 		be = rb
 		// Egress control is refused on remote at load, so these two are
 		// never used; they are set so nothing below sees an empty path.
@@ -398,9 +406,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
+			releaseResumes()
 			return err
 		}
 		stampUserOrigins(cfg, be)
+		releaseResumes()
 	}
 
 	reportReservedSheds(be)

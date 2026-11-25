@@ -142,10 +142,14 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		landingDir = config.HomePath + "/" + dir
 	}
 	createdAt := b.now().UTC().Round(0)
+	// Where the user came from, by the configuration now: recorded on the
+	// shed and on its instance's labels (the evidence an adoption recovers
+	// it from).
+	origin := b.deliverySvc.Origin(req.User)
 	maxRun := b.runLimit(req.Owner)
 
 	spec, err := provider.NewSpec(
-		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User},
+		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User, UserOrigin: origin},
 		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir},
 		b.opts.AuthorizedKeys, size, diskGB, image, maxRun,
 	)
@@ -178,11 +182,10 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		Delivery:    delivery.NewRecord(),
 		NoServerEnv: req.NoServerEnv,
 		ScriptKey:   req.ScriptKey,
-		// Where the user came from, by the configuration now.
-		UserOrigin: b.deliverySvc.Origin(req.User),
-		Size:       size.Name,
-		DiskGB:     diskGB,
-		MaxRun:     maxRun,
+		UserOrigin:  origin,
+		Size:        size.Name,
+		DiskGB:      diskGB,
+		MaxRun:      maxRun,
 	}
 
 	b.mu.Lock()

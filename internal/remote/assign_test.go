@@ -13,6 +13,8 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
+	"github.com/charliek/shed/internal/delivery/deliverytest"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/provider/fake"
@@ -539,5 +541,80 @@ func TestAssignUserLabelWrittenButErrorReturned(t *testing.T) {
 				t.Errorf("label = %q, want bob", v)
 			}
 		})
+	}
+}
+
+// TestAssignWritesUserAndOriginTogether: an assignment writes the user and
+// the origin they have now in one label update, so a read of the instance
+// (here a periodic pass, made right after the label write and before the
+// record's) sees the new user only with its new origin, and the record ends
+// with both. A label write that fails leaves both labels and the record as
+// they were. And a record whose known origin disagrees with its instance's
+// label for the same user fails closed: unknown.
+func TestAssignWritesUserAndOriginTogether(t *testing.T) {
+	e, _ := usersEnv(t)
+	svc := delivery.NewService(deliverytest.NewSource(), time.Second)
+	svc.SetOrigin(func(u string) string {
+		if u == "pat" {
+			return delivery.OriginDirectory
+		}
+		return delivery.OriginLocal
+	})
+	e.b.SetDelivery(svc)
+	e.createFor("box", "")
+	e.createFor("other", "")
+	if v, _ := e.labelOf("box", provider.LabelUserOrigin); v != delivery.OriginLocal {
+		t.Fatalf("test set-up: an unassigned shed's origin label = %q", v)
+	}
+
+	assignLabelledHook = func(name string) {
+		if u, _ := e.labelOf(name, provider.LabelUser); u != "pat" {
+			t.Errorf("after the label write: user %q", u)
+		}
+		if o, _ := e.labelOf(name, provider.LabelUserOrigin); o != delivery.OriginDirectory {
+			t.Errorf("after the label write: the user is pat and the origin %q: written apart", o)
+		}
+		e.sweep() // a read of the instance in the window
+	}
+	t.Cleanup(func() { assignLabelledHook = nil })
+	if _, err := e.assign("box", "pat"); err != nil {
+		t.Fatal(err)
+	}
+	assignLabelledHook = nil
+	if r := e.storedRecord("box"); r.Shed.User != "pat" || r.UserOrigin != delivery.OriginDirectory {
+		t.Fatalf("the record: user %q origin %q, want pat and directory", r.Shed.User, r.UserOrigin)
+	}
+
+	e.prov.FailNext(fake.OpClaimLabel, errors.New("the cloud refused the label write"))
+	if _, err := e.assign("other", "pat"); err == nil {
+		t.Fatal("an assignment whose label write failed succeeded")
+	}
+	if u, _ := e.labelOf("other", provider.LabelUser); u != "" {
+		t.Errorf("a failed write left user label %q", u)
+	}
+	if o, _ := e.labelOf("other", provider.LabelUserOrigin); o != delivery.OriginLocal {
+		t.Errorf("a failed write left origin label %q, want local as before", o)
+	}
+	if r := e.storedRecord("other"); r.Shed.User != "" || r.UserOrigin != delivery.OriginLocal {
+		t.Errorf("a failed write changed the record: user %q origin %q", r.Shed.User, r.UserOrigin)
+	}
+
+	// The same user, the origins disagree: unknown, and it stays so.
+	ref := e.ref("box")
+	e.prov.Seed(func() provider.Instance {
+		inst, err := e.prov.Get(context.Background(), ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inst.Labels[provider.LabelUserOrigin] = delivery.OriginLocal
+		return inst
+	}())
+	e.sweep()
+	if r := e.storedRecord("box"); r.UserOrigin != delivery.OriginUnknown {
+		t.Fatalf("a record whose origin disagrees with its label = %q, want unknown", r.UserOrigin)
+	}
+	e.sweep()
+	if r := e.storedRecord("box"); r.UserOrigin != delivery.OriginUnknown {
+		t.Fatalf("an unknown origin was filled by a later read: %q", r.UserOrigin)
 	}
 }

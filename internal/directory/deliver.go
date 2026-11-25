@@ -235,15 +235,16 @@ func (c *Client) callDeliveries(ctx context.Context, tok string, sent []string, 
 		return delivery.HostedRefused, nil, false, false
 	case code == http.StatusTooManyRequests || code >= 500:
 		return delivery.HostedOffline, nil, false, false
-	case code == http.StatusGone:
-		// 410 is the service's DEADLINE_PASSED, by the status alone: a
-		// body that does not parse, or none, is the same.
-		return delivery.HostedTimeout, nil, false, false
 	}
 	errCode := v1Code(deliveryErrorBody(resp))
 	switch {
 	case resp.StatusCode == http.StatusNotFound && errCode == "NO_SOURCE":
 		return delivery.HostedNotApplicable, nil, false, false
+	case resp.StatusCode == http.StatusGone && (errCode == "DEADLINE_PASSED" || errCode == ""):
+		// 410 DEADLINE_PASSED; a body that is not an error object (none,
+		// or one that does not parse) counts as the status alone, which is
+		// that row. A 410 whose code is another is not listed: refused.
+		return delivery.HostedTimeout, nil, false, false
 	case resp.StatusCode == http.StatusForbidden && errCode == "INSUFFICIENT_SCOPE":
 		// The grant was removed after the token was issued.
 		c.forgetDelivery(tok)
