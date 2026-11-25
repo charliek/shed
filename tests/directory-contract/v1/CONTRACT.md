@@ -188,8 +188,8 @@ grant_type=client_credentials
 ```
 
 - Optional: `client_id` (equal to the assertion's if sent) and `scope`
-  (absent means every scope the server has: `directory:read`; sent, scope
-  tokens separated by single spaces).
+  (absent means `directory:read`; a client asks for any other scope by
+  name; sent, scope tokens separated by single spaces).
 - Never: `resource`, `audience` (400 `invalid_target`), `client_secret` or
   an `Authorization` header (401 `invalid_client`). `grant_type`,
   `client_assertion`, `client_assertion_type`, `client_id` and `scope` may
@@ -441,8 +441,10 @@ refresh ("An answer never holds a client's credentials", above).
 
 ### Reserved
 
-`POST /v1/deliveries` is reserved for a later version and not specified
-here. Nothing in version 1 writes anything into a server or a shed.
+`POST /v1/deliveries` is not specified here: it is the provision
+contract's hosted source (its version 2, section 3b), reached with a token
+this section's token endpoint issues for the scope `deliveries:request`.
+Nothing in this contract writes anything into a server or a shed.
 
 ## 4. Rules
 

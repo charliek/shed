@@ -167,8 +167,19 @@ import (
 // ImplicitUser is the user of a server with no user list.
 const ImplicitUser = ""
 
-// KindMachine is the only Ref kind in this cut.
+// KindMachine is the only Ref kind a binding stores.
 const KindMachine = "machine"
+
+// KindService is the delivery slot's kind in GET /api/sources for a user
+// the account service answers for (a directory user): {"kind": "service",
+// "url": <the directory's URL>}, with "state": StateNotDelivering when the
+// service does not deliver to this server. It is never stored. The shapes
+// are pinned by crates/fixtures/sources/service*.json.
+const KindService = "service"
+
+// StateNotDelivering is a service Ref's state when the account service has
+// refused this server deliveries (it remembers that for five minutes).
+const StateNotDelivering = "not_delivering"
 
 // BoundByFirstConnect is BoundBy for a binding made by the first machine of
 // a user to connect.

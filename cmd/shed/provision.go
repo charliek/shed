@@ -126,7 +126,11 @@ func renderDeliveryStatus(out io.Writer, shed *config.Shed) {
 	fmt.Fprintf(out, "Delivery:  %s\n", safe(string(d.State)))
 	if d.Last != nil {
 		src := ""
-		if d.Last.Source != nil {
+		switch {
+		case d.Last.Source == nil:
+		case d.Last.Source.Kind == delivery.SourceKindService:
+			src = " from the account service"
+		default:
 			src = fmt.Sprintf(" from %s", safe(d.Last.Source.MachineName))
 		}
 		fmt.Fprintf(out, "Last:      %s (%s) %s%s\n", safe(d.Last.At), safe(string(d.Last.Reason)), safe(string(d.Last.Outcome)), src)

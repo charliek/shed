@@ -1,0 +1,25 @@
+{
+  "name": "value-control-c1",
+  "description": "A value holding a C1 control character (U+0085, NEL).",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "a\u0085b",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "value_not_printable"
+  }
+}

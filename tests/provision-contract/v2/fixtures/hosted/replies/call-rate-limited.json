@@ -1,0 +1,25 @@
+{
+  "name": "call-rate-limited",
+  "description": "429 RATE_LIMITED with Retry-After: source_offline, and no retry within the delivery.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 429,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Retry-After": "60"
+      },
+      "body": {
+        "error": {
+          "code": "RATE_LIMITED",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

@@ -89,7 +89,7 @@ func (b *activityBackend) CreateShed(ctx context.Context, req config.CreateShedR
 func (b *activityBackend) deliver(ctx context.Context, sh config.Shed, reason delivery.Reason) error {
 	run := &delivery.Run{
 		Service: b.svc, Reason: reason,
-		Params: delivery.Params{
+		Params: delivery.Params{Origin: delivery.OriginLocal,
 			User: sh.User, Owner: sh.Owner, ServiceClient: sh.Owner != "",
 			Shed: config.DeliveryRequestShed(sh.Name, sh.ID, delivery.BackendFirecracker, "", "", ""),
 		},
@@ -484,7 +484,7 @@ func TestActivityDeliveryDetail(t *testing.T) {
 	full := audit.DeliveryOutcome{
 		Reason: "create", State: "partial", Outcome: "accepted",
 		Failure: &audit.DeliveryFailure{Reason: "write_failed", Item: "token", Result: "io"},
-		Source:  &audit.DeliverySource{MachineID: "0123456789abcdef0123456789abcdef", MachineName: "laptop"},
+		Source:  &audit.DeliverySource{Kind: "machine", MachineID: "0123456789abcdef0123456789abcdef", MachineName: "laptop"},
 		Steps: &audit.DeliverySteps{
 			Stage1: audit.DeliveryStep{State: "failed", Reason: "write_failed"}, Clone: audit.DeliveryStep{State: "done"},
 			Stage2: audit.DeliveryStep{State: "owed"}, Install: audit.DeliveryStep{State: "owed"},

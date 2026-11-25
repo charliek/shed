@@ -1,0 +1,36 @@
+# Credential-sources fixture for the "Where" rows of `test_tauri_source.py` (plan 040
+# §3.9): one server per answer `sources.list` gives, each pointed at its own private
+# mock by a per-server `SHED_TAURI_MOCK_BASE_URL` override. Host/port are placeholders.
+#   here    — no machine bound; this machine's stream arrives first and is bound
+#   desk    — another machine ("desk") is bound
+#   account — the account service answers (a directory server)
+#   paused  — the account service answers, and does not deliver to this server
+#   fresh   — no machine bound, and the stream never gets in (nobody answers)
+#   old     — older than credential sources
+servers:
+    here:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    desk:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    account:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    paused:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    fresh:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    old:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: here
+sheds: {}

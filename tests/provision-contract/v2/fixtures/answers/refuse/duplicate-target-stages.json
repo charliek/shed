@@ -1,0 +1,39 @@
+{
+  "name": "duplicate-target-stages",
+  "description": "Two file items naming the same path under home at different stages: still one target.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "one",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "x",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-one"
+      },
+      {
+        "name": "two",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "home",
+        "path": "x",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-two"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_target"
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "name": "near-refused-targets",
+  "description": "Paths beside the refused targets, which are not refused: a backup of authorized_keys, known_hosts2, ssh config, a sibling of environment.d, and, under the project base, the very paths refused under home.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "a",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/authorized_keys.bak",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-a"
+      },
+      {
+        "name": "b",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/known_hosts2",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-b"
+      },
+      {
+        "name": "c",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".ssh/config",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-c"
+      },
+      {
+        "name": "d",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".config/environment.d.old/x",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-d"
+      },
+      {
+        "name": "e",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": ".config/environmentd",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-e"
+      },
+      {
+        "name": "f",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": ".ssh/authorized_keys",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-f"
+      },
+      {
+        "name": "g",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": ".config/environment.d/x.conf",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-g"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

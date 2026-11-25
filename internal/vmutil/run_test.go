@@ -351,7 +351,7 @@ func (noPin) DeliveryCurrent(string, string, uint64) bool   { return false }
 func bundleWithValue(t *testing.T, value string) *delivery.Bundle {
 	t.Helper()
 	const id = "0123456789abcdef0123456789abcdef"
-	a, refusal := delivery.ParseAnswer([]byte(`{"version":1,"id":"`+id+`","items":[`+
+	a, refusal := delivery.ParseAnswer([]byte(`{"version":2,"id":"`+id+`","items":[`+
 		`{"name":"tok","provider":"p","kind":"env","variable":"TOKEN","value":"`+value+`","fingerprint":"f"}],"problems":[]}`),
 		&delivery.Request{ID: id})
 	if refusal != nil {

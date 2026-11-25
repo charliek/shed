@@ -295,9 +295,9 @@ fn test_mode_door(env: &Env, op: &str) -> Result<(), (String, String)> {
     Ok(())
 }
 
-fn press_source_use_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+fn press_source_door(env: &Env, op: &str, params: &Value) -> Result<Value, (String, String)> {
     if !env.test_mode {
-        return Err(err("not_enabled", "ui.press_source_use requires test mode"));
+        return Err(err("not_enabled", format!("{op} requires test mode")));
     }
     let host = req_str(params, "host")?;
     if host.is_empty() {
@@ -618,10 +618,6 @@ pub fn present_main_window<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// open). Its snapshot is keyed under this label, read by `prefs.dump`.
 pub const PREFERENCES_ID: &str = "preferences";
 
-/// Emitted when an already-built Preferences window is shown again (see
-/// [`show_preferences_window`]); `PreferencesWindow.tsx` listens for it.
-pub const PREFS_SHOWN_EVENT: &str = "prefs-shown";
-
 /// The Preferences window's fixed content size. The mac window is 460×560; this
 /// carries the same grouped form with the Plex kit's roomier spacing. Fixed —
 /// the window is not resizable (mac parity).
@@ -651,14 +647,6 @@ pub fn show_preferences_window(app: &AppHandle) {
             let _ = w.unminimize();
             let _ = w.set_focus();
             set_activation_policy_prod(&handle, true);
-            // A reopen does not remount the page (close only hid it), so tell it it is
-            // on screen again: it re-reads what can change behind a hidden window (the
-            // credential source rows), throttled on its side. Sent from this one native
-            // path, so it fires the same under WKWebView and WebKitGTK; the webviews'
-            // own focus and visibility events also reach the page, but whether they
-            // fire for a programmatic show depends on the webview and the window
-            // manager, and this does not.
-            let _ = handle.emit(PREFS_SHOWN_EVENT, ());
             return;
         }
         if let Err(e) = tauri::WebviewWindowBuilder::new(
@@ -972,7 +960,7 @@ impl Handler {
             // that detail exactly as `ui.show_shed_delivery` does, and
             // `shed_egress.dump` reads what its egress section rendered.
             "egress.show" => {
-                let (event, payload, _) =
+                let (event, payload) =
                     crate::delivery::ui_door(self.env.test_mode, "ui.show_shed_delivery", params)?;
                 present_main_window(&self.app);
                 let _ = self.app.emit(event, payload);
@@ -1068,9 +1056,19 @@ impl Handler {
             // -- credential sources (plan 035 §3.4) --
             "source.status" => {
                 let rt = self.delivery_rt().ok();
-                Ok(crate::source::status(&self.backend, rt.as_deref()).await)
+                let servers = self.resolver().now().await;
+                Ok(crate::source::status(&servers, rt.as_deref()).await)
             }
             "source.use" => self.source_use(params).await,
+            // -- the Credentials view's Rust side (plan 040 §3.9) --
+            "sources.list" => {
+                let rt = self.delivery_rt().ok();
+                let servers = self.resolver().now().await;
+                Ok(crate::source::list(&servers, rt.as_deref()).await)
+            }
+            "source.unbind" => self.source_unbind(params).await,
+            "delivery.describe" => Ok(crate::delivery::describe()),
+            "delivery.recent" => Ok(crate::delivery::recent(&*self.delivery_rt()?)),
             // -- provisioning by delivery (plan 039 A6; `crate::delivery`) --
             "delivery.status" => Ok(self.delivery_rt()?.status()),
             "delivery.settings" => Ok(self.delivery_rt()?.settings()),
@@ -1083,8 +1081,20 @@ impl Handler {
             }
             "delivery.preview" => {
                 let server = req_str(params, "server")?;
-                let shed = opt_str(params, "shed")?;
-                crate::delivery::preview(&*self.delivery_rt()?, &self.backend, server, shed).await
+                let p = crate::delivery::PreviewParams {
+                    shed: opt_str(params, "shed")?,
+                    backend: opt_str(params, "backend")?,
+                    repo: opt_str(params, "repo")?,
+                    expect_runs: match params.get("runs") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => {
+                            Some(serde_json::from_value::<Vec<String>>(v.clone()).map_err(
+                                |_| err("bad_request", "'runs' must be a list of strings"),
+                            )?)
+                        }
+                    },
+                };
+                crate::delivery::preview(&*self.delivery_rt()?, &self.resolver(), server, p).await
             }
             "shed.delivery" => {
                 let (server, shed) = (req_str(params, "server")?, req_str(params, "shed")?);
@@ -1106,27 +1116,18 @@ impl Handler {
                 let shed = opt_str(params, "shed")?;
                 crate::delivery::activity(&self.backend, limit, cursor, shed).await
             }
-            // The provisioning UI's doors (plan 039 A7) — see [`crate::delivery::ui_door`]
-            // for which are TEST-MODE ONLY. A Prefs door acts on an open window (it is
-            // shown first, but a window built by this call has no listener yet).
-            "ui.prefs_section"
-            | "ui.show_shed_delivery"
+            // The provisioning UI's doors (plan 039 A7; the Credentials view's since plan
+            // 040 §3.9) — see [`crate::delivery::ui_door`] for which are TEST-MODE ONLY.
+            "ui.show_shed_delivery"
             | "ui.close_shed_delivery"
             | "ui.press_deliver_again"
-            | "ui.press_delivery_toggle"
             | "ui.press_delivery_button"
             | "ui.type_delivery_field"
-            | "ui.preview_delivery" => {
-                let (event, payload, to) =
-                    crate::delivery::ui_door(self.env.test_mode, op, params)?;
-                match to {
-                    crate::delivery::DoorTarget::Main if op == "ui.show_shed_delivery" => {
-                        present_main_window(&self.app)
-                    }
-                    crate::delivery::DoorTarget::Prefs if op == "ui.prefs_section" => {
-                        show_preferences_window(&self.app)
-                    }
-                    _ => {}
+            | "ui.fill_check"
+            | "ui.press_check" => {
+                let (event, payload) = crate::delivery::ui_door(self.env.test_mode, op, params)?;
+                if op == "ui.show_shed_delivery" {
+                    present_main_window(&self.app);
                 }
                 let _ = self.app.emit(event, payload);
                 Ok(json!({}))
@@ -1181,12 +1182,31 @@ impl Handler {
             "shed_delivery.dump" => Ok(json!({
                 "detail": self.ui_get("shed_delivery").unwrap_or(Value::Null),
             })),
-            // The Preferences row's "Use this machine" press — TEST-MODE ONLY, see
-            // [`press_source_use_door`]. Acts on a Preferences window already open.
-            "ui.press_source_use" => {
-                let payload = press_source_use_door(&self.env, params)?;
-                let _ = self.app.emit("press-source-use", payload);
+            // The Credentials view's "Answer from here" and "Stop answering from here"
+            // presses — TEST-MODE ONLY, see [`press_source_door`]. Each acts on the view
+            // when it is shown; a missing or disabled button takes no press.
+            "ui.press_source_use" | "ui.press_source_unbind" => {
+                let payload = press_source_door(&self.env, op, params)?;
+                let event = if op == "ui.press_source_use" {
+                    "press-source-use"
+                } else {
+                    "press-source-unbind"
+                };
+                let _ = self.app.emit(event, payload);
                 Ok(json!({}))
+            }
+            // What the Credentials view rendered (plan 040 §3.9): its four parts, read
+            // back off its own nodes; `null` off the view.
+            "credentials.dump" => {
+                test_mode_door(&self.env, op)?;
+                let on_pane =
+                    self.ui_get("pane").as_ref().and_then(Value::as_str) == Some("credentials");
+                let credentials = if on_pane {
+                    self.ui_get("credentials").unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                Ok(json!({ "credentials": credentials }))
             }
             // The mac popover's hermetic drive path — OS tray clicks aren't drivable,
             // so these run the EXACT Rust path the tray-icon left-click runs.
@@ -1295,7 +1315,10 @@ impl Handler {
     /// always acks so the harness can drive navigation.
     fn navigate(&self, params: &Value) -> Result<Value, (String, String)> {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
-        if !matches!(pane, "sheds" | "agents" | "activity" | "system") {
+        if !matches!(
+            pane,
+            "sheds" | "agents" | "credentials" | "activity" | "system"
+        ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
         // The frontend's `navigate` listener attaches asynchronously; the snapshot
@@ -2121,7 +2144,29 @@ impl Handler {
     async fn source_use(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = req_str(params, "host")?;
         let rt = self.delivery_rt().ok();
-        let res = crate::source::use_this_machine(&self.backend, rt.as_deref(), host).await;
+        let res = crate::source::use_this_machine(&self.resolver(), rt.as_deref(), host).await;
+        if res.is_ok() {
+            self.emit_prefs_changed();
+        }
+        res
+    }
+
+    /// How the source doors resolve the servers ([`crate::source::Resolver`]).
+    fn resolver(&self) -> crate::source::Resolver {
+        let current = self
+            .app
+            .try_state::<Arc<crate::source::CurrentServers>>()
+            .map(|s| s.inner().clone());
+        crate::source::Resolver::new(current, self.backend.clone())
+    }
+
+    /// `source.unbind {host}` → clear this user's credential source on `host` ("Stop
+    /// answering from here"), and tell an open Preferences window to read the rows
+    /// again. See [`crate::source::unbind`] for the answer and the refusals.
+    async fn source_unbind(&self, params: &Value) -> Result<Value, (String, String)> {
+        let host = req_str(params, "host")?;
+        let rt = self.delivery_rt().ok();
+        let res = crate::source::unbind(&self.resolver(), rt.as_deref(), host).await;
         if res.is_ok() {
             self.emit_prefs_changed();
         }
@@ -2502,6 +2547,7 @@ mod tests {
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             delivery_settings_path: PathBuf::from("/run/user/0/shed/delivery.toml"),
+            source_recheck: None,
             log_file: None,
             log_debug: false,
         }
@@ -2973,27 +3019,29 @@ mod tests {
         }
     }
 
-    /// **The "Use this machine" press door is test-mode only** (plan 035 §3.4): a
-    /// shipped app answers `not_enabled`; in test mode it carries the named server, and
-    /// a missing, empty or non-string host is a bad request.
+    /// **The Credentials view's source press doors are test-mode only** (plan 035 §3.4,
+    /// plan 040 §3.9): a shipped app answers `not_enabled`; in test mode each carries the
+    /// named server, and a missing, empty or non-string host is a bad request.
     #[test]
-    fn the_source_use_press_door_is_test_mode_only() {
+    fn the_source_press_doors_are_test_mode_only() {
         let press = json!({ "host": "mock" });
         let mut prod = env(None);
         prod.test_mode = false;
-        let (code, message) = press_source_use_door(&prod, &press)
-            .expect_err("a driver door must not be reachable in a shipped app");
-        assert_eq!(code, "not_enabled");
-        assert!(message.contains("ui.press_source_use"), "{message}");
-        assert_eq!(press_source_use_door(&env(None), &press).unwrap(), press);
-        for bad in [json!({}), json!({ "host": "" }), json!({ "host": 3 })] {
-            assert_eq!(
-                press_source_use_door(&env(None), &bad)
-                    .expect_err("not a press")
-                    .0,
-                "bad_request",
-                "{bad}"
-            );
+        for op in ["ui.press_source_use", "ui.press_source_unbind"] {
+            let (code, message) = press_source_door(&prod, op, &press)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled");
+            assert!(message.contains(op), "{message}");
+            assert_eq!(press_source_door(&env(None), op, &press).unwrap(), press);
+            for bad in [json!({}), json!({ "host": "" }), json!({ "host": 3 })] {
+                assert_eq!(
+                    press_source_door(&env(None), op, &bad)
+                        .expect_err("not a press")
+                        .0,
+                    "bad_request",
+                    "{bad}"
+                );
+            }
         }
     }
 

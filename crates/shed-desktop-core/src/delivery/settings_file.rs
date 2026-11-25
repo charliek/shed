@@ -3,7 +3,11 @@
 //! atomically, mode `0600`.
 //!
 //! A provider's view is `{name, configured, enabled, only, config}`, where `config` is
-//! the provider's table as flat JSON, exactly the shape `delivery.set` takes. The
+//! the provider's table as flat JSON, exactly the shape `delivery.set` takes. It is made
+//! from the providers' descriptors ([`describe`]): the providers in their order, and for
+//! each its machine fields, each with the value the settings hold, else its default
+//! (and a list of entries, empty), so the field lists are the schema walk's and the
+//! descriptors' alone. The
 //! settings name files and commands, never their contents, with one exception: a
 //! `passphrase_command`'s arguments may hold the passphrase itself (`["printf", "%s",
 //! "<it>"]`), so the view never carries them. It says [`KEEP`] (`"set"`) instead, and
@@ -18,16 +22,17 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
-use shed_provision::{Base, Only};
-use shed_provision_providers::settings::FileEntry;
-use shed_provision_providers::Settings;
+use shed_provision::Only;
+use shed_provision_providers::{describe, Descriptor, Field, FieldDefault, SettingValue, Settings};
 
-/// A `passphrase_command` as the view shows one, and as `delivery.set` takes it back:
-/// the stored command, its arguments never shown.
+/// A write-only field (a `passphrase_command`) as the view shows one, and as
+/// `delivery.set` takes it back: the stored value, never shown.
 pub const KEEP: &str = "set";
 
-/// The five providers, in the one order they are asked.
-pub const PROVIDERS: [&str; 5] = ["ssh-key", "github", "api-keys", "envsecrets-login", "files"];
+/// The providers' names, in the one order they are asked.
+pub fn provider_names() -> Vec<&'static str> {
+    describe().into_iter().map(|d| d.name).collect()
+}
 
 /// What reading the file gave.
 pub struct Loaded {
@@ -86,75 +91,66 @@ fn only_json(o: Option<&Only>) -> Value {
     }
 }
 
-fn file_json(e: &FileEntry) -> Value {
-    let mut m = Map::new();
-    m.insert("from".into(), json!(e.from));
-    m.insert("to".into(), json!(e.to));
-    m.insert(
-        "base".into(),
-        json!(match e.base {
-            Base::Home => "home",
-            Base::Project => "project",
-        }),
-    );
-    if let Some(mode) = &e.mode {
-        m.insert("mode".into(), json!(mode));
+fn value_json(v: &SettingValue) -> Value {
+    match v {
+        SettingValue::Switch(b) => json!(b),
+        SettingValue::Text(s) => json!(s),
+        SettingValue::List(l) => json!(l),
+        SettingValue::Only(o) => only_json(Some(o)),
+        SettingValue::Entries(_) => Value::Array(Vec::new()),
     }
-    if e.only.is_some() {
-        m.insert("only".into(), only_json(e.only.as_ref()));
+}
+
+/// One field's value in the view: what the settings hold (a write-only one as
+/// [`KEEP`]), else its default, else, for a list of entries, none.
+fn field_json(f: &Field, v: Option<&SettingValue>) -> Option<Value> {
+    match v {
+        Some(_) if f.write_only => Some(json!(KEEP)),
+        Some(SettingValue::Entries(entries)) => Some(Value::Array(
+            entries.iter().map(|e| entry_json(f, e)).collect(),
+        )),
+        Some(v) => Some(value_json(v)),
+        None => f
+            .default
+            .map(|d| match d {
+                FieldDefault::Switch(b) => json!(b),
+                FieldDefault::Text(t) => json!(t),
+            })
+            .or_else(|| (!f.entry.is_empty()).then(|| json!([]))),
+    }
+}
+
+/// One entry of the list field `list`, by its machine fields (and its own `only`).
+fn entry_json(list: &Field, e: &[(&str, SettingValue)]) -> Value {
+    let get = |key: &str| e.iter().find(|(k, _)| *k == key).map(|(_, v)| v);
+    let mut m = Map::new();
+    for f in list.entry.iter().filter(|f| f.place.on_machine()) {
+        if let Some(v) = field_json(f, get(f.key)) {
+            m.insert(f.key.into(), v);
+        }
+    }
+    if list.scoped {
+        if let Some(o) = get("only") {
+            m.insert("only".into(), value_json(o));
+        }
     }
     Value::Object(m)
 }
 
 /// One provider's table as flat JSON (the shape [`set`] takes), or `None` when the file
 /// has no table for it.
-fn provider_config(s: &Settings, name: &str) -> Option<(bool, Option<Only>, Map<String, Value>)> {
+fn provider_config(
+    s: &Settings,
+    d: &Descriptor,
+) -> Option<(bool, Option<Only>, Map<String, Value>)> {
+    let t = s.table(d.name)?;
     let mut m = Map::new();
-    let (enabled, only) = match name {
-        "ssh-key" => {
-            let p = s.ssh_key.as_ref()?;
-            if let Some(k) = &p.key_file {
-                m.insert("key_file".into(), json!(k));
-            }
-            m.insert("sign_commits".into(), json!(p.sign_commits));
-            (p.enabled, p.only.clone())
+    for f in d.machine_fields() {
+        if let Some(v) = field_json(f, t.get(f.key)) {
+            m.insert(f.key.into(), v);
         }
-        "github" => {
-            let p = s.github.as_ref()?;
-            if let Some(g) = &p.gh {
-                m.insert("gh".into(), json!(g));
-            }
-            (p.enabled, p.only.clone())
-        }
-        "api-keys" => {
-            let p = s.api_keys.as_ref()?;
-            m.insert("craze_providers".into(), json!(p.craze_providers));
-            if !p.env_files.is_empty() {
-                m.insert("env_files".into(), json!(p.env_files));
-            }
-            (p.enabled, p.only.clone())
-        }
-        "envsecrets-login" => {
-            let p = s.envsecrets_login.as_ref()?;
-            if let Some(f) = &p.passphrase_file {
-                m.insert("passphrase_file".into(), json!(f));
-            }
-            if p.passphrase_command.is_some() {
-                m.insert("passphrase_command".into(), json!(KEEP));
-            }
-            (p.enabled, p.only.clone())
-        }
-        "files" => {
-            let p = s.files.as_ref()?;
-            m.insert(
-                "file".into(),
-                Value::Array(p.files.iter().map(file_json).collect()),
-            );
-            (p.enabled, p.only.clone())
-        }
-        _ => return None,
-    };
-    Some((enabled, only, m))
+    }
+    Some((t.enabled, t.only, m))
 }
 
 /// The `delivery.settings` view of `loaded`, read from `path`.
@@ -164,9 +160,10 @@ pub fn view(path: &Path, loaded: &Loaded) -> Value {
         Ok(s) => (
             Value::Null,
             Value::Array(
-                PROVIDERS
+                describe()
                     .iter()
-                    .map(|name| match provider_config(s, name) {
+                    .map(|d| (d.name, provider_config(s, d)))
+                    .map(|(name, config)| match config {
                         None => json!({
                             "name": name, "configured": false, "enabled": false,
                             "only": null, "config": null,
@@ -285,10 +282,11 @@ fn render_table(provider: &str, config: &Map<String, Value>) -> Result<String, S
 /// file back. Refused, with the file unchanged, for an unknown provider, a change the
 /// schema refuses, or a file that cannot be read as settings now.
 pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> {
-    if !PROVIDERS.contains(&provider) {
+    let names = provider_names();
+    if !names.contains(&provider) {
         return Err(bad(format!(
             "unknown provider; one of {}",
-            PROVIDERS.join(", ")
+            names.join(", ")
         )));
     }
     // The whole read-modify-write is one transaction: in this process under one mutex,
@@ -327,6 +325,12 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
         }
         _ => return Err(bad("config is not an object or null")),
     };
+    if let Some(why) = incomplete(&new) {
+        return Err((
+            "incomplete".to_string(),
+            format!("{provider} cannot be on: {why}"),
+        ));
+    }
     match provider {
         "ssh-key" => settings.ssh_key = new.ssh_key,
         "github" => settings.github = new.github,
@@ -335,6 +339,56 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
         _ => settings.files = new.files,
     }
     write(path, settings.to_toml().as_bytes()).map_err(|e| ("write_failed".to_string(), e))
+}
+
+/// The commands building an answer from `s` runs on this machine, by name: `gh` (the
+/// github provider, when on) and `passphrase_command` (envsecrets-login, when on with a
+/// command). What the Credentials view's Check says before it runs, and what
+/// `delivery.preview` holds a Check to.
+pub fn commands_run(s: &Settings) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if s.github.as_ref().is_some_and(|p| p.enabled) {
+        out.push("gh");
+    }
+    if s.envsecrets_login
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.passphrase_command.is_some())
+    {
+        out.push("passphrase_command");
+    }
+    out
+}
+
+/// Why a provider of `s` that is on could deliver nothing, in fixed words, or `None`:
+/// the descriptors' required machine fields, and what each provider needs to read
+/// anything (the Credentials view's form holds the same rules, so a provider can be
+/// turned on only once they are met). A provider that is off may be incomplete.
+fn incomplete(s: &Settings) -> Option<&'static str> {
+    if s.ssh_key
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.key_file.is_none())
+    {
+        return Some("the key file is required");
+    }
+    if s.api_keys
+        .as_ref()
+        .is_some_and(|p| p.enabled && !p.craze_providers && p.env_files.is_empty())
+    {
+        return Some("craze's providers.toml or an env file is required");
+    }
+    if s.envsecrets_login
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.passphrase_file.is_none() && p.passphrase_command.is_none())
+    {
+        return Some("a passphrase file or a passphrase command is required");
+    }
+    if s.files
+        .as_ref()
+        .is_some_and(|p| p.enabled && p.files.is_empty())
+    {
+        return Some("at least one file is required");
+    }
+    None
 }
 
 /// An exclusive `flock` on `<settings>.lock` beside the settings file, held until drop.
@@ -448,6 +502,102 @@ mod tests {
             .iter()
             .find(|p| p["name"] == name)
             .unwrap()
+    }
+
+    /// A provider is written on only when it could deliver: its required fields are
+    /// there. Each incomplete one is refused with the fixed class `incomplete` and the
+    /// file is left as it was; written off, the same table is accepted.
+    #[test]
+    fn a_provider_is_written_on_only_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.toml");
+        set(&path, "github", &json!({"enabled": true})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for (provider, config, why) in [
+            (
+                "ssh-key",
+                json!({"enabled": true}),
+                "the key file is required",
+            ),
+            (
+                "ssh-key",
+                json!({"enabled": true, "sign_commits": true}),
+                "the key file is required",
+            ),
+            (
+                "api-keys",
+                json!({"enabled": true, "craze_providers": false}),
+                "craze's providers.toml or an env file is required",
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true}),
+                "a passphrase file or a passphrase command is required",
+            ),
+            (
+                "files",
+                json!({"enabled": true, "file": []}),
+                "at least one file is required",
+            ),
+            (
+                "files",
+                json!({"enabled": true}),
+                "at least one file is required",
+            ),
+        ] {
+            let e = set(&path, provider, &config).unwrap_err();
+            assert_eq!(e.0, "incomplete", "{provider} {config}");
+            assert_eq!(e.1, format!("{provider} cannot be on: {why}"));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{provider}: nothing written"
+            );
+            let mut off = config.clone();
+            off["enabled"] = json!(false);
+            set(&path, provider, &off).unwrap_or_else(|e| panic!("{provider} off: {e:?}"));
+            set(&path, provider, &Value::Null).unwrap();
+        }
+        for (provider, config) in [
+            (
+                "ssh-key",
+                json!({"enabled": true, "key_file": "~/.ssh/id_ed25519"}),
+            ),
+            ("api-keys", json!({"enabled": true})),
+            (
+                "api-keys",
+                json!({"enabled": true, "craze_providers": false, "env_files": ["~/k.env"]}),
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true, "passphrase_file": "~/p"}),
+            ),
+            (
+                "envsecrets-login",
+                json!({"enabled": true, "passphrase_command": ["pass", "x"]}),
+            ),
+            (
+                "files",
+                json!({"enabled": true, "file": [{"from": "~/a", "to": "a"}]}),
+            ),
+        ] {
+            set(&path, provider, &config).unwrap_or_else(|e| panic!("{provider}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_commands_a_check_runs() {
+        let s = |t: &str| Settings::parse(t).unwrap();
+        assert!(commands_run(&s("")).is_empty());
+        assert_eq!(commands_run(&s("[github]\nenabled = true\n")), ["gh"]);
+        assert!(commands_run(&s("[github]\nenabled = false\n")).is_empty());
+        let env = "[envsecrets-login]\nenabled = true\npassphrase_command = [\"pass\"]\n";
+        assert_eq!(
+            commands_run(&s(&format!("[github]\nenabled = true\n{env}"))),
+            ["gh", "passphrase_command"]
+        );
+        let file = "[envsecrets-login]\nenabled = true\npassphrase_file = \"~/p\"\n";
+        assert!(commands_run(&s(file)).is_empty());
     }
 
     #[test]
@@ -565,7 +715,12 @@ mod tests {
         .unwrap();
         let e = load(&path).settings.unwrap().envsecrets_login.unwrap();
         assert_eq!(e.passphrase_command.unwrap(), vec!["other".to_string()]);
-        set(&path, "envsecrets-login", &json!({"enabled": true})).unwrap();
+        set(
+            &path,
+            "envsecrets-login",
+            &json!({"enabled": true, "passphrase_file": "~/p"}),
+        )
+        .unwrap();
         assert!(load(&path)
             .settings
             .unwrap()
@@ -599,7 +754,7 @@ mod tests {
                 "envsecrets-login",
                 json!({"enabled": true, "passphrase_file": "~/p"}),
             ),
-            ("files", json!({"enabled": true})),
+            ("files", json!({"enabled": false})),
         ];
         for _ in 0..5 {
             std::thread::scope(|scope| {
@@ -633,5 +788,79 @@ mod tests {
         let (code, _) = set(&path, "github", &json!({"enabled": true})).unwrap_err();
         assert_eq!(code, "settings_unreadable");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[github\nSENTINEL");
+    }
+
+    /// The schema walk and the descriptors agree on every field: each machine field a
+    /// descriptor names, set in a file, is read by the walk, shown by the view under its
+    /// key, and set back from the view unchanged; and the view shows nothing else.
+    #[test]
+    fn the_walk_and_the_descriptors_agree_on_every_field() {
+        use shed_provision_providers::FieldKind;
+        fn sample(f: &Field) -> Value {
+            match f.kind {
+                FieldKind::Switch => json!(f.default != Some(FieldDefault::Switch(true))),
+                FieldKind::Path => json!("~/x"),
+                FieldKind::Text => json!(f.choices.last().copied().unwrap_or("x")),
+                FieldKind::List if f.entry.is_empty() => json!(["~/a", "~/b"]),
+                FieldKind::List => {
+                    let mut e = Map::new();
+                    for x in f.entry.iter().filter(|x| x.place.on_machine()) {
+                        let v = match (x.key, sample(x)) {
+                            // The walk takes the machine's two modes.
+                            ("mode", _) => json!("0400"),
+                            (_, v) => v,
+                        };
+                        e.insert(x.key.into(), v);
+                    }
+                    if f.scoped {
+                        e.insert("only".into(), json!({"servers": ["work"]}));
+                    }
+                    json!([e])
+                }
+                FieldKind::Secret | FieldKind::File => unreachable!("not on a machine"),
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.toml");
+        for d in describe() {
+            for f in d.machine_fields() {
+                // Off: one field alone need not make the provider complete.
+                let config = json!({
+                    "enabled": false,
+                    "only": {"backends": ["vz"]},
+                    f.key: sample(f),
+                });
+                set(&path, d.name, &config)
+                    .unwrap_or_else(|e| panic!("{} {}: {e:?}", d.name, f.key));
+                let v = view(&path, &load(&path));
+                let p = provider(&v, d.name);
+                let shown = p["config"].as_object().unwrap();
+                if f.write_only {
+                    assert_eq!(shown[f.key], KEEP);
+                } else {
+                    assert_eq!(shown[f.key], config[f.key], "{} {}", d.name, f.key);
+                }
+                // Nothing but the provider's own fields, `enabled` and `only`.
+                let allowed: Vec<&str> = d
+                    .machine_fields()
+                    .map(|f| f.key)
+                    .chain(["enabled", "only"])
+                    .collect();
+                assert!(
+                    shown.keys().all(|k| allowed.contains(&k.as_str())),
+                    "{shown:?}"
+                );
+                // The view set back changes nothing.
+                let before = std::fs::read_to_string(&path).unwrap();
+                set(&path, d.name, &p["config"]).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                set(&path, d.name, &Value::Null).unwrap();
+            }
+        }
+        // A key the descriptors do not name is one the walk refuses.
+        for d in describe() {
+            let (code, _) = set(&path, d.name, &json!({"enabled": true, "nope": 1})).unwrap_err();
+            assert_eq!(code, "bad_request");
+        }
     }
 }

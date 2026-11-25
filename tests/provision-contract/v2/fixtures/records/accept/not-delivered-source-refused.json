@@ -1,0 +1,37 @@
+{
+  "name": "not-delivered-source-refused",
+  "description": "The account service refused the server or its request (section 3b): stage 1 failed source_refused, no answer, the source {kind: service}.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "source_refused"
+      },
+      "clone": {
+        "state": "failed",
+        "reason": "clone_failed"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "no_answer",
+      "source": {
+        "kind": "service"
+      },
+      "failure": {
+        "reason": "source_refused"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

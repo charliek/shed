@@ -1,0 +1,21 @@
+{
+  "name": "missing-member-message",
+  "description": "A problem with no message.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "unreadable"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "missing_member"
+  }
+}

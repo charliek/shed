@@ -1,0 +1,23 @@
+{
+  "name": "value-shell-characters",
+  "description": "A value with quotes, a dollar sign, a backtick, a backslash and inner spaces: taken byte for byte, never quoted or expanded.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "quoted",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "QUOTED_VALUE",
+        "value": "it's \"quoted\" $HOME `x` a\\b and  two  spaces",
+        "fingerprint": "fp-quoted"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

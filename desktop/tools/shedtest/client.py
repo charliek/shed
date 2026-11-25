@@ -259,7 +259,8 @@ class TauriClient(_RcOps, IPCClient):
         return self.call("dashboard.dump")
 
     def sidebar_dump(self) -> dict:
-        """The sidebar's status foot as rendered: `{servers}`. Answers from any
+        """The sidebar as rendered: its nav `entries` (`{pane, label}`, in order) and its
+        status foot `servers`. Answers from any
         pane (the sidebar is always mounted), which is why an unreachable server
         is guaranteed to be visible."""
         return self.call("sidebar.dump")
@@ -282,11 +283,35 @@ class TauriClient(_RcOps, IPCClient):
         `forbidden`, `unsupported`, `action_failed`."""
         return self.call("source.use", {"host": host})
 
+    def sources_list(self) -> dict:
+        """`{servers, this_machine, this_machine_error}`: one row per configured server
+        (by name) — `{server, kind, machine, connected, url, state, stream, busy,
+        unreachable, error}`, `kind` one of `this_machine`, `other_machine`, `service`,
+        `nobody`, `unsupported`, `unknown` (plan 040 §3.9)."""
+        return self.call("sources.list")
+
+    def source_unbind(self, host: str) -> dict:
+        """Clear this user's credential source on `host` ("Stop answering from here");
+        `{server, unbound, previous, previous_was_this_machine, forgotten_machines}`.
+        Raises `ShedError`: `bad_request`, `source_is_service`, `unsupported`,
+        `forbidden`, `action_failed`."""
+        return self.call("source.unbind", {"host": host})
+
     def press_source_use(self, host: str) -> None:
-        """Press the open Preferences window's own "Use this machine" button for `host`
-        (the `button[data-source-use="<host>"]` it renders) — test mode only. A press on
-        a disabled or missing button lands nowhere, as a pointer's would."""
+        """Press the Credentials view's own "Answer from here" button for `host` (the
+        `button[data-source-use="<host>"]` it renders) — test mode only. A press on a
+        disabled or missing button lands nowhere, as a pointer's would."""
         self.call("ui.press_source_use", {"host": host})
+
+    def press_source_unbind(self, host: str) -> None:
+        """Press the Credentials view's own "Stop answering from here" button for `host`
+        (`button[data-source-unbind="<host>"]`) — test mode only."""
+        self.call("ui.press_source_unbind", {"host": host})
+
+    def credentials_dump(self) -> dict | None:
+        """What the Credentials view rendered (plan 040 §3.9): `{where, what, check,
+        recent, rendered}`, read off its own nodes; None off the view."""
+        return self.call("credentials.dump").get("credentials")
 
     def hosts_auth(self) -> list[dict]:
         """Per-server credential mode (plan 002 C3): `[{name, auth_mode, learned}]`,

@@ -5,9 +5,11 @@
 //! | op | params | result |
 //! |---|---|---|
 //! | `delivery.status` | — | this machine, each server's stream, recent answers (redacted) |
+//! | `delivery.describe` | — | `{providers}`: each provider's descriptor (title, summary, where it lands, fields) |
+//! | `delivery.recent` | — | `{recent}`: the answers this machine gave, newest first, redacted |
 //! | `delivery.settings` | — | `delivery.toml` as `{path, exists, error, providers}` |
 //! | `delivery.set` | `provider`, `config` (object, or null to remove) | the new settings view |
-//! | `delivery.preview` | `server`, `shed`? | what that shed would get, redacted |
+//! | `delivery.preview` | `server`, `shed`? or `backend` and `repo`?, `runs`? | what that shed (or a new shed on that backend with that repo) would get, redacted |
 //! | `shed.delivery` | `server`, `shed` | the shed document's delivery record, and the shed's effective egress |
 //! | `shed.provision` | `server`, `shed` | the provision's progress and its outcome |
 //! | `activity.server_list` | `limit`?, `cursor`?, `shed`? | the servers' activity, merged newest first |
@@ -20,9 +22,13 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use shed_app::Backend;
-use shed_core::http::Client;
+use shed_core::http::{Client, SourceError};
+use shed_core::models::{SourceDocument, SOURCE_IS_SERVICE};
+use shed_desktop_core::delivery::settings_file::provider_names;
 use shed_desktop_core::delivery::source;
-use shed_desktop_core::delivery::{DeliveryOptions, DeliveryRuntime, DiskReader};
+use shed_desktop_core::delivery::source::delivery::{ServiceCheck, SourceCheck};
+use shed_desktop_core::delivery::source::ServerTarget;
+use shed_desktop_core::delivery::{DeliveryOptions, DeliveryRuntime, DiskReader, PreviewOf};
 
 use crate::env::Env;
 
@@ -33,10 +39,80 @@ fn bad(message: impl Into<String>) -> OpError {
     ("bad_request".to_string(), message.into())
 }
 
+/// What a server's `GET /api/sources` says of the account service, for a stream settled
+/// on it: still answering (the document names it, or the route refuses
+/// `SOURCE_IS_SERVICE`), no longer (a machine's document, or a server older than the
+/// route), or unknown (any other failure: ask again at the next re-check).
+pub fn service_check_of(read: &Result<SourceDocument, SourceError>) -> ServiceCheck {
+    match read {
+        Ok(doc) if doc.service().is_some() => ServiceCheck::Service,
+        Ok(_) | Err(SourceError::Unsupported) => ServiceCheck::NotService,
+        Err(SourceError::Api { code, .. }) if code == SOURCE_IS_SERVICE => ServiceCheck::Service,
+        Err(_) => ServiceCheck::Unknown,
+    }
+}
+
+/// Builds the app's control-scope clients from the shed CLI config as it reads NOW (the
+/// same parts the startup Backend was built from).
+pub type FreshBackend = Arc<dyn Fn() -> Backend + Send + Sync>;
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+fn named_client(backend: &Backend, target: &ServerTarget) -> Option<Client> {
+    backend
+        .host_clients()
+        .into_iter()
+        .find(|(name, c)| *name == target.name && same_url(c.base_url(), &target.url))
+        .map(|(_, c)| c)
+}
+
+/// A control-scope client for the stream's CURRENT target: the startup Backend's, when
+/// it has one of the same name at the same endpoint; else one from the config as it
+/// reads now (a server added, or its endpoint changed, since the app started). `None`
+/// when neither has it (then the re-check cannot tell).
+pub fn client_for_target(
+    backend: &Backend,
+    fresh: &dyn Fn() -> Backend,
+    target: &ServerTarget,
+) -> Option<Client> {
+    named_client(backend, target).or_else(|| named_client(&fresh(), target))
+}
+
+/// The source runtime's re-check of a server settled on the account service: `GET
+/// /api/sources` on a control-scope client for the stream's current target
+/// ([`client_for_target`]; the stream's credentials-scope certificate cannot reach the
+/// route). A target no client matches is unknown.
+fn service_check(backend: Arc<Backend>, fresh: FreshBackend) -> SourceCheck {
+    Arc::new(move |target: &ServerTarget| {
+        let (backend, fresh, target) = (backend.clone(), fresh.clone(), target.clone());
+        Box::pin(async move {
+            let client =
+                tokio::task::spawn_blocking(move || client_for_target(&backend, &*fresh, &target))
+                    .await
+                    .ok()
+                    .flatten();
+            match client {
+                Some(c) => service_check_of(&c.source_status().await),
+                None => ServiceCheck::Unknown,
+            }
+        })
+    })
+}
+
 /// Starts the source runtime: this machine's identity (`<state>/broker/machine.json`),
 /// the fingerprint key under the same state directory, a stream per
-/// server of the app's shed config. Blocking file I/O; the setup hook calls it.
-pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime> {
+/// server of the app's shed config, and the re-check a stream settled on the account
+/// service asks through `backend` (or, for a target it does not have, through a client
+/// `fresh` builds from the config as it reads then). Blocking file I/O; the setup hook
+/// calls it.
+pub fn start(
+    env: &Env,
+    handle: &tokio::runtime::Handle,
+    backend: Arc<Backend>,
+    fresh: FreshBackend,
+) -> Arc<DeliveryRuntime> {
     let state = source::paths::state_dir();
     let machine = source::machine::load_or_create().map(|l| l.identity);
     if let Err(e) = &machine {
@@ -57,8 +133,12 @@ pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime>
         unreachable_hosts: env.mock_unreachable_hosts.clone(),
         reader: DiskReader::from_process(),
         rescan: shed_desktop_core::delivery::runtime::RESCAN,
+        service_recheck: env
+            .source_recheck
+            .unwrap_or(source::delivery::SERVICE_RECHECK),
+        paused_path: source::paused::paused_state_path(),
     };
-    let rt = DeliveryRuntime::start(handle, opts, machine);
+    let rt = DeliveryRuntime::start(handle, opts, machine, Some(service_check(backend, fresh)));
     app_info!(
         "shed-desktop-tauri: delivery: settings at {}",
         env.delivery_settings_path.display()
@@ -104,6 +184,20 @@ fn failure(e: &shed_core::http::ApiFailure) -> OpError {
     (code.to_string(), e.message.clone())
 }
 
+/// `delivery.describe`: every provider's descriptor, in the order they are asked (what a
+/// form is drawn from: title, summary, where its items land, its fields).
+pub fn describe() -> Value {
+    json!({ "providers": shed_desktop_core::delivery::providers::describe() })
+}
+
+/// `delivery.recent`: the answers this machine gave, newest first (at most
+/// [`shed_desktop_core::delivery::runtime::RECENT`]), redacted: when, the server, the
+/// shed, the reason, the items (name, target, size, fingerprint), the problems, and what
+/// the server made of each. No value.
+pub fn recent(rt: &DeliveryRuntime) -> Value {
+    json!({ "recent": rt.recent() })
+}
+
 /// `delivery.set`.
 pub fn set(rt: &DeliveryRuntime, provider: &str, config: &Value) -> Result<Value, OpError> {
     if !config.is_object() && !config.is_null() {
@@ -112,22 +206,64 @@ pub fn set(rt: &DeliveryRuntime, provider: &str, config: &Value) -> Result<Value
     rt.set(provider, config)
 }
 
-/// `delivery.preview`: with a shed, its document is read from `server` first.
+/// What a `delivery.preview` names: a shed on the server, or a new shed's backend and
+/// repository (the Credentials view's Check), or neither (everything the providers have).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PreviewParams<'a> {
+    pub shed: Option<&'a str>,
+    pub backend: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    /// The commands the person was told would run: a preview whose settings would run
+    /// others runs nothing (`settings_changed`).
+    pub expect_runs: Option<Vec<String>>,
+}
+
+/// A shed document that could not be read for a preview, as a code and fixed words:
+/// never the server's text.
+fn shed_read_failure(e: &shed_core::http::ApiFailure) -> OpError {
+    let (code, _) = failure(e);
+    let words = match code.as_str() {
+        "not_found" => "the server has no shed by that name",
+        "server_refused" => "the server refused to send the shed",
+        _ => "the server could not be reached, or its answer could not be read",
+    };
+    (code, words.to_string())
+}
+
+/// `delivery.preview`: with a shed, its document is read from `server` first; with a
+/// backend (and a repository, or none), the request a new shed of that kind would draw;
+/// a shed and a backend together are refused, as is a repository with no backend. The
+/// server is resolved as the source doors resolve it ([`crate::source::Resolver`]): the
+/// shed config as it reads now, so a server added while the app runs is known and a
+/// changed endpoint is read at the new one, for both forms.
 pub async fn preview(
     rt: &DeliveryRuntime,
-    backend: &Backend,
+    servers: &crate::source::Resolver,
     server: &str,
-    shed: Option<&str>,
+    p: PreviewParams<'_>,
 ) -> Result<Value, OpError> {
-    let c = client(backend, server)?;
-    let doc = match shed {
-        None => None,
-        Some(name) => {
+    let c = servers.client(server).await?;
+    let of = match (p.shed, p.backend) {
+        (Some(_), Some(_)) => return Err(bad("name a shed, or a backend and a repo, not both")),
+        (Some(name), None) => {
+            if p.repo.is_some() {
+                return Err(bad("a shed's repo is its own"));
+            }
             shed_param(name)?;
-            Some(c.shed_document(name).await.map_err(|e| failure(&e))?)
+            PreviewOf::Shed(
+                c.shed_document(name)
+                    .await
+                    .map_err(|e| shed_read_failure(&e))?,
+            )
         }
+        (None, Some(b)) => PreviewOf::Target {
+            backend: b.to_string(),
+            repo: p.repo.map(str::to_string),
+        },
+        (None, None) if p.repo.is_some() => return Err(bad("a repo needs a backend")),
+        (None, None) => PreviewOf::Everything,
     };
-    rt.preview(server, doc).await
+    rt.preview(server, of, p.expect_runs).await
 }
 
 /// `shed.delivery`: the delivery record of the shed's document (null for a server
@@ -275,18 +411,14 @@ pub async fn activity(
         .map_err(bad)
 }
 
-/// The five providers, as `ui.*` doors name them.
-const PROVIDERS: [&str; 5] = ["ssh-key", "github", "api-keys", "envsecrets-login", "files"];
-
+/// A provider as `ui.*` doors name one: one of [`provider_names`].
 fn provider_param(params: &Value) -> Result<&str, OpError> {
     let p = params.get("provider").and_then(Value::as_str).unwrap_or("");
-    if PROVIDERS.contains(&p) {
+    let names = provider_names();
+    if names.contains(&p) {
         Ok(p)
     } else {
-        Err(bad(format!(
-            "'provider' is one of {}",
-            PROVIDERS.join(", ")
-        )))
+        Err(bad(format!("'provider' is one of {}", names.join(", "))))
     }
 }
 
@@ -298,41 +430,34 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, OpError> {
         .ok_or_else(|| bad(format!("missing '{key}'")))
 }
 
-/// Where a UI door's event goes: the dashboard (`Main`, raised first) or an open
-/// Preferences window (`Prefs`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum DoorTarget {
-    Main,
-    Prefs,
-}
-
-/// The provisioning UI's doors (plan 039 A7): the event to emit, its payload and where
-/// it goes, or the refusal. Opening and closing a shed's detail and scrolling
-/// Preferences to a section are what a person's click does, and are open; the doors
-/// that type, press, preview or deliver are presses a harness has no pointer for, and
-/// are TEST-MODE ONLY, the `ui.press_source_use` rule: each acts on the real control in
-/// the open window (typing sets the input's value and fires its own input event), so
-/// a disabled control takes no press.
+/// The provisioning UI's doors (plan 039 A7, re-hosted on the Credentials view in plan
+/// 040 §3.9): the event to emit (to the dashboard, which holds the Credentials view) and
+/// its payload, or the refusal. Opening and closing a shed's detail are what a person's
+/// click does, and are open; the doors that type, press, check or deliver are
+/// presses a harness has no pointer for, and are TEST-MODE ONLY, the
+/// `ui.press_source_use` rule: each acts on the real control in the Credentials view
+/// (typing sets the input's value and fires its own input event), so a disabled or
+/// missing control takes no press.
 ///
 /// | op | params | event |
 /// |---|---|---|
-/// | `ui.prefs_section` | `section` | `prefs-section` |
 /// | `ui.show_shed_delivery` | `server`, `shed` | `show-shed-delivery` |
 /// | `ui.close_shed_delivery` | — | `close-shed-delivery` |
 /// | `ui.press_deliver_again` | `server`, `shed` | `press-deliver-again` (test) |
-/// | `ui.press_delivery_toggle` | `provider` | `press-delivery-toggle` (test) |
 /// | `ui.press_delivery_button` | `provider`, `button` | `press-delivery-button` (test) |
 /// | `ui.type_delivery_field` | `provider`, `field`, `index`?, `value` | `type-delivery-field` (test) |
-/// | `ui.preview_delivery` | `server`, `shed`? | `preview-delivery` (test) |
+/// | `ui.fill_check` | `field` (by, shed, server, backend, repo), `value` | `fill-check` (test) |
+/// | `ui.press_check` | `button` (run, details) | `press-check` (test) |
+/// The Check form's controls a `ui.fill_check` fills: which kind of Check (`by`: `shed`
+/// or `target`), the shed picked (`<server>/<shed>`), the server, the backend, the repo.
+const CHECK_FIELDS: &[&str] = &["by", "shed", "server", "backend", "repo"];
+
 pub fn ui_door(
     test_mode: bool,
     op: &str,
     params: &Value,
-) -> Result<(&'static str, Value, DoorTarget), OpError> {
-    let gated = !matches!(
-        op,
-        "ui.prefs_section" | "ui.show_shed_delivery" | "ui.close_shed_delivery"
-    );
+) -> Result<(&'static str, Value), OpError> {
+    let gated = !matches!(op, "ui.show_shed_delivery" | "ui.close_shed_delivery");
     if gated && !test_mode {
         return Err((
             "not_enabled".to_string(),
@@ -346,25 +471,12 @@ pub fn ui_door(
         Ok(json!({ "server": server, "shed": shed }))
     };
     match op {
-        "ui.prefs_section" => Ok((
-            "prefs-section",
-            json!({ "section": str_param(params, "section")? }),
-            DoorTarget::Prefs,
-        )),
-        "ui.show_shed_delivery" => Ok(("show-shed-delivery", shed_pair(params)?, DoorTarget::Main)),
-        "ui.close_shed_delivery" => Ok(("close-shed-delivery", json!({}), DoorTarget::Main)),
-        "ui.press_deliver_again" => {
-            Ok(("press-deliver-again", shed_pair(params)?, DoorTarget::Main))
-        }
-        "ui.press_delivery_toggle" => Ok((
-            "press-delivery-toggle",
-            json!({ "provider": provider_param(params)? }),
-            DoorTarget::Prefs,
-        )),
+        "ui.show_shed_delivery" => Ok(("show-shed-delivery", shed_pair(params)?)),
+        "ui.close_shed_delivery" => Ok(("close-shed-delivery", json!({}))),
+        "ui.press_deliver_again" => Ok(("press-deliver-again", shed_pair(params)?)),
         "ui.press_delivery_button" => Ok((
             "press-delivery-button",
             json!({ "provider": provider_param(params)?, "button": str_param(params, "button")? }),
-            DoorTarget::Prefs,
         )),
         "ui.type_delivery_field" => {
             let provider = provider_param(params)?;
@@ -382,24 +494,28 @@ pub fn ui_door(
             Ok((
                 "type-delivery-field",
                 json!({ "provider": provider, "field": field, "index": index, "value": value }),
-                DoorTarget::Prefs,
             ))
         }
-        "ui.preview_delivery" => {
-            let server = str_param(params, "server")?;
-            let shed = match params.get("shed") {
-                None | Some(Value::Null) => "",
-                Some(Value::String(s)) => s.as_str(),
-                Some(_) => return Err(bad("'shed' must be a string")),
-            };
-            if !shed.is_empty() {
-                shed_param(shed)?;
+        "ui.fill_check" => {
+            let field = str_param(params, "field")?;
+            if !CHECK_FIELDS.contains(&field) {
+                return Err(bad(format!(
+                    "'field' is one of {}",
+                    CHECK_FIELDS.join(", ")
+                )));
             }
-            Ok((
-                "preview-delivery",
-                json!({ "server": server, "shed": shed }),
-                DoorTarget::Prefs,
-            ))
+            let value = params
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("'value' must be a string"))?;
+            Ok(("fill-check", json!({ "field": field, "value": value })))
+        }
+        "ui.press_check" => {
+            let button = str_param(params, "button")?;
+            if !matches!(button, "run" | "details") {
+                return Err(bad("'button' is run or details"));
+            }
+            Ok(("press-check", json!({ "button": button })))
         }
         other => Err(("unknown_op".to_string(), format!("unknown op: {other}"))),
     }
@@ -413,30 +529,30 @@ mod tests {
     fn the_ui_doors_are_gated_and_validated() {
         let p = json!({ "provider": "github" });
         for op in [
-            "ui.press_delivery_toggle",
             "ui.press_delivery_button",
             "ui.type_delivery_field",
-            "ui.preview_delivery",
+            "ui.fill_check",
             "ui.press_deliver_again",
         ] {
             let e = ui_door(false, op, &p).unwrap_err();
             assert_eq!(e.0, "not_enabled", "{op}");
         }
-        let (ev, payload, to) = ui_door(
-            false,
+        // The switch, the Preferences preview and its section scroll are gone with the
+        // Provisioning pane.
+        for op in [
+            "ui.press_delivery_toggle",
+            "ui.preview_delivery",
             "ui.prefs_section",
-            &json!({"section": "provisioning"}),
-        )
-        .unwrap();
-        assert_eq!((ev, to), ("prefs-section", DoorTarget::Prefs));
-        assert_eq!(payload["section"], "provisioning");
-        let (ev, payload, to) = ui_door(
+        ] {
+            assert_eq!(ui_door(true, op, &p).unwrap_err().0, "unknown_op", "{op}");
+        }
+        let (ev, payload) = ui_door(
             false,
             "ui.show_shed_delivery",
             &json!({"server": "mock", "shed": "w"}),
         )
         .unwrap();
-        assert_eq!((ev, to), ("show-shed-delivery", DoorTarget::Main));
+        assert_eq!(ev, "show-shed-delivery");
         assert_eq!(payload, json!({"server": "mock", "shed": "w"}));
         assert_eq!(
             ui_door(false, "ui.close_shed_delivery", &json!({}))
@@ -455,17 +571,7 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(
-            ui_door(
-                true,
-                "ui.press_delivery_toggle",
-                &json!({"provider": "nope"})
-            )
-            .unwrap_err()
-            .0,
-            "bad_request"
-        );
-        let (_, typed, _) = ui_door(
+        let (_, typed) = ui_door(
             true,
             "ui.type_delivery_field",
             &json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"}),
@@ -475,7 +581,7 @@ mod tests {
             typed,
             json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"})
         );
-        let (_, typed, _) = ui_door(
+        let (_, typed) = ui_door(
             true,
             "ui.type_delivery_field",
             &json!({"provider": "ssh-key", "field": "key_file", "value": ""}),
@@ -487,13 +593,14 @@ mod tests {
             json!({"provider": "ssh-key", "field": "x", "value": ["a"]}),
             json!({"provider": "ssh-key", "field": "x", "index": -1, "value": "a"}),
             json!({"provider": "ssh-key", "value": "a"}),
+            json!({"provider": "nope", "field": "x", "value": "a"}),
         ] {
             assert!(
                 ui_door(true, "ui.type_delivery_field", &bad).is_err(),
                 "{bad}"
             );
         }
-        let (_, press, _) = ui_door(
+        let (_, press) = ui_door(
             true,
             "ui.press_delivery_button",
             &json!({"provider": "files", "button": "add:files"}),
@@ -506,20 +613,234 @@ mod tests {
             &json!({"provider": "files"})
         )
         .is_err());
-        let (_, pv, _) = ui_door(true, "ui.preview_delivery", &json!({"server": "mock"})).unwrap();
-        assert_eq!(pv, json!({"server": "mock", "shed": ""}));
-        assert!(ui_door(
+        // Check: its controls filled and pressed one by one, as a person does.
+        let (ev, fill) = ui_door(
             true,
-            "ui.preview_delivery",
-            &json!({"server": "mock", "shed": "../x"})
+            "ui.fill_check",
+            &json!({"field": "repo", "value": "a/b"}),
         )
-        .is_err());
-        assert!(ui_door(
-            true,
-            "ui.preview_delivery",
-            &json!({"server": "mock", "shed": 3})
-        )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            (ev, fill),
+            ("fill-check", json!({"field": "repo", "value": "a/b"}))
+        );
+        let (ev, press) = ui_door(true, "ui.press_check", &json!({"button": "run"})).unwrap();
+        assert_eq!((ev, press), ("press-check", json!({"button": "run"})));
+        for (op, bad) in [
+            ("ui.fill_check", json!({"field": "shed"})),
+            ("ui.fill_check", json!({"field": "nope", "value": "x"})),
+            ("ui.fill_check", json!({"field": "repo", "value": 3})),
+            ("ui.press_check", json!({"button": "save"})),
+            ("ui.press_check", json!({})),
+        ] {
+            assert_eq!(
+                ui_door(true, op, &bad).unwrap_err().0,
+                "bad_request",
+                "{op} {bad}"
+            );
+        }
+        for op in ["ui.fill_check", "ui.press_check"] {
+            assert_eq!(ui_door(false, op, &json!({})).unwrap_err().0, "not_enabled");
+        }
+        assert_eq!(
+            ui_door(
+                true,
+                "ui.run_check",
+                &json!({"server": "mock", "shed": "w"})
+            )
+            .unwrap_err()
+            .0,
+            "unknown_op"
+        );
+    }
+
+    /// The re-check of a stream settled on the account service reads the sources
+    /// document (the shared fixtures): the service still answering keeps it settled, a
+    /// machine's document or an older server reopens the stream, and anything else is
+    /// unknown (asked again later, never a reconnect loop).
+    #[test]
+    fn a_settled_stream_is_rechecked_from_the_sources_document() {
+        let doc = |text: &str| -> Result<SourceDocument, SourceError> {
+            Ok(serde_json::from_str(text).unwrap())
+        };
+        let api = |status: u16, code: &str| -> Result<SourceDocument, SourceError> {
+            Err(SourceError::Api {
+                status,
+                code: code.into(),
+                message: "x".into(),
+            })
+        };
+        for text in [
+            include_str!("../../../../crates/fixtures/sources/service.json"),
+            include_str!("../../../../crates/fixtures/sources/service-not-delivering.json"),
+        ] {
+            assert_eq!(service_check_of(&doc(text)), ServiceCheck::Service);
+        }
+        assert_eq!(
+            service_check_of(&api(409, SOURCE_IS_SERVICE)),
+            ServiceCheck::Service
+        );
+        assert_eq!(
+            service_check_of(&doc(
+                r#"{"user":"ada","binding":{"delivery":[{"kind":"machine","id":"fedcba9876543210fedcba9876543210"}]},"machines":[]}"#
+            )),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&doc(r#"{"user":"ada","binding":null,"machines":[]}"#)),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Unsupported)),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&api(403, "FORBIDDEN")),
+            ServiceCheck::Unknown
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Busy {
+                retry_after: None,
+                message: "x".into()
+            })),
+            ServiceCheck::Unknown
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Shed(
+                shed_core::http::ShedError::Transport("refused".into())
+            ))),
+            ServiceCheck::Unknown
+        );
+    }
+
+    /// Finding 5: the re-check asks a client for the stream's current target: the
+    /// startup one at the same endpoint, else one from the config as it reads now (a
+    /// server added since, or an endpoint changed); none when neither matches.
+    #[test]
+    fn the_recheck_client_matches_the_current_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let write = |servers: &[&str]| {
+            let mut text = String::from("servers:\n");
+            for s in servers {
+                text.push_str(&format!("    {s}:\n        host: {s}.example.test\n"));
+            }
+            std::fs::write(&cfg, text).unwrap();
+        };
+        let backend_at = |mock: &str| {
+            Backend::from_env_parts_with_credentials(
+                true,
+                Some(mock),
+                &cfg,
+                None,
+                None,
+                &Default::default(),
+            )
+        };
+        write(&["a"]);
+        let startup = backend_at("http://127.0.0.1:9");
+        let target = |name: &str, url: &str| ServerTarget {
+            name: name.into(),
+            url: url.into(),
+            token: String::new(),
+            tls_fingerprint: String::new(),
+            ssh_host: String::new(),
+            ssh_port: 0,
+            auth_mode: String::new(),
+            user: String::new(),
+            identity_file: String::new(),
+        };
+        let built = std::cell::Cell::new(0);
+        write(&["a", "b"]);
+        let fresh = || {
+            built.set(built.get() + 1);
+            backend_at("http://127.0.0.1:9,a=http://127.0.0.1:7")
+        };
+        // The startup client, as it is: nothing built.
+        let c = client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:9/")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:9");
+        assert_eq!(built.get(), 0);
+        // The endpoint changed: the new one, never the old.
+        let c = client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:7")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:7");
+        // A server added since the start.
+        let c = client_for_target(&startup, &fresh, &target("b", "http://127.0.0.1:9")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:9");
+        // Neither knows it.
+        assert!(client_for_target(&startup, &fresh, &target("c", "http://127.0.0.1:9")).is_none());
+        assert!(client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:5")).is_none());
+    }
+
+    /// The descriptors are the providers' own, in their order: the `ui.*` doors take
+    /// exactly those names.
+    #[test]
+    fn describe_lists_the_providers_the_doors_take() {
+        let d = describe();
+        let names: Vec<&str> = d["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, provider_names());
+        assert_eq!(
+            names,
+            ["ssh-key", "github", "api-keys", "envsecrets-login", "files"]
+        );
+        for p in d["providers"].as_array().unwrap() {
+            assert!(p["title"].as_str().is_some_and(|t| !t.is_empty()), "{p}");
+            assert!(p["fields"].as_array().is_some_and(|f| !f.is_empty()), "{p}");
+            assert!(provider_param(&json!({ "provider": p["name"] })).is_ok());
+        }
+        let e = provider_param(&json!({ "provider": "nope" })).unwrap_err();
+        assert_eq!(
+            e.1,
+            "'provider' is one of ssh-key, github, api-keys, envsecrets-login, files"
+        );
+    }
+
+    /// The Credentials view's view-model tests (`ui/test/credentials.test.mjs`) draw their
+    /// forms from a copy of `delivery.describe`: it is this answer exactly.
+    /// `UPDATE_DESCRIBE_FIXTURE=1` rewrites it.
+    #[test]
+    fn the_ui_tests_describe_fixture_is_the_answer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ui/test/fixtures/describe.json");
+        let want = serde_json::to_string_pretty(&describe()).unwrap() + "\n";
+        if std::env::var_os("UPDATE_DESCRIBE_FIXTURE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &want).unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            got,
+            want,
+            "{} differs from delivery.describe: run with UPDATE_DESCRIBE_FIXTURE=1",
+            path.display()
+        );
+    }
+
+    /// A shed that could not be read for a Check is a code and fixed words: the
+    /// server's message never comes through.
+    #[test]
+    fn a_shed_read_failure_is_fixed_words() {
+        for (status, code) in [
+            (Some(404), "not_found"),
+            (Some(500), "server_refused"),
+            (None, "action_failed"),
+        ] {
+            let e = shed_core::http::ApiFailure {
+                status,
+                code: "SHED_NOT_FOUND".into(),
+                message: "SERVER SENTINEL".into(),
+            };
+            let (c, m) = shed_read_failure(&e);
+            assert_eq!(c, code);
+            assert!(
+                !m.contains("SENTINEL") && !m.contains("SHED_NOT_FOUND"),
+                "{m}"
+            );
+        }
     }
 
     #[test]

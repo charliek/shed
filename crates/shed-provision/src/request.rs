@@ -16,6 +16,11 @@ pub enum Reason {
     Create,
     /// A person ran `shed provision` on it.
     Provision,
+    /// The shed started (a server of this version sends none).
+    Start,
+    /// A delivery to a running shed for any other cause (a server of this
+    /// version sends none).
+    Refresh,
 }
 
 impl Reason {
@@ -24,13 +29,18 @@ impl Reason {
         match self {
             Reason::Create => "create",
             Reason::Provision => "provision",
+            Reason::Start => "start",
+            Reason::Refresh => "refresh",
         }
     }
 
-    fn parse(s: &str) -> Option<Reason> {
+    /// The reason written `s`, if it is one of the four.
+    pub fn parse(s: &str) -> Option<Reason> {
         match s {
             "create" => Some(Reason::Create),
             "provision" => Some(Reason::Provision),
+            "start" => Some(Reason::Start),
+            "refresh" => Some(Reason::Refresh),
             _ => None,
         }
     }
@@ -151,7 +161,7 @@ pub fn parse_request(body: &[u8]) -> Result<Request, Refusal> {
     let root = parse_document(body)?;
     check_members(&root, "", REQUEST_MEMBERS, REQUEST_MEMBERS)?;
     check_types(&root, "", REQUEST_TYPES)?;
-    if text_of(&root, "version") != "1" {
+    if text_of(&root, "version") != "2" {
         return Err(Refusal::new(Rule::UnsupportedVersion, "version"));
     }
     let id = text_of(&root, "id");

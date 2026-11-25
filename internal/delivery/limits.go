@@ -3,7 +3,7 @@ package delivery
 import "time"
 
 // Version is the contract number every request and answer carries.
-const Version = 1
+const Version = 2
 
 // Limits of the contract. Every size is in bytes; a size of content is of the
 // decoded bytes.

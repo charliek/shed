@@ -1,0 +1,11 @@
+{
+  "name": "null-in-items",
+  "description": "A null element in items.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[null],\"problems\":[]}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "null_value"
+  }
+}

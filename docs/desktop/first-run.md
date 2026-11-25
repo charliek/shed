@@ -16,7 +16,7 @@ events on Linux, so there is no popover).
 
 ## The dashboard
 
-The sidebar has four entries, **Sheds**, **Agents**, **Activity** and **System**, and a **Shed servers** section that lists each configured server with a reachability dot:
+The sidebar has five entries, **Sheds**, **Agents**, **Credentials**, **Activity** and **System**, and a **Shed servers** section that lists each configured server with a reachability dot:
 
 - **Sheds** — every shed across all configured hosts, grouped by host, with status, image
   (the ref/alias label plus a short `sha256:` digest, matching `shed list -vv`), backend,
@@ -28,6 +28,7 @@ The sidebar has four entries, **Sheds**, **Agents**, **Activity** and **System**
 - **Agents** — agent sessions on each shed: read-only roost rows with activity,
   and craze sessions with a live transcript, approvals and **New craze session**.
   See [Agent lanes](agent-lanes.md).
+- **Credentials** — who answers for you on each server, the five providers and their scope, a check of what a shed would get, and the answers this machine gave. See [Credentials](credentials.md).
 - **Activity** — each configured server's own activity feed (`GET /api/activity`), merged
   newest first across servers, with a **Load older** button. You see only your own sheds'
   events, including for a deleted shed whose name someone else has since reused.
@@ -50,9 +51,9 @@ through apt.
 
 ## Preferences
 
-**Preferences…** (in the menu) covers launch-at-login, the terminal, and **Provisioning**:
-which of your machines is the credential source on each server (with
-**Use this machine**), the five providers and their `only` rules, and a preview. The full set of
+**Preferences…** (in the menu) covers launch-at-login and the terminal. Credentials (which machine answers on
+each server, the five providers and their `only` rules, and a check of what a shed would get)
+have their own sidebar entry; see [Credentials](credentials.md). The full set of
 settings — and the environment-variable overrides — is in
 [Configuration](configuration.md).
 

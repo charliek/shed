@@ -1,0 +1,32 @@
+{
+  "name": "call-unauthorized-then-ok",
+  "description": "401, then, after a new token, a 200 with a valid answer: accepted.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 401,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "WWW-Authenticate": "Bearer error=\"invalid_token\""
+      },
+      "body": {
+        "error": {
+          "code": "invalid_token",
+          "message": "fixed text"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "accept/typical"
+    }
+  ],
+  "expect": {
+    "result": "accepted"
+  }
+}

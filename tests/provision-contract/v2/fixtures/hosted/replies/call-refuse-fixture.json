@@ -1,0 +1,20 @@
+{
+  "name": "call-refuse-fixture",
+  "description": "A 200 whose answer breaks a rule (refuse/nested-target): answer_refused with that rule. Every refuse fixture is judged so.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "refuse/nested-target"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "answer_refused",
+    "rule": "nested_target"
+  }
+}

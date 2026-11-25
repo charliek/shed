@@ -1,0 +1,24 @@
+{
+  "name": "call-not-found-other-code",
+  "description": "404 with a code that is not NO_SOURCE: source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

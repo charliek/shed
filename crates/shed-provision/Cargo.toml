@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-provision — the provision contract's documents and validation (tests/provision-contract/v1), the Provider and Reader traits, the only rules, the answer builder, fingerprints and redacted previews. No workspace crate, no tokio, no reqwest, and no file or process access of its own."
+description = "shed-provision — the provision contract's documents and validation (tests/provision-contract/v2), the Provider and Reader traits, the only rules, the answer builder, fingerprints and redacted previews. No workspace crate, no tokio, no reqwest, and no file or process access of its own."
 
 [lib]
 name = "shed_provision"

@@ -1,0 +1,2433 @@
+{
+  "api-keys-env-files": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"api-keys.good\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"GOOD\",\"value\":\"1\",\"fingerprint\":\"g4jPz2049vdA-j7wDQ1nLwdh\"}],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0] line 2: the variable is one a shed may not have set; it was not delivered\"},{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0] line 3: the name is not upper-case letters, digits and underscores; it was not delivered\"},{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0] line 4: the value starts or ends with a space; it was not delivered\"},{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0]: 2 more lines break the env rules and were not delivered\"},{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[2] can be read by others; set its mode to 0600\"},{\"provider\":\"api-keys\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"}]}",
+    "preview": {
+      "items": [
+        {
+          "fingerprint": "g4jPz2049vdA-j7wDQ1nLwdh",
+          "kind": "env",
+          "name": "api-keys.good",
+          "provider": "api-keys",
+          "size": 1,
+          "stage": 1,
+          "target": "GOOD"
+        }
+      ],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0] line 2: the variable is one a shed may not have set; it was not delivered",
+          "provider": "api-keys"
+        },
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0] line 3: the name is not upper-case letters, digits and underscores; it was not delivered",
+          "provider": "api-keys"
+        },
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0] line 4: the value starts or ends with a space; it was not delivered",
+          "provider": "api-keys"
+        },
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0]: 2 more lines break the env rules and were not delivered",
+          "provider": "api-keys"
+        },
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[2] can be read by others; set its mode to 0600",
+          "provider": "api-keys"
+        },
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "api-keys"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "api-keys-fallback-names": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"api-keys.f0l1\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"A_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\",\"value\":\"1\",\"fingerprint\":\"g4jPz2049vdA-j7wDQ1nLwdh\"},{\"name\":\"api-keys.b\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"B\",\"value\":\"2\",\"fingerprint\":\"grjTNndWX4cYUIk1C51LD3DR\"},{\"name\":\"api-keys.c\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"C\",\"value\":\"3\",\"fingerprint\":\"tZytcogxTwhj3vaYCiOGkaxD\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "fingerprint": "g4jPz2049vdA-j7wDQ1nLwdh",
+          "kind": "env",
+          "name": "api-keys.f0l1",
+          "provider": "api-keys",
+          "size": 1,
+          "stage": 1,
+          "target": "A_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        },
+        {
+          "fingerprint": "grjTNndWX4cYUIk1C51LD3DR",
+          "kind": "env",
+          "name": "api-keys.b",
+          "provider": "api-keys",
+          "size": 1,
+          "stage": 1,
+          "target": "B"
+        },
+        {
+          "fingerprint": "tZytcogxTwhj3vaYCiOGkaxD",
+          "kind": "env",
+          "name": "api-keys.c",
+          "provider": "api-keys",
+          "size": 1,
+          "stage": 1,
+          "target": "C"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "api-keys-large-env-file": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "api-keys"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "api-keys-no-craze-file": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"missing_input\",\"message\":\"~/.craze/native/providers.toml does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "~/.craze/native/providers.toml does not exist",
+          "provider": "api-keys"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "api-keys-not-utf8": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0] is not UTF-8 text\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0] is not UTF-8 text",
+          "provider": "api-keys"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "craze-providers": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-command": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"cGFzc3BocmFzZV9lbnY6IEVOVlNFQ1JFVFNfUEFTU1BIUkFTRQpnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"xS3PQhxg2EY3PBR085kFksZF\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-from-command\",\"fingerprint\":\"ZuJ148NbKNH2N2HxBp3pcn48\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "xS3PQhxg2EY3PBR085kFksZF",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 76,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "ZuJ148NbKNH2N2HxBp3pcn48",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 21,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "example-pass show envsecrets"
+    ]
+  },
+  "envsecrets-command-failed": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"command_failed\",\"message\":\"envsecrets-login.passphrase_command failed\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "envsecrets-login.passphrase_command failed",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "example-pass show envsecrets"
+    ]
+  },
+  "envsecrets-command-not-utf8": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the passphrase breaks the env rule value_not_printable; it was not delivered\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the passphrase breaks the env rule value_not_printable; it was not delivered",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "example-pass show envsecrets"
+    ]
+  },
+  "envsecrets-config-0": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"missing_input\",\"message\":\"the envsecrets config has no passphrase_env\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "the envsecrets config has no passphrase_env",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-config-1": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"missing_input\",\"message\":\"the envsecrets config has no gcs_credentials; your own Google sign-in is never copied\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "the envsecrets config has no gcs_credentials; your own Google sign-in is never copied",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-config-2": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the envsecrets config's passphrase_env breaks the variable rule refused_variable\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the envsecrets config's passphrase_env breaks the variable rule refused_variable",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-config-3": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the envsecrets config's passphrase_env is not one plain value on its own line\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the envsecrets config's passphrase_env is not one plain value on its own line",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-config-4": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the envsecrets config's gcs_credentials is not one base64 value on its own line\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the envsecrets config's gcs_credentials is not one base64 value on its own line",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-config-not-utf8": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the envsecrets config is not UTF-8 text\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the envsecrets config is not UTF-8 text",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-file": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"cGFzc3BocmFzZV9lbnY6IEVOVlNFQ1JFVFNfUEFTU1BIUkFTRQpnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"xS3PQhxg2EY3PBR085kFksZF\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-pass\",\"fingerprint\":\"bGvV34zBudMTeXlesnwGEo0w\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "xS3PQhxg2EY3PBR085kFksZF",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 76,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "bGvV34zBudMTeXlesnwGEo0w",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 13,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-file-missing": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"missing_input\",\"message\":\"envsecrets-login.passphrase_file does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "envsecrets-login.passphrase_file does not exist",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-neither": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"missing_input\",\"message\":\"set envsecrets-login.passphrase_file or passphrase_command\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "set envsecrets-login.passphrase_file or passphrase_command",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-no-config": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"missing_input\",\"message\":\"~/.envsecrets/config.yaml does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "~/.envsecrets/config.yaml does not exist",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "envsecrets-passphrase-breaks-rule": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"envsecrets-login\",\"code\":\"unreadable\",\"message\":\"the passphrase breaks the env rule value_edge_space; it was not delivered\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the passphrase breaks the env rule value_edge_space; it was not delivered",
+          "provider": "envsecrets-login"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "every-provider": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"XoLsr9gOeup_3lMHdxonr4mq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"files..env\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":2,\"base\":\"project\",\"path\":\".env\",\"mode\":\"0600\",\"content\":\"REI9U0VOVElORUwtZGIK\",\"fingerprint\":\"Rv8o6V8XkdZwviKhfVixPB9w\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"bosUs6zIUr7H4MQXyqYP1Dpz\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        },
+        {
+          "base": "home",
+          "fingerprint": "bosUs6zIUr7H4MQXyqYP1Dpz",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 316,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "every-provider-preview": {
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        },
+        {
+          "base": "home",
+          "fingerprint": "bosUs6zIUr7H4MQXyqYP1Dpz",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 316,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "file-scoped-out": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "files-conflicts": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"files..env\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":2,\"base\":\"project\",\"path\":\".env\",\"mode\":\"0400\",\"content\":\"REI9U0VOVElORUwtZGIK\",\"fingerprint\":\"Rv8o6V8XkdZwviKhfVixPB9w\"}],\"problems\":[{\"provider\":\"github\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"},{\"provider\":\"files\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"},{\"provider\":\"ssh-key\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"}]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0400",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        }
+      ],
+      "problems": [
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "github"
+        },
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "files"
+        },
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "files-conflicts-local-dir": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"}],\"problems\":[{\"provider\":\"github\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"},{\"provider\":\"files\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"},{\"provider\":\"ssh-key\",\"code\":\"conflict\",\"message\":\"two items write the same target, or one inside the other; neither was delivered\"}]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        }
+      ],
+      "problems": [
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "github"
+        },
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "files"
+        },
+        {
+          "code": "conflict",
+          "message": "two items write the same target, or one inside the other; neither was delivered",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "files-missing": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"files\",\"code\":\"missing_input\",\"message\":\"files.file[0].from does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "files.file[0].from does not exist",
+          "provider": "files"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "github-no-gh": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"missing_input\",\"message\":\"gh auth token: the program was not found\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "gh auth token: the program was not found",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com"
+    ]
+  },
+  "github-not-a-login": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"command_failed\",\"message\":\"gh api user printed something that is not a login\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "gh api user printed something that is not a login",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com",
+      "/opt/example/gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "github-not-a-token": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"command_failed\",\"message\":\"gh auth token printed something that is not a token\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "gh auth token printed something that is not a token",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com"
+    ]
+  },
+  "github-off-preview": {
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        },
+        {
+          "base": "home",
+          "fingerprint": "ZOo9-AyoCQV8ENS7DxT4kGf8",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 155,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "github-ok": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMCiAgICBnaXRfcHJvdG9jb2w6IGh0dHBzCiAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMCiAgICB1c2VyOiBhZGEtZXhhbXBsZQo=\",\"fingerprint\":\"imRtuF-zEDUtsWIOswq7gtca\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"XBnZzOkxzp1tLlvJ8v3DmA4Y\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "imRtuF-zEDUtsWIOswq7gtca",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 158,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XBnZzOkxzp1tLlvJ8v3DmA4Y",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 223,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com",
+      "/opt/example/gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "github-signed-out": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"signed_out\",\"message\":\"gh is not signed in to github.com\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "signed_out",
+          "message": "gh is not signed in to github.com",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com"
+    ]
+  },
+  "github-token-timed-out": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"command_failed\",\"message\":\"gh auth token did not finish in time\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "gh auth token did not finish in time",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com"
+    ]
+  },
+  "github-user-failed": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"command_failed\",\"message\":\"gh api user failed\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "gh api user failed",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com",
+      "/opt/example/gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "github-user-too-much": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"github\",\"code\":\"command_failed\",\"message\":\"gh api user printed too much\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "command_failed",
+          "message": "gh api user printed too much",
+          "provider": "github"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "/opt/example/gh auth token --hostname github.com",
+      "/opt/example/gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "local-dir": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"XoLsr9gOeup_3lMHdxonr4mq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"bosUs6zIUr7H4MQXyqYP1Dpz\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "home",
+          "fingerprint": "bosUs6zIUr7H4MQXyqYP1Dpz",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 316,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "names-collide": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"files.dot\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\"dot\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"files.2\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\"DOT\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"files.bad-name-\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\"bad name!\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"}],\"problems\":[{\"provider\":\"files\",\"code\":\"missing_input\",\"message\":\"files.file[0].from does not exist\"}]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files.dot",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": "dot"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files.2",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": "DOT"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files.bad-name-",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": "bad name!"
+        }
+      ],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "files.file[0].from does not exist",
+          "provider": "files"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "no-repo": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"XoLsr9gOeup_3lMHdxonr4mq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"bosUs6zIUr7H4MQXyqYP1Dpz\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "home",
+          "fingerprint": "bosUs6zIUr7H4MQXyqYP1Dpz",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 316,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "only-github-other-server": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"files..env\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":2,\"base\":\"project\",\"path\":\".env\",\"mode\":\"0600\",\"content\":\"REI9U0VOVElORUwtZGIK\",\"fingerprint\":\"Rv8o6V8XkdZwviKhfVixPB9w\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQo=\",\"fingerprint\":\"ZOo9-AyoCQV8ENS7DxT4kGf8\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        },
+        {
+          "base": "home",
+          "fingerprint": "ZOo9-AyoCQV8ENS7DxT4kGf8",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 155,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": false,
+          "restricted": true
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "only-other-repo": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"},{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"XoLsr9gOeup_3lMHdxonr4mq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"bosUs6zIUr7H4MQXyqYP1Dpz\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "home",
+          "fingerprint": "bosUs6zIUr7H4MQXyqYP1Dpz",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 316,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "only-ssh-key-other-backend": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"XoLsr9gOeup_3lMHdxonr4mq\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"8DC0lI1Ql8IxyKjwDOJqVO5B\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"quoted\\\" $DOLLAR inner\",\"fingerprint\":\"CNzLpMvG3SX08Xmxmwygq1oF\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"wpTQpyPOBjYO3aSeBi39VOUB\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UgICMgb3IgdXNlIHBhc3NwaHJhc2VfY29tbWFuZApnY3NfY3JlZGVudGlhbHM6IGV5SlRSVTVVU1U1RlRDSTZNWDA9Cg==\",\"fingerprint\":\"5T7_8iabmmShMP0kbgi_nUtj\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"sCbeMtvRcXUJJSFVcEbkYDi-\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"qg63_A1kYIdGXQIxtZhq4p97\"},{\"name\":\"files..env\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":2,\"base\":\"project\",\"path\":\".env\",\"mode\":\"0600\",\"content\":\"REI9U0VOVElORUwtZGIK\",\"fingerprint\":\"Rv8o6V8XkdZwviKhfVixPB9w\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"XBnZzOkxzp1tLlvJ8v3DmA4Y\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "XoLsr9gOeup_3lMHdxonr4mq",
+          "kind": "file",
+          "mode": "0600",
+          "name": "github",
+          "provider": "github",
+          "size": 174,
+          "stage": 1,
+          "target": ".config/gh/hosts.yml"
+        },
+        {
+          "base": "home",
+          "fingerprint": "8DC0lI1Ql8IxyKjwDOJqVO5B",
+          "kind": "file",
+          "mode": "0600",
+          "name": "api-keys.craze",
+          "provider": "api-keys",
+          "size": 36,
+          "stage": 1,
+          "target": ".craze/native/providers.toml"
+        },
+        {
+          "fingerprint": "CNzLpMvG3SX08Xmxmwygq1oF",
+          "kind": "env",
+          "name": "api-keys.example_api_key",
+          "provider": "api-keys",
+          "size": 34,
+          "stage": 1,
+          "target": "EXAMPLE_API_KEY"
+        },
+        {
+          "fingerprint": "wpTQpyPOBjYO3aSeBi39VOUB",
+          "kind": "env",
+          "name": "api-keys.other_key",
+          "provider": "api-keys",
+          "size": 3,
+          "stage": 1,
+          "target": "OTHER_KEY"
+        },
+        {
+          "base": "home",
+          "fingerprint": "5T7_8iabmmShMP0kbgi_nUtj",
+          "kind": "file",
+          "mode": "0600",
+          "name": "envsecrets-login.config",
+          "provider": "envsecrets-login",
+          "size": 121,
+          "stage": 1,
+          "target": ".envsecrets/config.yaml"
+        },
+        {
+          "fingerprint": "sCbeMtvRcXUJJSFVcEbkYDi-",
+          "kind": "env",
+          "name": "envsecrets-login.passphrase",
+          "provider": "envsecrets-login",
+          "size": 19,
+          "stage": 1,
+          "target": "ENVSECRETS_PASSPHRASE"
+        },
+        {
+          "base": "home",
+          "fingerprint": "qg63_A1kYIdGXQIxtZhq4p97",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..npmrc",
+          "provider": "files",
+          "size": 49,
+          "stage": 1,
+          "target": ".npmrc"
+        },
+        {
+          "base": "project",
+          "fingerprint": "Rv8o6V8XkdZwviKhfVixPB9w",
+          "kind": "file",
+          "mode": "0600",
+          "name": "files..env",
+          "provider": "files",
+          "size": 15,
+          "stage": 2,
+          "target": ".env"
+        },
+        {
+          "base": "home",
+          "fingerprint": "XBnZzOkxzp1tLlvJ8v3DmA4Y",
+          "kind": "file",
+          "mode": "0600",
+          "name": "git-config",
+          "provider": "git-config",
+          "size": 223,
+          "stage": 1,
+          "target": ".config/git/config"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": false,
+          "restricted": true
+        },
+        {
+          "provider": "github",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "envsecrets-login",
+          "ran": true,
+          "restricted": false
+        },
+        {
+          "provider": "files",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": [
+      "gh auth token --hostname github.com",
+      "gh api user --hostname github.com --jq .login"
+    ]
+  },
+  "partial-read": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"api-keys.good\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"GOOD\",\"value\":\"SENTINEL-good\",\"fingerprint\":\"5ut4TrZJruuhZkCPoVSLwdBs\"}],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"unreadable\",\"message\":\"api-keys.env_files[0] could not be read: permission denied\"}]}",
+    "preview": {
+      "items": [
+        {
+          "fingerprint": "5ut4TrZJruuhZkCPoVSLwdBs",
+          "kind": "env",
+          "name": "api-keys.good",
+          "provider": "api-keys",
+          "size": 13,
+          "stage": 1,
+          "target": "GOOD"
+        }
+      ],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "api-keys.env_files[0] could not be read: permission denied",
+          "provider": "api-keys"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "api-keys",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-denied": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"ssh-key.key_file could not be read: permission denied\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "ssh-key.key_file could not be read: permission denied",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-fifo": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"ssh-key.key_file is not a regular file\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "ssh-key.key_file is not a regular file",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-no-pub": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"missing_input\",\"message\":\"the key's public half does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "the key's public half does not exist",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-none": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"missing_input\",\"message\":\"ssh-key.key_file does not exist\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "ssh-key.key_file does not exist",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-not-utf8": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"ssh-key.key_file is not a private key in a form the provider knows\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "ssh-key.key_file is not a private key in a form the provider knows",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-other-pub": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"the key's public half is not exactly one OpenSSH public key line\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the key's public half is not exactly one OpenSSH public key line",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-passphrase": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"passphrase_protected\",\"message\":\"the key has a passphrase; keys with one are not delivered\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "passphrase_protected",
+          "message": "the key has a passphrase; keys with one are not delivered",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-pub-carries-more": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"the key's public half is not exactly one OpenSSH public key line\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "the key's public half is not exactly one OpenSSH public key line",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-through-links": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-unknown-form": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"unreadable\",\"message\":\"ssh-key.key_file is not a private key in a form the provider knows\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "unreadable",
+          "message": "ssh-key.key_file is not a private key in a form the provider knows",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-unset": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[{\"provider\":\"ssh-key\",\"code\":\"missing_input\",\"message\":\"ssh-key.key_file is not set\"}]}",
+    "preview": {
+      "items": [],
+      "problems": [
+        {
+          "code": "missing_input",
+          "message": "ssh-key.key_file is not set",
+          "provider": "ssh-key"
+        }
+      ],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  },
+  "ssh-key-unsigned": {
+    "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"_Zu3kP9SsGmxjsyi4INtZqkb\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"Z8AdID1L5yhlA3QYH6v_iAwq\"}],\"problems\":[]}",
+    "preview": {
+      "items": [
+        {
+          "base": "home",
+          "fingerprint": "_Zu3kP9SsGmxjsyi4INtZqkb",
+          "kind": "file",
+          "mode": "0600",
+          "name": "ssh-key",
+          "provider": "ssh-key",
+          "size": 233,
+          "stage": 1,
+          "target": ".ssh/id_ed25519"
+        },
+        {
+          "base": "home",
+          "fingerprint": "Z8AdID1L5yhlA3QYH6v_iAwq",
+          "kind": "file",
+          "mode": "0644",
+          "name": "ssh-key.pub",
+          "provider": "ssh-key",
+          "size": 98,
+          "stage": 1,
+          "target": ".ssh/id_ed25519.pub"
+        }
+      ],
+      "problems": [],
+      "providers": [
+        {
+          "provider": "ssh-key",
+          "ran": true,
+          "restricted": false
+        }
+      ]
+    },
+    "ran": []
+  }
+}

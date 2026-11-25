@@ -289,7 +289,7 @@ mod tests {
         // six-byte escape where the alphabet allows one.
         let esc = |n: usize| "\\u003c".repeat(n);
         let body = format!(
-            "{{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"provision\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"{}\",\"shed\":{{\"name\":\"{}\",\"id\":\"{}\",\"backend\":\"firecracker\",\"repo\":{{\"url\":\"{}\",\"name\":\"{}/{}\"}},\"local_dir\":\"{}\",\"project_dir\":\"/{}\"}}}}",
+            "{{\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"provision\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"{}\",\"shed\":{{\"name\":\"{}\",\"id\":\"{}\",\"backend\":\"firecracker\",\"repo\":{{\"url\":\"{}\",\"name\":\"{}/{}\"}},\"local_dir\":\"{}\",\"project_dir\":\"/{}\"}}}}",
             esc(64), esc(64), "q".repeat(64), esc(2048), esc(127), esc(127), esc(255), esc(1023)
         );
         let text = format!("event: request\ndata: {body}\n\n");

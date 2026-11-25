@@ -1,0 +1,18 @@
+{
+  "name": "call-server-error",
+  "description": "500 with a body that is not JSON: source_offline, by the status alone.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 500,
+      "headers": {
+        "Content-Type": "text/plain"
+      },
+      "text": "internal error"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

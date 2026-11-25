@@ -1,0 +1,11 @@
+{
+  "name": "duplicate-member-top",
+  "description": "version named twice at the top level.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":2,\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[]}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_member"
+  }
+}

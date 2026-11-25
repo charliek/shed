@@ -1,0 +1,81 @@
+{
+  "name": "deliveries-ok",
+  "description": "ada has a source: a delivery token, then the call answers 200 with an answer to the request sent, judged under the answer rules.",
+  "before": [
+    {
+      "sources.set": "ada"
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=deliveries%3Arequest"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{delivery_token}}",
+      "expires_in": 600,
+      "scope": "deliveries:request",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/v1/deliveries",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer {{delivery_token}}"
+        },
+        "body": {
+          "version": 2,
+          "id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+          "reason": "create",
+          "deadline": "2026-11-16T06:00:30Z",
+          "user": "ada",
+          "shed": {
+            "name": "widgets",
+            "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+            "backend": "remote",
+            "repo": {
+              "url": "git@git.example.test:example/widgets.git",
+              "name": "example/widgets"
+            },
+            "project_dir": "/home/shed/widgets"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "answer": {
+          "result": "accepted"
+        }
+      }
+    }
+  ]
+}

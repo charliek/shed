@@ -214,17 +214,23 @@ pub enum ProblemCode {
     Conflict,
     /// A command the provider runs failed.
     CommandFailed,
+    /// The provider ran out of the request's time.
+    TimedOut,
+    /// What the provider holds has itself expired.
+    Expired,
 }
 
 impl ProblemCode {
     /// Every code, in the contract's order.
-    pub const ALL: [ProblemCode; 6] = [
+    pub const ALL: [ProblemCode; 8] = [
         ProblemCode::MissingInput,
         ProblemCode::Unreadable,
         ProblemCode::SignedOut,
         ProblemCode::PassphraseProtected,
         ProblemCode::Conflict,
         ProblemCode::CommandFailed,
+        ProblemCode::TimedOut,
+        ProblemCode::Expired,
     ];
 
     /// The code as the contract writes it.
@@ -236,6 +242,8 @@ impl ProblemCode {
             ProblemCode::PassphraseProtected => "passphrase_protected",
             ProblemCode::Conflict => "conflict",
             ProblemCode::CommandFailed => "command_failed",
+            ProblemCode::TimedOut => "timed_out",
+            ProblemCode::Expired => "expired",
         }
     }
 
@@ -279,7 +287,9 @@ impl Answer {
                 .map(|i| i.size() * 4 / 3 + 200)
                 .sum::<usize>(),
         );
-        out.push_str("{\"version\":1,\"id\":");
+        out.push_str("{\"version\":");
+        out.push_str(&crate::limits::VERSION.to_string());
+        out.push_str(",\"id\":");
         write_string(&mut out, &self.id);
         out.push_str(",\"items\":[");
         for (i, it) in self.items.iter().enumerate() {
@@ -432,7 +442,7 @@ pub fn parse_answer(body: &[u8], request: Option<&Request>) -> Result<Answer, Re
     let root = parse_document(body)?;
     check_members(&root, "", ANSWER_MEMBERS, ANSWER_MEMBERS)?;
     check_types(&root, "", ANSWER_TYPES)?;
-    if root.get("version").map(|v| v.text.as_str()) != Some("1") {
+    if root.get("version").map(|v| v.text.as_str()) != Some("2") {
         return Err(Refusal::new(Rule::UnsupportedVersion, "version"));
     }
     let id = root.get("id").map(|v| v.text.clone()).unwrap_or_default();

@@ -1,0 +1,18 @@
+{
+  "name": "call-unparseable-503",
+  "description": "503 whose body is not JSON: source_offline, by the status alone.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 503,
+      "headers": {
+        "Content-Type": "text/html"
+      },
+      "text": "<html>unavailable</html>"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

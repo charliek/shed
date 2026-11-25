@@ -1,4 +1,4 @@
-//! The contract reader: `tests/provision-contract/v1/`, read as a copy of
+//! The contract reader: `tests/provision-contract/v2/`, read as a copy of
 //! the contract would be. Every answer fixture (accept and refuse, each
 //! judged against the request fixture it names), every request, every
 //! record (accept and refuse), every stream transcript, and the manifest —
@@ -28,15 +28,15 @@ const FIXTURE_REQUEST_ID: &str = "0123456789abcdef0123456789abcdef";
 /// answer it carries: it may nest deeper than the contract's limit.
 const FIXTURE_DEPTH: usize = 64;
 
-fn v1() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/provision-contract/v1")
+fn v2() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/provision-contract/v2")
 }
 
-/// The `.json` files directly under `v1/<dir>`, by path under `v1/`;
+/// The `.json` files directly under `v2/<dir>`, by path under `v2/`;
 /// failing when there are none (a check over an empty folder would pass
 /// vacuously).
 fn json_files(dir: &str) -> Vec<String> {
-    let path = v1().join(dir);
+    let path = v2().join(dir);
     let mut out: Vec<String> = fs::read_dir(&path)
         .unwrap_or_else(|e| {
             panic!(
@@ -67,7 +67,7 @@ struct FixtureDoc {
 
 impl FixtureDoc {
     fn load(rel: &str, allowed: &[&str]) -> FixtureDoc {
-        let text = fs::read(v1().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let text = fs::read(v2().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         let (root, first) =
             parse_with(&text, FIXTURE_DEPTH).unwrap_or_else(|()| panic!("{rel}: not JSON"));
         assert!(first.is_none(), "{rel}: {first:?}");
@@ -365,7 +365,10 @@ fn contract_answer_refuse_fixtures() {
         }
     }
     for rule in ANSWER_RULES {
-        if rule != Rule::BodyTooLarge && !covered.contains(&rule) {
+        // body_too_large is generated (contract_body_too_large), and an
+        // echoed credential exists only on the hosted transport.
+        if rule != Rule::BodyTooLarge && rule != Rule::EchoesCredential && !covered.contains(&rule)
+        {
             failures.push(format!("no refuse fixture for {rule}"));
         }
     }
@@ -400,7 +403,7 @@ fn contract_fixtures_answer_any_request() {
 fn contract_body_too_large() {
     let req = load_request("fixtures/requests/create-repo.json");
     let mut body = format!(
-        "{{\"version\":1,\"id\":\"{FIXTURE_REQUEST_ID}\",\"items\":[],\"problems\":[],\"x\":\""
+        "{{\"version\":2,\"id\":\"{FIXTURE_REQUEST_ID}\",\"items\":[],\"problems\":[],\"x\":\""
     )
     .into_bytes();
     body.extend(std::iter::repeat_n(b'a', crate::limits::MAX_BODY_BYTES));
@@ -584,11 +587,11 @@ fn contract_stream_transcripts() {
     }
 }
 
-/// v1/ against MANIFEST.sha256: every file but the manifest listed with its
+/// v2/ against MANIFEST.sha256: every file but the manifest listed with its
 /// SHA-256, sorted by path, and nothing else — `sha256sum -c` in a copy.
 #[test]
 fn contract_manifest() {
-    let root = v1();
+    let root = v2();
     let mut files = BTreeMap::new();
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
@@ -602,7 +605,7 @@ fn contract_manifest() {
             }
             let rel = path
                 .strip_prefix(&root)
-                .expect("under v1")
+                .expect("under v2")
                 .components()
                 .map(|c| c.as_os_str().to_str().expect("utf-8 path"))
                 .collect::<Vec<_>>()
@@ -618,7 +621,7 @@ fn contract_manifest() {
             );
         }
     }
-    assert!(!files.is_empty(), "no files under v1/");
+    assert!(!files.is_empty(), "no files under v2/");
     let text = fs::read_to_string(root.join("MANIFEST.sha256")).expect("read the manifest");
     assert!(
         text.ends_with('\n'),

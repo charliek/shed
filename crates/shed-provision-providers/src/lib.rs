@@ -18,10 +18,23 @@
 //! command's output in a problem message. The settings schema is in
 //! [`settings`].
 //!
+//! Each provider is three things (plan 040 §3.4): its `Inputs` (what it
+//! delivers from, ordered, each element that becomes an item carrying the
+//! item's name, with a `Debug` that shows no value); `build(&Inputs,
+//! &Context) -> Contribution`, which judges the inputs and makes the items
+//! and does no I/O, so a host that holds the inputs itself (an account
+//! service) runs the same code; and `gather(&settings, &Context, &dyn
+//! Reader) -> Gathered`, the desktop's reading of `delivery.toml`'s
+//! settings. The desktop's [`Provider`]s are gather then build. A host with
+//! inputs hands `build`'s result to the builder as a
+//! [`Prepared`](shed_provision::Prepared). [`describe`] says what each
+//! provider is and which fields it has, for forms on both sides.
+//!
 //! Depends on `shed-provision` only (no other workspace crate), and has no
 //! YAML parser.
 
 mod common;
+mod describe;
 
 pub mod api_keys;
 pub mod envsecrets;
@@ -31,9 +44,26 @@ mod render;
 pub mod settings;
 pub mod ssh_key;
 
+pub use describe::{describe, Descriptor, Field, FieldDefault, FieldKind, Place};
+pub use render::{ProviderTable, SettingValue};
 pub use settings::{settings_path, Settings, SettingsError, SETTINGS_FILE_NAME};
 
-use shed_provision::{Built, FingerprintKey, Preview, Provider, Reader, Refusal, Request};
+use std::time::Instant;
+
+use shed_provision::{
+    Built, FingerprintKey, Preview, ProblemDraft, Provider, Reader, Refusal, Request,
+};
+
+/// What a provider's `gather` read: its inputs, or none when it stopped at
+/// a problem, and the problems it met (a provider that reads many things
+/// keeps what it could read when one of them fails).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gathered<I> {
+    /// What it read.
+    pub inputs: Option<I>,
+    /// What it could not read, in order.
+    pub problems: Vec<ProblemDraft>,
+}
 
 impl Settings {
     /// The enabled providers, in the one order they are asked: `ssh-key`,
@@ -64,23 +94,31 @@ fn as_dyn(list: &[Box<dyn Provider + Send + Sync>]) -> Vec<&dyn Provider> {
 }
 
 /// The answer to `request` from the server named `server`, built from
-/// `settings`' enabled providers: see [`shed_provision::build_answer`].
+/// `settings`' enabled providers at `now` (Unix seconds), within `budget`:
+/// see [`shed_provision::build_answer`].
 pub fn build_answer(
     settings: &Settings,
     request: &Request,
     server: &str,
+    now: i64,
+    budget: Option<Instant>,
     reader: &dyn Reader,
     key: &FingerprintKey,
 ) -> Result<Built, Refusal> {
     let list = settings.providers();
-    shed_provision::build_answer(request, server, &as_dyn(&list), reader, key)
+    shed_provision::build_answer(request, server, now, budget, &as_dyn(&list), reader, key)
 }
 
-/// What `settings` would deliver, redacted, with no request: see
+/// What `settings` would deliver, redacted, with no request, at `now`: see
 /// [`shed_provision::preview`].
-pub fn preview(settings: &Settings, reader: &dyn Reader, key: &FingerprintKey) -> Preview {
+pub fn preview(
+    settings: &Settings,
+    now: i64,
+    reader: &dyn Reader,
+    key: &FingerprintKey,
+) -> Preview {
     let list = settings.providers();
-    shed_provision::preview(&as_dyn(&list), reader, key)
+    shed_provision::preview(now, &as_dyn(&list), reader, key)
 }
 
 #[cfg(test)]

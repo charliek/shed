@@ -1,11 +1,14 @@
-"""The provisioning UI, driven through the real app (plan 039 A7).
+"""The provisioning UI, driven through the real app (plan 039 A7; plan 040 §3.9).
 
-Preferences → Provisioning (each provider on or off, its settings and its `only` rule,
-written to `delivery.toml`; the credential source rows; a preview of what a named shed
-would get) and each shed row's delivery badge and detail (items, last outcome,
-problems, Deliver again). Every cell drives the app's own controls through its `ui.*`
-doors and reads back what was RENDERED (`prefs.dump`'s `values.provisioning`,
-`shed_delivery.dump`, `dashboard.dump`'s `delivery_badge`), never the backend's view.
+The Credentials view (what each provider delivers, set up, edited, turned off and on
+or removed, its scope and its form written to `delivery.toml`; who answers on each
+server; Check, of a shed or of a server, backend and repo; the recent deliveries) and
+each shed row's delivery badge and detail (items, last outcome, problems, Deliver
+again). Every cell drives the app's own controls through its `ui.*` doors and reads
+back what was RENDERED (`credentials.dump`, `shed_delivery.dump`, `dashboard.dump`'s
+`delivery_badge`), never the backend's view. The cells that drove Preferences'
+Provisioning, Source machine and Preview sections before plan 040 drive the
+Credentials view now.
 
 The module launches its OWN app over a throwaway HOME that holds every input the five
 providers read (the A6 module's setup: a throwaway key, a fake `gh`, craze and env
@@ -32,7 +35,7 @@ import pytest
 
 import hermetic
 import ui
-from client import ShedError, TauriClient
+from client import ShedError, TauriClient, Timeout
 from mockserver import DELIVERED_RECORD, MockShedServer
 from test_tauri_delivery import (
     CONFIG, CRAZE_KEY, ENV_KEY, GCS, GH_TOKEN, NPMRC, PASSPHRASE, PROJECT_ENV, QUOTED,
@@ -129,7 +132,9 @@ def rig():
     proc = None
     try:
         hermetic.generate_key(home / ".ssh")
-        _script(home / "bin" / "gh", f"""case "$1 $2" in
+        # Each run is logged, so a cell can tell whether a Check ran it.
+        _script(home / "bin" / "gh", f"""echo "$1" >> '{home / "gh-runs.log"}'
+case "$1 $2" in
   "auth token") echo {GH_TOKEN} ;;
   "api user") echo octo-test ;;
   *) exit 1 ;;
@@ -175,14 +180,20 @@ def r(rig):
     rig.mock.provision_record = DELIVERED_RECORD
     rig.mock.provision_warning = None
     rig.mock.provision_should_fail = False
+    rig.mock.shed_doc_refusal = None
     rig.mock.release_provisions()
     yield rig
+    rig.mock.shed_doc_refusal = None
     rig.mock.release_provisions()
 
 
-def _shot(c: TauriClient, name: str) -> None:
+def _shot(c: TauriClient, name: str, anchor: str | None = None) -> None:
     if platform.system() == "Darwin":
         return
+    if anchor:
+        token = c.call("ui.scroll_to", {"anchor": anchor})["token"]
+        c.wait_until(lambda: (c.call("ui.scrolled")["scrolled"] or {}).get("token") == token,
+                     timeout=10, what=f"scrolled to {anchor}")
     png, w, h = c.screenshot(scale=1)
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
     if SHOTS:
@@ -349,61 +360,52 @@ def test_ui_doors_refuse_bad_params(r):
     c = r.client
     for op, params in (("ui.show_shed_delivery", {"server": SERVER}),
                        ("ui.show_shed_delivery", {"server": SERVER, "shed": "a/b"}),
-                       ("ui.press_delivery_toggle", {"provider": "nope"}),
                        ("ui.type_delivery_field", {"provider": "github", "field": "gh"}),
                        ("ui.type_delivery_field", {"provider": "github", "field": "gh", "value": 3}),
+                       ("ui.type_delivery_field", {"provider": "nope", "field": "gh", "value": "x"}),
                        ("ui.press_delivery_button", {"provider": "github"}),
-                       ("ui.preview_delivery", {"server": SERVER, "shed": "../x"}),
-                       ("ui.prefs_section", {})):
+                       ("ui.fill_check", {"field": "nope", "value": "x"}),
+                       ("ui.fill_check", {"field": "repo"}),
+                       ("ui.press_check", {"button": "save"}),
+                       ("ui.press_source_unbind", {}),
+                       ("ui.navigate", {"pane": "provisioning"})):
         with pytest.raises(ShedError) as e:
             c.call(op, params)
         assert e.value.code == "bad_request", (op, params)
+    # The switch, the Preferences preview and its section scroll went with the
+    # Provisioning pane.
+    for op in ("ui.press_delivery_toggle", "ui.preview_delivery", "ui.prefs_section",
+               "ui.run_check"):
+        with pytest.raises(ShedError) as e:
+            c.call(op, {"provider": "github", "server": SERVER, "section": "terminal"})
+        assert e.value.code == "unknown_op", op
 
 
-# -- Preferences → Provisioning ----------------------------------------------
+# -- the Credentials view: What ------------------------------------------------
 
-def _prov(c: TauriClient) -> dict:
-    snap = (c.prefs_dump().get("prefs") or {}).get("values") or {}
-    return snap.get("provisioning") or {}
+def _cred(c: TauriClient) -> dict:
+    return c.credentials_dump() or {}
+
+
+def _what(c: TauriClient) -> dict:
+    return _cred(c).get("what") or {}
 
 
 def _provider(c: TauriClient, name: str) -> dict:
-    return next((p for p in _prov(c).get("providers", []) if p["name"] == name), {})
+    return next((p for p in _what(c).get("providers", []) if p["name"] == name), {})
 
 
-def _prefs(c: TauriClient) -> None:
-    c.show_preferences()
-    c.wait_until(lambda: len(_prov(c).get("providers", [])) == 5, timeout=20,
-                 what="the Provisioning section's five providers")
-
-
-def test_toggling_a_provider_writes_delivery_toml(r):
-    c = r.client
-    _prefs(c)
-    # The window reads the file again when it is shown.
-    c.show_preferences()
-    c.wait_until(lambda: _provider(c, "github").get("enabled") is True, timeout=15,
-                 what="github on")
-    assert "provisioning" in c.prefs_dump()["prefs"]["sections"]
-    c.call("ui.press_delivery_toggle", {"provider": "github"})
-    c.wait_until(lambda: _provider(c, "github").get("enabled") is False, timeout=15,
-                 what="github's switch off")
-    text = r.settings.read_text()
-    gh = text.split("[github]", 1)[1].split("\n[", 1)[0]
-    assert "enabled = false" in gh, text
-    view = c.call("delivery.settings")
-    assert next(p for p in view["providers"] if p["name"] == "github")["enabled"] is False
-    # Every other provider is as it was.
-    for name in ("ssh-key", "api-keys", "envsecrets-login", "files"):
-        assert _provider(c, name)["enabled"] is True, name
-    c.call("ui.press_delivery_toggle", {"provider": "github"})
-    c.wait_until(lambda: _provider(c, "github").get("enabled") is True, timeout=15,
-                 what="github's switch on again")
-    _no_value(json.dumps(c.prefs_dump()), r.key_lines)
+def _view(c: TauriClient) -> None:
+    """Show the Credentials view (each navigation reads everything again) and wait for
+    its five providers."""
+    c.navigate("credentials")
+    c.wait_until(lambda: len(_what(c).get("providers", [])) == 5 and _cred(c).get("doors_ready")
+                 and ((_cred(c).get("where") or {}).get("rows") or []), timeout=20,
+                 what="the Credentials view's five providers and its Where rows")
 
 
 def _editor(c: TauriClient) -> dict:
-    return _prov(c).get("editor") or {}
+    return _what(c).get("editor") or {}
 
 
 def _values(c: TauriClient) -> dict:
@@ -419,13 +421,18 @@ def _type(c: TauriClient, provider: str, field: str, value: str, index: int | No
                                       "value": value})
     key = field if index is None else f"{field}[{index}]"
     c.wait_until(lambda: _values(c).get(key) in (value, "redacted"), timeout=10,
-                 what=f"{key} typed into the editor")
+                 what=f"{key} typed into the form")
 
 
-def _edit(c: TauriClient, provider: str) -> dict:
-    _press(c, provider, "edit")
+def _tick(c: TauriClient, provider: str, button: str, on: bool = True) -> None:
+    _press(c, provider, button)
+    c.wait_until(lambda: _values(c).get(button) is on, timeout=10, what=f"{button} {on}")
+
+
+def _edit(c: TauriClient, provider: str, action: str = "edit") -> dict:
+    _press(c, provider, action)
     c.wait_until(lambda: _editor(c).get("provider") == provider, timeout=15,
-                 what=f"{provider}'s editor open")
+                 what=f"{provider}'s form open")
     return _values(c)
 
 
@@ -441,31 +448,57 @@ def _stored(r: Rig) -> dict:
 
 
 def _fresh(c: TauriClient, pred, what: str) -> None:
-    """Show Preferences (it reads the file again) and wait until its rows show it."""
-    _prefs(c)
-    c.show_preferences()
-    c.wait_until(lambda: pred(_prov(c)), timeout=15, what=what)
+    """Show the view again (it reads the file again) and wait until its rows show it."""
+    _view(c)
+    c.wait_until(lambda: pred(_what(c)), timeout=15, what=what)
 
 
 def _cfg(p: dict, name: str) -> dict:
     return next((x for x in p.get("providers", []) if x["name"] == name), {}).get("config") or {}
 
 
-def test_the_ssh_key_editor_writes_its_fields_and_only_rule(r):
+def test_turning_a_provider_off_and_on_writes_delivery_toml(r):
     c = r.client
-    _fresh(c, lambda p: _cfg(p, "ssh-key").get("enabled") is True and "only" not in _cfg(p, "ssh-key"),
+    _fresh(c, lambda w: _cfg(w, "github").get("enabled") is True, "github on")
+    gh = _provider(c, "github")
+    assert gh["state"] == "on" and gh["state_text"] == "On", gh
+    assert gh["actions"] == ["edit", "turn_off", "remove"], gh
+    assert gh["title"] == "GitHub" and gh["scope"] == "On every server", gh
+    assert gh["lands"].startswith("~/.config/gh/hosts.yml"), gh
+    _press(c, "github", "turn_off")
+    c.wait_until(lambda: _provider(c, "github").get("enabled") is False, timeout=15,
+                 what="github off")
+    text = r.settings.read_text()
+    assert "enabled = false" in text.split("[github]", 1)[1].split("\n[", 1)[0], text
+    assert _provider(c, "github")["actions"] == ["turn_on", "edit", "remove"]
+    view = c.call("delivery.settings")
+    assert next(p for p in view["providers"] if p["name"] == "github")["enabled"] is False
+    for name in ("ssh-key", "api-keys", "envsecrets-login", "files"):
+        assert _provider(c, name)["enabled"] is True, name
+    _press(c, "github", "turn_on")
+    c.wait_until(lambda: _provider(c, "github").get("enabled") is True, timeout=15,
+                 what="github on again")
+    assert _stored(r)["github"]["gh"] == str(r.home / "bin" / "gh"), "turning on keeps the table"
+    _no_value(json.dumps(c.credentials_dump()), r.key_lines)
+
+
+def test_the_ssh_key_form_writes_its_fields_and_scope(r):
+    c = r.client
+    _fresh(c, lambda w: _cfg(w, "ssh-key").get("enabled") is True and "only" not in _cfg(w, "ssh-key"),
            "the settings read")
     v = _edit(c, "ssh-key")
     assert v["key_file"] == "~/.ssh/id_ed25519" and v["toggle:sign_commits"] is False, v
+    assert v["scope:every"] is True and v["scope:only"] is False, v
+    assert {b: v[f"backend:{b}"] for b in ("vz", "firecracker", "remote")} == \
+        {"vz": False, "firecracker": False, "remote": False}, v
     _type(c, "ssh-key", "key_file", "~/.ssh/id_work,1")
     _press(c, "ssh-key", "toggle:sign_commits")
     c.wait_until(lambda: _values(c).get("toggle:sign_commits") is True, timeout=10, what="the switch on")
-    _press(c, "ssh-key", "add:only.backends")
-    _type(c, "ssh-key", "only.backends", "vz", 0)
+    _tick(c, "ssh-key", "backend:vz")
     _press(c, "ssh-key", "add:only.repos")
     _type(c, "ssh-key", "only.repos", "example/*", 0)
     _save(c, "ssh-key")
-    assert _provider(c, "ssh-key")["only"] == "only backends: vz · repos: example/*"
+    assert _provider(c, "ssh-key")["scope"] == "On every server · VZ sheds only · repos matching example/*"
     ssh = _stored(r)["ssh-key"]
     assert ssh["key_file"] == "~/.ssh/id_work,1" and ssh["sign_commits"] is True, ssh
     assert ssh["only"] == {"backends": ["vz"], "repos": ["example/*"]} and ssh["enabled"] is True
@@ -473,24 +506,99 @@ def test_the_ssh_key_editor_writes_its_fields_and_only_rule(r):
     # file is left as it was; corrected, it saves, and the refusal goes.
     before = r.settings.read_text()
     v = _edit(c, "ssh-key")
-    assert v["only.backends[0]"] == "vz" and v["key_file"] == "~/.ssh/id_work,1", v
-    _type(c, "ssh-key", "only.backends", "docker", 0)
+    assert v["only.repos[0]"] == "example/*" and v["backend:vz"] is True, v
+    _type(c, "ssh-key", "only.repos", "widgets", 0)
     _press(c, "ssh-key", "save")
     c.wait_until(lambda: _provider(c, "ssh-key").get("error"), timeout=15, what="the refusal shown")
     err = _provider(c, "ssh-key")["error"]
-    assert "ssh-key.only.backends" in err and "expected" in err and "docker" not in err, err
+    assert "ssh-key.only.repos" in err and "expected" in err and "widgets" not in err, err
     assert r.settings.read_text() == before
-    _type(c, "ssh-key", "only.backends", "vz", 0)
-    _press(c, "ssh-key", "add:only.backends")
-    _type(c, "ssh-key", "only.backends", "remote", 1)
+    _type(c, "ssh-key", "only.repos", "example/*", 0)
+    _tick(c, "ssh-key", "backend:remote")
     _save(c, "ssh-key")
     assert not _provider(c, "ssh-key")["error"]
     assert _stored(r)["ssh-key"]["only"]["backends"] == ["vz", "remote"]
 
 
-def test_list_and_files_entries_are_edited_one_by_one(r):
+def test_scope_ticks_write_only_servers_exactly(r):
+    """Criterion 16: "Every server this machine answers on" writes no `only.servers`;
+    "Only these" writes exactly the ticked servers. A server the settings already name
+    that is not configured is a tick of its own, so it is never dropped unseen."""
     c = r.client
-    _fresh(c, lambda p: _cfg(p, "api-keys").get("env_files") == ["~/.config/shed/keys.env"],
+    _fresh(c, lambda w: _cfg(w, "github").get("enabled") is True, "github on")
+    v = _edit(c, "github")
+    assert v["scope:every"] is True and "server:mock" not in v, v
+    _press(c, "github", "scope:only")
+    c.wait_until(lambda: _values(c).get("scope:only") is True, timeout=10, what="Only these")
+    assert _values(c)["server:mock"] is False
+    assert _editor(c)["buttons"]["save"] is False, "only these, with nothing ticked"
+    assert "Tick at least one server, or choose every server." in _editor(c)["missing"]
+    _tick(c, "github", "server:mock")
+    _save(c, "github")
+    assert _stored(r)["github"]["only"] == {"servers": ["mock"]}
+    assert _provider(c, "github")["scope"] == "Only on mock"
+    # Every server again: no `only` at all.
+    _edit(c, "github")
+    _press(c, "github", "scope:every")
+    c.wait_until(lambda: _values(c).get("scope:every") is True, timeout=10, what="every server")
+    _save(c, "github")
+    assert "only" not in _stored(r)["github"], _stored(r)["github"]
+    assert _provider(c, "github")["scope"] == "On every server"
+    # A server named in the file but not configured keeps its tick, ticked.
+    _write(r.settings, _settings(r.home, github_only='only = { servers = ["lab"] }'))
+    _fresh(c, lambda w: (_cfg(w, "github").get("only") or {}).get("servers") == ["lab"], "only lab")
+    v = _edit(c, "github")
+    assert (v["scope:only"], v["server:mock"], v["server:lab"]) == (True, False, True), v
+    _tick(c, "github", "server:mock")
+    _save(c, "github")
+    assert _stored(r)["github"]["only"] == {"servers": ["mock", "lab"]}
+
+
+def test_a_provider_cannot_be_turned_on_with_a_required_field_empty(r):
+    """Criterion 16: there is no bare switch. A provider that is not set up offers Set
+    up, whose form cannot be saved (so the provider cannot be turned on) until its
+    required fields are filled; saved, it is on. One that is off and incomplete is set
+    up through its form, never turned on as it is."""
+    c = r.client
+    _view(c)
+    _press(c, "ssh-key", "remove")
+    c.wait_until(lambda: _provider(c, "ssh-key").get("state") == "not_set_up", timeout=15,
+                 what="ssh-key removed")
+    assert "ssh-key" not in _stored(r)
+    assert _provider(c, "ssh-key")["actions"] == ["setup"]
+    v = _edit(c, "ssh-key", "setup")
+    assert _editor(c)["mode"] == "setup" and v["key_file"] == "", v
+    assert _editor(c)["buttons"]["save"] is False
+    assert _editor(c)["save"] == "Save and turn on"
+    assert _editor(c)["missing"] == ["Key file is required."]
+    _press(c, "ssh-key", "save")
+    assert "ssh-key" not in _stored(r), "a press on the disabled Save writes nothing"
+    _type(c, "ssh-key", "key_file", "~/.ssh/id_ed25519")
+    c.wait_until(lambda: _editor(c).get("buttons", {}).get("save") is True, timeout=10,
+                 what="Save enabled once the key file is in")
+    _save(c, "ssh-key")
+    assert _stored(r)["ssh-key"] == {"enabled": True, "key_file": "~/.ssh/id_ed25519",
+                                     "sign_commits": False}
+    assert _provider(c, "ssh-key")["state"] == "on"
+    # Off, and incomplete: no Turn on, only Set up.
+    _write(r.settings, _settings(r.home, passphrase="enabled = false").replace(
+        "[envsecrets-login]\nenabled = true\n", "[envsecrets-login]\n"))
+    _fresh(c, lambda w: _cfg(w, "envsecrets-login").get("enabled") is False, "envsecrets off")
+    env = _provider(c, "envsecrets-login")
+    assert env["actions"] == ["setup", "remove"] and env["state_text"] == "Off · not complete", env
+    assert env["missing"] == "A passphrase file or a passphrase command is required.", env
+    _edit(c, "envsecrets-login", "setup")
+    assert _editor(c)["buttons"]["save"] is False
+    _type(c, "envsecrets-login", "passphrase_file", "~/.config/envsecrets/passphrase")
+    _save(c, "envsecrets-login")
+    assert _stored(r)["envsecrets-login"]["enabled"] is True
+
+
+def test_list_and_files_entries_are_edited_one_by_one(r):
+    """The plain lists, entry by entry; and the files form, which round-trips each
+    file's mode and its own scope (criterion 16)."""
+    c = r.client
+    _fresh(c, lambda w: _cfg(w, "api-keys").get("env_files") == ["~/.config/shed/keys.env"],
            "the settings read")
     v = _edit(c, "api-keys")
     assert v["env_files[0]"] == "~/.config/shed/keys.env" and v["toggle:craze_providers"] is True, v
@@ -498,7 +606,6 @@ def test_list_and_files_entries_are_edited_one_by_one(r):
     _type(c, "api-keys", "env_files", "~/keys,work.env", 1)
     _save(c, "api-keys")
     assert _stored(r)["api-keys"]["env_files"] == ["~/.config/shed/keys.env", "~/keys,work.env"]
-    # Removing one entry leaves the other exactly as it was.
     _edit(c, "api-keys")
     _press(c, "api-keys", "remove:env_files:0")
     c.wait_until(lambda: "env_files[1]" not in _values(c), timeout=10, what="the entry removed")
@@ -507,31 +614,54 @@ def test_list_and_files_entries_are_edited_one_by_one(r):
     assert _stored(r)["api-keys"]["env_files"] == ["~/keys,work.env"]
 
     v = _edit(c, "files")
-    assert v["files.from[0]"] == "~/.npmrc" and v["files.base[1]"] == "project", v
-    _press(c, "files", "add:files")
-    _type(c, "files", "files.from", "~/notes, todo.md", 2)
-    _type(c, "files", "files.to", "notes.md", 2)
-    _type(c, "files", "files.base", "project", 2)
+    assert v["file.from[0]"] == "~/.npmrc" and v["file.base[1]"] == "project", v
+    assert v["file.mode[0]"] == "" and v["file.1.scope:every"] is True, v
+    _press(c, "files", "add:file")
+    _type(c, "files", "file.from", "~/notes, todo.md", 2)
+    _type(c, "files", "file.to", "notes.md", 2)
+    _type(c, "files", "file.base", "project", 2)
+    _type(c, "files", "file.mode", "0400", 2)
+    _press(c, "files", "file.2.scope:only")
+    c.wait_until(lambda: _values(c).get("file.2.scope:only") is True, timeout=10, what="only these")
+    _tick(c, "files", "file.2.server:mock")
+    _tick(c, "files", "file.2.backend:vz")
+    _press(c, "files", "add:file.2.only.repos")
+    _type(c, "files", "file.2.only.repos", "example/widgets", 0)
     _save(c, "files")
     entries = _stored(r)["files"]["file"]
-    assert entries[2] == {"from": "~/notes, todo.md", "to": "notes.md", "base": "project"}, entries
+    assert entries[2] == {"from": "~/notes, todo.md", "to": "notes.md", "base": "project",
+                          "mode": "0400", "only": {"servers": ["mock"], "backends": ["vz"],
+                                                   "repos": ["example/widgets"]}}, entries
     assert entries[1]["only"] == {"repos": ["example/widgets"]}, "an entry's own rule is kept"
+    assert _provider(c, "files")["lands"] == "~/.npmrc, the project's .env, the project's notes.md"
+    # Read back into the form: the same mode and scope.
+    v = _edit(c, "files")
+    assert (v["file.mode[2]"], v["file.2.scope:only"], v["file.2.server:mock"],
+            v["file.2.backend:vz"], v["file.2.only.repos[0]"]) == \
+        ("0400", True, True, True, "example/widgets"), v
+    _type(c, "files", "file.mode", "", 2)
+    _press(c, "files", "file.2.scope:every")
+    c.wait_until(lambda: _values(c).get("file.2.scope:every") is True, timeout=10, what="every")
+    _save(c, "files")
+    assert _stored(r)["files"]["file"][2] == {
+        "from": "~/notes, todo.md", "to": "notes.md", "base": "project",
+        "only": {"backends": ["vz"], "repos": ["example/widgets"]}}
 
 
 def test_a_passphrase_command_is_never_shown_and_is_kept(r):
+    """Criterion 16: a stored passphrase command never reaches the page or a dump."""
     c = r.client
     cmd = ["printf", "%s", "SENTINEL-CMD-0001", ""]
     _write(r.settings, _settings(r.home, passphrase=f"passphrase_command = {json.dumps(cmd)}"))
-    _fresh(c, lambda p: _cfg(p, "envsecrets-login").get("passphrase_command") == "set",
+    _fresh(c, lambda w: _cfg(w, "envsecrets-login").get("passphrase_command") == "set",
            "the command shown as set")
-    for shown in (json.dumps(c.call("delivery.settings")), json.dumps(c.prefs_dump())):
+    for shown in (json.dumps(c.call("delivery.settings")), json.dumps(c.credentials_dump())):
         assert "SENTINEL-CMD" not in shown and "printf" not in shown
     v = _edit(c, "envsecrets-login")
     assert v["passphrase_command"] == "set" and "passphrase_command[0]" not in v, v
     assert _editor(c)["buttons"]["replace:passphrase_command"] is True
     # An unrelated edit saves the command back exactly.
-    _press(c, "envsecrets-login", "add:only.backends")
-    _type(c, "envsecrets-login", "only.backends", "vz", 0)
+    _tick(c, "envsecrets-login", "backend:vz")
     _save(c, "envsecrets-login")
     stored = _stored(r)["envsecrets-login"]
     assert stored["passphrase_command"] == cmd and stored["only"] == {"backends": ["vz"]}, stored
@@ -544,13 +674,16 @@ def test_a_passphrase_command_is_never_shown_and_is_kept(r):
     _press(c, "envsecrets-login", "add:passphrase_command")
     _type(c, "envsecrets-login", "passphrase_command", "SENTINEL-CMD-0002, b", 1)
     _press(c, "envsecrets-login", "add:passphrase_command")
-    c.wait_until(lambda: (_prov(c).get("draft") or {}).get("passphrase_command") == "replaced (3 arguments)",
+    c.wait_until(lambda: (_what(c).get("draft") or {}).get("passphrase_command") == "replaced (3 arguments)",
                  timeout=10, what="the replaced command, redacted")
-    for shown in (json.dumps(c.prefs_dump()), json.dumps(c.call("delivery.settings"))):
+    for shown in (json.dumps(c.credentials_dump()), json.dumps(c.call("delivery.settings"))):
         assert "SENTINEL-CMD" not in shown
     _save(c, "envsecrets-login")
     assert _stored(r)["envsecrets-login"]["passphrase_command"] == ["printf", "SENTINEL-CMD-0002, b", ""]
-    assert "SENTINEL-CMD" not in json.dumps(c.prefs_dump())
+    assert "SENTINEL-CMD" not in json.dumps(c.credentials_dump())
+    # Check says it will run the command, and the command's words never reach it.
+    note = _cred(c)["check"]["note"]
+    assert note.startswith("Check runs gh and your passphrase command on this machine"), note
     # Cleared, for a passphrase file instead (the two are one or the other).
     _edit(c, "envsecrets-login")
     _press(c, "envsecrets-login", "clear:passphrase_command")
@@ -562,14 +695,14 @@ def test_a_passphrase_command_is_never_shown_and_is_kept(r):
 
 
 def test_a_draft_changed_underneath_is_discarded_and_said(r):
-    """A reload that finds the provider changed elsewhere discards the open draft, so
-    Save can never write back an `enabled` the switch no longer shows."""
+    """A reload that finds the provider changed elsewhere discards the open form, so
+    Save can never write back an `enabled` the row no longer shows."""
     c = r.client
-    _fresh(c, lambda p: _cfg(p, "github").get("enabled") is True, "github on")
+    _fresh(c, lambda w: _cfg(w, "github").get("enabled") is True, "github on")
     _edit(c, "github")
     gh = next(p for p in c.call("delivery.settings")["providers"] if p["name"] == "github")
     c.call("delivery.set", {"provider": "github", "config": {**gh["config"], "enabled": False}})
-    c.show_preferences()
+    c.navigate("credentials")
     c.wait_until(lambda: "settings changed" in (_provider(c, "github").get("notice") or ""),
                  timeout=15, what="the draft discarded, and said")
     p = _provider(c, "github")
@@ -579,82 +712,230 @@ def test_a_draft_changed_underneath_is_discarded_and_said(r):
 
 def test_a_settings_file_error_is_shown_with_its_place(r):
     c = r.client
-    _prefs(c)
+    _view(c)
     _write(r.settings, '[github]\nenabled = true\nbogus = "SENTINEL-SETTINGS-0001"\n')
-    c.show_preferences()
-    c.wait_until(lambda: _prov(c).get("error"), timeout=15, what="the settings error shown")
-    p = _prov(c)
-    assert p["error"].startswith("delivery.toml line 3, column 1: "), p["error"]
-    assert "SENTINEL" not in json.dumps(c.prefs_dump())
-    assert p["providers"] == [], "no switch while the file does not read"
+    c.navigate("credentials")
+    c.wait_until(lambda: _what(c).get("error"), timeout=15, what="the settings error shown")
+    w = _what(c)
+    assert w["error"].startswith("delivery.toml line 3, column 1: "), w["error"]
+    assert "SENTINEL" not in json.dumps(c.credentials_dump())
+    assert w["providers"] == [], "no provider row while the file does not read"
     _write(r.settings, _settings(r.home))
-    c.show_preferences()
-    c.wait_until(lambda: not _prov(c).get("error") and len(_prov(c).get("providers", [])) == 5,
-                 timeout=15, what="the settings read again")
+    _view(c)
+    c.wait_until(lambda: not _what(c).get("error"), timeout=15, what="the settings read again")
 
 
-def test_the_preview_renders_items_and_no_value(r):
+# -- the Credentials view: Check -----------------------------------------------
+
+def _check(c: TauriClient) -> dict:
+    return _cred(c).get("check") or {}
+
+
+def _fill(c: TauriClient, field: str, value: str) -> None:
+    """Fill one of Check's own controls (the segmented choice, a picker, the repo)."""
+    c.call("ui.fill_check", {"field": field, "value": value})
+    c.wait_until(lambda: _check(c).get(field) == value, timeout=10,
+                 what=f"Check's {field} filled with {value!r}")
+
+
+def _press_check(c: TauriClient) -> dict:
+    """Press the real Check button and wait for what it rendered."""
+    started = _check(c).get("started") or 0
+    c.wait_until(lambda: (_check(c).get("run") or {}).get("enabled"), timeout=15,
+                 what="the Check button enabled")
+    c.call("ui.press_check", {"button": "run"})
+    # A Check started (not just a press taken): what is read next is its own outcome,
+    # never the one before it.
+    c.wait_until(lambda: (_check(c).get("started") or 0) > started, timeout=15,
+                 what="the press started a Check")
+    c.wait_until(lambda: not _check(c).get("busy")
+                 and (_check(c).get("items") or _check(c).get("error") or _check(c).get("about")),
+                 timeout=30, what="the check rendered")
+    return _check(c)
+
+
+def _run(c: TauriClient, *, shed: str | None = None, backend: str | None = None,
+         repo: str = "", details: bool = False) -> dict:
+    """Fill Check's controls as a person does (a shed from the list, or a server, a
+    backend and a repo), press Check, and, with `details`, press Details."""
+    if shed is not None:
+        _fill(c, "by", "shed")
+        _fill(c, "shed", f"{SERVER}/{shed}")
+    else:
+        _fill(c, "by", "target")
+        _fill(c, "server", SERVER)
+        _fill(c, "backend", backend or "vz")
+        _fill(c, "repo", repo)
+    pv = _press_check(c)
+    if details and pv.get("items"):
+        c.call("ui.press_check", {"button": "details"})
+        c.wait_until(lambda: _check(c).get("details") is True
+                     and "target" in (_check(c).get("items") or [{}])[0], timeout=10,
+                     what="the details shown")
+        pv = _check(c)
+    return pv
+
+
+def _gh_runs(r: Rig) -> int:
+    log = r.home / "gh-runs.log"
+    return len(log.read_text().splitlines()) if log.exists() else 0
+
+
+def test_check_from_a_shed_renders_items_and_no_value(r):
+    """Criterion 17: Check from a shed picked from the list. It says before it runs
+    which commands it runs; items are in words, with paths, modes, sizes and
+    fingerprints behind Details."""
     c = r.client
-    _prefs(c)
-    c.call("ui.preview_delivery", {"server": SERVER, "shed": "widgets"})
-    c.wait_until(lambda: ((_prov(c).get("preview") or {}).get("items") or [])
-                 and not _prov(c)["preview"]["busy"], timeout=30, what="the preview rendered")
-    pv = _prov(c)["preview"]
-    assert pv["server"] == SERVER and pv["shed"] == "widgets" and pv["error"] is None
+    _view(c)
+    c.wait_until(lambda: _check(c).get("shed") == "mock/widgets", timeout=20,
+                 what="the shed picker filled from the sheds list")
+    note = _check(c)["note"]
+    assert note.startswith("Check runs gh on this machine"), note
+    pv = _run(c, shed="widgets", details=True)
+    assert pv["about"] == "widgets on mock · VZ · example/widgets" and pv["error"] is None, pv
+    assert pv["shed"] == "mock/widgets" and pv["by"] == "shed", pv
     items = {i["name"]: i for i in pv["items"]}
+    assert items["ssh-key"]["words"] == "SSH key: ~/.ssh/id_ed25519"
     assert items["ssh-key"]["target"] == ".ssh/id_ed25519" and items["ssh-key"]["mode"] == "0600"
     assert items["ssh-key.pub"]["mode"] == "0644"
     assert items["files..env"]["stage"] == "2"
+    assert items["files..env"]["words"] == "Files: the project's .env"
     assert {"EXAMPLE_API_KEY", "ENVSECRETS_PASSPHRASE", ".config/gh/hosts.yml"} <= {
         i["target"] for i in pv["items"]}
     for it in pv["items"]:
         assert len(it["fingerprint"]) == 24 and it["size"].endswith("B"), it
-    assert "widgets on mock · vz · example/widgets" in pv["rendered"]
     _no_value(pv["rendered"], r.key_lines)
-    _no_value(json.dumps(c.prefs_dump()), r.key_lines)
-    c.call("ui.prefs_section", {"section": "delivery-preview"})
-    c.wait_until(lambda: _prov(c).get("shown_section") == "delivery-preview", timeout=10,
-                 what="the preview scrolled into view")
-    _shot(c, "preview.png")
+    _no_value(json.dumps(c.credentials_dump()), r.key_lines)
+    _shot(c, "check-shed.png", "credentials-check")
+    # Without Details: the words alone.
+    pv = _run(c, shed="widgets")
+    assert pv["details"] is False and "target" not in pv["items"][0], pv["items"][0]
     # A rule that leaves a provider out: it is named, and its items are gone.
     c.call("delivery.set", {"provider": "github", "config": {
         "enabled": True, "gh": str(r.home / "bin" / "gh"), "only": {"backends": ["remote"]}}})
-    c.call("ui.preview_delivery", {"server": SERVER, "shed": "widgets"})
-    c.wait_until(lambda: "Left out by their only rule: github" in
-                 ((_prov(c).get("preview") or {}).get("rendered") or ""),
-                 timeout=30, what="github left out")
-    assert "github" not in {i["name"] for i in _prov(c)["preview"]["items"]}
-    # No shed: everything the providers have. An unknown shed is an error, shown.
-    c.call("ui.preview_delivery", {"server": SERVER})
-    c.wait_until(lambda: (_prov(c).get("preview") or {}).get("shed") is None
-                 and "before any only rule" in ((_prov(c).get("preview") or {}).get("rendered") or ""),
-                 timeout=30, what="the shed-less preview")
-    c.call("ui.preview_delivery", {"server": SERVER, "shed": "no-such-shed"})
-    c.wait_until(lambda: (_prov(c).get("preview") or {}).get("error"), timeout=30,
-                 what="the unknown shed's error")
+    pv = _run(c, shed="folio")
+    assert pv["left_out"] == "Left out by their scope: GitHub", pv
+    assert "github" not in {i["name"] for i in pv["items"]}
+    # A shed the server will not send is fixed words by code: never the server's.
+    r.mock.shed_doc_refusal = (404, "SHED_NOT_FOUND", "SERVER SENTINEL-DOC")
+    pv = _run(c, shed="widgets")
+    assert pv["error"] == "mock has no shed by that name.", pv
+    r.mock.shed_doc_refusal = (500, "INTERNAL", "SERVER SENTINEL-DOC")
+    pv = _run(c, shed="widgets")
+    assert pv["error"] == "mock refused to send the shed.", pv
+    assert "SENTINEL-DOC" not in json.dumps(c.credentials_dump())
+    with pytest.raises(ShedError) as e:
+        c.call("delivery.preview", {"server": SERVER, "shed": "widgets"})
+    assert "SENTINEL" not in e.value.message, e.value
 
 
-def test_the_provisioning_section_in_light_and_dark(r):
+def test_check_never_runs_under_a_stale_warning(r):
+    """Check's warning names the commands it runs; turned on behind the view's back,
+    a provider's command is not run under the old warning: the press reads the
+    settings again, shows the new warning and runs nothing, and the next press runs."""
     c = r.client
-    _prefs(c)
-    c.show_preferences()
-    c.wait_until(lambda: any(s.get("server") == SERVER for s in _prov(c).get("streams", [])),
-                 timeout=30, what="the delivery stream line")
-    # The source rows moved into this section and still work as they did.
-    c.wait_until(lambda: "Use this machine" in (_prov(c).get("rendered") or ""), timeout=20,
-                 what="the source row in the section")
-    assert [s["host"] for s in c.prefs_dump()["prefs"]["values"]["sources"]] == [SERVER]
+    gh = {"enabled": False, "gh": str(r.home / "bin" / "gh")}
+    c.call("delivery.set", {"provider": "github", "config": gh})
+    _view(c)
+    c.wait_until(lambda: "runs no command" in (_check(c).get("note") or ""), timeout=15,
+                 what="the warning naming no command")
+    c.call("delivery.set", {"provider": "github", "config": {**gh, "enabled": True}})
+    before = _gh_runs(r)
+    pv = _run(c, shed="widgets")
+    assert pv["error"].startswith("The settings changed since this view read them"), pv
+    assert pv["note"].startswith("Check runs gh on this machine"), pv
+    assert _gh_runs(r) == before, "gh ran under a warning that did not name it"
+    pv = _press_check(c)
+    assert pv["error"] is None and "github" in {i["name"] for i in pv["items"]}, pv
+    assert _gh_runs(r) > before
+    # Held to the commands it was told: the preview itself refuses another list.
+    with pytest.raises(ShedError) as e:
+        c.call("delivery.preview", {"server": SERVER, "shed": "widgets", "runs": []})
+    assert e.value.code == "settings_changed", e.value
+
+
+def test_check_from_a_server_backend_and_repo(r):
+    """Criterion 17: Check from a server, a backend and a repo, with no shed: each
+    scope judged against a new shed of that kind."""
+    c = r.client
+    _view(c)
+    pv = _run(c, backend="remote", repo="example/widgets", details=True)
+    assert pv["about"] == "A new Cloud shed on mock with example/widgets", pv
+    assert (pv["by"], pv["server"], pv["backend"], pv["repo"]) == \
+        ("target", SERVER, "remote", "example/widgets"), pv
+    items = {i["name"]: i for i in pv["items"]}
+    assert items["files..env"]["stage"] == "2", "a repo-scoped project file is in"
+    assert {"ssh-key", "github", "files..npmrc"} <= set(items)
+    _no_value(json.dumps(c.credentials_dump()), r.key_lines)
+    _shot(c, "check-target.png", "credentials-check")
+    # Switching to "A shed" clears the result: it was about another Check.
+    _fill(c, "by", "shed")
+    c.wait_until(lambda: not _check(c).get("items") and _check(c).get("about") is None
+                 and _check(c).get("error") is None and _check(c).get("details") is False,
+                 timeout=10, what="the result cleared on the switch")
+    # No repo: the repo-scoped file is left out.
+    pv = _run(c, backend="vz")
+    assert pv["about"] == "A new VZ shed on mock with no repo", pv
+    assert "files..env" not in {i["name"] for i in pv["items"]}
+    # A repo that is not owner/name is refused before anything runs.
+    pv = _run(c, backend="vz", repo="widgets")
+    assert pv["error"] == "A repo is owner/name.", pv
+
+
+def test_the_credentials_view_in_light_and_dark(r):
+    c = r.client
+    _view(c)
+    c.wait_until(lambda: any(row["host"] == SERVER for row in (_cred(c).get("where") or {}).get("rows", [])),
+                 timeout=30, what="the Where row")
+    row = next(x for x in _cred(c)["where"]["rows"] if x["host"] == SERVER)
+    assert row["kind"] == "other_machine" and row["source_name"] == "desk", row
+    assert row["action"]["label"] == "Answer from here", row
     for mode in ("light", "dark"):
         c.call("ui.set_appearance", {"mode": mode})
-        c.wait_until(lambda: c.prefs_dump()["prefs"]["mode"] == mode, timeout=10,
-                     what=f"preferences in {mode}")
-        c.call("ui.prefs_section", {"section": "provisioning"})
-        c.wait_until(lambda: _prov(c).get("shown_section") == "provisioning", timeout=10,
-                     what="the section scrolled into view")
-        _shot(c, f"provisioning-{mode}.png")
-        # Scroll away so the next pass scrolls again.
-        c.call("ui.prefs_section", {"section": "delivery-preview"})
-        c.wait_until(lambda: _prov(c).get("shown_section") == "delivery-preview", timeout=10,
-                     what="scrolled away")
+        c.wait_until(lambda: (c.computed_style() or {}).get("mode") == mode, timeout=10,
+                     what=f"the dashboard in {mode}")
+        _shot(c, f"credentials-{mode}.png", "credentials")
+        _shot(c, f"what-{mode}.png", "credentials-what")
+        _edit(c, "files")
+        _shot(c, f"what-files-form-{mode}.png", "credentials-form")
+        _press(c, "files", "cancel")
+        c.wait_until(lambda: not _editor(c), timeout=10, what="the form closed")
     c.call("ui.set_appearance", {"mode": "light"})
-    c.prefs_close()
+
+
+# -- the Credentials view: Recent deliveries ----------------------------------
+
+def test_recent_deliveries_list_the_answers_with_no_value(r):
+    """Criterion 17: the answers this machine gave, newest first: when, the server,
+    the shed, the items by name and what became of each. No value. (Last: it makes
+    this machine the source.)"""
+    c = r.client
+    _view(c)
+    assert _cred(c)["recent"]["empty"] == "This machine has answered no request since the app started."
+    c.source_use(SERVER)
+    c.wait_until(lambda: next((s for s in c.call("delivery.status")["servers"]
+                               if s["server"] == SERVER), {}).get("state") == "connected",
+                 timeout=30, what="the stream connected")
+    first = r.mock.push_delivery_request(shed="widgets", repo="example/widgets", backend="vz")
+    r.mock.await_delivery_answer(first["id"], timeout=30)
+    second = r.mock.push_delivery_request(shed="folio", backend="firecracker")
+    r.mock.await_delivery_answer(second["id"], timeout=30)
+
+    def rows() -> list[dict]:
+        return (_cred(c).get("recent") or {}).get("rows") or []
+
+    c.wait_until(lambda: (c.navigate("credentials"), len(rows()) >= 2
+                          and rows()[0].get("outcome") == "delivered")[1],
+                 timeout=30, what="the two answers listed")
+    top, nxt = rows()[0], rows()[1]
+    assert (top["key"], nxt["key"]) == (second["id"], first["id"]), rows()
+    assert (top["shed"], top["server"], top["reason"]) == ("folio", SERVER, "create"), top
+    assert top["when"].endswith(" UTC"), top
+    assert top["items"].split(":")[0].endswith("items"), top
+    assert "ssh-key" in top["items"] and "files..npmrc" in top["items"], top
+    assert "files..env" in nxt["items"], nxt
+    _no_value(json.dumps(c.credentials_dump()), r.key_lines)
+    where = next(x for x in _cred(c)["where"]["rows"] if x["host"] == SERVER)
+    assert where["kind"] == "this_machine", where
+    _shot(c, "recent.png", "credentials-recent")
+    _shot(c, "where-this-machine.png", "credentials-where")

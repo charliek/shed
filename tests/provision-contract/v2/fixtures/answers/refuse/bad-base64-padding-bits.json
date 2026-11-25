@@ -1,0 +1,28 @@
+{
+  "name": "bad-base64-padding-bits",
+  "description": "content whose padding bits are not zero (YR== for YQ==).",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "f",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "x",
+        "mode": "0600",
+        "content": "YR==",
+        "fingerprint": "fp-f"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_base64"
+  }
+}

@@ -18,7 +18,7 @@ use shed_core::create::{CreateProgress, CreateStore};
 use shed_core::http::{Client, ShedError, SourceError};
 use shed_core::models::{
     display_source_text, CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SourceDocument,
-    SystemDiskUsage, SOURCE_TEXT_MAX_BYTES,
+    SourceUnbound, SystemDiskUsage, SOURCE_TEXT_MAX_BYTES,
 };
 use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
@@ -540,6 +540,15 @@ impl Backend {
         ))
     }
 
+    /// Clear this user's credential source on `host` (`POST /api/sources/unbind`): the
+    /// server forgets the binding and the machines it remembered, and ends the user's
+    /// streams. `host` names a configured server exactly.
+    pub async fn source_unbind(&self, host: &str) -> Result<SourceUnbound, SourceError> {
+        let client = resolve(&self.clients, None, Some(host))
+            .ok_or_else(|| SourceError::Shed(no_configured_host(Some(host))))?;
+        client.source_unbind().await
+    }
+
     // -- terminal (A1c-2) -------------------------------------------------
 
     /// Resolve the ssh command that opens a shell in `shed` on `host` (host-less →
@@ -760,6 +769,11 @@ pub struct HostSource {
     /// The machine that answers, or `None` when no machine is bound yet (or the server
     /// could not be read).
     pub source: Option<SourceMachineRow>,
+    /// On a directory server, the account service when it answers for this user there
+    /// instead of any machine (plan 040 §3.2); then `source` is `None`. Absent from the
+    /// row otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<SourceServiceRow>,
     /// Whether `source` is this machine.
     pub this_machine: bool,
     /// Whether `source` holds a live subscription right now.
@@ -776,7 +790,60 @@ pub struct HostSource {
     /// why; whoever shows the row keeps what it last knew for this host, notes that the
     /// server cannot be reached, and reads again later.
     pub unreachable: bool,
+    /// Why the row is in error: the fixed words of [`Self::error_class`]
+    /// ([`source_error_words`]), never the server's text or a decode error's.
     pub error: Option<String>,
+    /// `error` as a closed classification ([`SOURCE_ERROR_CLASSES`]); `None` when there
+    /// is no error. Not serialized: the `source.status` shape is unchanged.
+    #[serde(skip)]
+    pub error_class: Option<&'static str>,
+}
+
+/// Every [`HostSource::error_class`]: `unreachable` (no answer, or one that could not be
+/// read), `busy`, `unauthorized`, `forbidden`, `source_is_service`, `refused` (another
+/// API refusal), `failed` (anything else).
+pub const SOURCE_ERROR_CLASSES: &[&str] = &[
+    "unreachable",
+    "busy",
+    "unauthorized",
+    "forbidden",
+    "source_is_service",
+    "refused",
+    "failed",
+];
+
+/// The closed classification of a failed source call ([`SOURCE_ERROR_CLASSES`]); `None`
+/// for a server older than the routes (no error: it has none to show).
+pub fn source_error_class(e: &SourceError) -> Option<&'static str> {
+    Some(match e {
+        SourceError::Unsupported => return None,
+        SourceError::Busy { .. } => "busy",
+        _ if is_unreachable(e) => "unreachable",
+        SourceError::Api { code, .. } if code == shed_core::models::SOURCE_IS_SERVICE => {
+            "source_is_service"
+        }
+        SourceError::Api { status: 401, .. } | SourceError::Shed(ShedError::BadStatus(401)) => {
+            "unauthorized"
+        }
+        SourceError::Api { status: 403, .. } | SourceError::Shed(ShedError::BadStatus(403)) => {
+            "forbidden"
+        }
+        SourceError::Api { .. } => "refused",
+        SourceError::Shed(_) => "failed",
+    })
+}
+
+/// The fixed words for a [`source_error_class`]: never a server's.
+pub fn source_error_words(class: &str) -> &'static str {
+    match class {
+        "unreachable" => "the server could not be reached, or its answer could not be read",
+        "busy" => "the server is busy; it is asked again later",
+        "unauthorized" => "the server refused this app's credentials",
+        "forbidden" => "the server does not let this client see its credential source",
+        "source_is_service" => "the account service answers for you on this server",
+        "refused" => "the server refused to say who answers",
+        _ => "the server could not be asked who answers",
+    }
 }
 
 /// A machine as a source row shows it. Both strings came from other machines by way of
@@ -787,6 +854,19 @@ pub struct SourceMachineRow {
     pub id: String,
     pub name: String,
 }
+
+/// The account service as a source row shows it: its URL and, when the server says so,
+/// `not_delivering` (the service does not deliver to that server). Both came from the
+/// server and are cleaned ([`display_source_text`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceServiceRow {
+    pub url: String,
+    /// `not_delivering`, or `None`.
+    pub state: Option<String>,
+}
+
+/// The most of the account service's URL a row shows.
+pub const SOURCE_SERVICE_URL_MAX_BYTES: usize = 256;
 
 impl HostSource {
     /// The row a source document gives, as seen from the machine whose id is
@@ -800,15 +880,22 @@ impl HostSource {
                 .map(|m| display_source_text(&m.name, SOURCE_TEXT_MAX_BYTES))
                 .unwrap_or_default(),
         });
+        let service = doc.service().map(|r| SourceServiceRow {
+            url: display_source_text(&r.url, SOURCE_SERVICE_URL_MAX_BYTES),
+            state: (r.state == shed_core::models::SOURCE_STATE_NOT_DELIVERING)
+                .then(|| r.state.clone()),
+        });
         Self {
             host,
             supported: true,
             this_machine: source_id.is_some() && source_id == this_machine,
             connected: entry.is_some_and(|m| m.connected),
             source,
+            service,
             busy: false,
             unreachable: false,
             error: None,
+            error_class: None,
         }
     }
 
@@ -817,24 +904,30 @@ impl HostSource {
     /// server that could not be reached or read is `unreachable` — unknown, not
     /// unsupported.
     pub fn from_error(host: String, e: &SourceError) -> Self {
+        let class = source_error_class(e);
+        // The class's fixed words: the server's message, a decode error's quoted input
+        // and an echoed token never reach the row.
+        let words = || class.map(|c| source_error_words(c).to_string());
         let (supported, error) = match e {
             SourceError::Unsupported => (false, None),
             // Transient: it has sources, and could not say which right now.
             SourceError::Busy { .. } => (true, None),
             // The server answered the route with a refusal: it has sources, and said
             // why this caller cannot see them.
-            SourceError::Api { .. } => (true, Some(e.to_string())),
-            SourceError::Shed(_) => (false, Some(e.to_string())),
+            SourceError::Api { .. } => (true, words()),
+            SourceError::Shed(_) => (false, words()),
         };
         Self {
             host,
             supported,
             source: None,
+            service: None,
             this_machine: false,
             connected: false,
             busy: matches!(e, SourceError::Busy { .. }),
             unreachable: is_unreachable(e),
             error,
+            error_class: class,
         }
     }
 }
@@ -1680,11 +1773,10 @@ mod tests {
 
         let r = row("refusing");
         assert!(r.supported);
-        assert!(
-            r.error
-                .as_deref()
-                .unwrap()
-                .contains("service clients may not"),
+        // The refusal's class in fixed words, never the server's message.
+        assert_eq!(
+            r.error.as_deref(),
+            Some("the server does not let this client see its credential source"),
             "{r:?}"
         );
 
@@ -1782,6 +1874,163 @@ mod tests {
         assert_eq!(row.source.unwrap().name, "box");
         // An unknown host is an error, never the default server.
         let e = backend.source_use("nope", THIS_ID).await.unwrap_err();
+        assert!(
+            matches!(e, SourceError::Shed(ShedError::Config(_))),
+            "{e:?}"
+        );
+    }
+
+    /// A directory user's document (the shared fixtures, `crates/fixtures/sources/`):
+    /// the row names the account service with its URL (and `not_delivering` when the
+    /// server says so), and no machine. A machine's row carries no service member.
+    #[tokio::test]
+    async fn source_status_reads_the_account_service() {
+        let answering = |body: &'static str| async move {
+            let s = MockServer::start_async().await;
+            s.mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200).body(body);
+            })
+            .await;
+            s
+        };
+        let svc = answering(include_str!("../../fixtures/sources/service.json")).await;
+        let off = answering(include_str!(
+            "../../fixtures/sources/service-not-delivering.json"
+        ))
+        .await;
+        let machine = MockServer::start_async().await;
+        machine
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200).body(sources_body(OTHER_ID, "desk", true));
+            })
+            .await;
+        let rows = backend_with(vec![
+            client_at("svc", svc.base_url()),
+            client_at("off", off.base_url()),
+            client_at("machine", machine.base_url()),
+        ])
+        .source_status(Some(THIS_ID))
+        .await;
+        let row = |h: &str| rows.iter().find(|r| r.host == h).unwrap().clone();
+        let s = row("svc");
+        assert!(
+            s.supported && s.source.is_none() && !s.this_machine,
+            "{s:?}"
+        );
+        assert_eq!(
+            s.service,
+            Some(SourceServiceRow {
+                url: "https://accounts.example.test".into(),
+                state: None
+            })
+        );
+        assert_eq!(
+            row("off").service.unwrap().state.as_deref(),
+            Some("not_delivering")
+        );
+        let m = row("machine");
+        assert_eq!(m.service, None);
+        let shown = serde_json::to_value(&m).unwrap();
+        assert!(shown.get("service").is_none(), "{shown}");
+    }
+
+    /// A failed source call is classed from a closed list: no server's words, codes or
+    /// decode text reach the class.
+    #[test]
+    fn source_errors_are_classed_from_a_closed_list() {
+        let api = |status: u16, code: &str| SourceError::Api {
+            status,
+            code: code.into(),
+            message: "ghp_SENTINEL".into(),
+        };
+        let cases = [
+            (SourceError::Unsupported, None),
+            (
+                SourceError::Busy {
+                    retry_after: None,
+                    message: "x".into(),
+                },
+                Some("busy"),
+            ),
+            (
+                SourceError::Shed(ShedError::Transport("ghp_SENTINEL".into())),
+                Some("unreachable"),
+            ),
+            (
+                SourceError::Shed(ShedError::Decode("ghp_SENTINEL".into())),
+                Some("unreachable"),
+            ),
+            (
+                SourceError::Shed(ShedError::BadStatus(502)),
+                Some("unreachable"),
+            ),
+            (
+                SourceError::Shed(ShedError::BadStatus(401)),
+                Some("unauthorized"),
+            ),
+            (api(401, "UNAUTHORIZED"), Some("unauthorized")),
+            (api(403, "ghp_SENTINEL_CODE"), Some("forbidden")),
+            (
+                api(409, shed_core::models::SOURCE_IS_SERVICE),
+                Some("source_is_service"),
+            ),
+            (api(418, "ghp_SENTINEL_CODE"), Some("refused")),
+            (
+                SourceError::Shed(ShedError::Config("ghp_SENTINEL".into())),
+                Some("failed"),
+            ),
+        ];
+        for (e, want) in cases {
+            let got = source_error_class(&e);
+            assert_eq!(got, want, "{e:?}");
+            assert!(got.is_none_or(|c| SOURCE_ERROR_CLASSES.contains(&c)));
+            let row = HostSource::from_error("h".into(), &e);
+            assert_eq!(row.error_class, want);
+            assert_eq!(
+                row.error.as_deref(),
+                match &e {
+                    SourceError::Unsupported | SourceError::Busy { .. } => None,
+                    _ => want.map(source_error_words),
+                }
+            );
+            let shown = serde_json::to_string(&row).unwrap();
+            assert!(!shown.contains("SENTINEL"), "{shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_unbind_targets_the_named_host_only() {
+        let a = MockServer::start_async().await;
+        let unbound = a
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sources/unbind")
+                    .json_body(serde_json::json!({}));
+                t.status(200).body(format!(
+                    r#"{{"user":"ada","unbound":true,"previous":{{"id":"{THIS_ID}","name":"box"}},"forgotten_machines":2}}"#
+                ));
+            })
+            .await;
+        let b = MockServer::start_async().await;
+        let untouched = b
+            .mock_async(|w, t| {
+                w.path_contains("/api/");
+                t.status(200);
+            })
+            .await;
+        let backend = backend_with(vec![
+            client_at("a", a.base_url()),
+            client_at("b", b.base_url()),
+        ]);
+        let got = backend.source_unbind("a").await.unwrap();
+        unbound.assert_async().await;
+        untouched.assert_hits_async(0).await;
+        assert!(got.unbound);
+        assert_eq!(got.forgotten_machines, 2);
+        assert_eq!(got.previous.unwrap().id, THIS_ID);
+        let e = backend.source_unbind("nope").await.unwrap_err();
         assert!(
             matches!(e, SourceError::Shed(ShedError::Config(_))),
             "{e:?}"

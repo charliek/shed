@@ -95,6 +95,14 @@ type Record struct {
 	// knows no source would be asked, and runs its clone and hooks.
 	ScriptKey bool `json:"script_key,omitempty"`
 
+	// UserOrigin is where the shed's user came from when it was created:
+	// "local" (a server with no directory, or a local admin) or "directory"
+	// (a person of the account service), by the rule of plan 040 section
+	// 3.2. A delivery to the shed is refused (SHED_ORIGIN_CHANGED) when it
+	// is not the current origin of the user's name. A shed from before it
+	// is stamped once, at the server's first start that knows it.
+	UserOrigin string `json:"user_origin,omitempty"`
+
 	// Address is the last address the cloud reported; AddressAt is when.
 	Address   string    `json:"address,omitempty"`
 	AddressAt time.Time `json:"address_at,omitempty"`
@@ -257,10 +265,15 @@ func (s *Store) Records() (records []*Record, bad []string, err error) {
 	}
 	for _, p := range paths {
 		var r Record
-		if err := readJSON(p, &r); err != nil || r.Shed.Name == "" {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			err = json.Unmarshal(data, &r)
+		}
+		if err != nil || r.Shed.Name == "" {
 			bad = append(bad, p)
 			continue
 		}
+		delivery.NormalizeLegacy(r.Delivery, data)
 		records = append(records, &r)
 	}
 	sort.Slice(records, func(a, b int) bool { return records[a].Shed.Name < records[b].Shed.Name })

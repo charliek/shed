@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -29,35 +32,45 @@ func directoryConfigs(t *testing.T) (oneDir, twoDir, oneUsers *config.ServerConf
 	return oneDir, twoDir, oneUsers
 }
 
-// TestDirectoryServerKeepsListPeoplesSourceRecords: on a directory server
-// the start-up step does not drop the credential source records of users
-// outside the configured names (the local admins): the list's people are not
-// known at start, and their records survive every restart. With auth.users
-// naming the same local admin, the same records are dropped, as before.
-func TestDirectoryServerKeepsListPeoplesSourceRecords(t *testing.T) {
+// TestDirectoryServerRemovesDirectoryUsersBindings: on a directory server
+// the start-up step removes the credential source binding (and remembered
+// machines) of every user who is not a local admin, logging each, since the
+// account service answers for them and no machine does (plan 040, section
+// 3.2); a local admin's binding is kept. With auth.users and no directory,
+// the same user's records are dropped as not configured, as before.
+func TestDirectoryServerRemovesDirectoryUsersBindings(t *testing.T) {
 	oneDir, _, oneUsers := directoryConfigs(t)
 	for _, tc := range []struct {
 		name string
 		cfg  *config.ServerConfig
-		kept bool
+		line string
 	}{
-		{"directory", oneDir, true},
-		{"auth.users", oneUsers, false},
+		{"directory", oneDir, `Credential source: removed the binding of "ada": the account service answers for this user on this server`},
+		{"auth.users", oneUsers, `Users: dropped the credential source records of "ada", which is not a configured user`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			log.SetOutput(&logs)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
 			state := t.TempDir()
 			fb := bindingsStore(t, filepath.Join(t.TempDir(), source.FileName))
 			admitT(t, fb, "ada", smachine(1))
 			admitT(t, fb, "ada", smachine(2))
+			admitT(t, fb, "ops", smachine(3))
 			for i := 0; i < 2; i++ {
 				stamp(t, tc.name, func() (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 					return stampUnassignedIn(tc.cfg, newListOnlyBackend(), state, fb)
 				})
 				fb = restart(t, fb)
 			}
-			kept := boundTo(fb, "ada") == smachine(1).ID && len(fb.Machines("ada")) == 2
-			if kept != tc.kept {
-				t.Fatalf("ada's records kept across two starts: %v, want %v", kept, tc.kept)
+			if boundTo(fb, "ada") != "" || len(fb.Machines("ada")) != 0 {
+				t.Fatalf("ada's records survived the start: bound to %q, %d machines", boundTo(fb, "ada"), len(fb.Machines("ada")))
+			}
+			if boundTo(fb, "ops") != smachine(3).ID {
+				t.Fatalf("the local admin's binding was not kept: %q", boundTo(fb, "ops"))
+			}
+			if !strings.Contains(logs.String(), tc.line) {
+				t.Fatalf("the removal was not logged as %q:\n%s", tc.line, logs.String())
 			}
 		})
 	}

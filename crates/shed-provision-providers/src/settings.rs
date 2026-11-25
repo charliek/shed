@@ -52,6 +52,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use shed_provision::{check_path, valid_repo_pattern, Backend, Base, Only};
+
+use crate::describe::{describe, Descriptor};
 use toml::de::{DeTable, DeValue};
 use toml::Spanned;
 
@@ -233,6 +235,47 @@ impl fmt::Display for SettingsError {
 }
 
 impl std::error::Error for SettingsError {}
+
+// The keys the walk allows come from the providers' descriptors: a table's
+// are its provider's machine fields beside `enabled` and `only`, and a
+// `[[files.file]]` entry's are that list's machine fields and its `only`.
+// `describe`'s tests hold each one to a key the walk reads.
+
+/// `provider`'s descriptor.
+fn descriptor(provider: &str) -> Descriptor {
+    describe()
+        .into_iter()
+        .find(|d| d.name == provider)
+        .expect("a provider of the schema")
+}
+
+/// The keys of `provider`'s table beside `enabled` and `only`.
+fn own(provider: &str) -> Vec<&'static str> {
+    descriptor(provider)
+        .machine_fields()
+        .map(|f| f.key)
+        .collect()
+}
+
+/// The keys of one `[[files.file]]` entry.
+fn file_entry_keys() -> Vec<&'static str> {
+    let d = descriptor("files");
+    let list = d
+        .fields
+        .iter()
+        .find(|f| f.key == "file")
+        .expect("files.file");
+    let mut keys: Vec<&str> = list
+        .entry
+        .iter()
+        .filter(|f| f.place.on_machine())
+        .map(|f| f.key)
+        .collect();
+    if list.scoped {
+        keys.push("only");
+    }
+    keys
+}
 
 const EXPECT_PATH: &str = "an absolute path or one starting with ~/";
 const EXPECT_BACKEND: &str = "\"firecracker\", \"vz\" or \"remote\"";
@@ -448,7 +491,7 @@ impl Walk<'_> {
     }
 
     fn ssh_key(&self, v: &Value<'_>) -> Result<SshKeySettings, SettingsError> {
-        let (enabled, only) = self.provider(v, "ssh-key", &["key_file", "sign_commits"])?;
+        let (enabled, only) = self.provider(v, "ssh-key", &own("ssh-key"))?;
         let t = self.table(v, "ssh-key")?;
         Ok(SshKeySettings {
             enabled,
@@ -464,7 +507,7 @@ impl Walk<'_> {
     }
 
     fn github(&self, v: &Value<'_>) -> Result<GithubSettings, SettingsError> {
-        let (enabled, only) = self.provider(v, "github", &["gh"])?;
+        let (enabled, only) = self.provider(v, "github", &own("github"))?;
         let t = self.table(v, "github")?;
         let gh = match find(t, "gh") {
             None => None,
@@ -485,7 +528,7 @@ impl Walk<'_> {
     }
 
     fn api_keys(&self, v: &Value<'_>) -> Result<ApiKeysSettings, SettingsError> {
-        let (enabled, only) = self.provider(v, "api-keys", &["craze_providers", "env_files"])?;
+        let (enabled, only) = self.provider(v, "api-keys", &own("api-keys"))?;
         let t = self.table(v, "api-keys")?;
         let mut env_files = Vec::new();
         if let Some(l) = find(t, "env_files") {
@@ -514,7 +557,7 @@ impl Walk<'_> {
 
     fn envsecrets_login(&self, v: &Value<'_>) -> Result<EnvsecretsLoginSettings, SettingsError> {
         const NAME: &str = "envsecrets-login";
-        let (enabled, only) = self.provider(v, NAME, &["passphrase_file", "passphrase_command"])?;
+        let (enabled, only) = self.provider(v, NAME, &own(NAME))?;
         let t = self.table(v, NAME)?;
         let passphrase_file = find(t, "passphrase_file")
             .map(|f| self.path(f, "envsecrets-login.passphrase_file"))
@@ -552,7 +595,7 @@ impl Walk<'_> {
     }
 
     fn files(&self, v: &Value<'_>) -> Result<FilesSettings, SettingsError> {
-        let (enabled, only) = self.provider(v, "files", &["file"])?;
+        let (enabled, only) = self.provider(v, "files", &own("files"))?;
         let t = self.table(v, "files")?;
         let mut files = Vec::new();
         if let Some(l) = find(t, "file") {
@@ -577,7 +620,7 @@ impl Walk<'_> {
 
     fn file_entry(&self, v: &Value<'_>, at: &str) -> Result<FileEntry, SettingsError> {
         let t = self.table(v, at)?;
-        self.keys(t, &["from", "to", "base", "mode", "only"])?;
+        self.keys(t, &file_entry_keys())?;
         let required = |name: &str| {
             find(t, name).ok_or_else(|| {
                 self.err(
@@ -664,10 +707,8 @@ impl Settings {
             )
         })?;
         let root = doc.get_ref();
-        w.keys(
-            root,
-            &["ssh-key", "github", "api-keys", "envsecrets-login", "files"],
-        )?;
+        let providers: Vec<&str> = describe().iter().map(|d| d.name).collect();
+        w.keys(root, &providers)?;
         Ok(Settings {
             ssh_key: find(root, "ssh-key").map(|v| w.ssh_key(v)).transpose()?,
             github: find(root, "github").map(|v| w.github(v)).transpose()?,

@@ -1,0 +1,24 @@
+{
+  "name": "call-payload-too-large",
+  "description": "413 PAYLOAD_TOO_LARGE: source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 413,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "PAYLOAD_TOO_LARGE",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

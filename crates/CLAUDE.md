@@ -99,9 +99,21 @@ shedctl (no internal deps)
   in-process fake server, mTLS included), `credentials` (`SourceCredentials`: the
   credentials-scope certificate from the durable store, fenced by its stream task's stop
   signal so a retired task writes nothing), `tasks` (`SourceTasks`: one stream per server, reconciled with the
-  list; `restart` reopens one server's stream at once, after "Use this machine") and
+  list; `restart` reopens one server's stream at once, after "Answer from here") and
   `token_minter` (`SourceTokenMinter`: shed-core's `TokenMinter` over the control-token
   provider, refusing every credential shape but one complete one).
+  Plan 040 adds three things. A `409 SOURCE_IS_SERVICE` on the stream is a **settled
+  state** (the account service answers for that user): no backoff loop; the stream is
+  re-checked through `GET /api/sources` every five minutes and on a server-list change,
+  using the app's control-scope client for the server as configured now, not the
+  start-up clients. A per-server **paused set** (`paused-servers.json` beside
+  `machine.json`, atomic, `0600`; an unreadable file pauses every server and says so)
+  keeps a server's stream from being opened until "Answer from here"; a server that leaves
+  the config keeps its pause (the name is inert), so one added back is still paused. And `unbind`/`use` are **serialised per server**: unbind pauses first, waits
+  for that server's stream task to end, sends the unbind, re-reads the binding and
+  unbinds once more if a late admission re-bound this machine. Provider forms are
+  descriptor-driven (`shed-provision-providers` descriptors through `delivery.describe`),
+  so a new provider or field needs no UI code.
   `minter`'s `CredentialSource` takes a process-wide turn per store, server and scope
   around its mint and store write and re-reads the store first (adopting a fresher
   certificate another source stored), so two sources never mint twice at once; a source whose group was stopped gives up its turn at once.
@@ -122,7 +134,7 @@ shedctl (no internal deps)
   links those). `shed-source` reaches only `shed-core`/`shed-lane`/`shed-provision` and no
   `saphyr-parser`, and the same mobile crates do not reach it.
 - **`shed-provision`** (plan 039) — the source side of the provision contract
-  `tests/provision-contract/v1/`: the documents and every rule that judges
+  `tests/provision-contract/v2/`: the documents and every rule that judges
   them, matching `internal/delivery` rule for rule and in order (requests,
   answers, records; printable = Go's `unicode.IsPrint`, from a table
   `gen/printable.go` generates with Go), the stream's SSE framing, the
@@ -140,7 +152,23 @@ shedctl (no internal deps)
   parser: the envsecrets config's two flat keys are read with a strict line
   pattern. A `.pub` is exactly one key line, re-written, and must match the
   private key (OpenSSH, or derived from PEM/PKCS#8 RSA, ECDSA, DSA). Problem
-  messages are fixed text, never a value or a command's output. The `Reader`
+  messages are fixed text, never a value or a command's output. Plan 040 split
+  each provider into `Inputs` (ordered, item names carried, a redacting
+  `Debug`), a pure `build(&Inputs, &Context)` (all judging; shared with a
+  hosted source) and the desktop's `gather(&settings, &Context, &dyn Reader)`
+  (reads, keeps partial results, stops before a command that would not run
+  today); a desktop `Provider` is gather then build, and
+  `tests/golden.rs` holds its answers byte for byte to v0.11.0's
+  (`fixtures/golden-v0.11.0.json`, written once by v0.11.0; shed-desktop-core's
+  `tests/delivery_golden.rs` does the same on disk). `Context` carries the
+  host's `now` and a `budget` instant: the builder starts no provider past it
+  (`timed_out`), a gather starts no read or command past it and caps commands
+  at what is left. A host with inputs passes `shed_provision::Prepared` and
+  `NoReader`. `describe()` is the providers' descriptors (`Serialize`), and
+  the desktop's settings view is built from them and `Settings::table`; the
+  walk takes the keys it allows from them, and a test holds each to a key the
+  walk reads. `ssh_key::public_line` and `encode_ed25519` read and write OpenSSH
+  keys with no cryptography. The `Reader`
   follows links on purpose; its docs say what a disk reader must do (open
   non-blocking, check the opened descriptor is a regular file, read at most
   the limit). Default member. `shed-desktop-core` depends on

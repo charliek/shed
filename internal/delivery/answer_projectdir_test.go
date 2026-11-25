@@ -5,7 +5,7 @@ import "testing"
 // A request built in code, not decoded, must not carry a project
 // directory ParseAnswer cannot place lexically.
 func TestParseAnswerRefusesANonCanonicalProjectDir(t *testing.T) {
-	body := []byte(`{"version":1,"id":"0123456789abcdef0123456789abcdef","items":[],"problems":[]}`)
+	body := []byte(`{"version":2,"id":"0123456789abcdef0123456789abcdef","items":[],"problems":[]}`)
 	for _, dir := range []string{"/home/shed/", "/home/shed//x", "home/shed/x", "/home/shed/./x", "/home/shed/../x"} {
 		t.Run(dir, func(t *testing.T) {
 			req := &Request{ID: "0123456789abcdef0123456789abcdef"}

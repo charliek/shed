@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/delivery/deliverytest"
+	"github.com/charliek/shed/internal/remote/guest"
 )
 
 // The tracked steps through delivery.Run on a fake host, a fake source and
@@ -156,7 +158,7 @@ func shed(name string) delivery.RequestShed {
 func createRun(svc *delivery.Service, h *fakeHost, p *progress) *delivery.Run {
 	return &delivery.Run{
 		Service: svc, Reason: delivery.ReasonCreate,
-		Params:  delivery.Params{User: "alice", Shed: shed("widgets")},
+		Params:  delivery.Params{Origin: delivery.OriginLocal, User: "alice", Shed: shed("widgets")},
 		HasRepo: true, Prior: delivery.NewRecord(), Host: h, Report: p.report(),
 	}
 }
@@ -483,7 +485,7 @@ func TestRunProvisionFinishesWhatCreateLeft(t *testing.T) {
 	h.calls = nil
 	prov := &delivery.Run{
 		Service: svc, Reason: delivery.ReasonProvision,
-		Params:  delivery.Params{User: "alice", Shed: shed("widgets")},
+		Params:  delivery.Params{Origin: delivery.OriginLocal, User: "alice", Shed: shed("widgets")},
 		HasRepo: true, Prior: rec, Host: h, Report: p.report(),
 	}
 	rec, err = prov.Execute(context.Background())
@@ -535,7 +537,7 @@ func TestRunRedeliveryKeepsWhatTheAnswerDropped(t *testing.T) {
 	})
 	prov := &delivery.Run{
 		Service: svc, Reason: delivery.ReasonProvision,
-		Params:  delivery.Params{User: "alice", Shed: shed("widgets")},
+		Params:  delivery.Params{Origin: delivery.OriginLocal, User: "alice", Shed: shed("widgets")},
 		HasRepo: true, Prior: rec, Host: h, Report: p.report(),
 	}
 	rec, err = prov.Execute(context.Background())
@@ -583,7 +585,7 @@ func TestRunNoRecordStartsFromStageOne(t *testing.T) {
 	h.installed = true
 	prov := &delivery.Run{
 		Service: svc, Reason: delivery.ReasonProvision,
-		Params:  delivery.Params{User: "alice", Shed: shed("widgets")},
+		Params:  delivery.Params{Origin: delivery.OriginLocal, User: "alice", Shed: shed("widgets")},
 		HasRepo: true, Host: h, Report: p.report(),
 	}
 	rec, err := prov.Execute(context.Background())
@@ -731,7 +733,7 @@ func TestRunWritesItsAuditEvent(t *testing.T) {
 	// A service client's shed: not applicable, the client named as the
 	// owner and, with no actor on the context, as the one who caused it.
 	r := createRun(svc, newHost(), &progress{})
-	r.Params = delivery.Params{Owner: "ci", ServiceClient: true, Shed: shed("built")}
+	r.Params = delivery.Params{Origin: delivery.OriginLocal, Owner: "ci", ServiceClient: true, Shed: shed("built")}
 	if _, err := r.Execute(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -743,23 +745,388 @@ func TestRunWritesItsAuditEvent(t *testing.T) {
 	}
 }
 
-// TestResumedRunNeverAsksASource: a resumed create (a job that lost the
-// create request) asks no source even when one is bound and connected by
-// the time it runs: its stages read not applicable and nothing is sent.
-func TestResumedRunNeverAsksASource(t *testing.T) {
-	src, svc := source(t, 5*time.Second)
-	src.Set("alice", deliverytest.Answer, canned)
-	h, p := newHost(), &progress{}
-	run := createRun(svc, h, p)
-	run.Resumed = true
-	rec, err := run.Execute(context.Background())
+// resumeAt is a create interrupted at a point: the record as it was saved
+// there (stage 1 and the last delivery as the fresh run left them).
+func resumeAt(t *testing.T, stage1 delivery.Step, last *delivery.Last, clone delivery.Step) *delivery.Record {
+	t.Helper()
+	rec := delivery.NewRecord()
+	rec.Steps.Stage1, rec.Steps.Clone, rec.Last = stage1, clone, last
+	rec.State = delivery.DeriveState(rec)
+	if err := rec.Validate(); err != nil {
+		t.Fatalf("the interrupted record does not validate: %v", err)
+	}
+	return rec
+}
+
+// TestResumeReadsTheRecordOnly: a resumed create (a job that lost the create
+// request: a server restart, a cloud read that failed) asks no source, even
+// one bound and connected by the time it runs, never rewrites a recorded
+// step or the last delivery, and runs only the steps not yet recorded whose
+// dependencies are recorded and that need no bundle (plan 040, section 3.3),
+// at each point a create can be interrupted.
+func TestResumeReadsTheRecordOnly(t *testing.T) {
+	at := "2026-11-25T10:00:00Z"
+	na := &delivery.Last{At: at, Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeNotRequested}
+	accepted := &delivery.Last{At: at, Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeAccepted, Source: delivery.ServiceSource()}
+	offline := &delivery.Last{At: at, Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeNoAnswer,
+		Failure: &delivery.Failure{Reason: delivery.ReasonSourceOffline}, Source: delivery.ServiceSource()}
+	owed := delivery.Step{State: delivery.StepOwed}
+	done := delivery.Step{State: delivery.StepDone}
+	for _, tc := range []struct {
+		name  string
+		prior *delivery.Record
+		// steps is the record after the resume; calls what ran.
+		steps, calls string
+		saves        int
+	}{
+		{
+			name:  "before stage 1 was recorded: nothing runs, every step stays owed",
+			prior: delivery.NewRecord(),
+			steps: "owed owed owed owed", calls: "", saves: 0,
+		},
+		{
+			name:  "after stage 1 recorded not applicable: the clone and the install hook run",
+			prior: resumeAt(t, delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNotApplicable}, na, owed),
+			steps: "skipped/not_applicable done skipped/not_applicable done", calls: "clone install startup", saves: 3,
+		},
+		{
+			name:  "after stage 1 done with the clone not recorded: the clone runs, stage 2 and the hook stay owed",
+			prior: resumeAt(t, done, accepted, owed),
+			steps: "done done owed owed", calls: "clone", saves: 3,
+		},
+		{
+			name:  "after stage 1 done and the clone done: stage 2 and the hook stay owed",
+			prior: resumeAt(t, done, accepted, done),
+			steps: "done done owed owed", calls: "", saves: 2,
+		},
+		{
+			name:  "after stage 1 recorded failed: the clone runs as on a fresh run, stage 2 and the hook stay owed",
+			prior: resumeAt(t, delivery.Step{State: delivery.StepFailed, Reason: delivery.ReasonSourceOffline}, offline, owed),
+			steps: "failed/source_offline done owed owed", calls: "clone", saves: 3,
+		},
+		{
+			name:  "a clone recorded failed is not tried again",
+			prior: resumeAt(t, delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNotApplicable}, na, delivery.Step{State: delivery.StepFailed, Reason: delivery.ReasonCloneFailed}),
+			steps: "skipped/not_applicable failed/clone_failed skipped/not_applicable owed", calls: "", saves: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A source that would answer at once: a resumed run must not ask it.
+			src, svc := source(t, 5*time.Second)
+			src.Set("alice", deliverytest.Answer, canned)
+			h, p := newHost(), &progress{}
+			run := createRun(svc, h, p)
+			run.Resumed, run.Prior = true, tc.prior
+			rec, err := run.Execute(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := len(src.Requests()); n != 0 {
+				t.Fatalf("a resumed run sent %d request(s)", n)
+			}
+			if got := steps(rec); got != tc.steps {
+				t.Fatalf("steps = %s, want %s", got, tc.steps)
+			}
+			if got := strings.Join(h.calls, " "); got != tc.calls {
+				t.Fatalf("calls = %q, want %q", got, tc.calls)
+			}
+			if len(h.saved) != tc.saves {
+				t.Fatalf("%d saves, want %d", len(h.saved), tc.saves)
+			}
+			// Stage 1 and the last delivery are never rewritten.
+			if rec.Steps.Stage1 != tc.prior.Steps.Stage1 {
+				t.Fatalf("stage 1 rewritten: %+v, was %+v", rec.Steps.Stage1, tc.prior.Steps.Stage1)
+			}
+			if a, b := mustJSON(t, rec.Last), mustJSON(t, tc.prior.Last); a != b {
+				t.Fatalf("last rewritten: %s, was %s", a, b)
+			}
+			checkSaved(t, h)
+		})
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := jsonOf(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(src.Requests()); n != 0 {
-		t.Fatalf("a resumed run sent %d request(s)", n)
+	return b
+}
+
+// TestRunRefusesAShedWhoseOriginChanged: a delivery to a shed whose recorded
+// user origin is not its user's current one is refused before anything is
+// asked or saved, and writes no audit event.
+func TestRunRefusesAShedWhoseOriginChanged(t *testing.T) {
+	src, svc := source(t, 5*time.Second)
+	src.Set("alice", deliverytest.Answer, canned)
+	svc.SetOrigin(func(user string) string { return delivery.OriginDirectory })
+	h := newHost()
+	run := createRun(svc, h, &progress{})
+	run.Reason = delivery.ReasonProvision
+	run.Params.Origin = delivery.OriginLocal
+	prior := run.Prior.Clone()
+	rec, err := run.Execute(context.Background())
+	if !errors.Is(err, delivery.ErrShedOriginChanged) {
+		t.Fatalf("Execute = %v, want ErrShedOriginChanged", err)
 	}
-	if got := steps(rec); got != "skipped/not_applicable done skipped/not_applicable done" {
-		t.Fatalf("steps = %s", got)
+	if len(src.Requests()) != 0 || len(h.saved) != 0 || len(h.calls) != 0 {
+		t.Fatalf("a refused run asked %d, saved %d, called %v", len(src.Requests()), len(h.saved), h.calls)
+	}
+	if mustJSON(t, rec) != mustJSON(t, prior) {
+		t.Fatalf("the record changed: %s", mustJSON(t, rec))
+	}
+	// The same origin is not refused; no recorded origin is (it fails
+	// closed), and a run for such a shed asks nothing and saves nothing.
+	if err := svc.CheckOrigin("alice", delivery.OriginDirectory); err != nil {
+		t.Fatalf("CheckOrigin(directory) = %v", err)
+	}
+	if err := svc.CheckOrigin("alice", ""); !errors.Is(err, delivery.ErrShedOriginUnknown) {
+		t.Fatalf("CheckOrigin(\"\") = %v, want ErrShedOriginUnknown", err)
+	}
+	run = createRun(svc, h, &progress{})
+	run.Params.Origin = ""
+	if _, err := run.Execute(context.Background()); !errors.Is(err, delivery.ErrShedOriginUnknown) {
+		t.Fatalf("Execute with no origin = %v", err)
+	}
+	if len(src.Requests()) != 0 || len(h.saved) != 0 {
+		t.Fatal("a shed with no origin was asked for or saved")
+	}
+}
+
+// pausedAgent is a shed's agent whose probe waits at gate (after telling
+// entered it began).
+type pausedAgent struct {
+	*deliverytest.Agent
+	entered chan struct{}
+	gate    chan struct{}
+	once    sync.Once
+}
+
+func (a *pausedAgent) Probe(ctx context.Context) (guest.AgentInfo, error) {
+	a.once.Do(func() { close(a.entered) })
+	<-a.gate
+	return a.Agent.Probe(ctx)
+}
+
+// pausedHost is a fakeHost whose agent's probe pauses.
+type pausedHost struct {
+	*fakeHost
+	agent *pausedAgent
+}
+
+func (h *pausedHost) Agent() delivery.Agent { return h.agent }
+
+// countingHosted is an account service that answers every request with an
+// accepted answer, after gate (when set), whatever its context says (a late
+// reply), and counts the requests.
+type countingHosted struct {
+	mu    sync.Mutex
+	calls int
+	gate  chan struct{}
+}
+
+func (c *countingHosted) Deliver(_ context.Context, request []byte) (delivery.HostedStatus, []byte) {
+	c.mu.Lock()
+	c.calls++
+	gate := c.gate
+	c.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	req, _ := delivery.ParseRequest(request)
+	return delivery.HostedAnswer, canned(req)
+}
+
+func (c *countingHosted) NotDelivering() bool { return false }
+
+func (c *countingHosted) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// hostedRun is a directory user's create on a service whose source is h.
+func hostedRun(h *countingHosted) (*delivery.Service, *fakeHost) {
+	svc := delivery.NewService(deliverytest.NewSource(), 5*time.Second)
+	svc.SetOrigin(func(string) string { return delivery.OriginDirectory })
+	svc.SetHosted(h)
+	return svc, newHost()
+}
+
+// TestHostedRunEndsWithItsShed: a directory user's run is ended by a stop or
+// delete of its shed from its admission on (plan 040, section 3.3): paused
+// in the agent's probe, or admitted and not yet started, it never asks the
+// account service and saves nothing; and a reply that comes after the stop
+// is never written. The shed's slot is free afterwards.
+func TestHostedRunEndsWithItsShed(t *testing.T) {
+	t.Run("stopped during the probe", func(t *testing.T) {
+		hosted := &countingHosted{}
+		svc, fh := hostedRun(hosted)
+		agent := &pausedAgent{Agent: fh.agent, entered: make(chan struct{}), gate: make(chan struct{})}
+		run := createRun(svc, fh, &progress{})
+		run.Params.Origin = delivery.OriginDirectory
+		run.Host = &pausedHost{fakeHost: fh, agent: agent}
+		run.Ticket = svc.Admit("widgets", shed("widgets").ID)
+		errc := make(chan error, 1)
+		go func() { _, err := run.Execute(context.Background()); errc <- err }()
+		<-agent.entered
+		svc.EndShed("widgets", shed("widgets").ID)
+		close(agent.gate)
+		if err := <-errc; !errors.Is(err, delivery.ErrShedEnded) {
+			t.Fatalf("Execute = %v, want ErrShedEnded", err)
+		}
+		if hosted.count() != 0 || len(fh.saved) != 0 || len(fh.agent.Writes()) != 0 {
+			t.Fatalf("an ended run asked %d times, saved %d, wrote %d", hosted.count(), len(fh.saved), len(fh.agent.Writes()))
+		}
+		// The slot is free, and a new run of the shed asks.
+		next := createRun(svc, newHost(), &progress{})
+		next.Params.Origin = delivery.OriginDirectory
+		if rec, err := next.Execute(context.Background()); err != nil || hosted.count() != 1 || rec.Last.Outcome != delivery.OutcomeAccepted {
+			t.Fatalf("the next run = %v (%d asked)", err, hosted.count())
+		}
+	})
+	t.Run("stopped between its admission and its start", func(t *testing.T) {
+		hosted := &countingHosted{}
+		svc, fh := hostedRun(hosted)
+		run := createRun(svc, fh, &progress{})
+		run.Params.Origin = delivery.OriginDirectory
+		run.Ticket = svc.Admit("widgets", shed("widgets").ID)
+		svc.EndShed("widgets", shed("widgets").ID)
+		if _, err := run.Execute(context.Background()); !errors.Is(err, delivery.ErrShedEnded) {
+			t.Fatalf("Execute = %v, want ErrShedEnded", err)
+		}
+		if hosted.count() != 0 || len(fh.saved) != 0 {
+			t.Fatalf("asked %d, saved %d", hosted.count(), len(fh.saved))
+		}
+	})
+	t.Run("a reply after the stop is not written", func(t *testing.T) {
+		hosted := &countingHosted{gate: make(chan struct{})}
+		svc, fh := hostedRun(hosted)
+		run := createRun(svc, fh, &progress{})
+		run.Params.Origin = delivery.OriginDirectory
+		errc := make(chan error, 1)
+		go func() { _, err := run.Execute(context.Background()); errc <- err }()
+		for hosted.count() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		svc.EndShed("widgets", shed("widgets").ID)
+		close(hosted.gate)
+		if err := <-errc; !errors.Is(err, delivery.ErrShedEnded) {
+			t.Fatalf("Execute = %v, want ErrShedEnded", err)
+		}
+		if len(fh.agent.Writes()) != 0 || len(fh.saved) != 0 {
+			t.Fatalf("a late reply was written (%d writes, %d saves)", len(fh.agent.Writes()), len(fh.saved))
+		}
+	})
+}
+
+// TestStaleStopLeavesAReplacementAlone: a stop or delete is matched to the
+// shed incarnation it was checked against (its permanent id): one of an
+// older shed of the same name, delivered late, does not end a replacement's
+// run, paused in its probe; the replacement's own stop does.
+func TestStaleStopLeavesAReplacementAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stopID  string
+		wantErr error
+	}{
+		{"the old incarnation's stop", "oldincarnation0000000000000", nil},
+		{"its own stop", shed("widgets").ID, delivery.ErrShedEnded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hosted := &countingHosted{}
+			svc, fh := hostedRun(hosted)
+			agent := &pausedAgent{Agent: fh.agent, entered: make(chan struct{}), gate: make(chan struct{})}
+			run := createRun(svc, fh, &progress{})
+			run.Params.Origin = delivery.OriginDirectory
+			run.Host = &pausedHost{fakeHost: fh, agent: agent}
+			run.Ticket = svc.Admit("widgets", shed("widgets").ID)
+			errc := make(chan error, 1)
+			go func() { _, err := run.Execute(context.Background()); errc <- err }()
+			<-agent.entered
+			svc.EndShed("widgets", tc.stopID)
+			close(agent.gate)
+			err := <-errc
+			if tc.wantErr == nil && (err != nil || hosted.count() != 1) {
+				t.Fatalf("the replacement's run = %v (%d asked), want it delivered", err, hosted.count())
+			}
+			if tc.wantErr != nil && (!errors.Is(err, tc.wantErr) || hosted.count() != 0) {
+				t.Fatalf("the run = %v (%d asked), want %v", err, hosted.count(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestEndedRunKeepsItsCause: a run whose shed is stopped after its answer
+// arrived and before its step reports ErrShedEnded (so a provision maps it to
+// 409), not a bare cancellation.
+func TestEndedRunKeepsItsCause(t *testing.T) {
+	hosted := &countingHosted{}
+	svc, fh := hostedRun(hosted)
+	run := createRun(svc, fh, &progress{})
+	run.Params.Origin = delivery.OriginDirectory
+	run.Host = &stoppingHost{fakeHost: fh, stop: func() { svc.EndShed("widgets", shed("widgets").ID) }}
+	_, err := run.Execute(context.Background())
+	if !errors.Is(err, delivery.ErrShedEnded) {
+		t.Fatalf("Execute = %v, want ErrShedEnded", err)
+	}
+	if hosted.count() != 1 || len(fh.agent.Writes()) != 0 || len(fh.saved) != 0 {
+		t.Fatalf("asked %d, wrote %d, saved %d", hosted.count(), len(fh.agent.Writes()), len(fh.saved))
+	}
+}
+
+// stoppingHost is a fakeHost whose shed is stopped as its first step
+// begins, as a stop that lands between the answer and the write: the step
+// then refuses, as a real host's does, with its context's cause.
+type stoppingHost struct {
+	*fakeHost
+	stop func()
+}
+
+func (h *stoppingHost) Step(ctx context.Context, fn func(context.Context) error) error {
+	h.stop()
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return h.fakeHost.Step(ctx, fn)
+}
+
+// endingAgent is an agent that stops the shed while it writes stage 1: the
+// write is done, and the save after it finds the run ended.
+type endingAgent struct {
+	*deliverytest.Agent
+	stop func()
+}
+
+func (a *endingAgent) Run(ctx context.Context, argv []string, stdin io.Reader, stdout io.Writer, max int) (int, error) {
+	code, err := a.Agent.Run(ctx, argv, stdin, stdout, max)
+	a.stop()
+	return code, err
+}
+
+// agentHost is a fakeHost with another agent.
+type agentHost struct {
+	*fakeHost
+	agent delivery.Agent
+}
+
+func (h *agentHost) Agent() delivery.Agent { return h.agent }
+
+// TestEndedDuringItsWriteKeepsItsCause: a stop that lands while stage 1 is
+// written leaves the save to find the run ended: it reports ErrShedEnded,
+// not a bare cancellation, and nothing is saved.
+func TestEndedDuringItsWriteKeepsItsCause(t *testing.T) {
+	hosted := &countingHosted{}
+	svc, fh := hostedRun(hosted)
+	run := createRun(svc, fh, &progress{})
+	run.Params.Origin = delivery.OriginDirectory
+	run.Host = &agentHost{fakeHost: fh, agent: &endingAgent{Agent: fh.agent, stop: func() { svc.EndShed("widgets", shed("widgets").ID) }}}
+	_, err := run.Execute(context.Background())
+	if !errors.Is(err, delivery.ErrShedEnded) {
+		t.Fatalf("Execute = %v, want ErrShedEnded", err)
+	}
+	if len(fh.saved) != 0 {
+		t.Fatalf("%d saves after the run ended", len(fh.saved))
 	}
 }

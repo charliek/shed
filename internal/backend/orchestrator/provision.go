@@ -42,6 +42,9 @@ type LocalShed struct {
 	ResetGen uint64
 	// Request is the shed as a delivery request names it.
 	Request delivery.RequestShed
+	// Origin is the shed's recorded user origin (user_origin): "local",
+	// "directory", or "" for a shed from before it.
+	Origin string
 	// Repo is the repository URL as stored (the clone's).
 	Repo string
 	// CloneEnv is the environment the clone runs with besides the server's
@@ -96,8 +99,11 @@ type LocalRun struct {
 	// and server-env rule).
 	scriptKey, fromSnapshot, noProvision bool
 	base                                 *runBase
-	clone                                func(ctx context.Context, ls *LocalShed) delivery.Step
-	hooks                                func(ctx context.Context, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool)
+	// ticket is the run's admission (delivery.Service.Admit), taken with
+	// the shed's provisioning slot: a stop or delete after it ends the run.
+	ticket delivery.Ticket
+	clone  func(ctx context.Context, ls *LocalShed) delivery.Step
+	hooks  func(ctx context.Context, install bool, startup func(delivery.Step, bool) bool) (delivery.Step, bool)
 }
 
 // runBase is what every step of a run is checked against: the shed's id,
@@ -124,12 +130,24 @@ func BeginProvision(ctx context.Context, lb LocalBackend, svc *delivery.Service,
 	if err == nil && ls.Shed.Status != config.StatusRunning {
 		err = fmt.Errorf("%w: %s is %s; start it first", config.ErrShedNotRunningSentinel, name, ls.Shed.Status)
 	}
+	if err == nil {
+		// A shed whose user's name has changed origin since it was made is
+		// refused before anything is asked (409 SHED_ORIGIN_CHANGED).
+		_, user := config.ShedOwnership(ls.Shed.Owner, ls.Shed.User)
+		err = svc.CheckOrigin(user, ls.Origin)
+	}
+	var ticket delivery.Ticket
+	if err == nil {
+		// The run's admission, under the lifecycle lock a stop or delete
+		// takes before it ends the shed's runs.
+		ticket = svc.Admit(name, ls.ID)
+	}
 	unlock()
 	if err != nil {
 		release()
 		return nil, err
 	}
-	return &LocalRun{lb: lb, svc: svc, name: name, reason: delivery.ReasonProvision, first: ls, release: release}, nil
+	return &LocalRun{lb: lb, svc: svc, name: name, reason: delivery.ReasonProvision, first: ls, release: release, ticket: ticket}, nil
 }
 
 // Release gives the shed's provisioning slot back. It is safe to call more
@@ -161,10 +179,11 @@ func (r *LocalRun) Run(ctx context.Context) (*config.Shed, error) {
 		Reason:  r.reason,
 		Params: delivery.Params{
 			User: user, Shed: ls.Request, Owner: ls.Shed.Owner, ServiceClient: ls.Shed.Owner != "",
-			ScriptKey: r.scriptKey, FromSnapshot: r.fromSnapshot,
+			ScriptKey: r.scriptKey, FromSnapshot: r.fromSnapshot, Origin: ls.Origin,
 		},
 		HasRepo:     ls.Repo != "",
 		NoProvision: r.noProvision,
+		Ticket:      r.ticket,
 		Prior:       ls.Record,
 		Host:        h,
 		Report:      backend.DeliveryProgress(ctx),
@@ -201,8 +220,10 @@ type localHost struct {
 }
 
 func (h *localHost) Step(ctx context.Context, fn func(ctx context.Context) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx.Err() != nil {
+		// Its cause, so a run its shed's stop or delete ended reports
+		// that (ErrShedEnded), not a bare cancellation.
+		return context.Cause(ctx)
 	}
 	unlock := h.lb.LockShed(h.name)
 	defer unlock()

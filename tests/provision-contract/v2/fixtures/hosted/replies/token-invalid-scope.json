@@ -1,0 +1,19 @@
+{
+  "name": "token-invalid-scope",
+  "description": "400 invalid_scope: the service does not offer delivery, or does not let this server ask. not_applicable.",
+  "request": "create-repo",
+  "token": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "error": "invalid_scope",
+      "error_description": "fixed text"
+    }
+  },
+  "expect": {
+    "result": "not_applicable"
+  }
+}

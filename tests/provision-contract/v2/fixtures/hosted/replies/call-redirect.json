@@ -1,0 +1,19 @@
+{
+  "name": "call-redirect",
+  "description": "302 with a Location: no redirect is followed. source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 302,
+      "headers": {
+        "Location": "https://accounts.example.test/elsewhere",
+        "Cache-Control": "no-store"
+      },
+      "text": ""
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

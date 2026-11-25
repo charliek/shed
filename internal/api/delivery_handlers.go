@@ -1,7 +1,7 @@
 package api
 
 // The provision contract's transport for a machine source
-// (tests/provision-contract/v1/CONTRACT.md, section 3): the delivery request
+// (tests/provision-contract/v2/CONTRACT.md, section 3): the delivery request
 // stream and the answer route. The machine is admitted for its user by the
 // pin (plugin.Registry.SubscribeDelivery, under the user's gate, as a bus
 // subscription is); the requests, their binding and the judgement of an
@@ -123,7 +123,7 @@ func (s *Server) deliveryReady(w http.ResponseWriter) bool {
 // stream ends every request it carried fails.
 func (s *Server) handleDeliveryStream(w http.ResponseWriter, r *http.Request) {
 	user, ok := deliveryCaller(w, r)
-	if !ok || !s.deliveryReady(w) {
+	if !ok || s.refuseServiceTarget(w, r, user) || !s.deliveryReady(w) {
 		return
 	}
 	machine, ok := machineFromRequest(r)
@@ -141,6 +141,8 @@ func (s *Server) handleDeliveryStream(w http.ResponseWriter, r *http.Request) {
 			writeSourceNotBound(w, notBound.Bound)
 		case errors.As(err, &throttled):
 			writeAdmissionThrottled(w, throttled.RetryAfter)
+		case errors.Is(err, plugin.ErrSourceIsService):
+			writeError(w, http.StatusConflict, config.ErrSourceIsService, config.SourceIsServiceMessage)
 		case errors.Is(err, plugin.ErrDuplicateStream):
 			writeDuplicateDeliveryStream(w)
 		case errors.Is(err, plugin.ErrBindingStore):
@@ -283,7 +285,7 @@ func writeAnswerRefused(w http.ResponseWriter, rule delivery.Rule, where string)
 // a directory server, against the user list as it is now).
 func (s *Server) handleDeliveryAnswer(w http.ResponseWriter, r *http.Request) {
 	user, ok := deliveryCaller(w, r)
-	if !ok || !s.deliveryReady(w) {
+	if !ok || s.refuseServiceTarget(w, r, user) || !s.deliveryReady(w) {
 		return
 	}
 	machine, ok := machineFromRequest(r)

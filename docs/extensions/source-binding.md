@@ -17,6 +17,17 @@ This page covers how a machine identifies itself, how the pin is set, what the o
 machines show, and how to move it. The server side of the same rules is in
 [Security](../reference/security.md); the commands are in the [CLI reference](../reference/cli.md).
 
+## Users the account service answers for
+
+On a server that takes its users from an [account service](../guides/user-directory.md), a user the service lists has **no binding**: the account service is their credential source, and no machine answers for them there. Local admins, named in the server's own config, keep a pin as described on this page.
+
+- At start, a directory server removes every binding whose user is not a local admin, and logs each removal. Nothing recreates one: a first connection from such a user's machine is not bound, and every route that would bind, move or clear a pin answers `409 SOURCE_IS_SERVICE`. That covers `shed source use` and `unbind`, the bus's listener routes and the delivery stream and answer routes.
+- The source routes judge the **target** user. An admin's `?user=` names the user they act on, so an admin asking about a directory user gets the service document, not their own.
+- `GET /api/sources` answers `machines: []` and a service entry in the delivery slot; `shed source status` says the account service answers. See [the API](../reference/api.md#get-apisources).
+- A name that moves into the local-admin set later never meets a pin made while it was a directory user, because none was made.
+
+See [Credentials from the account service](../guides/credentials-from-the-account-service.md).
+
 ## Machine identity
 
 Each machine that runs the shed desktop app keeps an identity in one file. One machine is one
@@ -76,8 +87,8 @@ The server keeps one pin per user. It is set in one of two ways:
   user is bound (the pin records `first-connect` as who bound it). The app opens a stream to
   **every server in your shed config**, so you do not choose a server for it to ask: the
   first of your machines to sign in to a server becomes your source there.
-- **On purpose, by moving it.** **Use this machine** in the app's Preferences, under
-  **Provisioning**, or `shed source use` (the app's IPC op is `source.use`).
+- **On purpose, by moving it.** **Use this machine** in the app's
+  [Credentials view](../desktop/credentials.md), or `shed source use` (the app's IPC op is `source.use`).
 
 A pin can also be **cleared** with `shed source unbind` (see [Clearing the
 source](#clearing-the-source)); the next machine to connect is then bound, as the first one
@@ -119,11 +130,9 @@ first machine to connect for each user becomes its source.
 
 A machine that is not the source shows it in these places:
 
-- The app's Preferences show the source's name on that server's row, with a **Use this
-  machine** button. A server that cannot be reached when Preferences reads it keeps the row
-  it last showed, marked **cannot reach the server**, and Preferences reads it again a few
-  times; a server that answers but is busy shows **server busy, retrying**. A server older
-  than credential sources has no row.
+- The app's [Credentials view](../desktop/credentials.md) shows the source's name for each
+  server, with an **Answer from here** button. A server older than credential sources has a
+  row that says so, with no action.
 - `delivery.status` (IPC) reports that server's stream as `not_bound`, or `duplicate` for a
   duplicate.
 - From a terminal, `shed source status` names the source and says whether it is connected.
@@ -154,9 +163,9 @@ its exact name, as `shed source ls` lists them; put `--` before a name that begi
 A machine appears in `shed source ls` only after its app has opened a stream to that server
 at least once. An admin can act on another user's source with `--user`.
 
-From the desktop app: Preferences → Provisioning lists one row per server that supports
+From the desktop app: the Credentials view lists each server that supports
 credential sources, and **Use this machine** makes the machine the app runs on the source
-there. See [Provisioning](../desktop/provisioning.md).
+there. See [Credentials](../desktop/credentials.md).
 
 What a move does:
 

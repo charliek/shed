@@ -1,0 +1,20 @@
+{
+  "name": "create-repo-no-name",
+  "description": "A create with a repository whose URL does not parse to owner/name: the URL alone.",
+  "request": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "reason": "create",
+    "deadline": "2026-11-23T10:00:30Z",
+    "user": "ada",
+    "shed": {
+      "name": "widgets",
+      "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "backend": "vz",
+      "repo": {
+        "url": "https://git.example.test/deep/group/widgets.git"
+      },
+      "project_dir": "/home/shed/widgets"
+    }
+  }
+}

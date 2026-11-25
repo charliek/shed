@@ -65,17 +65,20 @@ var ErrOutage = errors.New("the control directory holds an outage file: every lo
 
 // Size limits on the control directory's files.
 const (
-	maxUsersFile    = 8 << 20
-	maxControlLines = 1 << 20
+	maxUsersFile      = 8 << 20
+	maxDeliveriesFile = 16 << 20
+	maxControlLines   = 1 << 20
 )
 
 // ControlDir is the inputs as files in one directory, read on every request
 // that needs them:
 //
-//	users.json  the list as served: [{"name", "admin", "keys": [{"key", "label", "expires"?}]}]
-//	codes       one "<server name> <code>" per line; each code is spent once, in memory
-//	disabled    one client id per line
-//	outage      present: every lookup fails, as in a storage outage
+//	users.json      the list as served: [{"name", "admin", "keys": [{"key", "label", "expires"?}]}]
+//	codes           one "<server name> <code>" per line; each code is spent once, in memory
+//	disabled        one client id per line
+//	no-deliveries   one client id per line: servers that may not ask for deliveries (every other may)
+//	deliveries.json each person's source: {"<user>": "NO_SOURCE" | Delivery}; a person not in it has none
+//	outage          present: every lookup fails, as in a storage outage
 //
 // The directory and each file must not be writable by group or others, and
 // neither may be a symbolic link. users.json missing is a failed lookup
@@ -293,4 +296,48 @@ func (c *ControlDir) Disabled(clientID string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// DeliveriesDenied looks a client id up in the file no-deliveries: every
+// server may ask for deliveries until it is listed there.
+func (c *ControlDir) DeliveriesDenied(clientID string) (bool, error) {
+	recs, err := c.lines("no-deliveries")
+	if err != nil {
+		return false, err
+	}
+	for i, f := range recs {
+		if len(f) != 1 {
+			return false, fmt.Errorf("no-deliveries: record %d (blank lines not counted) is not one client id", i+1)
+		}
+		if f[0] == clientID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Delivery looks a person up in deliveries.json: one JSON object from user
+// name to "NO_SOURCE" or a Delivery, each member named once. The file
+// missing, or a person not in it, is no source.
+func (c *ControlDir) Delivery(user string) (Delivery, bool, error) {
+	b, exists, err := c.read("deliveries.json", maxDeliveriesFile)
+	if err != nil || !exists {
+		return Delivery{}, false, err
+	}
+	if err := checkStrictJSON(b, 16); err != nil {
+		return Delivery{}, false, fmt.Errorf("deliveries.json: %w", err)
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(b, &all); err != nil || all == nil {
+		return Delivery{}, false, errors.New("deliveries.json: not one JSON object")
+	}
+	raw, ok := all[user]
+	if !ok {
+		return Delivery{}, false, nil
+	}
+	d, found, err := decodeDelivery(raw)
+	if err != nil {
+		return Delivery{}, false, fmt.Errorf("deliveries.json: %s: %w", user, err)
+	}
+	return d, found, nil
 }

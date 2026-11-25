@@ -2,7 +2,7 @@
 
 A shed can hold the credentials your work needs: a key to clone a private repository, a GitHub token, the API keys your coding agents use, a login for your secrets store. They get there by **delivery**: when a shed is created, or when you run `shed provision`, the shed desktop app on your own machine answers the server with files and environment variables, and the shed's agent writes them in. Nothing is asked per use, and nothing is brokered while you work.
 
-This guide says what each provider delivers, how to sign in to AWS and to a container registry inside a shed, what a shed can reach once it holds these, and what you are trading for the convenience. The mechanics are on the [Credential delivery](../reference/delivery.md) page; the app's settings editor is described under [Desktop provisioning](../desktop/provisioning.md).
+This guide says what each provider delivers, how to sign in to AWS and to a container registry inside a shed, what a shed can reach once it holds these, and what you are trading for the convenience. The mechanics are on the [Credential delivery](../reference/delivery.md) page; the app's **Credentials** view, where you set the providers up, is described under [Desktop credentials](../desktop/credentials.md). On a server whose users come from an [account service](credentials-from-the-account-service.md), the service can answer instead of your machine.
 
 ## The trade
 
@@ -12,14 +12,18 @@ Decide what a shed holds the way you would decide what to put on a shared build 
 
 - Deliver the least that does the job, and prefer a key made for sheds over your personal one.
 - Prefer credentials the provider can scope or revoke (a fine-grained token, a read-only key).
-- Put an [`only` rule](../desktop/provisioning.md#the-only-rules) on every provider, and above all `only.servers`, so a server you do not trust cannot draw it.
+- Put an [`only` rule](../desktop/credentials.md#the-only-rules) on every provider, and above all `only.servers`, so a server you do not trust cannot draw it.
 - A shed assigned to a person with `shed assign` may already hold what someone else put there. A `shed provision` of such a shed writes your credentials into a filesystem you did not build.
 
 The server sees the values in transit but never records, logs or returns them. See [What "no values" covers](../reference/delivery.md#what-no-values-covers).
 
 ## The five providers
 
-You turn each on in **Preferences → Provisioning** (or in `~/.config/shed/delivery.toml`). A provider that is absent or off delivers nothing.
+You set each up in the desktop app's **Credentials** view (or in `~/.config/shed/delivery.toml`); a provider cannot be turned on until its required fields are filled. A provider that is absent or off delivers nothing.
+
+### Who answers
+
+On a server whose users are your own pinned machines, the desktop app answers: the first of your machines to connect becomes your source, and the Credentials view's **Answer from here** and **Stop answering from here** move or stop it. On a server whose users come from an account service (a directory server), the account service answers for those users, other than the server's local admins, with the values you stored there, and a pinned machine is not asked: the view shows the service as the source and offers no action. Your `delivery.toml` is then not used for those users on that server. Which one answers is shown per server in the Credentials view.
 
 | Provider | What a shed gets | Settings |
 |---|---|---|
@@ -29,7 +33,7 @@ You turn each on in **Preferences → Provisioning** (or in `~/.config/shed/deli
 | `envsecrets-login` | `~/.envsecrets/config.yaml` byte for byte, and its passphrase as the environment variable the config names (`passphrase_env`), so the shed pulls secrets for itself. A config with no `passphrase_env` or no `gcs_credentials` is a problem and delivers nothing. | `passphrase_file` or `passphrase_command` (one of them) |
 | `files` | Files copied as they are, to a target under the home directory or, after the clone, the project directory, with mode `0600` or `0400` | a list of `from`, `to`, `base`, `mode`, `only` |
 
-Each provider and each `files` entry accepts an `only` rule with `servers`, `backends` and `repos`; every list given must match. Only `servers` holds against a dishonest server. See [the `only` rules](../desktop/provisioning.md#the-only-rules).
+Each provider and each `files` entry accepts an `only` rule with `servers`, `backends` and `repos`; every list given must match. Only `servers` holds against a dishonest server. See [the `only` rules](../desktop/credentials.md#the-only-rules).
 
 A value delivered at stage 1 reaches the environment of commands and sessions started after the delivery. A process already running (a tmux server, a roost session, a craze hub) keeps the environment it started with.
 

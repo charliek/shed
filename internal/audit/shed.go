@@ -107,10 +107,12 @@ type DeliveryFailure struct {
 	Result string `json:"result,omitempty"`
 }
 
-// DeliverySource is the machine a delivery's request went to.
+// DeliverySource is the source a delivery's request went to: its kind
+// (machine or service) and, for a machine, its id and name.
 type DeliverySource struct {
-	MachineID   string `json:"machine_id"`
-	MachineName string `json:"machine_name"`
+	Kind        string `json:"kind"`
+	MachineID   string `json:"machine_id,omitempty"`
+	MachineName string `json:"machine_name,omitempty"`
 }
 
 // DeliverySteps is each tracked step's state.

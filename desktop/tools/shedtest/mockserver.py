@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 # A non-zero GET /api/system/df payload (M7) so the System pane renders real numbers.
@@ -86,7 +87,7 @@ DEFAULT_INFO = {
 # delivery transport, the provision route and the activity feed.
 #
 # Shapes are the server's, pinned against the provision contract
-# (`tests/provision-contract/v1/`, `CONTRACT.md` §3-4) and the Go handlers
+# (`tests/provision-contract/v2/`, `CONTRACT.md` §3-4) and the Go handlers
 # (`internal/api/delivery_handlers.go`, `provision.go`, `activity.go`):
 #   * the stream: `GET /api/delivery/requests`, `200` with `Content-Type:
 #     text/event-stream`, `Cache-Control: no-store` and `X-Shed-Delivery-Stream:
@@ -117,7 +118,7 @@ DELIVERED_RECORD = {
     "steps": {"stage1": {"state": "done"}, "clone": {"state": "done"},
               "stage2": {"state": "done"}, "install": {"state": "done"}},
     "last": {"at": "2026-11-23T10:00:00Z", "reason": "create", "outcome": "accepted",
-             "source": {"machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+             "source": {"kind": "machine", "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
                         "machine_name": "ada-laptop"}},
     "items": [
         {"name": "ssh-key", "provider": "ssh-key", "stage": 1, "kind": "file", "base": "home",
@@ -138,6 +139,16 @@ DELIVERED_RECORD = {
          "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
     ],
 }
+#: The shapes the source routes answer for a user the account service answers for (plan
+#: 040 §3.2): `GET /api/sources` with the service in the delivery slot (and its
+#: `not_delivering` form), and the `409 SOURCE_IS_SERVICE` body. Read from the fixtures the
+#: server's API tests and shed-core's `SourceDocument` test also read.
+_SOURCE_SHAPES = Path(__file__).resolve().parents[3] / "crates" / "fixtures" / "sources"
+SERVICE_SOURCE_DOCUMENT = json.loads((_SOURCE_SHAPES / "service.json").read_text())
+SERVICE_NOT_DELIVERING_DOCUMENT = json.loads(
+    (_SOURCE_SHAPES / "service-not-delivering.json").read_text())
+SOURCE_IS_SERVICE_BODY = json.loads((_SOURCE_SHAPES / "source-is-service.json").read_text())
+
 #: The contract's `records/accept/none.json` record: a shed from before delivery.
 NONE_RECORD = {"state": "none"}
 
@@ -211,16 +222,22 @@ NOT_SOURCE_ACTIVE = {
     "machine_name": "desk",
 }
 
-# Credential sources (plan 035 §3.4): `GET /api/sources` and `POST /api/sources/use`.
-# Unarmed (the default) the mock is a server older than the feature: both routes answer
+# Credential sources (plan 035 §3.4): `GET /api/sources`, `POST /api/sources/use` and
+# `POST /api/sources/unbind`. Unarmed (the default) the mock is a server older than the
+# feature: every route answers
 # chi's plain 404 for an unrouted path (labelled JSON by the server's middleware, no API
 # error body) and every delivery stream is served, so every cell that does not arm it is
 # unchanged. Armed (`arm_source`) it holds one binding: a delivery stream (or answer)
 # whose machine id is not the bound one is refused 403 SOURCE_NOT_BOUND naming the bound
 # machine, a matching one is served, and a move answers the document and ends every
-# other machine's stream — the server's contract as the desktop is built against it.
+# other machine's stream — the server's contract as the desktop is built against it. With
+# no machine bound (after an unbind), the first machine whose stream arrives is bound, as
+# on the server. A user the account service answers for (`serve_service_source`, plan
+# 040 §3.2) is refused `409 SOURCE_IS_SERVICE` (the shared fixture's body) on the stream,
+# the answer, the move and the unbind routes.
 _SOURCES_PATH = "/api/sources"
 _SOURCES_USE_PATH = "/api/sources/use"
+_SOURCES_UNBIND_PATH = "/api/sources/unbind"
 _PLAIN_404 = "404 page not found\n"
 # Used with `fullmatch` only: `$` also matches before a final newline, so an id with
 # one appended would pass a `match` (the real server refuses it 400).
@@ -236,6 +253,12 @@ _SOURCE_USE_REFUSALS: dict[int, dict] = {
                                "may still take effect when the server restarts; check with "
                                "'shed source ls' before retrying"}},
 }
+
+
+def _source_is_service() -> dict:
+    """The `409 SOURCE_IS_SERVICE` body every source route answers for a user the
+    account service answers for (a fresh copy of the shared fixture)."""
+    return json.loads(json.dumps(SOURCE_IS_SERVICE_BODY))
 
 
 def _not_source_body(machine_id: str, machine_name: str) -> dict:
@@ -317,11 +340,17 @@ class MockShedServer:
         self._port = 0
         # ---- credential sources (plan 035 §3.4); all under _dlv_cond ----
         self._src_armed = False
+        # The account service answers (None: machines do): "" or "not_delivering".
+        self._src_service: str | None = None
         self._src_bound: str | None = None  # the bound machine's id
         self._src_generation = 0
         # id -> {"name", "first_seen", "connected" (None: its live slots decide)}
         self._src_machines: dict[str, dict] = {}
         self._src_use_requests: list[dict] = []  # every POST /api/sources/use body
+        self._src_unbind_requests: list[dict] = []  # every POST /api/sources/unbind body
+        # Machines a stream attempt admits just after the next unbinds, one per unbind
+        # (`admit_after_unbind`): the late admission an unbind can race.
+        self._src_late_admits: list[tuple[str, str]] = []
         self._src_use_script: list[int] = []  # statuses the next moves answer first
         self._src_use_delay = 0.0  # seconds every move waits before it is applied
         # The next GETs answer 503 SOURCE_BUSY (with this Retry-After) this many times.
@@ -362,6 +391,8 @@ class MockShedServer:
         self.provision_should_fail = False
         self.provision_record = DELIVERED_RECORD
         self.provisions: list[str] = []
+        # Set: every `GET /api/sheds/{name}` is refused with this (status, code, message).
+        self.shed_doc_refusal: tuple[int, str, str] | None = None
         # Armed (`hold_provisions`): each provision waits, after its progress, for
         # `release_provisions` (at most 30 s), so a cell can act while one is in flight.
         self._provision_gate: threading.Event | None = None
@@ -408,6 +439,7 @@ class MockShedServer:
             self.provision_should_fail = False
             self.provision_record = DELIVERED_RECORD
             self.provisions = []
+            self.shed_doc_refusal = None
             self.egress_enabled = True
             self.egress_default = []
             gate, self._provision_gate = self._provision_gate, None
@@ -558,6 +590,36 @@ class MockShedServer:
                 "name": machine_name, "first_seen": "2026-11-16T09:00:00Z",
                 "connected": connected}
 
+    def arm_source_unbound(self) -> None:
+        """Become a pinning server with no machine bound yet: the first machine whose
+        delivery stream arrives is bound (the server's first-connect rule)."""
+        with self._dlv_cond:
+            self._src_armed = True
+            self._src_bound = None
+
+    def serve_service_source(self, state: str = "") -> None:
+        """Become a directory server on which the account service answers for this user
+        (plan 040 §3.2): `GET /api/sources` answers the fixture's document, with
+        `"state": "not_delivering"` when `state` says so, and the stream, answer, move and
+        unbind routes answer `409 SOURCE_IS_SERVICE`. As the server does when it starts
+        so, no machine is bound and none is remembered, and every live stream ends."""
+        assert state in ("", "not_delivering"), state
+        with self._dlv_cond:
+            self._src_armed = True
+            self._src_service = state
+            self._src_bound = None
+            self._src_machines.clear()
+            self._dlv_end_all_locked()
+
+    def stop_service_source(self) -> None:
+        """The account service no longer answers for this user (the name moved to the
+        server's local admins): machines do again, with none bound, so the first
+        machine whose stream arrives is bound."""
+        with self._dlv_cond:
+            assert self._src_service is not None, "serve_service_source first"
+            self._src_service = None
+            self._dlv_cond.notify_all()
+
     def know_machine(self, machine_id: str, machine_name: str) -> None:
         """Record a machine as seen for this user — what a delivery stream from it
         does on the real server (a move to an unseen machine is 404)."""
@@ -607,6 +669,19 @@ class MockShedServer:
         with self._dlv_cond:
             return self._src_bound
 
+    def admit_after_unbind(self, machine_id: str, machine_name: str, times: int = 1) -> None:
+        """The next `times` unbinds are each followed at once by a late admission of
+        `machine_id`: a stream attempt the server received before the unbind and admits
+        after it, which binds that machine again (its stream long gone)."""
+        assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
+        with self._dlv_cond:
+            self._src_late_admits.extend([(machine_id, machine_name)] * times)
+
+    def source_unbind_requests(self) -> list[dict]:
+        """Every `POST /api/sources/unbind` body received, refused ones included."""
+        with self._dlv_cond:
+            return [dict(b) for b in self._src_unbind_requests]
+
     def source_use_requests(self) -> list[dict]:
         """Every `POST /api/sources/use` body received, refused ones included."""
         with self._dlv_cond:
@@ -621,6 +696,9 @@ class MockShedServer:
 
     def _src_document(self) -> dict:
         """The GET/POST answer (caller holds _dlv_cond)."""
+        if self._src_service is not None:
+            doc = SERVICE_NOT_DELIVERING_DOCUMENT if self._src_service else SERVICE_SOURCE_DOCUMENT
+            return json.loads(json.dumps(doc))
         binding = None
         if self._src_bound is not None:
             ref = [{"kind": "machine", "id": self._src_bound}]
@@ -684,6 +762,8 @@ class MockShedServer:
                 return None
             self._src_use_requests.append(dict(body))
             self._dlv_cond.notify_all()
+            if self._src_service is not None:
+                return 409, _source_is_service()
             delay = self._src_use_delay
         if delay:
             time.sleep(delay)
@@ -703,16 +783,58 @@ class MockShedServer:
             self._src_move_locked(mid)
             return 200, self._src_document()
 
+    def _src_unbind(self, body: object) -> tuple[int, dict] | None:
+        """An unbind (`shed source unbind`): (status, body), or None when unarmed (a
+        plain 404). As the server's `handleUnbindSource`: the binding and every
+        remembered machine are forgotten and every stream of the user ends (its pending
+        requests fail); nothing bound is `"unbound": false`."""
+        with self._dlv_cond:
+            if not self._src_armed:
+                return None
+            self._src_unbind_requests.append(dict(body) if isinstance(body, dict) else {})
+            self._dlv_cond.notify_all()
+            if not isinstance(body, dict) or set(body) - {"user"}:
+                return 400, _api_error("INVALID_REQUEST",
+                                       'the body must be {} or {"user":"<name>"}')
+            if self._src_service is not None:
+                return 409, _source_is_service()
+            bound = self._src_bound
+            previous = None
+            if bound is not None:
+                previous = {"id": bound,
+                            "name": self._src_machines.get(bound, {}).get("name", "")}
+            forgotten = len(self._src_machines)
+            if bound is not None:
+                self._src_bound = None
+                self._src_generation += 1
+                self._src_machines.clear()
+                self._dlv_end_all_locked()
+            if self._src_late_admits:
+                mid, name = self._src_late_admits.pop(0)
+                self._src_machines[mid] = {"name": name, "connected": False,
+                                           "first_seen": "2026-11-16T09:30:00Z"}
+                self._src_bound = mid
+                self._src_generation += 1
+            return 200, {"user": "mock-user", "unbound": bound is not None,
+                         "previous": previous,
+                         "forgotten_machines": forgotten if bound is not None else 0}
+
     def _src_admit(self, identity: tuple[str | None, str | None]) -> tuple[int, object] | None:
         """The pin on a delivery stream (caller holds _dlv_cond): None to serve it,
         else the refusal. Unarmed: always None. The stream route has checked the
-        machine headers already."""
+        machine headers already. With no machine bound, this one is bound (the
+        server's first-connect rule)."""
         if not self._src_armed:
             return None
+        if self._src_service is not None:
+            return 409, _source_is_service()
         mid, name = identity
         if mid not in self._src_machines:
             self._src_machines[mid] = {"name": name or "", "connected": None,
                                        "first_seen": "2026-11-16T09:30:00Z"}
+        if self._src_bound is None:
+            self._src_bound = mid
+            self._src_generation += 1
         if mid != self._src_bound:
             bound = self._src_machines.get(self._src_bound or "", {})
             return 403, _not_source_body(self._src_bound or "", bound.get("name", ""))
@@ -789,7 +911,7 @@ class MockShedServer:
         if project_dir:
             req_shed["project_dir"] = project_dir
         deadline = time.time() + deadline_s
-        req = {"version": 1, "id": secrets.token_hex(16), "reason": reason,
+        req = {"version": 2, "id": secrets.token_hex(16), "reason": reason,
                "deadline": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(deadline)),
                "user": user, "shed": req_shed}
         live = self.live_delivery_stream(timeout)
@@ -815,6 +937,16 @@ class MockShedServer:
             for live in list(self._dlv_live.values()):
                 live["end"].set()
             self._dlv_cond.notify_all()
+
+    def _dlv_end_all_locked(self) -> None:
+        """Unregister and end every live stream now, failing its pending requests
+        (caller holds _dlv_cond) — what an unbind or a move does on the server."""
+        for owner, live in list(self._dlv_live.items()):
+            live["end"].set()
+            del self._dlv_live[owner]
+            for rid in [r for r, p in self._dlv_pending.items() if p["stream"] == live["id"]]:
+                del self._dlv_pending[rid]
+        self._dlv_cond.notify_all()
 
     def await_delivery_answer(self, request_id: str, timeout: float = 10.0) -> dict:
         """The answer to `request_id` the mock accepted (`204`)."""
@@ -872,7 +1004,9 @@ class MockShedServer:
         with self._dlv_cond:
             known = self._dlv_pending.get(rid) or self._dlv_done.get(rid)
             bound = self._src_bound if self._src_armed else None
-            if bound is not None and mid != bound:
+            if self._src_armed and self._src_service is not None:
+                status, body = 409, _source_is_service()
+            elif bound is not None and mid != bound:
                 status, body = 403, _not_source_body(
                     bound, self._src_machines.get(bound, {}).get("name", ""))
             elif known is None:
@@ -1048,7 +1182,10 @@ class MockShedServer:
                 m = _SHED_DOC_RE.match(path)
                 if m:
                     doc = state.shed(unquote(m.group(1)))
-                    if doc is None:
+                    refusal = state.shed_doc_refusal
+                    if refusal is not None:
+                        self._send(refusal[0], _api_error(refusal[1], refusal[2]))
+                    elif doc is None:
                         self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
                     else:
                         self._send(200, doc)
@@ -1280,6 +1417,17 @@ class MockShedServer:
                     except ValueError:
                         body = {}
                     answer = state._src_use(body if isinstance(body, dict) else {})
+                    if answer is None:
+                        self._plain_404()
+                    else:
+                        self._send(*answer)
+                    return
+                if path == _SOURCES_UNBIND_PATH:
+                    try:
+                        body = self._body()
+                    except ValueError:
+                        body = None
+                    answer = state._src_unbind(body)
                     if answer is None:
                         self._plain_404()
                     else:

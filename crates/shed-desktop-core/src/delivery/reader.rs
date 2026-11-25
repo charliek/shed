@@ -237,34 +237,67 @@ impl Reader for DiskReader {
     }
 
     fn run(&self, command: &Command) -> Result<CommandOutput, RunError> {
-        let program = self.locate(&command.program).ok_or(RunError::NotFound)?;
-        // Spawned and registered under the registry's lock, so a cancel either refuses
-        // it or sees it.
-        let mut registry = self.children.lock();
-        if registry.cancelled {
-            return Err(RunError::Failed);
-        }
-        let spawn = || {
-            std::process::Command::new(&program)
+        self.run_spawning(command, |program| {
+            std::process::Command::new(program)
                 .args(&command.args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0)
                 .spawn()
+        })
+    }
+}
+
+impl DiskReader {
+    /// [`Reader::run`], starting the command with `spawn`. The command's time is
+    /// absolute from the call: the lookup and every spawn attempt count against it, no
+    /// attempt starts once it has passed (that is [`RunError::TimedOut`], the command
+    /// never started), a retry never sleeps past it, the command is killed at that same
+    /// instant, and a command that ends after it is [`RunError::TimedOut`] with its
+    /// output discarded.
+    fn run_spawning(
+        &self,
+        command: &Command,
+        mut spawn: impl FnMut(&Path) -> std::io::Result<std::process::Child>,
+    ) -> Result<CommandOutput, RunError> {
+        let start = std::time::Instant::now();
+        // A timeout too large to add is no practical bound: a far instant, not a panic.
+        let deadline = start
+            .checked_add(command.timeout)
+            .unwrap_or_else(|| start + Duration::from_secs(30 * 365 * 86_400));
+        let past = || std::time::Instant::now() >= deadline;
+        let Some(program) = self.locate(&command.program) else {
+            return Err(if past() {
+                RunError::TimedOut
+            } else {
+                RunError::NotFound
+            });
         };
+        // Spawned and registered under the registry's lock, so a cancel either refuses
+        // it or sees it.
+        let mut registry = self.children.lock();
+        if registry.cancelled {
+            return Err(RunError::Failed);
+        }
         // ETXTBSY: the program was just written and another thread's fork still holds
         // its write descriptor until that child execs. It clears within moments.
-        let mut spawned = spawn();
-        for _ in 0..50 {
-            match &spawned {
-                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
-                    std::thread::sleep(Duration::from_millis(20));
-                    spawned = spawn();
-                }
-                _ => break,
+        let mut retries = 0;
+        let spawned = loop {
+            if past() {
+                return Err(RunError::TimedOut);
             }
-        }
+            // A spawn already begun cannot be bounded; one that ends past the deadline
+            // starts a command whose result is timed out below, its output unused.
+            match spawn(&program) {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && retries < 50 => {
+                    retries += 1;
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(Duration::from_millis(20).min(left));
+                }
+                r => break r,
+            }
+        };
         let mut child = spawned.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => RunError::NotFound,
             _ => RunError::Failed,
@@ -299,7 +332,6 @@ impl Reader for DiskReader {
                 status
             })
         };
-        let deadline = std::time::Instant::now() + command.timeout;
         let mut failure = None;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -326,6 +358,10 @@ impl Reader for DiskReader {
         }
         if let Some(f) = failure {
             return Err(f);
+        }
+        if past() {
+            // It ended after its time: whatever it printed is not a result.
+            return Err(RunError::TimedOut);
         }
         if stdout.len() > max || stderr.len() > max {
             return Err(RunError::OutputTooLarge);
@@ -541,5 +577,95 @@ mod tests {
         c.max_output = 1024;
         c.timeout = Duration::from_secs(10);
         assert_eq!(r.run(&c), Err(RunError::OutputTooLarge));
+    }
+
+    /// A spawn that keeps failing with ETXTBSY past a tiny timeout: the retry sleeps no
+    /// further than the deadline, no attempt starts after it, and the result is the
+    /// timed-out outcome.
+    #[test]
+    fn a_spawn_retried_past_the_deadline_never_starts_and_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let echo = script(dir.path(), "echoer", "echo started");
+        let r = reader(dir.path());
+        let mut c = Command::new(echo.to_str().unwrap(), Vec::<String>::new());
+        c.timeout = Duration::from_millis(5);
+        let attempts = std::cell::Cell::new(Vec::new());
+        let started = std::time::Instant::now();
+        let deadline = started + c.timeout;
+        let result = r.run_spawning(&c, |program| {
+            let mut a = attempts.take();
+            a.push(std::time::Instant::now());
+            let first = a.len() == 1;
+            attempts.set(a);
+            if first {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                // A later attempt would start the command for real.
+                std::process::Command::new(program).spawn()
+            }
+        });
+        assert_eq!(result, Err(RunError::TimedOut));
+        let a = attempts.take();
+        assert_eq!(a.len(), 1, "an attempt started after the deadline");
+        assert!(a.iter().all(|t| *t < deadline));
+        // No wall-clock bound on the whole call: a loaded runner stretches it, and the
+        // attempt count and the before-deadline check above already pin the behaviour.
+        assert_eq!(r.children().running(), 0);
+        // A spawn that clears in time runs the command.
+        c.timeout = Duration::from_secs(5);
+        let mut once = true;
+        let out = r
+            .run_spawning(&c, |program| {
+                if std::mem::take(&mut once) {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETXTBSY));
+                }
+                std::process::Command::new(program)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+            })
+            .unwrap();
+        assert_eq!(out.stdout, b"started\n");
+    }
+
+    /// A spawn that returns only after the deadline (the command it started has
+    /// already ended, so its completion arrives after the deadline): the result is
+    /// timed out and its output is not used.
+    #[test]
+    fn a_command_that_ends_after_the_deadline_is_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let echo = script(dir.path(), "echoer", "echo SENTINEL-late");
+        let r = reader(dir.path());
+        let mut c = Command::new(echo.to_str().unwrap(), Vec::<String>::new());
+        c.timeout = Duration::from_millis(50);
+        let result = r.run_spawning(&c, |program| {
+            let child = std::process::Command::new(program)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()?;
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(child)
+        });
+        assert_eq!(result, Err(RunError::TimedOut));
+        assert_eq!(r.children().running(), 0);
+    }
+
+    #[test]
+    fn a_huge_timeout_does_not_panic_and_a_late_lookup_is_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let echo = script(dir.path(), "echoer", "echo ok");
+        let r = reader(dir.path());
+        let mut c = Command::new(echo.to_str().unwrap(), Vec::<String>::new());
+        c.timeout = Duration::MAX;
+        assert_eq!(r.run(&c).unwrap().stdout, b"ok\n");
+        let mut missing = Command::new("no-such-program-here", Vec::<String>::new());
+        missing.timeout = Duration::ZERO;
+        assert_eq!(r.run(&missing), Err(RunError::TimedOut));
+        missing.timeout = Duration::from_secs(5);
+        assert_eq!(r.run(&missing), Err(RunError::NotFound));
     }
 }

@@ -67,9 +67,16 @@ type Run struct {
 	// skipped.
 	NoProvision bool
 	// Resumed is a create run again by a job that lost the create
-	// request's (a server restart, a cloud read that failed). Only steps
-	// recorded owed are tried: one recorded failed is left for `shed
-	// provision`.
+	// request's (a server restart, a cloud read that failed). It reads the
+	// record and nothing else (plan 040, section 3.3): it never asks a
+	// source (no Applicable, no probe, no request), never rewrites a step
+	// already recorded, and runs a step not yet recorded only when what it
+	// depends on is recorded and it does not need the bundle, which is gone.
+	// With stage 1 still owed nothing runs; with stage 1 recorded the clone
+	// runs if it is owed, stage 2 is skipped when stage 1 was not
+	// applicable and stays owed otherwise, and the install hook runs when
+	// everything before it is settled. A step recorded failed is left for
+	// `shed provision`.
 	Resumed bool
 	// Prior is the shed's record before the run; nil for a shed with no
 	// record. Initial, when Prior is nil, is the steps to start from (the
@@ -81,6 +88,12 @@ type Run struct {
 	Report  Progress
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
+	// Ticket is the run's admission (Service.Admit), taken by the backend
+	// where it admitted the run; zero, it is taken when Execute starts. For
+	// a directory user's run (the account service answers), a stop or
+	// delete of the shed since then ends the run: it asks nothing, and no
+	// step writes a bundle after it.
+	Ticket Ticket
 
 	// saved is the record as last saved, for the run's audit event.
 	saved *Record
@@ -98,6 +111,15 @@ type Run struct {
 // Every run, however it ends, writes one delivery event to the service's
 // audit log (auditRun): the record as last saved, never a value.
 func (r *Run) Execute(ctx context.Context) (*Record, error) {
+	// A shed whose user's name has moved between the local admins and the
+	// account service since it was made gets nothing, and its record is
+	// left as it is: no request, no step, no event.
+	if r.Service != nil {
+		if err := r.Service.CheckOrigin(r.Params.User, r.Params.Origin); err != nil {
+			log.Printf("delivery: shed %q%s: not delivered: %v", r.Params.Shed.Name, forUser(r.Params.User), err)
+			return r.Prior.Clone(), err
+		}
+	}
 	rec, err := r.execute(ctx)
 	r.auditRun(ctx, err)
 	return rec, err
@@ -137,15 +159,31 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 		return rec, err
 	}
 
-	// Stage 1. The request is its attempt, made outside any step: the wait
-	// for a source takes no lock.
-	r.phase("delivery")
-	res, err := r.request(ctx, p)
-	if err != nil {
-		return rec, err
+	// A resumed create reads its record only: with stage 1 not recorded,
+	// nothing runs (the steps stay owed for `shed provision`); otherwise
+	// stage 1 and the last delivery are left as recorded.
+	if r.Resumed && rec.Steps.Stage1.State == StepOwed {
+		return rec, nil
 	}
-	bundle := res.Bundle
-	res.Bundle = nil
+
+	// A directory user's run, from here (before the agent's probe) to its
+	// last write, ends at a stop or delete of the shed since it was
+	// admitted, and at the shutdown: its request is never started after
+	// one, and its bundle never written.
+	if r.Service != nil && r.Service.Origin(p.User) == OriginDirectory {
+		t := r.Ticket
+		if !t.taken {
+			t = r.Service.Admit(name, p.Shed.ID)
+		}
+		var stop func()
+		ctx, stop = r.Service.inflight.watchSince(ctx, t)
+		defer stop()
+	}
+
+	// Stage 1. The request is its attempt, made outside any step: the wait
+	// for a source takes no lock. Its outcome is saved before any later
+	// step starts.
+	var bundle *Bundle
 	defer func() { bundle = nil }()
 
 	warned := false
@@ -158,50 +196,63 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 		}
 	}
 
-	if err := r.Host.Step(ctx, func(ctx context.Context) error {
-		var failure *Failure
-		switch {
-		case bundle != nil:
-			r.status("Writing delivered credentials...")
-			st := r.Service.Write(ctx, r.Host.Agent(), 1, bundle, p.Shed.ProjectDir)
-			rec.Steps.Stage1 = Step{State: st.State, Reason: st.Reason}
-			rec.Items = stageOneItems(rec.Items, bundle, st, FormatTime(r.now()))
-			failure = st.Failure
-		case res.Reason == ReasonNotApplicable:
-			rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonNotApplicable}
-		case res.Reason == ReasonImageTooOld:
-			// The image can never take a delivery: skipped, with the
-			// failure warned of, so the clone and the hooks still run.
-			rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonImageTooOld}
-			failure = &Failure{Reason: ReasonImageTooOld}
-		default:
-			rec.Steps.Stage1 = Step{State: StepFailed, Reason: res.Reason}
-			failure = &Failure{Reason: res.Reason, Rule: res.Rule}
+	if !r.Resumed {
+		r.phase("delivery")
+		res, err := r.request(ctx, p)
+		if err != nil {
+			return rec, err
 		}
-		rec.Last = &Last{
-			At: FormatTime(res.At), Reason: r.Reason, Outcome: res.Outcome,
-			Failure: failure, Source: res.Source, Problems: bundle.Problems(),
-		}
-		if res.Outcome == OutcomeNotRequested {
-			rec.Last.Source = nil
-		}
-		if err := r.save(ctx, rec); err != nil {
-			return err
-		}
-		warn(failure)
-		if failure == nil && bundle != nil {
-			msg := fmt.Sprintf("Credentials delivered (%d items)", len(bundle.StageItems(1)))
-			if n := len(bundle.Problems()); n > 0 {
-				msg += fmt.Sprintf("; the source reported %d problems (shed provision %s --status)", n, name)
+		bundle = res.Bundle
+		res.Bundle = nil
+		if err := r.Host.Step(ctx, func(ctx context.Context) error {
+			var failure *Failure
+			switch {
+			case bundle != nil:
+				if err := ended(ctx); err != nil {
+					return err
+				}
+				r.status("Writing delivered credentials...")
+				st := r.Service.Write(ctx, r.Host.Agent(), 1, bundle, p.Shed.ProjectDir)
+				rec.Steps.Stage1 = Step{State: st.State, Reason: st.Reason}
+				rec.Items = stageOneItems(rec.Items, bundle, st, FormatTime(r.now()))
+				failure = st.Failure
+			case res.Reason == ReasonNotApplicable:
+				rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonNotApplicable}
+			case res.Reason == ReasonImageTooOld:
+				// The image can never take a delivery: skipped, with the
+				// failure warned of, so the clone and the hooks still run.
+				rec.Steps.Stage1 = Step{State: StepSkipped, Reason: ReasonImageTooOld}
+				failure = &Failure{Reason: ReasonImageTooOld}
+			default:
+				rec.Steps.Stage1 = Step{State: StepFailed, Reason: res.Reason}
+				failure = &Failure{Reason: res.Reason, Rule: res.Rule}
 			}
-			r.status(msg)
+			rec.Last = &Last{
+				At: FormatTime(res.At), Reason: r.Reason, Outcome: res.Outcome,
+				Failure: failure, Source: res.Source, Problems: bundle.Problems(),
+			}
+			if res.Outcome == OutcomeNotRequested {
+				rec.Last.Source = nil
+			}
+			if err := r.save(ctx, rec); err != nil {
+				return err
+			}
+			warn(failure)
+			if failure == nil && bundle != nil {
+				msg := fmt.Sprintf("Credentials delivered (%d items)", len(bundle.StageItems(1)))
+				if n := len(bundle.Problems()); n > 0 {
+					msg += fmt.Sprintf("; the source reported %d problems (shed provision %s --status)", n, name)
+				}
+				r.status(msg)
+			}
+			return nil
+		}); err != nil {
+			return rec, err
 		}
-		return nil
-	}); err != nil {
-		return rec, err
 	}
 
-	// The clone.
+	// The clone. On a resumed run stage 1 is recorded by now (in any
+	// state), as on a fresh one, where it has just been saved.
 	if r.attempt(rec.Steps.Clone) {
 		if err := r.Host.Step(ctx, func(ctx context.Context) error {
 			switch {
@@ -222,7 +273,9 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 	if r.attempt(rec.Steps.Stage2) || bundle != nil {
 		if err := r.Host.Step(ctx, func(ctx context.Context) error {
 			switch {
-			case res.Outcome == OutcomeNotRequested && res.Reason == ReasonNotApplicable:
+			case rec.Steps.Stage1 == Step{State: StepSkipped, Reason: ReasonNotApplicable}:
+				// Decided from the record, so a resumed run, which has no
+				// request's result, decides it as the fresh run did.
 				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonNotApplicable}
 			case p.Shed.LocalDir != "":
 				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonLocalDir}
@@ -233,6 +286,9 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 			case p.Shed.ProjectDir == "":
 				rec.Steps.Stage2 = Step{State: StepSkipped, Reason: ReasonNoProjectDir}
 			default:
+				if err := ended(ctx); err != nil {
+					return err
+				}
 				st := r.Service.Write(ctx, r.Host.Agent(), 2, bundle, p.Shed.ProjectDir)
 				rec.Steps.Stage2 = Step{State: st.State, Reason: st.Reason}
 				stageTwoItems(rec.Items, bundle, st, FormatTime(r.now()))
@@ -288,8 +344,7 @@ func (r *Run) execute(ctx context.Context) (*Record, error) {
 // or a request the service could not make, is an error.
 func (r *Run) request(ctx context.Context, p Params) (Result, error) {
 	now := r.now().UTC()
-	// A resumed run never asks a source (N3), even if one was bound after
-	// the job decided it could resume: its stages read not applicable.
+	// A resumed run never gets here: it asks no source (section 3.3).
 	if r.Resumed || r.Service == nil || !r.Service.Applicable(p) {
 		return Result{Outcome: OutcomeNotRequested, Reason: ReasonNotApplicable, At: now}, nil
 	}
@@ -334,8 +389,10 @@ func (r *Run) status(msg string) {
 // is not saved either, and the run ends (the rule and place are logged,
 // never a value).
 func (r *Run) save(ctx context.Context, rec *Record) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx.Err() != nil {
+		// Its cause, so a run its shed's stop or delete ended reports
+		// that (ErrShedEnded), not a bare cancellation.
+		return context.Cause(ctx)
 	}
 	rec.State = DeriveState(rec)
 	if err := rec.Validate(); err != nil {

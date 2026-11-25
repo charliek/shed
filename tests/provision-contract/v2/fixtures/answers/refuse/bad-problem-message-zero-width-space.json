@@ -1,0 +1,22 @@
+{
+  "name": "bad-problem-message-zero-width-space",
+  "description": "A problem message holding U+200B: not printable.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "can\u200bnot read"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_problem_message"
+  }
+}

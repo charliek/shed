@@ -1,5 +1,7 @@
 //! The [`Provider`] trait and what a provider contributes to an answer.
 
+use std::time::{Duration, Instant};
+
 use crate::answer::{ItemBody, ProblemCode};
 use crate::only::Only;
 use crate::reader::Reader;
@@ -7,29 +9,49 @@ use crate::request::Request;
 
 /// What a delivery is for: the server the source is connected to, and the
 /// request, which a preview (the Preferences pane, before any shed asks)
-/// does not have.
+/// does not have; and the two things a host injects, its wall clock and how
+/// long the source has.
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
     /// The server, by the name the person's config gives it, when known.
     pub server: Option<&'a str>,
     /// The request being answered, when there is one.
     pub request: Option<&'a Request>,
+    /// The host's wall clock, in Unix seconds: what a provider judges an
+    /// expiry against.
+    pub now: i64,
+    /// The instant by which the source must have answered (the request's
+    /// deadline less a margin for the reply), or `None` for no bound. The
+    /// builder starts no provider past it, and a provider starts no read or
+    /// command past it and runs no command for longer than what is left.
+    pub budget: Option<Instant>,
 }
 
 impl<'a> Context<'a> {
-    /// An answer to `request`, from the server named `server`.
-    pub fn answer(server: &'a str, request: &'a Request) -> Context<'a> {
+    /// An answer to `request`, from the server named `server`, at `now`
+    /// (Unix seconds), to be given by `budget`.
+    pub fn answer(
+        server: &'a str,
+        request: &'a Request,
+        now: i64,
+        budget: Option<Instant>,
+    ) -> Context<'a> {
         Context {
             server: Some(server),
             request: Some(request),
+            now,
+            budget,
         }
     }
 
-    /// A preview: no request, so no `only` rule can be judged.
-    pub fn preview() -> Context<'a> {
+    /// A preview at `now`: no request, so no `only` rule can be judged, and
+    /// no budget.
+    pub fn preview(now: i64) -> Context<'a> {
         Context {
             server: None,
             request: None,
+            now,
+            budget: None,
         }
     }
 
@@ -41,6 +63,18 @@ impl<'a> Context<'a> {
             None => true,
             Some(r) => only.matches(self.server.unwrap_or(""), r),
         }
+    }
+
+    /// What is left of the budget: `None` with no budget, zero once it has
+    /// passed.
+    pub fn time_left(&self) -> Option<Duration> {
+        self.budget
+            .map(|b| b.saturating_duration_since(Instant::now()))
+    }
+
+    /// Whether the budget has passed: nothing more may be started.
+    pub fn out_of_time(&self) -> bool {
+        self.time_left().is_some_and(|d| d.is_zero())
     }
 }
 
@@ -146,4 +180,32 @@ pub trait Provider {
 
     /// What it has for the shed `ctx` describes, read through `reader`.
     fn provide(&self, ctx: &Context<'_>, reader: &dyn Reader) -> Contribution;
+}
+
+/// A provider whose contribution a host has already made: from inputs it
+/// holds (an account service's stored entries, built by the providers'
+/// `build`), handed to the builder with the name and `only` rule it
+/// delivers under. It reads nothing.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    /// The provider's name.
+    pub name: String,
+    /// Where it delivers; `None` delivers everywhere.
+    pub only: Option<Only>,
+    /// What it contributes.
+    pub contribution: Contribution,
+}
+
+impl Provider for Prepared {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn only(&self) -> Option<&Only> {
+        self.only.as_ref()
+    }
+
+    fn provide(&self, _ctx: &Context<'_>, _reader: &dyn Reader) -> Contribution {
+        self.contribution.clone()
+    }
 }

@@ -870,33 +870,66 @@ fn loginitem_set(
     login_item_set(&app, &env, enabled)
 }
 
-// -- credential sources (plan 035 §3.4): the Preferences source rows -------------
+// -- credential sources (plan 035 §3.4): the Credentials view's Where rows --------
+// (`source.status` is an IPC op only: the view reads `sources_list`.)
 
-/// Which machine answers credential requests on each configured server, and this
-/// machine's identity — the Preferences source rows. Mirrors the `source.status` IPC op
-/// (see [`source::status`]).
-#[tauri::command]
-async fn source_status(
-    app: tauri::AppHandle,
-    backend: tauri::State<'_, Arc<Backend>>,
-) -> Result<serde_json::Value, String> {
-    let rt = delivery_runtime(&app).ok();
-    Ok(source::status(&backend, rt.as_deref()).await)
+/// A refused move, unbind or Check as the Credentials view takes it: its code, from the
+/// closed lists [`source::use_this_machine`], [`source::unbind`] and
+/// [`delivery::preview`] give, which the view turns into its own fixed words (the
+/// message is the same refusal, for a log).
+fn coded_refusal((code, message): (String, String)) -> serde_json::Value {
+    serde_json::json!({ "code": code, "message": message })
 }
 
-/// "Use this machine": make this machine the source on `host` (and reopen its delivery
-/// stream there). The error string is the refusal in plain words, which the row shows.
-/// Mirrors the `source.use` IPC op (see [`source::use_this_machine`]).
+/// How the source doors resolve the servers ([`source::Resolver`]).
+fn resolver(app: &tauri::AppHandle, backend: &Arc<Backend>) -> source::Resolver {
+    let current = app
+        .try_state::<Arc<source::CurrentServers>>()
+        .map(|s| s.inner().clone());
+    source::Resolver::new(current, backend.clone())
+}
+
+/// "Answer from here": make this machine the source on `host` (and reopen its delivery
+/// stream there). The error is `{code, message}` ([`coded_refusal`]). Mirrors the
+/// `source.use` IPC op (see [`source::use_this_machine`]).
 #[tauri::command]
 async fn source_use(
     app: tauri::AppHandle,
     backend: tauri::State<'_, Arc<Backend>>,
     host: String,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let rt = delivery_runtime(&app).ok();
+    source::use_this_machine(&resolver(&app, &backend), rt.as_deref(), &host)
+        .await
+        .map_err(coded_refusal)
+}
+
+/// Who answers on each configured server (this machine, another machine, the account
+/// service, nobody) and this machine's stream there. Mirrors the `sources.list` IPC op
+/// (see [`source::list`]).
+#[tauri::command]
+async fn sources_list(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
 ) -> Result<serde_json::Value, String> {
     let rt = delivery_runtime(&app).ok();
-    source::use_this_machine(&backend, rt.as_deref(), &host)
+    let servers = resolver(&app, &backend).now().await;
+    Ok(source::list(&servers, rt.as_deref()).await)
+}
+
+/// "Stop answering from here": clear this user's credential source on `host`. The error
+/// is `{code, message}` ([`coded_refusal`]). Mirrors the `source.unbind` IPC op (see
+/// [`source::unbind`]).
+#[tauri::command]
+async fn source_unbind(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+    host: String,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let rt = delivery_runtime(&app).ok();
+    source::unbind(&resolver(&app, &backend), rt.as_deref(), &host)
         .await
-        .map_err(|(_, message)| message)
+        .map_err(coded_refusal)
 }
 
 // -- provisioning by delivery (plan 039 A6): the same ops as the IPC socket's -------
@@ -915,6 +948,18 @@ fn delivery_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     Ok(delivery_runtime(&app)?.status())
 }
 
+/// `delivery.describe`.
+#[tauri::command]
+fn delivery_describe() -> serde_json::Value {
+    delivery::describe()
+}
+
+/// `delivery.recent`.
+#[tauri::command]
+fn delivery_recent(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    Ok(delivery::recent(&*delivery_runtime(&app)?))
+}
+
 /// `delivery.settings`.
 #[tauri::command]
 fn delivery_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
@@ -931,18 +976,29 @@ fn delivery_set(
     delivery::set(&*delivery_runtime(&app)?, &provider, &config).map_err(|(_, m)| m)
 }
 
-/// `delivery.preview`.
+/// `delivery.preview` (the Credentials view's Check). The error is `{code, message}`;
+/// the view words it from the code alone.
 #[tauri::command]
 async fn delivery_preview(
     app: tauri::AppHandle,
     backend: tauri::State<'_, Arc<Backend>>,
     server: String,
     shed: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let rt = delivery_runtime(&app)?;
-    delivery::preview(&rt, &backend, &server, shed.as_deref())
+    vm_backend: Option<String>,
+    repo: Option<String>,
+    runs: Option<Vec<String>>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let rt = delivery_runtime(&app)
+        .map_err(|m| serde_json::json!({ "code": "unavailable", "message": m }))?;
+    let p = delivery::PreviewParams {
+        shed: shed.as_deref().filter(|s| !s.is_empty()),
+        backend: vm_backend.as_deref().filter(|s| !s.is_empty()),
+        repo: repo.as_deref().filter(|s| !s.is_empty()),
+        expect_runs: runs,
+    };
+    delivery::preview(&rt, &resolver(&app, &backend), &server, p)
         .await
-        .map_err(|(_, m)| m)
+        .map_err(coded_refusal)
 }
 
 /// `shed.delivery`.
@@ -1201,9 +1257,12 @@ pub fn run() {
             set_appearance_state,
             loginitem_status,
             loginitem_set,
-            source_status,
             source_use,
+            sources_list,
+            source_unbind,
             delivery_status,
+            delivery_describe,
+            delivery_recent,
             delivery_settings,
             delivery_set,
             delivery_preview,
@@ -1285,7 +1344,39 @@ pub fn run() {
                 &env.mock_unreachable_hosts,
             ));
             app.manage(backend.clone());
-            app.manage(auth_modes);
+            app.manage(auth_modes.clone());
+            // The servers the source doors read: the config as it reads at each call,
+            // each server's client kept while its whole entry is unchanged
+            // (`source::CurrentServers`).
+            {
+                let build: source::BuildClients = {
+                    let (env, minter, modes) = (env.clone(), minter.clone(), auth_modes.clone());
+                    Arc::new(move |config: &shed_core::config::ShedConfig| {
+                        let mock = if env.test_mode {
+                            env.mock_base_url.as_deref()
+                        } else {
+                            None
+                        };
+                        if env.test_mode && mock.is_none() {
+                            return Backend::from_config(&Default::default(), None);
+                        }
+                        modes.seed_from_config(config);
+                        Backend::from_config_with_credentials(
+                            config,
+                            mock,
+                            Some(&minter),
+                            Some(&modes),
+                            &env.mock_unreachable_hosts,
+                        )
+                    })
+                };
+                app.manage(Arc::new(source::CurrentServers::new(
+                    env.config_path.clone(),
+                    build,
+                    &backend,
+                    &shed_core::config::ShedConfig::load(&env.config_path.to_string_lossy()),
+                )));
+            }
 
             // Shed hosts and agent lanes (plan 038): one runtime owns both,
             // the spawn gate, and the orderly shutdown. Sheds are probed as
@@ -1313,7 +1404,21 @@ pub fn run() {
             let delivery_rt = tauri::async_runtime::block_on(async {
                 let handle = tokio::runtime::Handle::current();
                 let env = env.clone();
-                tokio::task::spawn_blocking(move || delivery::start(&env, &handle))
+                let backend = backend.clone();
+                let fresh: delivery::FreshBackend = {
+                    let (env, minter, modes) = (env.clone(), minter.clone(), auth_modes.clone());
+                    Arc::new(move || {
+                        Backend::from_env_parts_with_credentials(
+                            env.test_mode,
+                            env.mock_base_url.as_deref(),
+                            &env.config_path,
+                            Some(&minter),
+                            Some(&modes),
+                            &env.mock_unreachable_hosts,
+                        )
+                    })
+                };
+                tokio::task::spawn_blocking(move || delivery::start(&env, &handle, backend, fresh))
                     .await
                     .expect("the delivery runtime starts")
             });

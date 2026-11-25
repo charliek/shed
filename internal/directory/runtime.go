@@ -260,6 +260,9 @@ type Runtime struct {
 	unknownAt     time.Time
 	unknownShedAt time.Time
 
+	// deliver is the memory of a refusal of deliveries (deliver.go).
+	deliver deliverMemory
+
 	// What has been logged, for the lines logged once per change of state.
 	failClass   string
 	enrolLogged string
@@ -578,12 +581,15 @@ func (r *Runtime) CheckTrustAtStop(ctx context.Context) error {
 }
 
 // Refresh pulls the list now (`shed users refresh`), ignoring a pending
-// Retry-After, and reports the pull as the report's Directory row: a failed
+// Retry-After, forgets a refusal of deliveries (NotDelivering), and reports the pull as the report's Directory row: a failed
 // pull is a row, not an error. It joins a pull asked for but not yet
 // started, and otherwise waits behind the one running, so the row is never
 // of a pull that started before the call. Only ctx's end is an error; the
 // pull then carries on and its result applies when it ends.
 func (r *Runtime) Refresh(ctx context.Context) (users.RefreshReport, error) {
+	// An admin's refresh also forgets that the service refused this server
+	// deliveries: the next delivery asks again.
+	r.clearNotDelivering()
 	f := r.request()
 	select {
 	case <-f.done:

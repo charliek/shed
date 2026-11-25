@@ -609,6 +609,11 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	if err := checkIdentity(ctx, name, meta); err != nil {
 		return err
 	}
+	// A delivery in flight for this shed (this incarnation: its id) ends
+	// now, and any admitted run of it that has not started never asks: the
+	// identity is checked first, so a stale stop or delete of an older
+	// shed of the name never reaches a replacement's run.
+	c.deliverySvc.EndShed(name, meta.ID)
 
 	if meta.Status == config.StatusRunning {
 		backend.Status(ctx, "Terminating virtual machine...")
@@ -700,6 +705,11 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	if err := checkIdentity(ctx, name, meta); err != nil {
 		return nil, err
 	}
+	// A delivery in flight for this shed (this incarnation: its id) ends
+	// now, and any admitted run of it that has not started never asks: the
+	// identity is checked first, so a stale stop or delete of an older
+	// shed of the name never reaches a replacement's run.
+	c.deliverySvc.EndShed(name, meta.ID)
 
 	return c.stopShedLocked(ctx, meta, stopGraceful)
 }

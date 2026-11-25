@@ -3,7 +3,7 @@
 //! bytes.
 
 /// The contract number every request and answer carries.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The largest answer body the server reads: a body over it is refused
 /// (`413`, `body_too_large`) before it is read.

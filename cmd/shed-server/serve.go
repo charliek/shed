@@ -241,6 +241,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// over the pin; the delivery routes hand answers to the same service the
 	// backends' create and provision ask.
 	deliveryService := delivery.NewService(pluginRegistry, cfg.DeliveryTimeout())
+	// Who is asked (plan 040, section 3.2), from the static configuration
+	// alone: on a directory server every name but a local admin's is the
+	// account service's, and no machine is ever bound for it on the bus.
+	deliveryService.SetOrigin(cfg.UserOrigin)
+	pluginRegistry.SetServiceUsers(func(user string) bool {
+		return cfg.UserOrigin(user) == delivery.OriginDirectory
+	})
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -261,6 +268,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// waitBackendReady blocks until the backend may serve shed routes
 	// (remote only: its first complete list of the cloud; nil otherwise).
 	var waitBackendReady func(context.Context) error
+	// releaseResumes lets the creates the start-up pass resumed run their
+	// delivery steps, once the origin migration has run (remote only; a
+	// no-op otherwise).
+	releaseResumes := func() {}
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -307,6 +318,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
 			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
 		rb.SetDelivery(deliveryService)
+		// Creates resumed by the start-up pass wait for the origin
+		// migration below (stampUserOrigins).
+		rb.HoldResumes()
+		releaseResumes = rb.ReleaseResumes
 		be = rb
 		// Egress control is refused on remote at load, so these two are
 		// never used; they are set so nothing below sees an empty path.
@@ -374,6 +389,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
 			return err
 		}
+		stampUserOrigins(cfg, be)
 	}
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
@@ -390,8 +406,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
+			releaseResumes()
 			return err
 		}
+		stampUserOrigins(cfg, be)
+		releaseResumes()
 	}
 
 	reportReservedSheds(be)
@@ -481,6 +500,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("SSH auth mode: %s", userLookup.Mode())
 	dirUsers, _ := userLookup.(*directory.Runtime)
+	if dirUsers != nil {
+		// The hosted source's handle, late-bound: set before any listener
+		// starts, so every fresh delivery sees it. A create job resumed at
+		// start-up (resumeChannels, which ran before this) never asks a
+		// source; one that asked before it was set would get
+		// source_offline, never a machine.
+		deliveryService.SetHosted(dirUsers)
+	}
 	switch names := cfg.UserNames(); {
 	case dirUsers != nil:
 		for _, line := range directoryStartupLines(cfg, dirUsers, time.Now()) {
@@ -656,6 +683,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		beforeShutdown: func() {
 			log.Printf("Closing credential bus streams...")
 			pluginRegistry.Close()
+			// Hosted delivery requests in flight end now (their calls are
+			// aborted and their slots released); none starts after.
+			deliveryService.Close()
 		},
 		stopping: func(shutdownServers func()) {
 			stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
@@ -976,7 +1006,7 @@ func stampUnassignedWith(cfg *config.ServerConfig, be backend.Backend, stateDir 
 	if err != nil {
 		return backend.UpgradeReport{}, upgrade, err
 	}
-	if err := applySourceUpgrade(bindings, plan, cfg.UserNames(), !cfg.DirectoryConfigured()); err != nil {
+	if err := applySourceUpgrade(bindings, plan, cfg.UserNames(), cfg.DirectoryConfigured()); err != nil {
 		return backend.UpgradeReport{}, upgrade, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
@@ -1019,14 +1049,14 @@ func stampUnassignedWith(cfg *config.ServerConfig, be backend.Backend, stateDir 
 //     user alone when there is no user list), so a name configured again
 //     later starts clean. With no user list nothing is adopted, and only
 //     named users' records (unreachable without a user list) are dropped.
-//     Not on a directory server (retain false): names are then the local
-//     admins only, the list's people are not known at start, and dropping
-//     every other user's records would drop each list person's at every
-//     start.
+//     On a directory server (directory true) the names are the local admins
+//     alone, and every other user is the account service's (plan 040,
+//     section 3.2): their bindings are removed, each logged, and none is
+//     ever made again (the bus refuses to admit a machine for them).
 //
 // A store that cannot be written fails the start; the marker still says what
 // the next start does.
-func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string, retain bool) error {
+func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string, directory bool) error {
 	if b == nil {
 		return nil
 	}
@@ -1059,21 +1089,45 @@ func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []str
 	case plan.Deferred:
 		keep = append(append([]string(nil), names...), source.ImplicitUser)
 	}
-	if !retain {
-		return nil
-	}
 	dropped, err := b.RetainUsers(keep)
 	if err != nil {
 		return fmt.Errorf("credential source bindings: dropping the records of users no longer configured: %w", err)
 	}
 	for _, u := range dropped {
-		if u == source.ImplicitUser {
+		switch {
+		case u == source.ImplicitUser:
 			log.Printf("Users: dropped the credential source records from before the user list")
-		} else {
+		case directory:
+			log.Printf("Credential source: removed the binding of %q: the account service answers for this user on this server, and no machine does", u)
+		default:
 			log.Printf("Users: dropped the credential source records of %q, which is not a configured user", u)
 		}
 	}
 	return nil
+}
+
+// stampUserOrigins is the start-up step that records where the user of each
+// shed made before user_origin came from (plan 040, section 3.2), from the
+// one decision the first start recorded in the origin migration file
+// (backend.MigrateUserOrigins: <state dir>/delivery/origin-migration.json),
+// never from a later start's configuration. A backend that keeps no origin
+// is skipped. A failure is logged; a shed it leaves unstamped is refused
+// deliveries (SHED_ORIGIN_UNKNOWN) until a start stamps it.
+func stampUserOrigins(cfg *config.ServerConfig, be backend.Backend) {
+	st, ok := be.(backend.OriginStamper)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
+	defer cancel()
+	path := filepath.Join(serverStateDir(cfg), backend.OriginMigrationDir, backend.OriginMigrationFile)
+	stamped, err := backend.MigrateUserOrigins(ctx, st, path, cfg.UserOrigin, time.Now(), log.Printf)
+	if err != nil {
+		log.Printf("WARNING: Users: recording where the users of older sheds came from: %v", err)
+	}
+	if len(stamped) > 0 {
+		log.Printf("Users: recorded where the users of %d older shed(s) came from: %s", len(stamped), strings.Join(stamped, ", "))
+	}
 }
 
 // upgradeUsers is the configured user list (auth.users) as the start-up pass

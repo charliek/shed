@@ -142,10 +142,14 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		landingDir = config.HomePath + "/" + dir
 	}
 	createdAt := b.now().UTC().Round(0)
+	// Where the user came from, by the configuration now: recorded on the
+	// shed and on its instance's labels (the evidence an adoption recovers
+	// it from).
+	origin := b.deliverySvc.Origin(req.User)
 	maxRun := b.runLimit(req.Owner)
 
 	spec, err := provider.NewSpec(
-		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User},
+		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User, UserOrigin: origin},
 		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir},
 		b.opts.AuthorizedKeys, size, diskGB, image, maxRun,
 	)
@@ -178,6 +182,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		Delivery:    delivery.NewRecord(),
 		NoServerEnv: req.NoServerEnv,
 		ScriptKey:   req.ScriptKey,
+		UserOrigin:  origin,
 		Size:        size.Name,
 		DiskGB:      diskGB,
 		MaxRun:      maxRun,
@@ -206,6 +211,10 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	j := b.newJobLocked(state.JobCreate, req.Name, id)
 	j.repoURL = repoURL
 	j.deliver = true
+	// The delivery's admission, taken with the job, before the cloud
+	// provisions or the agent is waited for: a stop or delete of the shed
+	// during its boot ends the run before it asks.
+	j.ticket = b.deliverySvc.Admit(req.Name, id)
 	j.actor, j.hasActor = audit.ActorFrom(ctx)
 	j.fastWindow = true
 	first := b.shedOf(rec)
@@ -366,6 +375,10 @@ func (b *Backend) StopShed(ctx context.Context, name string) (*config.Shed, erro
 		b.mu.Unlock()
 		return nil, err
 	}
+	// A delivery of this shed (this incarnation: its id, checked just
+	// now) ends: one in flight is aborted, and one admitted and not started
+	// never asks.
+	b.deliverySvc.EndShed(name, r.Shed.ID)
 	var launch *job
 	switch r.Shed.Status {
 	case config.StatusStarting:
@@ -441,6 +454,10 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		b.mu.Unlock()
 		return err
 	}
+	// A delivery of this shed (this incarnation: its id, checked just
+	// now) ends: one in flight is aborted, and one admitted and not started
+	// never asks.
+	b.deliverySvc.EndShed(name, r.Shed.ID)
 	// The marker carries the owner the shed was reported with
 	// (ownership), never the raw stored one: a wait that follows the delete
 	// through the marker is bound to what its caller was authorized on.

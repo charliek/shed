@@ -13,6 +13,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
@@ -74,6 +75,9 @@ type job struct {
 	// one. Never stored, like deliver.
 	actor    audit.Identity
 	hasActor bool
+	// ticket is the create's delivery admission (delivery.Service.Admit),
+	// taken when the create request admitted the job. Never stored.
+	ticket delivery.Ticket
 
 	// fastWindow and fastErr are guarded by Backend.mu. While fastWindow is
 	// true the create handler has not answered yet, and a failure is its to
@@ -609,7 +613,7 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 		b.mu.Unlock()
 		return errSuperseded
 	}
-	b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+	b.reconcileUserLocked(r, inst.Labels, b.logNote)
 	b.commitCreatedLocked(r, inst) // saves r
 	status := r.Shed.Status
 	b.mu.Unlock()
@@ -699,7 +703,7 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 		}
 		r.Address = inst.Address
 		r.AddressAt = now
-		b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+		b.reconcileUserLocked(r, inst.Labels, b.logNote)
 	})
 }
 

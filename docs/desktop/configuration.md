@@ -27,52 +27,26 @@ on Linux. A missing or unreadable file falls back to the defaults; it never bloc
 |---|---|---|---|
 | **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json`; `login_item_defaulted` records only that the app turned it on once | Starts the app when you sign in. On by default: the app turns it on once, at its first launch, so credentials are delivered whenever you are logged in. Switch it off and it stays off. |
 | **Terminal** | Open sheds in: Ghostty / Roost / Custom | `terminal_preset`, `terminal_template` | Which terminal **Open in Terminal** launches. Custom takes a command template where `{cmd}` is the ssh command and `{shed}` the shed name, e.g. `ghostty -e {cmd}`; an empty template opens the platform's default terminal. |
-| **Provisioning** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines is asked for your credentials on each server. See [Credential sources](#credential-sources) below. |
-| **Provisioning** | The five providers, each with an on/off switch, its settings and its `only` rule; a preview | `~/.config/shed/delivery.toml` | What a shed gets. See [Provisioning](provisioning.md). |
 
-Server hosts are managed with the `shed` CLI (no Preferences UI).
+Preferences holds General and Terminal only. Credentials are set up in the **Credentials** view of the sidebar (see [Credentials](credentials.md)). Server hosts are managed with the `shed` CLI (no Preferences UI).
 
 ## Credential sources
 
 A shed server asks one of your machines only for your sheds' credentials: your
-[credential source](../extensions/source-binding.md) on that server. In
-Preferences → Provisioning:
+[credential source](../extensions/source-binding.md) on that server, or, on a server where the
+account service answers, the service instead. The sidebar's **Credentials** view shows who
+answers on each server and offers **Answer from here** and **Stop answering from here**; see
+[Credentials → Where](credentials.md#where).
 
-- **This machine:** the name of the machine the app runs on, from the `machine.json` the
-  app keeps. If the machine has no identity, the reason is shown and
-  every **Use this machine** button is disabled.
-- One row per configured server that supports credential sources (a server older than that
-  shows no row): the server's name, `Source: <machine>` (with `· not connected` when that
-  machine holds no delivery stream), or `No source yet — the first machine to connect becomes
-  it.`. A server that answered `503 SOURCE_BUSY` on every retry shows the last source it
-  knew, or `Checking the source — the server is busy, retrying…`. A server that could not be
-  reached (it is restarting, or the network is down) keeps the row it last showed, with
-  `· cannot reach the server`; the window reads it again after 2, 4, 8 and 16 seconds, then
-  waits until it is shown, focused or reloaded; a server that answers busy after that shows
-  `· server busy, retrying`, no longer `· cannot reach the server`. A server that answers a
-  plain `404` (older than credential sources) has no row, and nor does one that has not been
-  reached since the window opened (there is no last row to keep). The window makes one
-  read at a time: a read asked for while one is in flight (a focus, a reload, a move's
-  read-back) is made once, right after it.
-- On the row of a server where this machine is the source, `this machine`; on any other row,
-  **Use this machine**.
-
-**Use this machine** makes this machine the source on that server: one click, no
-confirmation, one request that is not retried. It always sends this machine's own id. When it
-succeeds the row shows the server's answer; when the server refuses it the row returns to the
-last confirmed source and shows why. Moving the source here fails any delivery request still
-waiting on the other machine. If the server has never seen this machine (its delivery stream has not reached that
-server yet), the app says so and does not retry. The app has no unbind: `shed source unbind` clears
-a pin, and this machine, while the app runs, is bound again when it next connects.
-
-The app reopens this server's delivery stream at once, so it connects without waiting for
-its next retry. Nothing fails over by itself: if the source is off, nothing
-answers until you choose another.
-
-The window reads the sources when it opens and again whenever it is shown or focused, at most
-once every five seconds. After a move whose read-back shows this machine `· not connected`
-(its stream had not connected yet), it reads once more a few seconds later. The same reads and the move are available over IPC as
-[`source.status` and `source.use`](ipc.md#source-delivery-and-egress-ops).
+The machine's name comes from the `machine.json` the app keeps. If the machine has no identity,
+the view says why and offers no move. **Stop answering from here** records the server in
+`paused-servers.json` beside `machine.json` (mode `0600`), so the stop survives restarts; an
+unreadable file pauses every server. **Answer from here** takes the server out of the file, and
+nothing else does: a server removed from the config and added back is still paused.
+Moving the source here fails any delivery request still waiting on the other machine. If the
+server has never seen this machine (its delivery stream has not reached it yet), the app says so
+and does not retry. The same reads and moves are available over IPC as
+[`sources.list`, `source.use` and `source.unbind`](ipc.md#source-delivery-and-egress-ops).
 
 ## Host list (`~/.shed/config.yaml`)
 

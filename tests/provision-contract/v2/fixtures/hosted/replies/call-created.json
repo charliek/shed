@@ -1,0 +1,19 @@
+{
+  "name": "call-created",
+  "description": "201 with a valid answer: only a 200 carries an answer. source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 201,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "accept/typical"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

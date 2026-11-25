@@ -11,6 +11,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/remote/provider/fake"
+	"github.com/charliek/shed/internal/remote/state"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -257,6 +258,16 @@ func TestCloneWithholdsServerEnvForAUserWhoIsNotAnAdmin(t *testing.T) {
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
+		// Interrupted after stage 1 was recorded (not applicable: the server
+		// has no delivery), which is what lets a resumed create clone
+		// (plan 040, section 3.3).
+		e.b.update("box", id, func(r *state.Record) {
+			d := delivery.NewRecord()
+			d.Steps.Stage1 = delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNotApplicable}
+			d.Last = &delivery.Last{At: delivery.FormatTime(time.Now()), Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeNotRequested}
+			d.State = delivery.DeriveState(d)
+			r.Delivery = d
+		})
 		rec := &cloneRecorder{}
 		e.clone = rec.clone
 		e.restart()
@@ -264,9 +275,8 @@ func TestCloneWithholdsServerEnvForAUserWhoIsNotAnAdmin(t *testing.T) {
 		if got := e.settled("box"); got.Status != config.StatusRunning || got.ID != id {
 			t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
 		}
-		// No source would be asked for this shed (the server has no
-		// delivery), so the resumed create clones on its own, and withholds
-		// the server's variables (the flag is on the record).
+		// Stage 1 is recorded, so the resumed create clones on its own, and
+		// withholds the server's variables (the flag is on the record).
 		if got := rec.calls(); len(got) != 1 || !got[0] {
 			t.Fatalf("the resumed create's clone: owned %v, want [true]", got)
 		}

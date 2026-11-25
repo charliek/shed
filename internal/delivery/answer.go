@@ -30,6 +30,7 @@ var modes = []string{"0400", "0600", "0644"}
 // ProblemCodes is the closed list of a problem's code.
 var ProblemCodes = []string{
 	"missing_input", "unreadable", "signed_out", "passphrase_protected", "conflict", "command_failed",
+	"timed_out", "expired",
 }
 
 // Answer is what a source sends for one request.
@@ -210,7 +211,7 @@ func ParseAnswer(body []byte, req *Request) (*Answer, *Refusal) {
 	if r := checkTypes(root, "", answerMembers, answerKinds); r != nil {
 		return nil, r
 	}
-	if root.get("version").text != "1" {
+	if root.get("version").text != "2" {
 		return nil, refuse(RuleUnsupportedVer, "version")
 	}
 	id := root.get("id").text

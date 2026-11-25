@@ -14,6 +14,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
@@ -965,6 +966,15 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrProvisionBusySentinel) {
 		return http.StatusConflict, config.ErrProvisionInProgress, err.Error()
+	}
+	if errors.Is(err, delivery.ErrShedOriginChanged) {
+		return http.StatusConflict, config.ErrShedOriginChanged, config.ShedOriginChangedMessage
+	}
+	if errors.Is(err, delivery.ErrShedEnded) {
+		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+	if errors.Is(err, delivery.ErrShedOriginUnknown) {
+		return http.StatusConflict, config.ErrShedOriginUnknown, config.ShedOriginUnknownMessage
 	}
 	if errors.Is(err, config.ErrShedNotStoppedSentinel) {
 		return http.StatusConflict, config.ErrShedNotStopped, err.Error()

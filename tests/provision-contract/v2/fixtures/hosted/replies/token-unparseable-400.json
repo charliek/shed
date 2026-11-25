@@ -1,0 +1,16 @@
+{
+  "name": "token-unparseable-400",
+  "description": "A 400 whose body is not JSON: the status alone, which is not invalid_scope. source_refused.",
+  "request": "create-repo",
+  "token": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "text/html"
+    },
+    "text": "<html>bad request</html>"
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

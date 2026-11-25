@@ -835,3 +835,44 @@ func TestReportErrorLeavesOtherCommandsAlone(t *testing.T) {
 		t.Errorf("assign JSON error = %q, want it unchanged", got)
 	}
 }
+
+// TestSourceForAServiceUser: for a user the account service answers for, the
+// server's document names the service and no machine. `shed source ls` and
+// `status` say so (and, for a server not delivering, that too); `use` and
+// `unbind` read the document first and change nothing, sending no move and
+// no unbind.
+func TestSourceForAServiceUser(t *testing.T) {
+	f := sourcesRig(t, srcLaptop)
+	f.resp.Machines = []config.SourceMachine{}
+	f.resp.Binding = &config.SourceBinding{
+		Delivery: []config.SourceRef{{Kind: "service", URL: "https://accounts.example.test"}},
+		Signing:  []config.SourceRef{},
+	}
+	for _, args := range [][]string{{"source", "status"}, {"source", "ls"}} {
+		out, err := runShed(t, args...)
+		if err != nil || !strings.Contains(out, "Credential source for you on srv: the account service (https://accounts.example.test); no machine answers here.") ||
+			strings.Contains(out, "not delivering") {
+			t.Fatalf("%v = %q, %v", args, out, err)
+		}
+	}
+	out, err := runShed(t, "source", "status", "--json")
+	var st sourceStatus
+	if err != nil || json.Unmarshal([]byte(out), &st) != nil || st.Service == nil || st.Service.URL != "https://accounts.example.test" || !st.Service.Delivering || st.Source != nil {
+		t.Fatalf("status --json = %q, %v", out, err)
+	}
+
+	f.resp.Binding.Delivery[0].State = "not_delivering"
+	if out, err := runShed(t, "source", "status"); err != nil || !strings.Contains(out, "The account service is not delivering credentials to this server") {
+		t.Fatalf("not delivering status = %q, %v", out, err)
+	}
+
+	for _, args := range [][]string{{"source", "use", "laptop"}, {"source", "unbind"}} {
+		_, err := runShed(t, args...)
+		if err == nil || !strings.Contains(err.Error(), config.SourceIsServiceMessage) || !strings.Contains(err.Error(), "nothing changed") {
+			t.Fatalf("%v = %v, want the service refusal", args, err)
+		}
+	}
+	if len(f.usesSnapshot()) != 0 || len(f.unbindsSnapshot()) != 0 {
+		t.Fatalf("a move or unbind was sent: %v %v", f.usesSnapshot(), f.unbindsSnapshot())
+	}
+}

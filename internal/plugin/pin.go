@@ -242,6 +242,31 @@ func (r *Registry) SetBindings(b source.Bindings) {
 	r.bindings = b
 }
 
+// ErrSourceIsService refuses every binding of a user the account service
+// answers for (a directory user on a directory server): no machine is
+// admitted, bound, moved to or answered from for them, on the bus's listener
+// routes and on the delivery routes alike (plan 040, section 3.2).
+var ErrSourceIsService = errors.New("the account service is this user's credential source: no machine is bound for them")
+
+// SetServiceUsers tells the registry which users the account service answers
+// for (directory users, by the server's static configuration): from then on
+// no binding is ever created or used for one of them. shed-server calls it
+// once at start-up, before any listener can register; nil (the default)
+// refuses nobody.
+func (r *Registry) SetServiceUsers(isService func(user string) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.serviceUser = isService
+}
+
+// isServiceUser reports whether the account service answers for user.
+func (r *Registry) isServiceUser(user string) bool {
+	r.mu.Lock()
+	f := r.serviceUser
+	r.mu.Unlock()
+	return f != nil && f(user)
+}
+
 // pin returns the source bindings, nil when there are none.
 func (r *Registry) pin() source.Bindings {
 	r.mu.Lock()
@@ -379,6 +404,12 @@ func (r *Registry) Subscribe(ctx context.Context, key ListenerKey, m source.Mach
 // binding generation the machine was admitted under. what names the request
 // in a refusal's log line.
 func (r *Registry) admitLocked(g *userGate, b source.Bindings, user string, m source.Machine, what string) (uint64, error) {
+	// A directory user's machine is never admitted: admission would bind
+	// the first one to connect (store.Admit), which is the one path that
+	// creates a binding.
+	if r.isServiceUser(user) {
+		return 0, ErrSourceIsService
+	}
 	// A machine the store already remembers for the user that is not the
 	// bound one is refused here, also before anything is spent from the rate
 	// limit and without Admit: what it presents now is not recorded, and only
@@ -544,6 +575,9 @@ func (r *Registry) Move(ctx context.Context, user, machineID, by string) (MoveRe
 	b := r.pin()
 	if b == nil {
 		return MoveResult{}, ErrNotPinned
+	}
+	if r.isServiceUser(user) {
+		return MoveResult{}, ErrSourceIsService
 	}
 	g := r.gate(user)
 	if err := g.lock(ctx); err != nil {

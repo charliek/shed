@@ -16,8 +16,8 @@ const manifestName = "MANIFEST.sha256"
 
 var manifestLine = regexp.MustCompile(`^([0-9a-f]{64})  (\S.*)$`)
 
-// contractFiles hashes every file of v1/ but the manifest, by its path
-// under v1/ (forward slashes).
+// contractFiles hashes every file of v2/ but the manifest, by its path
+// under v2/ (forward slashes).
 func contractFiles(t *testing.T) map[string]string {
 	t.Helper()
 	files := map[string]string{}
@@ -70,7 +70,7 @@ func renderManifest(files map[string]string) string {
 	return b.String()
 }
 
-// TestContractManifest holds v1/ to MANIFEST.sha256: every file but the
+// TestContractManifest holds v2/ to MANIFEST.sha256: every file but the
 // manifest is listed with its SHA-256, sorted by path, and nothing else is.
 // A file added, removed or changed without its manifest line fails here, as
 // `sha256sum -c MANIFEST.sha256` would in a copy.

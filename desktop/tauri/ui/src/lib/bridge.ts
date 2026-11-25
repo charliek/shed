@@ -7,13 +7,13 @@ import { initialReport } from "@/lib/report";
 import { pairRowsWithCards } from "@/lib/shedStatus";
 import type { SourceMachine, SourceRow, SourceStatus } from "@/lib/sources";
 
-export type Pane = "sheds" | "agents" | "activity" | "system";
+export type Pane = "sheds" | "agents" | "credentials" | "activity" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
 export type Modal = null | "create" | "craze";
 
-const PANES: readonly Pane[] = ["sheds", "agents", "activity", "system"];
+const PANES: readonly Pane[] = ["sheds", "agents", "credentials", "activity", "system"];
 
 /** Narrow an untrusted value (an IPC payload) to a known pane. */
 export function isPane(x: unknown): x is Pane {
@@ -139,6 +139,8 @@ export type SidebarInput = {
  *  navigate/refresh listeners, so a partial report from here would create the
  *  `main` slot early and false-signal readiness (see `report`). */
 export type SidebarReport = {
+  /** The nav entries as rendered, in order: their pane and their label. */
+  entries: { pane: string; label: string }[];
   servers: { name: string; reachable: boolean; detail: string }[];
 };
 
@@ -232,6 +234,10 @@ function report({ pane, sheds, refreshToken, modal, badges, sidebar, mode, hostE
       // hover text — so a test can prove the reason is threaded to the row and
       // not merely that the row exists.
       sidebar: {
+        entries: Array.from(document.querySelectorAll<HTMLElement>("[data-nav]")).map((el) => ({
+          pane: el.dataset.nav ?? "",
+          label: el.querySelector("[data-nav-label]")?.textContent ?? "",
+        })),
         servers: sidebar.servers.map((sv) => ({
           ...sv,
           detail: hostFailureFor(hostErrors, sv.name)?.summary ?? "",
@@ -595,46 +601,31 @@ export async function setLoginItem(enabled: boolean): Promise<void> {
   await core.invoke("loginitem_set", { enabled });
 }
 
-/* ---- credential sources (plan 035 §3.4) ------------------------------------ */
+/* ---- credential sources (plan 035 §3.4; the Credentials view's Where) ---------- */
 
-/* The row types and how reads and moves are reconciled live in `sources.ts` (pure,
- * unit-tested); the calls live here. A machine's name came from ANOTHER machine by
- * way of the server: Rust has already cleaned it, and `cleanMachineText` cleans it
- * again here; render it only as a text node, never into HTML, a title or a tooltip. */
+/* The row types and how reads, moves and stops are reconciled live in `sources.ts`, and
+ * what each row says in `credentials.ts` (both pure, unit-tested); the calls live here.
+ * A machine's name came from ANOTHER machine by way of the server: Rust has already
+ * cleaned it, and `credentials.ts` cleans it again (a second line of defence); render
+ * it only as a text node, never into HTML, a title or a tooltip. */
 export type { SourceMachine, SourceRow, SourceStatus };
 
-/** Control and Unicode format characters (bidirectional overrides, zero-widths) out:
- *  a second line of defence behind the Rust cleaner for text from other machines. */
-export function cleanMachineText(s: string): string {
-  return s.replace(/[\p{Cc}\p{Cf}]/gu, "");
+/** `sources.list`: who answers on each configured server (swallowing, like `invoke`:
+ *  `undefined` on any failure). */
+export async function listSources(): Promise<unknown> {
+  return invoke<unknown>("sources_list");
 }
 
-function cleanMachine(m: SourceMachine | null | undefined): SourceMachine | null {
-  return m ? { id: cleanMachineText(m.id), name: cleanMachineText(m.name) } : null;
+/** "Answer from here": make this machine the one that answers on `host`, answering
+ *  that host's row as the server left it after the move. THROWS the refusal as
+ *  `{code, message}`; the view words it from the code. */
+export async function answerFromHere(host: string): Promise<{ row: unknown; woke_source: boolean }> {
+  return invokeStrict("source_use", { host });
 }
 
-function cleanRow(r: SourceRow): SourceRow {
-  return { ...r, source: cleanMachine(r.source), busy: !!r.busy, unreachable: !!r.unreachable };
-}
-
-/** The source rows (swallowing, like `invoke`: `undefined` on any failure). */
-export async function getSourceStatus(): Promise<SourceStatus | undefined> {
-  const s = await invoke<SourceStatus>("source_status");
-  if (!s) return undefined;
-  return {
-    ...s,
-    rows: (s.rows ?? []).map(cleanRow),
-    this_machine: cleanMachine(s.this_machine),
-  };
-}
-
-/** "Use this machine": make this machine the source on `host`, answering that host's
- *  row as the server left it after the move. THROWS the refusal in plain words
- *  (unlike the swallowing `invoke`), which the row shows. */
-export async function makeThisMachineSource(host: string): Promise<{ row: SourceRow; woke_source: boolean }> {
-  const core = await import("@tauri-apps/api/core");
-  const res = await core.invoke<{ row: SourceRow; woke_source: boolean }>("source_use", { host });
-  return { ...res, row: cleanRow(res.row) };
+/** "Stop answering from here" on `host`. THROWS the refusal as `{code, message}`. */
+export async function stopAnsweringFromHere(host: string): Promise<Record<string, unknown>> {
+  return invokeStrict("source_unbind", { host });
 }
 
 /* ---- provisioning by delivery (plan 039 A6) ----------------------------------- */
@@ -692,10 +683,35 @@ export function setDeliveryProvider(
   return invokeStrict("delivery_set", { provider, config });
 }
 
-/** What `shed` on `server` would be delivered (or, with no shed, what the providers
- *  have at all): names, targets, stages, sizes, fingerprints and problems. */
-export function previewDelivery(server: string, shed?: string): Promise<Record<string, unknown>> {
-  return invokeStrict("delivery_preview", { server, shed: shed ?? null });
+/** What a shed on `server` would be delivered (the Credentials view's Check): a named
+ *  shed, or a new shed on `backend` with `repo` (or none): names, targets, stages,
+ *  sizes, fingerprints and problems. */
+export function previewDelivery(
+  server: string,
+  of: { shed: string } | { backend: string; repo: string | null },
+  runs: readonly string[],
+): Promise<Record<string, unknown>> {
+  // `runs`: the commands the person was told would run; settings that would run others
+  // are refused `settings_changed`, and nothing runs. THROWS `{code, message}`.
+  return "shed" in of
+    ? invokeStrict("delivery_preview", { server, shed: of.shed, runs })
+    : invokeStrict("delivery_preview", { server, vmBackend: of.backend, repo: of.repo, runs });
+}
+
+/** `delivery.describe`: each provider's descriptor (title, summary, where it lands,
+ *  fields), in the order they are asked. */
+export function describeDelivery(): Promise<unknown> {
+  return invokeStrict("delivery_describe");
+}
+
+/** `delivery.recent`: the answers this machine gave, newest first, redacted. */
+export function recentDeliveries(): Promise<unknown> {
+  return invokeStrict("delivery_recent");
+}
+
+/** What the Credentials view rendered (`credentials.dump`), or null off the view. */
+export function reportCredentials(snapshot: Record<string, unknown> | null): void {
+  void invoke("ui_report", { snapshot: { credentials: snapshot } });
 }
 
 /** The delivery record of a shed's document (null for a server older than delivery),
@@ -799,33 +815,14 @@ export async function setAppearanceState(mode: "light" | "dark"): Promise<void> 
 /** The Preferences window's rendered snapshot, reported under its own window label
  *  ("preferences") so the `prefs.dump` op can observe it (UI truth, like the egress
  *  report): the visible section ids in mac order, the rendered control values, and
- *  the active light/dark mode. Keys are additive + stable — the harness asserts them. */
+ *  the active light/dark mode. Keys are additive + stable — the harness asserts them.
+ *  (Credentials, and who answers on each server, are the Credentials view's.) */
 export type PrefsReport = {
   sections: string[];
   values: {
     preset: string;
     template: string;
     login: boolean;
-    /** The credential-source rows as rendered (supporting servers only), plan 035. */
-    sources: {
-      host: string;
-      source_name: string | null;
-      this_machine: boolean;
-      connected: boolean;
-      /** A move of this row is in flight. */
-      busy: boolean;
-      /** The server was busy at the last read; a later read is scheduled. */
-      retrying: boolean;
-      /** The server could not be reached at the last read: the row is the last one
-       *  known, and a few later reads are scheduled. */
-      unreachable: boolean;
-      can_use: boolean;
-      error: string | null;
-    }[];
-    this_machine_name: string | null;
-    this_machine_error: string | null;
-    /** The Provisioning section's rendered report (plan 039 A7), null until it has one. */
-    provisioning: Record<string, unknown> | null;
   };
   mode: string;
 };
