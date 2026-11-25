@@ -14,6 +14,7 @@ import {
   checkRequest,
   checkRuns,
   sameRuns,
+  stopUnverifiedText,
   checkResult,
   configFromDraft,
   draftFromConfig,
@@ -135,6 +136,13 @@ test("an uncertain stop can be undone from the view; an unreachable server offer
   const v = whereView(bound, { moving: false, canUse: true, refusal: null });
   assert.deepEqual(v.actions.map((a) => [a.id, a.label, a.enabled]),
     [["use", "Answer from here", true], ["unbind", "Stop answering from here", true]]);
+  // Another machine answers, this one not stopped there: Answer from here, and a
+  // stop that only pauses this machine; once paused, only Answer from here.
+  const desk = whereRowOf(listRow("d", "other_machine", { machine: DESK }));
+  assert.deepEqual(whereView(desk, { moving: false, canUse: true, refusal: null }).actions.map((a) => a.id),
+    ["use", "unbind"]);
+  assert.deepEqual(whereView({ ...desk, paused: true }, { moving: false, canUse: true, refusal: null })
+    .actions.map((a) => a.id), ["use"]);
   // Negative control: answering here, not paused, offers only the stop.
   const live = whereView(whereRowOf(listRow("a", "this_machine", { machine: ME })), { moving: false, canUse: false, refusal: null });
   assert.deepEqual(live.actions.map((a) => a.id), ["unbind"]);
@@ -163,6 +171,11 @@ test("a pause file that cannot be written is not one that cannot be read", () =>
   for (const e of ["unreadable", "unparseable", "unknown_version"]) {
     assert.match(pausedErrorText(e), /answers on none of them/, e);
   }
+});
+
+test("an unconfirmed stop is fixed words", () => {
+  assert.equal(stopUnverifiedText("mock"),
+    "mock's answer could not be confirmed, so nothing was sent; this machine stays stopped there. Try again.");
 });
 
 test("a move's answer is this machine's row", () => {

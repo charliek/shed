@@ -232,14 +232,17 @@ fn shed_read_failure(e: &shed_core::http::ApiFailure) -> OpError {
 
 /// `delivery.preview`: with a shed, its document is read from `server` first; with a
 /// backend (and a repository, or none), the request a new shed of that kind would draw;
-/// a shed and a backend together are refused, as is a repository with no backend.
+/// a shed and a backend together are refused, as is a repository with no backend. The
+/// server is resolved as the source doors resolve it ([`crate::source::Resolver`]): the
+/// shed config as it reads now, so a server added while the app runs is known and a
+/// changed endpoint is read at the new one, for both forms.
 pub async fn preview(
     rt: &DeliveryRuntime,
-    backend: &Backend,
+    servers: &crate::source::Resolver,
     server: &str,
     p: PreviewParams<'_>,
 ) -> Result<Value, OpError> {
-    let c = client(backend, server)?;
+    let c = servers.client(server).await?;
     let of = match (p.shed, p.backend) {
         (Some(_), Some(_)) => return Err(bad("name a shed, or a backend and a repo, not both")),
         (Some(name), None) => {

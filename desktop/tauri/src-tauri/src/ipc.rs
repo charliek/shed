@@ -1094,7 +1094,7 @@ impl Handler {
                         }
                     },
                 };
-                crate::delivery::preview(&*self.delivery_rt()?, &self.backend, server, p).await
+                crate::delivery::preview(&*self.delivery_rt()?, &self.resolver(), server, p).await
             }
             "shed.delivery" => {
                 let (server, shed) = (req_str(params, "server")?, req_str(params, "shed")?);

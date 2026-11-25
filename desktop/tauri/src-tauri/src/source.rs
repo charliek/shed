@@ -162,7 +162,7 @@ impl Resolver {
     /// the config cannot be read (the safer choice: an action is never sent to a server
     /// the config may no longer name, or at an endpoint it may have changed), and
     /// `bad_request` for a server it does not list.
-    async fn client(&self, host: &str) -> Result<Client, (String, String)> {
+    pub async fn client(&self, host: &str) -> Result<Client, (String, String)> {
         let servers = self.now().await;
         if servers.config_unreadable {
             return Err(err(
@@ -372,10 +372,12 @@ pub async fn unbind(
     if answers_by_service(&read) {
         return Err(service_refusal(host));
     }
-    // Another machine of this user's answers there: this machine stops answering (the
-    // pause), and that machine's binding is never cleared, so no unbind is sent.
+    // A server older than sources has nothing to stop: refused, nothing paused.
+    if let Err(e @ SourceError::Unsupported) = &read {
+        return Err(refusal(host, e, "unbind"));
+    }
     let me_now = this_machine(rt).await.ok();
-    let other = other_machine_bound(&read, me_now.as_ref().map(|m| m.id.as_str()));
+    let me_id = me_now.as_ref().map(|m| m.id.as_str());
     let was_paused = rt.is_some_and(|rt| rt.is_paused(host));
     if let Some(rt) = rt {
         rt.pause(host).map_err(|_| {
@@ -394,37 +396,49 @@ pub async fn unbind(
             ));
         }
     }
-    // The first read can be stale: a first-connect bind may have made this machine the
-    // source since. Read again now that this machine's stream has stopped; if it names
-    // this machine, the stop is an ordinary unbind (with its re-check below).
-    let other = match other {
-        None => None,
-        Some(first) => {
-            let again = client.source_status().await;
-            let mine = me_now.as_ref().is_some_and(|m| {
-                again.as_ref().ok().and_then(|d| d.source_machine_id()) == Some(m.id.as_str())
-            });
-            if mine {
-                None
-            } else {
-                Some(
-                    other_machine_bound(&again, me_now.as_ref().map(|m| m.id.as_str()))
-                        .unwrap_or(first),
-                )
-            }
+    // Read the binding again now that this machine's stream has stopped (the first read
+    // may be stale: a first-connect bind can race it). An unbind is sent only when this
+    // read succeeded and names THIS machine. Another machine's binding is never cleared;
+    // a read that failed (or is busy) says nothing, so nothing is sent either. In both
+    // cases this machine stays paused there.
+    let again = client.source_status().await;
+    match stop_decision(&again, me_id) {
+        StopDecision::Unbind => {}
+        StopDecision::AnotherMachine(previous) => {
+            return Ok(json!({
+                "server": host,
+                "unbound": false,
+                "previous": previous,
+                "previous_was_this_machine": false,
+                "forgotten_machines": 0,
+                "paused": rt.is_some(),
+                "verified": false,
+                "another_machine_answers": true,
+            }));
         }
-    };
-    if let Some(other) = other {
-        return Ok(json!({
-            "server": host,
-            "unbound": false,
-            "previous": other,
-            "previous_was_this_machine": false,
-            "forgotten_machines": 0,
-            "paused": rt.is_some(),
-            "verified": false,
-            "another_machine_answers": true,
-        }));
+        StopDecision::Nobody => {
+            return Ok(json!({
+                "server": host,
+                "unbound": false,
+                "previous": null,
+                "previous_was_this_machine": false,
+                "forgotten_machines": 0,
+                "paused": rt.is_some(),
+                "verified": true,
+            }));
+        }
+        StopDecision::Unknown => {
+            return Ok(json!({
+                "server": host,
+                "unbound": false,
+                "previous": null,
+                "previous_was_this_machine": false,
+                "forgotten_machines": 0,
+                "paused": rt.is_some(),
+                "verified": false,
+                "unverified": true,
+            }));
+        }
     }
     let done = match client.source_unbind().await {
         Ok(done) => done,
@@ -487,6 +501,37 @@ fn answers_by_service(read: &Result<shed_core::models::SourceDocument, SourceErr
         Ok(doc) => doc.service().is_some(),
         Err(SourceError::Api { code, .. }) => code == SOURCE_IS_SERVICE,
         Err(_) => false,
+    }
+}
+
+/// What a stop does once this machine's stream has stopped, from a fresh read of the
+/// binding: unbind (the read names this machine), keep the pause only because another
+/// machine answers (its binding is never cleared) or nobody is bound, or keep the pause
+/// only because the read said nothing (failed, busy, or a service refusal).
+#[derive(Debug, PartialEq)]
+enum StopDecision {
+    Unbind,
+    AnotherMachine(Value),
+    Nobody,
+    Unknown,
+}
+
+fn stop_decision(
+    read: &Result<shed_core::models::SourceDocument, SourceError>,
+    me: Option<&str>,
+) -> StopDecision {
+    let Ok(doc) = read else {
+        return StopDecision::Unknown;
+    };
+    if doc.service().is_some() {
+        return StopDecision::Unknown;
+    }
+    match doc.source_machine_id() {
+        None => StopDecision::Nobody,
+        Some(id) if Some(id) == me => StopDecision::Unbind,
+        Some(_) => other_machine_bound(read, me)
+            .map(StopDecision::AnotherMachine)
+            .unwrap_or(StopDecision::Unknown),
     }
 }
 
@@ -1019,6 +1064,52 @@ mod tests {
         assert!(!answers_by_service(&doc(&machine_doc(None))));
         assert!(!answers_by_service(&Err(api(403, "FORBIDDEN", "x"))));
         assert!(!answers_by_service(&Err(SourceError::Unsupported)));
+    }
+
+    /// After the pause a stop unbinds only on a read that names this machine; another
+    /// machine, nobody, or a read that says nothing keeps the pause and sends nothing.
+    #[test]
+    fn a_stop_unbinds_only_on_a_read_naming_this_machine() {
+        let doc = |t: &str| Ok(serde_json::from_str::<SourceDocument>(t).unwrap());
+        assert_eq!(
+            stop_decision(&doc(&machine_doc(Some(ME))), Some(ME)),
+            StopDecision::Unbind
+        );
+        assert_eq!(
+            stop_decision(&doc(&machine_doc(Some(DESK))), Some(ME)),
+            StopDecision::AnotherMachine(json!({"id": DESK, "name": "desk"}))
+        );
+        assert!(
+            matches!(
+                stop_decision(&doc(&machine_doc(Some(ME))), None),
+                StopDecision::AnotherMachine(_)
+            ),
+            "with no identity, no machine is this one"
+        );
+        assert_eq!(
+            stop_decision(&doc(&machine_doc(None)), Some(ME)),
+            StopDecision::Nobody
+        );
+        for e in [
+            SourceError::Busy {
+                retry_after: None,
+                message: "x".into(),
+            },
+            SourceError::Shed(ShedError::Transport("x".into())),
+            api(409, SOURCE_IS_SERVICE, "x"),
+            SourceError::Unsupported,
+        ] {
+            assert_eq!(stop_decision(&Err(e), Some(ME)), StopDecision::Unknown);
+        }
+        assert_eq!(
+            stop_decision(
+                &doc(include_str!(
+                    "../../../../crates/fixtures/sources/service.json"
+                )),
+                Some(ME)
+            ),
+            StopDecision::Unknown
+        );
     }
 
     /// A stop where another machine answers pauses this machine only: the other machine

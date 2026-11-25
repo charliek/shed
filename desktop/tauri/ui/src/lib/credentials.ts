@@ -275,6 +275,8 @@ export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; re
   // on one that cannot be reached now (the server could not take it). Where this
   // machine is bound and yet stopped answering (a stop whose outcome was uncertain),
   // "Answer from here" undoes the pause, and "Stop answering from here" tries again.
+  // Where another machine answers and this one has not stopped there, it can stop (a
+  // pause only: that machine's binding is never cleared).
   const actions: WhereAction[] = [];
   if (r.unreachable || kind === "service" || kind === "unsupported") {
     // none
@@ -283,6 +285,9 @@ export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; re
     actions.push({ id: "unbind", label: o.moving ? "Switching…" : "Stop answering from here", enabled: !o.moving });
   } else {
     actions.push({ id: "use", label: o.moving ? "Stopping…" : "Answer from here", enabled: !o.moving && o.canUse });
+    if (kind === "other_machine" && !r.paused && !o.moving) {
+      actions.push({ id: "unbind", label: "Stop answering from here", enabled: true });
+    }
   }
   return {
     server: r.host,
@@ -329,6 +334,12 @@ export function refusalText(code: string, server: string, what: "use" | "unbind"
     default:
       return `${server} could not confirm the ${act}; check who answers before trying again.`;
   }
+}
+
+/** The note under a row whose stop could not be confirmed (`source.unbind`'s
+ *  `unverified`): fixed words. */
+export function stopUnverifiedText(server: string): string {
+  return `${server}'s answer could not be confirmed, so nothing was sent; this machine stays stopped there. Try again.`;
 }
 
 /** A refusal as the app's command throws it (`{code, message}`), reduced to its code. */

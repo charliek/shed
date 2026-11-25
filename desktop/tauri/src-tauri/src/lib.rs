@@ -996,7 +996,7 @@ async fn delivery_preview(
         repo: repo.as_deref().filter(|s| !s.is_empty()),
         expect_runs: runs,
     };
-    delivery::preview(&rt, &backend, &server, p)
+    delivery::preview(&rt, &resolver(&app, &backend), &server, p)
         .await
         .map_err(coded_refusal)
 }

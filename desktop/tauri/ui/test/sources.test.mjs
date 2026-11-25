@@ -25,6 +25,7 @@ import {
   restartRetries,
   shownRows,
   stopConfirmed,
+  stopUnverified,
 } from "../dist-test/sources.js";
 
 const ME = { id: "0".repeat(32), name: "laptop" };
@@ -527,8 +528,16 @@ test("a move shows this machine answering, with its stream not known yet", () =>
 
 test("Stop answering from here: shown at once, kept on confirm, put back on refusal", () => {
   let s = loaded();
-  assert.equal(canStop(s, "a"), false, "another machine answers: nothing to stop");
-  assert.equal(beginStop(s, "a"), null);
+  // Another machine answers: this machine can still stop there, a pause only — the
+  // row keeps that machine, marked paused.
+  assert.equal(canStop(s, "a"), true);
+  const pausedOnly = beginStop(s, "a");
+  assert.deepEqual([pausedOnly.rows.a.source, pausedOnly.rows.a.paused, pausedOnly.rows.a.this_machine],
+    [DESK, true, false]);
+  const stopped = stopConfirmed(pausedOnly, "a", 2);
+  assert.equal(canStop(stopped, "a"), false, "already stopped there");
+  assert.equal(canStop({ ...s, rows: { ...s.rows, a: { ...s.rows.a, unreachable: true } } }, "a"), false,
+    "not while the server cannot be reached");
   s = moveConfirmed(beginMove(s, "a"), "a", 2, row("a", ME));
   assert.equal(canStop(s, "a"), true);
   const stopping = beginStop(s, "a");
@@ -548,4 +557,21 @@ test("Stop answering from here: shown at once, kept on confirm, put back on refu
   const back = moveFailed(stopping, "a", "no");
   assert.equal(back.rows.a.this_machine, true);
   assert.equal(back.errors.a, "no");
+});
+
+test("a stop the server could not confirm keeps the binding it showed, paused, and can be tried again", () => {
+  let s = moveConfirmed(beginMove(loaded(), "a"), "a", 2, row("a", ME));
+  const stopping = beginStop(s, "a");
+  assert.equal(stopping.rows.a.kind, "nobody", "shown at once while in flight");
+  s = stopUnverified(stopping, "a", 3, "could not be confirmed");
+  assert.equal(s.moving.a, undefined);
+  assert.deepEqual([s.rows.a.this_machine, s.rows.a.source, s.rows.a.paused], [true, ME, true],
+    "never the unconfirmed nobody");
+  assert.equal(s.errors.a, "could not be confirmed");
+  assert.equal(canStop(s, "a"), true, "Stop stays available");
+  assert.equal(canUse(s, "a"), true, "and Answer from here undoes the pause");
+  // A read issued before the answer never lands over it.
+  assert.equal(applyRead(s, 2, status(row("a", DESK), row("b", DESK))).state.rows.a.this_machine, true);
+  // Negative control: a confirmed stop shows nobody.
+  assert.equal(stopConfirmed(stopping, "a", 3).rows.a.kind, "nobody");
 });

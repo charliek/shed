@@ -32,14 +32,14 @@ import {
 } from "@/lib/bridge";
 import {
   EMPTY_SOURCES, beginMove, beginStop, canUse, createSourceReader, moveConfirmed, moveFailed,
-  shownRows, stopConfirmed,
+  shownRows, stopConfirmed, stopUnverified,
   type SourceReader, type SourcesState,
 } from "@/lib/sources";
 import {
   ACTION_LABEL, BACKENDS, BACKEND_LABEL, EMPTY_CHECK, EVERY_SERVER, ONLY_THESE,
   checkErrorText, checkNote, checkRequest, checkResult, checkRuns, sameRuns, choiceOptions, clean, configFromDraft, draftFromConfig, edit,
   configErrorText, entryFields, fieldControl, machineFields, missing, pausedErrorText, readDescriptors, recentRows,
-  redactedConfig, refusalCode, refusalText, saveEnabled, saveLabel, serverTicks, shedPick, switched,
+  redactedConfig, refusalCode, refusalText, stopUnverifiedText, saveEnabled, saveLabel, serverTicks, shedPick, switched,
   whatView, whereRowOfMove, whereStatusOf, whereView,
   type CheckForm, type CheckResult, type ProviderDesc, type ProviderDraft, type ProviderSetting,
   type RecentView, type ScopeAt, type ScopeDraft, type WhatAction, type WhereRow,
@@ -152,8 +152,11 @@ export function useCredentialSources(active: boolean, shown: number): Credential
     if (!started) return;
     commit(started);
     void stopAnsweringFromHere(host).then(
-      () => {
-        commit(stopConfirmed(srcRef.current, host, ++seq.current));
+      (done) => {
+        // Unconfirmed: the binding it showed, paused, with a note; not "nobody".
+        commit(done?.unverified === true
+          ? stopUnverified(srcRef.current, host, ++seq.current, stopUnverifiedText(host))
+          : stopConfirmed(srcRef.current, host, ++seq.current));
         reader.current?.read(host);
       },
       (e: unknown) => {

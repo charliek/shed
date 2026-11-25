@@ -251,26 +251,32 @@ export function beginMove(state: SourcesState, host: string): SourcesState | nul
 /** Whether `host`'s "Stop answering from here" can be pressed: this machine answers
  *  there, and no move or stop of that row is in flight. */
 export function canStop(state: SourcesState, host: string): boolean {
-  return !state.moving[host] && !!state.rows[host]?.this_machine;
+  const row = state.rows[host];
+  if (state.moving[host] || !row) return false;
+  // Where another machine answers, this machine can still stop answering there (a pause
+  // only: that machine's binding is never cleared), while the server can be reached.
+  const other = !row.this_machine && !!row.source && row.kind !== "service";
+  return row.this_machine || (other && !row.paused && !row.unreachable);
 }
 
 /** A "Stop answering from here" press: `null` when it cannot start ([canStop]), else
- *  the state with the row showing nobody, this machine stopped there, and the row it
- *  replaced kept for a refusal ([moveFailed]). */
+ *  the state with the row showing this machine stopped there — nobody answering where
+ *  this machine did, the other machine kept where it answers — and the row it replaced
+ *  kept for a refusal ([moveFailed]). */
 export function beginStop(state: SourcesState, host: string): SourcesState | null {
   const prev = state.rows[host];
   if (!prev || !canStop(state, host)) return null;
   const errors = { ...state.errors };
   delete errors[host];
-  return {
-    ...state,
-    rows: {
-      ...state.rows,
-      [host]: {
+  const next: SourceRow = prev.this_machine
+    ? {
         ...prev, source: null, this_machine: false, connected: false, busy: false, unreachable: false,
         error: null, kind: "nobody", paused: true, stream: null, stream_error: null,
-      },
-    },
+      }
+    : { ...prev, busy: false, error: null, paused: true, stream: null, stream_error: null };
+  return {
+    ...state,
+    rows: { ...state.rows, [host]: next },
     moving: { ...state.moving, [host]: prev },
     errors,
   };
@@ -285,6 +291,23 @@ export function stopConfirmed(state: SourcesState, host: string, seq: number): S
     ...state,
     applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
     moving,
+  };
+}
+
+/** The stop was answered, but the server's binding could not be read afterwards (the
+ *  backend's `unverified`): nothing was sent and this machine stays paused there. The
+ *  row goes back to the binding it showed before (never "nobody", which was not
+ *  confirmed), marked paused, with `note` under it; Stop stays available to try again. */
+export function stopUnverified(state: SourcesState, host: string, seq: number, note: string): SourcesState {
+  const moving = { ...state.moving };
+  const prev = moving[host];
+  delete moving[host];
+  return {
+    ...state,
+    rows: prev ? { ...state.rows, [host]: { ...prev, paused: true } } : state.rows,
+    applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
+    moving,
+    errors: { ...state.errors, [host]: note },
   };
 }
 

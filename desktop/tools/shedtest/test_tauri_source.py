@@ -1054,6 +1054,9 @@ def test_a_server_added_while_the_app_runs_is_listed_and_actionable(tmp_path):
         hosts = lambda: [r["server"] for r in client.sources_list()["servers"]]
         assert hosts() == ["mock"]
         with pytest.raises(ShedError) as e:
+            client.call("delivery.preview", {"server": "mock2", "backend": "vz"})
+        assert e.value.code == "bad_request", e.value
+        with pytest.raises(ShedError) as e:
             client.source_unbind("mock2")
         assert e.value.code == "bad_request", e.value
         cfg.write_text(base.replace(
@@ -1061,6 +1064,9 @@ def test_a_server_added_while_the_app_runs_is_listed_and_actionable(tmp_path):
             "    mock2:\n        host: 127.0.0.1\n        http_port: 8081\n"
             "        ssh_port: 2222\ndefault_server: mock"))
         assert hosts() == ["mock", "mock2"]
+        # Check reads the server as the config reads now, too.
+        pv = client.call("delivery.preview", {"server": "mock2", "backend": "vz"})
+        assert pv["server"] == "mock2", pv
         _open_view(client)
         client.wait_until(lambda: _view_row(client, "mock2") is not None, timeout=20,
                           what="the added server's row")
@@ -1184,6 +1190,22 @@ def test_stopping_where_another_machine_answers_pauses_only_this_machine():
         client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
                           what="answering again")
         assert _list_row(client, "mock")["paused"] is False
+        # The same through the view: another machine answers again, and the row offers
+        # Stop answering from here, which pauses this machine only.
+        mock.move_source(OTHER_MACHINE, "desk")
+        _open_view(client)
+        client.wait_until(
+            lambda: (lambda r: r and r["kind"] == "other_machine" and r["can_stop"])(
+                _view_row(client)), timeout=20, what="desk answering, with a stop offered")
+        assert [a["id"] for a in _view_row(client)["actions"]] == ["use", "unbind"]
+        client.press_source_unbind("mock")
+        client.wait_until(
+            lambda: (lambda r: r and r["paused"] and not r["busy"])(_view_row(client)),
+            timeout=20, what="this machine paused there")
+        row = _view_row(client)
+        assert (row["kind"], row["source_name"], row["error"]) == ("other_machine", "desk", None), row
+        assert [a["id"] for a in row["actions"]] == ["use"], row
+        assert mock.source_unbind_requests() == [] and mock.source_bound() == OTHER_MACHINE
 
 
 def test_a_stop_whose_first_read_is_stale_unbinds_this_machine():
@@ -1208,6 +1230,34 @@ def test_a_stop_whose_first_read_is_stale_unbinds_this_machine():
         assert "another_machine_answers" not in done, done
         assert mock.source_unbind_requests() == [{}]
         assert mock.source_bound() is None
+
+
+def test_a_stop_the_server_cannot_confirm_keeps_the_binding_paused():
+    """The server is busy for every read a stop makes: nothing is sent, this machine
+    stays paused there, and the view keeps the row's binding (never "Nobody answers
+    here"), says the answer could not be confirmed, and keeps Stop available."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
+                          what="this machine the source")
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("can_stop") is True,
+                          timeout=20, what="Stop answering from here")
+        mock.source_busy(1000, retry_after="0")
+        try:
+            client.press_source_unbind("mock")
+            client.wait_until(lambda: (_view_row(client) or {}).get("error"), timeout=30,
+                              what="the note under the row")
+            row = _view_row(client)
+            assert row["error"] == ("mock's answer could not be confirmed, so nothing was sent; "
+                                    "this machine stays stopped there. Try again."), row
+            assert row["kind"] == "this_machine" and row["paused"] is True, row
+            assert row["can_stop"] is True and row["busy"] is False, row
+            assert mock.source_unbind_requests() == []
+        finally:
+            mock.source_busy(0)
+        assert client.call("delivery.status")["paused"] == ["mock"]
 
 
 def test_an_unusable_paused_file_starts_no_stream():
