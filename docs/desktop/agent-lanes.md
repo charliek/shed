@@ -28,7 +28,7 @@ wire into the contract. Craze is the only adapter:
 
 | Adapter | Crate | What it talks to | Which rows |
 |---|---|---|---|
-| **craze** | `crates/shed-craze` | A shed's [craze](https://github.com/charliek/craze) **hub**, which fronts every cursor, grok, claude and native session on that shed | Every craze session the hub lists; the desktop runs one craze source per running shed |
+| **craze** | `crates/shed-craze` | A shed's [craze](https://github.com/charliek/craze) **hub**, which fronts every cursor, grok, claude, antigravity and native session on that shed | Every craze session the hub lists; the desktop runs one craze source per running shed |
 
 A roost tab (`claude`, `opencode`, `codex`, or anything else roost owns) is a
 plain row: roost's status, no transcript. The desktop does not dial a local
