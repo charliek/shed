@@ -35,6 +35,11 @@ The account service becomes a credential source for the users it lists, and the 
 - **Preferences reduced.** Preferences keeps General and Terminal; Provisioning, Source machine and Preview are gone. IPC: new `delivery.describe`, `sources.list`, `source.unbind`, `delivery.recent`, `credentials.dump`, `sidebar.dump`, `ui.fill_check`, `ui.press_check`, `ui.press_source_unbind`; `delivery.preview` takes a backend and repo; `ui.prefs_section`, `ui.press_delivery_toggle` and `ui.preview_delivery` are removed.
 - **A stop that sticks.** "Stop answering from here" unbinds and pauses that server in `paused-servers.json`, so the app does not bind itself again; only "Answer from here" lifts it, even if the server leaves the config and comes back meanwhile. A `409 SOURCE_IS_SERVICE` on the delivery stream is a settled state, rechecked every five minutes, not a reconnect loop.
 - Docs: a new guide, [Credentials from the account service](docs/guides/credentials-from-the-account-service.md); the delivery, security, CLI and API references.
+- **Images: the `base` and `full` images bake craze 0.5.0** (0.11.0 baked 0.4.1), and the
+  tests run against it. In a shed built from them, the desktop's create sheet lists craze's
+  `antigravity` provider (Google's Antigravity CLI, `agy`), which craze 0.5.0 added between
+  `claude` and `native`, dimmed until `agy` is installed. A shed keeps the craze its image
+  baked; recreate it to pick up the new one.
 
 ## v0.11.0 — 2026-11-24
 

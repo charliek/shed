@@ -275,9 +275,9 @@ ARG ROOST_SESSION_SHA256_ARM64=8340a4473f5699a5ab6ddc727b6be94361a336627175d1715
 # lockstep with craze-pin.env's CRAZE_RELEASE (the check-roost-pin precedent).
 # These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so the
 # values are named here and overridable by --build-arg on a manual build.
-ARG CRAZE_VERSION=0.4.1
-ARG CRAZE_SHA256_AMD64=7fe27b7d6d98725182f55f6e1f359945ea01d312b76641a0513d0a30ba7c26a7
-ARG CRAZE_SHA256_ARM64=ec4e5b48a0f71f0a882de318d774b5b4c54848f5ce1d8d42da0cc0d6eb740ac8
+ARG CRAZE_VERSION=0.5.0
+ARG CRAZE_SHA256_AMD64=682e84834ca377832dc3fcc56e88376752d68dd3fdf2c414979061c7fefe8a10
+ARG CRAZE_SHA256_ARM64=c662fabde8ca2e1fcb85b905e73815d2403aa1c07534fcc60c651b60ec3f3822
 
 # Plain statements under `set -euo pipefail`, no `&&`/`||` chains: set -e ignores a
 # failure in a non-final element of an `&&`/`||` list. Each failure stops the
