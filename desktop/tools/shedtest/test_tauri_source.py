@@ -4,9 +4,11 @@ beside it: the log file, the per-server credential mode and launch at login.
 
 The app binds to a server through its delivery stream (`GET /api/delivery/requests`
 with this machine's id): a pinning server refuses another machine's stream `403
-SOURCE_NOT_BOUND`, "Use this machine" (`source.use`, or the Preferences row's own
-button) moves the binding here and reopens the stream at once. There is no broker and
-no plugin bus.
+SOURCE_NOT_BOUND`, "Answer from here" (`source.use`, or the Credentials view's Where row's
+own button) moves the binding here and reopens the stream at once. There is no broker and
+no plugin bus. The Where rows were Preferences' Source machine section until plan 040
+§3.9 moved them to the Credentials view; the cells that drove that section drive the
+view now.
 
 Every cell launches its OWN hermetic app instance (a throwaway HOME/XDG_RUNTIME_DIR →
 its own socket, single-instance lock and machine identity) with its own PRIVATE mock
@@ -17,6 +19,8 @@ The mock URL is plain `http://` on loopback, so nothing mints over SSH.
 from __future__ import annotations
 
 import json
+import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -38,6 +42,26 @@ CONFIG = FIXTURES / "config.yaml"
 MTLS_CONFIG = FIXTURES / "config-mtls.yaml"
 SOURCES_CONFIG = FIXTURES / "config-sources.yaml"
 SERVICE_URL = "https://accounts.example.test"
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+#: Keeps the Credentials view's screenshots (Linux; TCC-gated on macOS).
+SHOTS = os.environ.get("SHED_DELIVERY_SHOTS")
+
+
+def _shot(client, name: str, anchor: str | None = None) -> None:
+    if platform.system() == "Darwin":
+        return
+    if anchor:
+        token = client.call("ui.scroll_to", {"anchor": anchor})["token"]
+        client.wait_until(lambda: (client.call("ui.scrolled")["scrolled"] or {}).get("token") == token,
+                          timeout=10, what=f"scrolled to {anchor}")
+    png, w, h = client.screenshot(scale=1)
+    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+    if SHOTS:
+        out = Path(SHOTS).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        (out / name).write_bytes(png)
+
 
 # The machine the armed mock binds by default (`mockserver.NOT_SOURCE_ACTIVE`).
 OTHER_MACHINE = "fedcba9876543210fedcba9876543210"
@@ -65,6 +89,7 @@ def _source_app(
     mock: MockShedServer | None = None,
     mock_base_url: str | None = None,
     source_recheck_ms: int | None = None,
+    unreachable_hosts: tuple[str, ...] = (),
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `runtime_dir` and
@@ -85,6 +110,7 @@ def _source_app(
       `hermetic.mock_url`).
     * `source_recheck_ms` — how often a stream settled on the account service is
       checked again (`SHED_TAURI_SOURCE_RECHECK_MS`).
+    * `unreachable_hosts` — config server names pointed at a closed port.
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
@@ -105,7 +131,8 @@ def _source_app(
             (runtime_dir / "broker-state").write_text("not a directory\n")
         env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=base_url,
                              config_path=shed_config_path,
-                             source_recheck_ms=source_recheck_ms)
+                             source_recheck_ms=source_recheck_ms,
+                             unreachable_hosts=unreachable_hosts)
         if before_launch is not None:
             before_launch(runtime_dir)
         sock = runtime_dir / cfg.sock_rel
@@ -145,27 +172,31 @@ def _source_row(client, host: str = "mock") -> dict:
     return next(r for r in client.source_status()["rows"] if r["host"] == host)
 
 
-def _prefs_report(client) -> dict:
-    return client.prefs_dump().get("prefs") or {}
+def _where(client) -> dict:
+    """The Credentials view's Where part as it rendered ({} off the view)."""
+    return (client.credentials_dump() or {}).get("where") or {}
 
 
-def _prefs_source(client, host: str = "mock") -> dict | None:
-    for row in (_prefs_report(client).get("values") or {}).get("sources") or []:
+def _view_row(client, host: str = "mock") -> dict | None:
+    for row in _where(client).get("rows") or []:
         if row["host"] == host:
             return row
     return None
 
 
-def _open_prefs(client) -> None:
-    client.show_preferences()
-    client.wait_until(lambda: client.prefs_dump()["visible"] and _prefs_report(client),
-                      timeout=20, what="preferences window visible + reported")
+def _open_view(client) -> None:
+    """Navigate to the Credentials view (each navigation reads every server again) and
+    wait until it has reported."""
+    client.navigate("credentials")
+    client.wait_until(lambda: client.current_pane() == "credentials" and _where(client)
+                      and (client.credentials_dump() or {}).get("doors_ready"),
+                      timeout=20, what="the Credentials view shown + reported")
 
 
-def _close_prefs(client) -> None:
-    client.prefs_close()
-    client.wait_until(lambda: not client.prefs_dump()["visible"],
-                      timeout=10, what="preferences window hidden")
+def _leave_view(client) -> None:
+    client.navigate("sheds")
+    client.wait_until(lambda: client.credentials_dump() is None,
+                      timeout=10, what="the Credentials view left")
 
 
 def _holds(pred, seconds: float, what: str) -> None:
@@ -181,7 +212,7 @@ def _not_bound(client) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The source rows, "Use this machine" over IPC and through the Preferences button
+# The source rows, "Answer from here" over IPC and through the Credentials view
 # ---------------------------------------------------------------------------
 
 def test_not_bound_until_use_this_machine_then_connected_at_once():
@@ -228,44 +259,50 @@ def test_not_bound_until_use_this_machine_then_connected_at_once():
         assert _source_row(client)["this_machine"] is True
 
 
-def test_preferences_source_row_flips_after_use_this_machine():
-    """Preferences shows one row per supporting server: the other machine's name with
-    a "Use this machine" button, and a line naming this machine. Pressing the REAL
-    button (its `data-source-use` element, clicked by the harness door) sends this
-    machine's id; the row then reads "this machine" and the stream connects."""
+def test_answer_from_here_flips_the_where_row():
+    """The Credentials view's Where part has one row per configured server: the other
+    machine's name with an "Answer from here" button, and a line naming this machine.
+    Pressing the REAL button (its `data-source-use` element, clicked by the harness
+    door) sends this machine's id; the row then reads "This machine answers here" with
+    "Stop answering from here", and the stream connects."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
         machine = _machine(client)
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("source_name") == "desk",
                           timeout=20, what="the source row naming desk")
-        row = _prefs_source(client)
+        row = _view_row(client)
+        assert row["kind"] == "other_machine" and row["who"] == "Another machine answers here:", row
         assert row["this_machine"] is False and row["can_use"] is True, row
+        assert row["action"] == {"id": "use", "label": "Answer from here", "enabled": True}, row
         assert row["busy"] is False and row["error"] is None, row
-        values = _prefs_report(client)["values"]
-        assert values["this_machine_name"] == machine["name"], values
-        assert values["this_machine_error"] is None, values
+        where = _where(client)
+        assert where["this_machine_name"] == machine["name"], where
+        assert where["this_machine_error"] is None, where
 
         client.press_source_use("mock")
         client.wait_until(lambda: mock.source_use_requests(),
                           timeout=15, what="the button's move request")
         assert mock.source_use_requests() == [{"machine_id": machine["id"]}]
         client.wait_until(
-            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_prefs_source(client)),
+            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_view_row(client)),
             timeout=15, what="the row flipped to this machine")
-        row = _prefs_source(client)
+        row = _view_row(client)
         assert row["source_name"] == machine["name"], row
         assert row["error"] is None, row
-        # No button where this machine already is the source, and none reported.
-        assert row["can_use"] is False, row
+        # No "Answer from here" where this machine already is the source: its action is
+        # to stop.
+        assert row["can_use"] is False and row["action"]["id"] == "unbind", row
         client.wait_until(lambda: _stream(client)["state"] == "connected",
                           timeout=30, what="the stream connected after the button")
+        client.wait_until(lambda: (_view_row(client) or {}).get("detail") == "connected",
+                          timeout=20, what="the row saying its stream is connected")
 
 
-def test_unarmed_server_has_no_source_rows():
+def test_an_older_server_has_a_row_with_no_action():
     """A server older than the feature (the unarmed mock: a plain 404 on
-    `/api/sources`) is `supported: false` with no error, Preferences shows no source
-    row and no new section, and a move is refused as unsupported."""
+    `/api/sources`) is `supported: false` with no error over IPC, its Where row says so
+    and offers no action, and a move is refused as unsupported."""
     with _source_app() as (client, mock, _i):
         mock.live_delivery_stream(timeout=scaled_timeout(20))
         status = client.source_status()
@@ -277,31 +314,31 @@ def test_unarmed_server_has_no_source_rows():
         with pytest.raises(ShedError) as e:
             client.source_use("mock")
         assert e.value.code == "unsupported", e.value
-        _open_prefs(client)
-        client.wait_until(lambda: "provisioning" in (_prefs_report(client).get("sections") or []),
-                          timeout=20, what="the Provisioning section")
-        report = _prefs_report(client)
-        assert report["sections"] == ["general", "terminal", "provisioning"], report
-        assert report["values"]["sources"] == [], report
-        assert report["values"]["this_machine_name"] is None, report
+        _open_view(client)
+        client.wait_until(lambda: _view_row(client) is not None, timeout=20,
+                          what="the older server's row")
+        row = _view_row(client)
+        assert row["kind"] == "unsupported" and row["action"] is None, row
+        assert row["who"] == "This server is older than credential sources", row
+        assert row["error"] is None, row
 
 
 def test_refused_moves_show_their_messages():
     """A move the server refuses is reported in fixed words, never the server's: a 403
-    under the Preferences row (pressed through the real button, the row flips back), a
+    under the Where row (pressed through the real button, the row flips back), a
     500 as "could not confirm", an unknown server as a bad request — each one request,
     never retried."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
         mock.source_use_script([403, 500])
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("can_use") is True,
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("can_use") is True,
                           timeout=20, what="an enabled Use this machine button")
         client.press_source_use("mock")
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("error"),
+        client.wait_until(lambda: (_view_row(client) or {}).get("error"),
                           timeout=15, what="the refusal under the row")
-        row = _prefs_source(client)
+        row = _view_row(client)
         assert "does not let this client change its credential source" in row["error"], row
         assert "script key" not in row["error"], row
         assert row["this_machine"] is False and row["busy"] is False, row
@@ -323,21 +360,22 @@ def test_refused_moves_show_their_messages():
 def test_machine_name_with_control_and_bidi_characters_is_shown_cleaned():
     """A machine name is text from another machine: its control and Unicode format
     characters (a bell, a newline, a right-to-left override, a zero-width space) are
-    gone wherever it is shown — the source row and Preferences."""
+    gone wherever it is shown — the source row and the Credentials view."""
     dirty = "desk\N{RIGHT-TO-LEFT OVERRIDE}\u0007\n\N{ZERO WIDTH SPACE}evil"
     with _source_app(source={"machine_name": dirty}) as (client, _m, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
         assert _source_row(client)["source"] == {"id": OTHER_MACHINE, "name": "deskevil"}
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "deskevil",
-                          timeout=20, what="the cleaned name in Preferences")
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("source_name") == "deskevil",
+                          timeout=20, what="the cleaned name in the view")
+        assert "deskevil" in _view_row(client)["text"]
 
 
 def test_no_machine_identity_disables_use_this_machine():
     """With no machine identity (the state dir cannot hold one) no delivery stream
-    runs, a move is refused with the reason and nothing is sent, and Preferences
-    disables the button and says why."""
+    runs, a move is refused with the reason and nothing is sent, and the Credentials
+    view disables the button and says why."""
     with _source_app(source={}, block_state_dir=True) as (client, mock, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
@@ -350,20 +388,23 @@ def test_no_machine_identity_disables_use_this_machine():
         assert e.value.message.startswith("this machine has no identity"), e.value
         assert mock.source_use_requests() == []
         assert mock.delivery_attempts() == [], "no stream without an identity"
-        _open_prefs(client)
-        client.wait_until(lambda: _prefs_source(client) is not None,
-                          timeout=20, what="the source row in Preferences")
-        assert _prefs_source(client)["can_use"] is False
-        values = _prefs_report(client)["values"]
-        assert values["this_machine_error"] == status["this_machine_error"], values
+        _open_view(client)
+        client.wait_until(lambda: _view_row(client) is not None,
+                          timeout=20, what="the source row in the view")
+        assert _view_row(client)["can_use"] is False
+        where = _where(client)
+        assert where["this_machine_error"] == status["this_machine_error"], where
+        assert "This machine has no identity, so it cannot answer" in \
+            client.credentials_dump()["rendered"]
 
 
 def test_busy_source_read_keeps_the_last_known_source_and_recovers():
     """`503 SOURCE_BUSY` is transient. Over IPC: two busy answers are retried away
     inside one read; busy on every ask is a `busy` row — supported, no error, the
-    source unknown rather than absent. In Preferences, reopened after another machine
-    took the source while the server is busy: the row keeps the source it last showed,
-    marked retrying (never "no source"), and the one later read brings the new one."""
+    source unknown rather than absent. In the Credentials view, shown again after
+    another machine took the source while the server is busy: the row keeps the source
+    it last showed, marked retrying (never "no source"), and the one later read brings
+    the new one."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
@@ -379,110 +420,109 @@ def test_busy_source_read_keeps_the_last_known_source_and_recovers():
                        "this_machine": False, "connected": False, "busy": True,
                        "unreachable": False, "error": None}, row
 
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("source_name") == "desk",
                           timeout=20, what="the source row naming desk")
-        _close_prefs(client)
+        _leave_view(client)
         mock.move_source(LAB_MACHINE, "lab")
         mock.source_busy(3, retry_after="0")
-        client.show_preferences()
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("retrying") is True,
+        client.navigate("credentials")
+        client.wait_until(lambda: (_view_row(client) or {}).get("retrying") is True,
                           timeout=20, what="the row marked busy, retrying")
-        row = _prefs_source(client)
+        row = _view_row(client)
         assert row["source_name"] == "desk", f"the last known source, never none: {row}"
         assert row["error"] is None, row
         client.wait_until(
             lambda: (lambda r: r and r["source_name"] == "lab" and not r["retrying"])(
-                _prefs_source(client)),
+                _view_row(client)),
             timeout=20, what="the later read naming lab")
 
 
 def test_source_row_survives_a_server_restart_and_recovers():
-    """A read while the server is down (a restart) keeps the source row Preferences
+    """A read while the server is down (a restart) keeps the Where row the view
     showed — the last known source, noted "cannot reach the server" — instead of
-    dropping it, and the window reads again on its own: once the server is back the
+    dropping it, and the view reads again on its own: once the server is back the
     row is current again, with nothing shown, focused or reloaded meanwhile. Over IPC
     the same read is `unreachable`, never `supported: false` with nothing to show."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("source_name") == "desk",
                           timeout=20, what="the source row naming desk")
         mock.pause()
         try:
             row = _source_row(client)
             assert row["unreachable"] is True and row["error"], row
-            # Any prefs change reloads the window: its source read finds the server down.
-            prefs = client.prefs_get()
-            client.prefs_set_terminal(prefs["terminal_preset"], prefs.get("terminal_template"))
-            client.wait_until(lambda: (_prefs_source(client) or {}).get("unreachable") is True,
+            # Navigating to the view again reads every server: the read finds it down.
+            client.navigate("credentials")
+            client.wait_until(lambda: (_view_row(client) or {}).get("unreachable") is True,
                               timeout=20, what="the row kept, marked unreachable")
-            row = _prefs_source(client)
+            row = _view_row(client)
             assert row["source_name"] == "desk", f"the last known source, never gone: {row}"
             assert row["error"] is None, row
-            # Another machine takes the source while the server is down; the window must
+            assert "cannot reach the server" in row["detail"], row
+            # Another machine takes the source while the server is down; the view must
             # learn it by itself once the server is back.
             mock.move_source(LAB_MACHINE, "lab")
-            _holds(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+            _holds(lambda: (_view_row(client) or {}).get("source_name") == "desk",
                    1.0, "the row stays while the server is down")
         finally:
             mock.resume()
         client.wait_until(
             lambda: (lambda r: r and r["source_name"] == "lab" and not r["unreachable"])(
-                _prefs_source(client)),
+                _view_row(client)),
             timeout=30, what="the row current again once the server is back")
 
 
-def test_reopening_preferences_reads_a_source_taken_elsewhere():
-    """Closing Preferences only hides it, so a reopen must read the sources again:
-    this machine was the source when it closed, another machine took it meanwhile
-    (which ends this machine's stream), and the reopened window says so and offers the
+def test_showing_the_view_again_reads_a_source_taken_elsewhere():
+    """The Where rows outlive the view, so showing it again must read the sources
+    again: this machine was the source when the view was left, another machine took it
+    meanwhile (which ends this machine's stream), and the view says so and offers the
     button again."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
         client.source_use("mock")
         client.wait_until(lambda: _stream(client)["state"] == "connected",
                           timeout=30, what="the stream connected")
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("this_machine") is True,
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("this_machine") is True,
                           timeout=20, what="the row reading this machine")
-        assert _prefs_source(client)["can_use"] is False
-        _close_prefs(client)
+        assert _view_row(client)["can_use"] is False
+        _leave_view(client)
         mock.move_source(OTHER_MACHINE, "desk")
         client.wait_until(lambda: _not_bound(client), timeout=30,
                           what="the stream ended by the move and refused after it")
-        client.show_preferences()
+        client.navigate("credentials")
         client.wait_until(
             lambda: (lambda r: r and r["source_name"] == "desk" and not r["this_machine"]
-                     and r["can_use"])(_prefs_source(client)),
-            timeout=20, what="the reopened window naming desk with the button back")
+                     and r["can_use"])(_view_row(client)),
+            timeout=20, what="the view naming desk with the button back")
 
 
 def test_a_read_overtaken_by_a_move_never_lands_over_it():
-    """A read the window started BEFORE a move, answered after the move's own answer
+    """A read the view started BEFORE a move, answered after the move's own answer
     and read-back (the server took its document first), is older: it must not put
     the other machine back on the row."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
         machine = _machine(client)
-        _open_prefs(client)
-        client.wait_until(lambda: (_prefs_source(client) or {}).get("can_use") is True,
-                          timeout=20, what="an enabled Use this machine button")
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("can_use") is True,
+                          timeout=20, what="an enabled Answer from here button")
         gets = mock.source_gets()
         mock.source_reads_late(3.0)
-        # Any prefs change reloads the window: its source read is the late one.
-        prefs = client.prefs_get()
-        client.prefs_set_terminal(prefs["terminal_preset"], prefs.get("terminal_template"))
+        # Navigating to the view again reads every server: that read is the late one.
+        client.navigate("credentials")
         client.wait_until(lambda: mock.source_gets() > gets, timeout=10,
-                          what="the window's read reaching the server (desk)")
+                          what="the view's read reaching the server (desk)")
         client.press_source_use("mock")
         client.wait_until(
-            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_prefs_source(client)),
+            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_view_row(client)),
             timeout=15, what="the move confirmed")
         client.wait_until(lambda: mock.source_late_answered() >= 1, timeout=15,
                           what="the overtaken read answered")
-        _holds(lambda: (_prefs_source(client) or {}).get("source_name") == machine["name"],
+        _holds(lambda: (_view_row(client) or {}).get("source_name") == machine["name"],
                1.5, "the row still names this machine after the stale answer")
 
 
@@ -497,24 +537,24 @@ def test_moves_on_two_servers_at_once_and_a_second_press_lands_nowhere(tmp_path)
         "        ssh_port: 2222\ndefault_server: mock"))
     with _source_app(source={}, shed_config_path=cfg) as (client, mock, _i):
         client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
-        _open_prefs(client)
+        _open_view(client)
         both = ("mock", "mock2")
         client.wait_until(
-            lambda: all((_prefs_source(client, h) or {}).get("can_use") for h in both),
+            lambda: all((_view_row(client, h) or {}).get("can_use") for h in both),
             timeout=20, what="both servers' buttons enabled")
         mock.delay_source_use(1.5)
         client.press_source_use("mock")
         client.press_source_use("mock2")
         client.wait_until(
-            lambda: all((_prefs_source(client, h) or {}).get("busy") for h in both),
+            lambda: all((_view_row(client, h) or {}).get("busy") for h in both),
             timeout=5, what="both moves in flight at once")
         client.press_source_use("mock")  # the row's move is in flight: no button
         client.wait_until(
             lambda: all((lambda r: r and r["this_machine"] and not r["busy"])(
-                _prefs_source(client, h)) for h in both),
+                _view_row(client, h)) for h in both),
             timeout=20, what="both rows reading this machine")
         assert len(mock.source_use_requests()) == 2, mock.source_use_requests()
-        assert not any(_prefs_source(client, h)["can_use"] for h in both)
+        assert not any(_view_row(client, h)["can_use"] for h in both)
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +821,43 @@ def test_sources_list_says_who_answers_on_each_server():
             assert len(mocks["account"].source_use_requests()) == 1
             assert mocks["account"].source_unbind_requests() == [{}]
             assert len(mocks["account"].delivery_attempts()) == 1
+
+            # Criterion 15: the Credentials view's Where part draws each state, says
+            # "not delivering" where the server says so, and offers no action where the
+            # account service answers.
+            client.navigate("credentials")
+            client.wait_until(
+                lambda: len(_where(client).get("rows") or []) == 6
+                and all(r["kind"] != "unknown" for r in _where(client)["rows"])
+                and (_view_row(client, "here") or {}).get("detail") == "connected",
+                timeout=20, what="six Where rows")
+            shown = {r["host"]: r for r in _where(client)["rows"]}
+            assert list(shown) == ["account", "desk", "fresh", "here", "old", "paused"], shown
+            assert {h: r["kind"] for h, r in shown.items()} == kinds
+            assert shown["here"]["who"] == "This machine answers here"
+            assert shown["here"]["action"]["label"] == "Stop answering from here"
+            assert shown["desk"]["who"] == "Another machine answers here:"
+            assert shown["desk"]["source_name"] == "desk" and "desk" in shown["desk"]["text"]
+            assert shown["desk"]["action"]["label"] == "Answer from here"
+            for name in ("account", "paused"):
+                r = shown[name]
+                assert r["who"] == "The account service answers here", r
+                assert r["url"] == SERVICE_URL and r["action"] is None, r
+            assert shown["account"]["not_delivering"] is False
+            assert shown["paused"]["not_delivering"] is True
+            assert shown["paused"]["detail"] == "It is not delivering to this server."
+            assert shown["fresh"]["who"] == "Nobody answers here"
+            assert shown["fresh"]["action"]["label"] == "Answer from here"
+            assert shown["old"]["who"] == "This server is older than credential sources"
+            assert shown["old"]["action"] is None
+            assert SOURCE_IS_SERVICE_BODY["error"]["message"] not in json.dumps(
+                client.credentials_dump())
+            _shot(client, "where.png", "credentials-where")
+            client.call("ui.set_appearance", {"mode": "dark"})
+            client.wait_until(lambda: (client.computed_style() or {}).get("mode") == "dark",
+                              timeout=10, what="dark")
+            _shot(client, "where-dark.png", "credentials-where")
+            client.call("ui.set_appearance", {"mode": "light"})
     finally:
         for m in mocks.values():
             m.stop()
@@ -890,6 +967,106 @@ def test_stop_answering_from_here_sticks_until_answer_from_here():
         client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
                           what="the stream still runs")
 
+
+
+def test_stop_answering_from_here_through_the_view():
+    """The Where row's own "Stop answering from here" (pressed through the real
+    button) unbinds and pauses this machine there: the row reads nobody, this machine
+    stopped, with "Answer from here", which brings it back. A refused stop puts the row
+    back with fixed words."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        machine = _machine(client)
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source")
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("can_stop") is True,
+                          timeout=20, what="Stop answering from here")
+        client.press_source_unbind("mock")
+        client.wait_until(
+            lambda: (lambda r: r and r["kind"] == "nobody" and r["paused"] and not r["busy"])(
+                _view_row(client)),
+            timeout=20, what="the row reading nobody, this machine stopped")
+        assert mock.source_unbind_requests() == [{}]
+        row = _view_row(client)
+        assert row["detail"] == "This machine stopped answering here.", row
+        assert row["action"] == {"id": "use", "label": "Answer from here", "enabled": True}, row
+        assert row["error"] is None, row
+        client.wait_until(lambda: _stream(client)["state"] is None, timeout=10,
+                          what="no stream runs for the server")
+
+        client.press_source_use("mock")
+        client.wait_until(
+            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_view_row(client)),
+            timeout=20, what="this machine answering again")
+        assert mock.source_bound() == machine["id"]
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="the stream back")
+        # A stop the server undoes at once (a late admission, twice) is refused: the row
+        # is put back, with fixed words under it.
+        client.wait_until(lambda: (_view_row(client) or {}).get("can_stop") is True,
+                          timeout=20, what="Stop answering from here again")
+        mock.admit_after_unbind(machine["id"], machine["name"], times=2)
+        client.press_source_unbind("mock")
+        client.wait_until(lambda: (_view_row(client) or {}).get("error"), timeout=30,
+                          what="the refusal under the row")
+        row = _view_row(client)
+        assert row["error"] == ("mock bound this machine again after the stop; it stays "
+                                "stopped here. Try again."), row
+
+
+def test_a_server_unreachable_from_the_start_has_a_row_and_a_tick(tmp_path):
+    """A configured server that cannot be reached at the first read still has its
+    Where row (fixed words, no "Reading your servers…" once the read has landed) and
+    its tick in a scope; with every server offline the view still says so."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG.read_text().replace(
+        "default_server: mock",
+        "    mock2:\n        host: 127.0.0.1\n        http_port: 8081\n"
+        "        ssh_port: 2222\ndefault_server: mock"))
+    with _source_app(source={}, shed_config_path=cfg, unreachable_hosts=("mock2",)) as (
+            client, _mock, _i):
+        _open_view(client)
+        client.wait_until(lambda: _view_row(client, "mock2") is not None
+                          and _view_row(client, "mock") is not None, timeout=30,
+                          what="both servers' rows")
+        row = _view_row(client, "mock2")
+        assert row["who"] == "This server cannot be reached" and row["unreachable"], row
+        assert row["kind"] == "unknown" and row["error"], row
+        assert "Reading your servers" not in client.credentials_dump()["rendered"]
+        # Its tick is offered in a scope.
+        client.call("ui.press_delivery_button", {"provider": "github", "button": "setup"})
+        client.wait_until(lambda: ((client.credentials_dump() or {}).get("what") or {})
+                          .get("editor"), timeout=15, what="github's form")
+        client.call("ui.press_delivery_button", {"provider": "github", "button": "scope:only"})
+        client.wait_until(
+            lambda: "server:mock2" in (client.credentials_dump()["what"]["editor"] or {})
+            .get("values", {}), timeout=10, what="mock2's tick")
+    with _source_app(unreachable_hosts=("mock",)) as (client, _mock, _i):
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("unreachable"), timeout=30,
+                          what="the offline server's row")
+        assert "Reading your servers" not in client.credentials_dump()["rendered"]
+
+
+def test_a_pause_shows_whoever_answers():
+    """This machine stopped answering on a server, and another machine answers there
+    now: the row names that machine and still says this machine stopped answering."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source")
+        client.source_unbind("mock")
+        mock.move_source(OTHER_MACHINE, "desk")
+        _open_view(client)
+        client.wait_until(lambda: (_view_row(client) or {}).get("kind") == "other_machine",
+                          timeout=20, what="desk answering")
+        row = _view_row(client)
+        assert row["paused"] is True and row["paused_shown"] is True, row
+        assert "this machine stopped answering here" in row["detail"], row
+        assert row["source_name"] == "desk", row
 
 
 def test_an_unusable_paused_file_starts_no_stream():

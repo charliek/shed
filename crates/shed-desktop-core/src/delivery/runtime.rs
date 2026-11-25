@@ -89,6 +89,21 @@ pub struct DeliveryOptions {
     pub paused_path: PathBuf,
 }
 
+/// What a [`DeliveryRuntime::preview`] is of.
+#[derive(Debug, Clone)]
+pub enum PreviewOf {
+    /// Everything the providers have, before any `only` rule.
+    Everything,
+    /// The shed of this document (as its server sent it).
+    Shed(Value),
+    /// A new shed on `backend` (`firecracker`, `vz`, `remote`) with `repo` (an
+    /// `owner/name`, or none).
+    Target {
+        backend: String,
+        repo: Option<String>,
+    },
+}
+
 /// One answer, redacted.
 #[derive(Debug, Clone, Serialize)]
 pub struct Answered {
@@ -546,13 +561,22 @@ impl DeliveryRuntime {
         Ok(self.settings())
     }
 
-    /// `delivery.preview`: what the shed of `doc` (its document from `server`) would be
-    /// delivered, or, with no document, what the providers have at all (every `only` rule
-    /// let through). Redacted: no value, no content.
+    /// `delivery.preview`: what the shed of a document from `server` would be delivered
+    /// ([`PreviewOf::Shed`]), what a new shed on a backend with a repository would be
+    /// ([`PreviewOf::Target`]: the request [`super::preview::request_for_target`] draws,
+    /// answered `shed: null` with its `request`), or what the providers have at all
+    /// ([`PreviewOf::Everything`], every `only` rule let through). Redacted: no value, no
+    /// content.
+    ///
+    /// The answer carries `runs`, the commands the preview ran ([`settings_file::commands_run`]
+    /// of the settings it read). With `expect_runs` (what a person was told would run) a
+    /// preview whose settings would run anything else runs nothing and is refused
+    /// `settings_changed`.
     pub async fn preview(
         &self,
         server: &str,
-        doc: Option<Value>,
+        of: PreviewOf,
+        expect_runs: Option<Vec<String>>,
     ) -> Result<Value, (String, String)> {
         let answerer = self.answerer.clone();
         let server = server.to_string();
@@ -564,46 +588,61 @@ impl DeliveryRuntime {
             let settings = settings_file::load(&answerer.settings_path)
                 .settings
                 .map_err(|e| ("settings_unreadable".to_string(), e))?;
-            match doc {
-                None => {
-                    let p = shed_provision_providers::preview(
-                        &settings,
-                        shed_source::time::now_unix(),
-                        &answerer.reader,
-                        &key,
-                    );
-                    Ok(json!({"server": server, "shed": null, "preview": p}))
-                }
-                Some(doc) => {
-                    let now = shed_source::time::now_unix();
-                    let deadline = shed_provision::format_time(now + 3600);
-                    let request = super::preview::request_for(&doc, Reason::Provision, &deadline)
-                        .map_err(|e| ("bad_shed".to_string(), e))?;
-                    // A preview is asked for by a person and bounded by each command's own
-                    // timeout, as before: it has no budget.
-                    let built = shed_provision_providers::build_answer(
-                        &settings,
-                        &request,
-                        &server,
-                        now,
-                        None,
-                        &answerer.reader,
-                        &key,
-                    )
-                    .map_err(|r| ("preview_failed".to_string(), r.to_string()))?;
-                    Ok(json!({
-                        "server": server,
-                        "shed": request.shed.name,
-                        "request": {
-                            "backend": request.shed.backend,
-                            "repo": request.repo_name(),
-                            "local_dir": request.shed.local_dir,
-                            "project_dir": request.shed.project_dir,
-                        },
-                        "preview": built.preview,
-                    }))
-                }
+            let runs = settings_file::commands_run(&settings);
+            if expect_runs.is_some_and(|want| want != runs) {
+                return Err((
+                    "settings_changed".to_string(),
+                    "the settings changed since the commands a check runs were shown".to_string(),
+                ));
             }
+            let now = shed_source::time::now_unix();
+            let deadline = shed_provision::format_time(now + 3600);
+            let (request, named) = match of {
+                PreviewOf::Everything => {
+                    let p =
+                        shed_provision_providers::preview(&settings, now, &answerer.reader, &key);
+                    return Ok(json!({"server": server, "shed": null, "runs": runs, "preview": p}));
+                }
+                PreviewOf::Shed(doc) => (
+                    super::preview::request_for(&doc, Reason::Provision, &deadline)
+                        .map_err(|e| ("bad_shed".to_string(), e))?,
+                    true,
+                ),
+                PreviewOf::Target { backend, repo } => (
+                    super::preview::request_for_target(
+                        &backend,
+                        repo.as_deref(),
+                        Reason::Create,
+                        &deadline,
+                    )
+                    .map_err(|e| ("bad_request".to_string(), e.to_string()))?,
+                    false,
+                ),
+            };
+            // A preview is asked for by a person and bounded by each command's own
+            // timeout, as before: it has no budget.
+            let built = shed_provision_providers::build_answer(
+                &settings,
+                &request,
+                &server,
+                now,
+                None,
+                &answerer.reader,
+                &key,
+            )
+            .map_err(|r| ("preview_failed".to_string(), r.to_string()))?;
+            Ok(json!({
+                "server": server,
+                "shed": if named { json!(request.shed.name) } else { Value::Null },
+                "request": {
+                    "backend": request.shed.backend,
+                    "repo": request.repo_name(),
+                    "local_dir": request.shed.local_dir,
+                    "project_dir": request.shed.project_dir,
+                },
+                "runs": runs,
+                "preview": built.preview,
+            }))
         })
         .await
         .map_err(|e| ("preview_failed".to_string(), e.to_string()))?
@@ -891,6 +930,105 @@ mod tests {
             rt.status()["recent"],
             serde_json::to_value(&recent).unwrap()
         );
+        rt.drain();
+    }
+
+    /// Check by server, backend and repository: each `only` rule judged against a new
+    /// shed of that backend and repository, a project file written at stage 2, and no
+    /// value in what comes back.
+    #[tokio::test]
+    async fn a_target_preview_applies_every_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in [("npmrc", "SENTINEL-HOME"), ("env", "SENTINEL-PROJECT")] {
+            let f = dir.path().join(name);
+            std::fs::write(&f, text).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let settings_path = dir.path().join("delivery.toml");
+        std::fs::write(
+            &settings_path,
+            "[files]\nenabled = true\nonly = { servers = [\"mini\"] }\n\
+             [[files.file]]\nfrom = \"~/npmrc\"\nto = \".npmrc\"\nonly = { backends = [\"vz\"] }\n\
+             [[files.file]]\nfrom = \"~/env\"\nto = \".env\"\nbase = \"project\"\n\
+             only = { repos = [\"example/*\"] }\n",
+        )
+        .unwrap();
+        let opts = DeliveryOptions {
+            shed_config_path: PathBuf::new(),
+            settings_path,
+            key_path: dir.path().join("key"),
+            known_hosts: String::new(),
+            mock_base_url: None,
+            unreachable_hosts: Default::default(),
+            reader: DiskReader::new(dir.path(), None),
+            rescan: RESCAN,
+            service_recheck: shed_source::delivery::SERVICE_RECHECK,
+            paused_path: dir.path().join("paused.json"),
+        };
+        let machine = MachineIdentity {
+            id: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b".into(),
+            name: "ada laptop".into(),
+        };
+        let rt = tokio::task::spawn_blocking(move || {
+            DeliveryRuntime::start(&tokio::runtime::Handle::current(), opts, Ok(machine), None)
+        })
+        .await
+        .unwrap();
+        let target = |backend: &str, repo: Option<&str>| PreviewOf::Target {
+            backend: backend.into(),
+            repo: repo.map(str::to_string),
+        };
+        let names = |v: &Value| -> Vec<String> {
+            v["preview"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let both = rt
+            .preview("mini", target("vz", Some("example/widgets")), None)
+            .await
+            .unwrap();
+        assert_eq!(names(&both), ["files..npmrc", "files..env"]);
+        assert_eq!(both["shed"], Value::Null);
+        assert_eq!(both["request"]["backend"], "vz");
+        assert_eq!(both["request"]["repo"], "example/widgets");
+        assert_eq!(both["request"]["project_dir"], "/home/shed/widgets");
+        let env = &both["preview"]["items"][1];
+        assert_eq!(
+            (env["stage"].clone(), env["base"].clone()),
+            (json!(2), json!("project"))
+        );
+        assert!(!both.to_string().contains("SENTINEL"), "{both}");
+        // Another backend, another repository, no repository, another server.
+        let home = rt
+            .preview("mini", target("remote", Some("example/widgets")), None)
+            .await
+            .unwrap();
+        assert_eq!(names(&home), ["files..env"]);
+        let none = rt.preview("mini", target("vz", None), None).await.unwrap();
+        assert_eq!(names(&none), ["files..npmrc"]);
+        let other = rt
+            .preview("other", target("vz", Some("example/widgets")), None)
+            .await
+            .unwrap();
+        assert!(names(&other).is_empty(), "{other}");
+        // What it ran is in the answer; held to another list it runs nothing.
+        assert_eq!(both["runs"], json!([]));
+        let e = rt
+            .preview("mini", target("vz", None), Some(vec!["gh".into()]))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, "settings_changed");
+        rt.preview("mini", target("vz", None), Some(vec![]))
+            .await
+            .unwrap();
+        // A target the request cannot be drawn for is refused, not guessed.
+        for (b, r) in [("docker", None), ("vz", Some("widgets"))] {
+            let e = rt.preview("mini", target(b, r), None).await.unwrap_err();
+            assert_eq!(e.0, "bad_request", "{b} {r:?}");
+        }
         rt.drain();
     }
 

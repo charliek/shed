@@ -159,18 +159,27 @@ def test_navigate_reports_rendered_pane(tauri):
     tauri.wait_until(lambda: tauri.current_pane() == "system", timeout=15, what="pane=system")
     tauri.navigate("agents")
     tauri.wait_until(lambda: tauri.current_pane() == "agents", timeout=15, what="pane=agents")
+    tauri.navigate("credentials")
+    tauri.wait_until(lambda: tauri.current_pane() == "credentials", timeout=15, what="pane=credentials")
     tauri.navigate("activity")
     tauri.wait_until(lambda: tauri.current_pane() == "activity", timeout=15, what="pane=activity")
     tauri.navigate("sheds")
     tauri.wait_until(lambda: tauri.current_pane() == "sheds", timeout=15, what="pane=sheds")
 
 
-def test_sidebar_has_four_entries(tauri):
-    # The sidebar is Sheds, Agents, Activity, System (plan 039 §3.10). Each entry
-    # navigates and is reported as the rendered pane; the badges carry no approval
+def test_sidebar_has_five_entries(tauri):
+    # The sidebar is Sheds, Agents, Credentials, Activity, System (plan 040 §3.9). Each
+    # entry navigates and is reported as the rendered pane; the badges carry no approval
     # count.
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    for pane in ("sheds", "agents", "activity", "system"):
+    # The entries as RENDERED, in order: their pane and their label.
+    want = [("sheds", "Sheds"), ("agents", "Agents"), ("credentials", "Credentials"),
+            ("activity", "Activity"), ("system", "System")]
+    tauri.wait_until(lambda: (tauri.sidebar_dump() or {}).get("entries"), timeout=15,
+                     what="the sidebar entries reported")
+    entries = [(e["pane"], e["label"]) for e in tauri.sidebar_dump()["entries"]]
+    assert entries == want, entries
+    for pane, _label in want:
         tauri.navigate(pane)
         tauri.wait_until(lambda: tauri.current_pane() == pane, timeout=15, what=f"pane={pane}")
     tauri.navigate("sheds")
@@ -420,13 +429,12 @@ def test_preferences_window_opens(tauri):
     tauri.wait_until(lambda: _prefs_values(tauri).get("preset") == prefs["terminal_preset"]
                      and _prefs_values(tauri).get("login") == login,
                      timeout=15, what="reported prefs match the backend")
-    # General, Terminal and Provisioning, and nothing of the broker: no broker,
-    # approvals, SSH, AWS, Docker or per-shed override section (plan 039 PR B).
-    tauri.wait_until(lambda: _prefs_sections(tauri) == ["general", "terminal", "provisioning"],
-                     timeout=15, what="the three sections")
+    # General and Terminal only (plan 040 §3.9): Provisioning, Source machine and
+    # Preview moved to the Credentials view, and nothing of the broker is left.
+    tauri.wait_until(lambda: _prefs_sections(tauri) == ["general", "terminal"],
+                     timeout=15, what="the two sections")
     v = tauri.prefs_dump()["prefs"]["values"]
-    for gone in ("policy", "method", "ttl", "provider_modes", "shed_rules_count", "broker_error"):
-        assert gone not in v, (gone, v)
+    assert set(v) == {"preset", "template", "login"}, v
     # Defensive: Preferences is no longer a dashboard modal.
     assert tauri.modal() != "prefs"
     # Close hides (never destroys)...

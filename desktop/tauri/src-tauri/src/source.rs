@@ -2,8 +2,8 @@
 //! for this user on each configured server (this machine, another machine, the account
 //! service, or nobody), "Use this machine" and "Stop answering from here" — the
 //! desktop's half of the pin. Shared by the `source.status` / `sources.list` /
-//! `source.use` / `source.unbind` IPC ops and the app's commands of the same names, so
-//! the two doors cannot disagree.
+//! `source.use` / `source.unbind` IPC ops and the app's commands of the same names
+//! (`sources_list`, `source_use`, `source_unbind`), so the two doors cannot disagree.
 //!
 //! The calls go out on the Backend's ordinary control-scope client per server (the
 //! credential the app uses for shed lifecycle calls), never the source's

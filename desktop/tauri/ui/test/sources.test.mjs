@@ -15,6 +15,8 @@ import {
   UNREACHABLE_RETRY_MS,
   applyRead,
   beginMove,
+  beginStop,
+  canStop,
   canUse,
   createSourceReader,
   moveConfirmed,
@@ -22,6 +24,7 @@ import {
   refreshDelay,
   restartRetries,
   shownRows,
+  stopConfirmed,
 } from "../dist-test/sources.js";
 
 const ME = { id: "0".repeat(32), name: "laptop" };
@@ -262,9 +265,13 @@ test("unreachable reads retry with growing spacing, then stop until a show, focu
   assert.equal(r.retryMs, UNREACHABLE_RETRY_MS[0]);
 });
 
-test("an unreachable server with no row known yet shows nothing, and is read again", () => {
-  const r = applyRead(EMPTY_SOURCES, 1, status(unreachable("a"), row("b", DESK)));
-  assert.deepEqual(shownRows(r.state).map((x) => x.host), ["b"]);
+test("an unreachable server with no row known yet has its own row, and is read again", () => {
+  // As `sources.list` reads it (`credentials.ts`'s whereRowOf): listed, who answers unknown.
+  const listed = { ...unreachable("a"), supported: true, kind: "unknown", error: "fixed words" };
+  const r = applyRead(EMPTY_SOURCES, 1, status(listed, row("b", DESK)));
+  assert.deepEqual(shownRows(r.state).map((x) => x.host), ["a", "b"]);
+  assert.equal(shown(r.state, "a").unreachable, true);
+  assert.equal(shown(r.state, "a").source, null);
   assert.equal(r.retry, true);
   assert.equal(r.retryMs, UNREACHABLE_RETRY_MS[0]);
   const later = applyRead(r.state, 2, status(row("a", DESK), row("b", DESK)));
@@ -499,4 +506,37 @@ test("a move's hold asked for during a read rides on the follow-up", async () =>
   assert.equal(shown(h.state, "a").busy, false, "held: a busy read-back is not applied over it");
   assert.equal(h.timers.size, 1, "and one later read is asked for");
   assert.equal([...h.timers.values()][0].ms, SOURCE_RETRY_MS);
+});
+
+test("a move shows this machine answering, with its stream not known yet", () => {
+  const s = beginMove(loaded(), "a");
+  assert.deepEqual(
+    [s.rows.a.kind, s.rows.a.paused, s.rows.a.stream, s.rows.a.this_machine],
+    ["this_machine", false, null, true],
+  );
+});
+
+test("Stop answering from here: shown at once, kept on confirm, put back on refusal", () => {
+  let s = loaded();
+  assert.equal(canStop(s, "a"), false, "another machine answers: nothing to stop");
+  assert.equal(beginStop(s, "a"), null);
+  s = moveConfirmed(beginMove(s, "a"), "a", 2, row("a", ME));
+  assert.equal(canStop(s, "a"), true);
+  const stopping = beginStop(s, "a");
+  assert.deepEqual(
+    [stopping.rows.a.kind, stopping.rows.a.paused, stopping.rows.a.source, stopping.rows.a.this_machine],
+    ["nobody", true, null, false],
+  );
+  assert.equal(canStop(stopping, "a"), false, "no second stop while one is in flight");
+  assert.equal(canUse(stopping, "a"), false, "no move either");
+  // A read issued before the stop answered never lands over it.
+  const done = stopConfirmed(stopping, "a", 5);
+  assert.equal(done.moving.a, undefined);
+  assert.equal(done.rows.a.kind, "nobody");
+  const late = applyRead(done, 4, status(row("a", ME), row("b", DESK))).state;
+  assert.equal(late.rows.a.kind, "nobody", "the older read is skipped for that row");
+  // Refused: the row it replaced, and the words.
+  const back = moveFailed(stopping, "a", "no");
+  assert.equal(back.rows.a.this_machine, true);
+  assert.equal(back.errors.a, "no");
 });

@@ -412,6 +412,15 @@ def test_delivery_set_round_trips_and_refuses_without_writing(settings):
         assert e.value.code == "bad_request", params
         assert "SENTINEL" not in str(e.value), str(e.value)
     assert c.settings.read_text() == before
+    # A provider cannot be written on without what it needs (plan 040 §3.9): the
+    # fixed class `incomplete`, and the file is left as it was.
+    for provider, config in (("ssh-key", {"enabled": True}),
+                             ("envsecrets-login", {"enabled": True}),
+                             ("files", {"enabled": True, "file": []})):
+        with pytest.raises(ShedError) as e:
+            c.client.call("delivery.set", {"provider": provider, "config": config})
+        assert e.value.code == "incomplete", (provider, e.value)
+    assert c.settings.read_text() == before
     # null removes the provider.
     out = c.client.call("delivery.set", {"provider": "files", "config": None})
     assert not next(p for p in out["providers"] if p["name"] == "files")["configured"]

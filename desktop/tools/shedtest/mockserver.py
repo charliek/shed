@@ -391,6 +391,8 @@ class MockShedServer:
         self.provision_should_fail = False
         self.provision_record = DELIVERED_RECORD
         self.provisions: list[str] = []
+        # Set: every `GET /api/sheds/{name}` is refused with this (status, code, message).
+        self.shed_doc_refusal: tuple[int, str, str] | None = None
         # Armed (`hold_provisions`): each provision waits, after its progress, for
         # `release_provisions` (at most 30 s), so a cell can act while one is in flight.
         self._provision_gate: threading.Event | None = None
@@ -437,6 +439,7 @@ class MockShedServer:
             self.provision_should_fail = False
             self.provision_record = DELIVERED_RECORD
             self.provisions = []
+            self.shed_doc_refusal = None
             self.egress_enabled = True
             self.egress_default = []
             gate, self._provision_gate = self._provision_gate, None
@@ -1179,7 +1182,10 @@ class MockShedServer:
                 m = _SHED_DOC_RE.match(path)
                 if m:
                     doc = state.shed(unquote(m.group(1)))
-                    if doc is None:
+                    refusal = state.shed_doc_refusal
+                    if refusal is not None:
+                        self._send(refusal[0], _api_error(refusal[1], refusal[2]))
+                    elif doc is None:
                         self._send(404, _api_error("SHED_NOT_FOUND", "no such shed"))
                     else:
                         self._send(200, doc)

@@ -1,0 +1,231 @@
+{
+  "providers": [
+    {
+      "fields": [
+        {
+          "help": "Your private key, with no passphrase; its public half is the file beside it ending .pub.",
+          "key": "key_file",
+          "kind": "path",
+          "place": "machine",
+          "required": true,
+          "title": "Key file"
+        },
+        {
+          "help": "Made for you, or pasted: an OpenSSH, PEM or PKCS#8 key with no passphrase.",
+          "key": "private_key",
+          "kind": "secret",
+          "place": "service",
+          "required": true,
+          "title": "Private key"
+        },
+        {
+          "default": false,
+          "help": "git in the shed signs your commits with this key.",
+          "key": "sign_commits",
+          "kind": "switch",
+          "place": "both",
+          "required": false,
+          "title": "Sign commits"
+        }
+      ],
+      "lands": "~/.ssh/id_<type> (0600) and its .pub (0644); signing settings in ~/.config/git/config",
+      "name": "ssh-key",
+      "summary": "Your SSH key, so git in the shed reaches your repositories and can sign your commits.",
+      "title": "SSH key"
+    },
+    {
+      "fields": [
+        {
+          "help": "The gh this machine asks for your token and login: a name on your PATH (gh when unset) or an absolute path.",
+          "key": "gh",
+          "kind": "text",
+          "place": "machine",
+          "required": false,
+          "title": "gh program"
+        },
+        {
+          "help": "A fine-grained personal access token.",
+          "key": "token",
+          "kind": "secret",
+          "place": "service",
+          "required": true,
+          "title": "Token"
+        },
+        {
+          "help": "Your GitHub login: confirmed by GitHub when the token is saved, or typed.",
+          "key": "login",
+          "kind": "text",
+          "place": "service",
+          "required": true,
+          "title": "Login"
+        }
+      ],
+      "lands": "~/.config/gh/hosts.yml (0600); gh as git's credential helper in ~/.config/git/config",
+      "name": "github",
+      "summary": "Your GitHub sign-in, so gh and git in the shed act as you on github.com.",
+      "title": "GitHub"
+    },
+    {
+      "fields": [
+        {
+          "default": true,
+          "help": "Deliver ~/.craze/native/providers.toml from this machine.",
+          "key": "craze_providers",
+          "kind": "switch",
+          "place": "machine",
+          "required": false,
+          "title": "craze's providers.toml"
+        },
+        {
+          "help": "Files of KEY=VALUE lines on this machine, each readable by you only (0600).",
+          "key": "env_files",
+          "kind": "list",
+          "place": "machine",
+          "required": false,
+          "title": "Env files"
+        },
+        {
+          "entry": [
+            {
+              "help": "Its name: upper-case letters, digits and underscores.",
+              "key": "variable",
+              "kind": "text",
+              "place": "service",
+              "required": true,
+              "title": "Variable"
+            },
+            {
+              "help": "Its value.",
+              "key": "value",
+              "kind": "secret",
+              "place": "service",
+              "required": true,
+              "title": "Value"
+            }
+          ],
+          "help": "One environment variable each.",
+          "key": "env",
+          "kind": "list",
+          "place": "service",
+          "required": false,
+          "scoped": true,
+          "title": "Variables"
+        }
+      ],
+      "lands": "~/.craze/native/providers.toml (0600); one environment variable each",
+      "name": "api-keys",
+      "summary": "Keys for coding agents and tools: craze's providers.toml and environment variables.",
+      "title": "API keys"
+    },
+    {
+      "fields": [
+        {
+          "help": "A file holding the passphrase. Set this or a passphrase command.",
+          "key": "passphrase_file",
+          "kind": "path",
+          "place": "machine",
+          "required": false,
+          "title": "Passphrase file"
+        },
+        {
+          "help": "A command that prints the passphrase: its program and arguments, run with no shell. Never shown back.",
+          "key": "passphrase_command",
+          "kind": "list",
+          "place": "machine",
+          "required": false,
+          "title": "Passphrase command",
+          "write_only": true
+        },
+        {
+          "help": "Your ~/.envsecrets/config.yaml, with passphrase_env and gcs_credentials.",
+          "key": "config",
+          "kind": "file",
+          "place": "service",
+          "required": true,
+          "title": "Config"
+        },
+        {
+          "help": "The config's passphrase.",
+          "key": "passphrase",
+          "kind": "secret",
+          "place": "service",
+          "required": true,
+          "title": "Passphrase"
+        }
+      ],
+      "lands": "~/.envsecrets/config.yaml (0600); the passphrase as the variable its passphrase_env names",
+      "name": "envsecrets-login",
+      "summary": "Your envsecrets config and its passphrase, so envsecrets works in the shed.",
+      "title": "envsecrets login"
+    },
+    {
+      "fields": [
+        {
+          "entry": [
+            {
+              "help": "The file on this machine.",
+              "key": "from",
+              "kind": "path",
+              "place": "machine",
+              "required": true,
+              "title": "From"
+            },
+            {
+              "help": "The file's content.",
+              "key": "content",
+              "kind": "file",
+              "place": "service",
+              "required": true,
+              "title": "File"
+            },
+            {
+              "help": "Where it goes, relative to its base.",
+              "key": "to",
+              "kind": "text",
+              "place": "both",
+              "required": true,
+              "title": "To"
+            },
+            {
+              "choices": [
+                "home",
+                "project"
+              ],
+              "default": "home",
+              "help": "home, or project: inside the project directory, after the clone.",
+              "key": "base",
+              "kind": "text",
+              "place": "both",
+              "required": false,
+              "title": "Base"
+            },
+            {
+              "choices": [
+                "0600",
+                "0400",
+                "0644"
+              ],
+              "help": "0600 when unset; 0400 read-only; 0644 readable by all, in a service only.",
+              "key": "mode",
+              "kind": "text",
+              "place": "both",
+              "required": false,
+              "title": "Mode"
+            }
+          ],
+          "help": "On a machine, files on its disk; in a service, files you upload.",
+          "key": "file",
+          "kind": "list",
+          "place": "both",
+          "required": false,
+          "scoped": true,
+          "title": "Files"
+        }
+      ],
+      "lands": "Each file's target, under your home or the project directory",
+      "name": "files",
+      "summary": "Files copied into the shed as they are.",
+      "title": "Files"
+    }
+  ]
+}

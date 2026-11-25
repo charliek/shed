@@ -9,7 +9,7 @@
 //! | `delivery.recent` | — | `{recent}`: the answers this machine gave, newest first, redacted |
 //! | `delivery.settings` | — | `delivery.toml` as `{path, exists, error, providers}` |
 //! | `delivery.set` | `provider`, `config` (object, or null to remove) | the new settings view |
-//! | `delivery.preview` | `server`, `shed`? | what that shed would get, redacted |
+//! | `delivery.preview` | `server`, `shed`? or `backend` and `repo`?, `runs`? | what that shed (or a new shed on that backend with that repo) would get, redacted |
 //! | `shed.delivery` | `server`, `shed` | the shed document's delivery record, and the shed's effective egress |
 //! | `shed.provision` | `server`, `shed` | the provision's progress and its outcome |
 //! | `activity.server_list` | `limit`?, `cursor`?, `shed`? | the servers' activity, merged newest first |
@@ -28,7 +28,7 @@ use shed_desktop_core::delivery::settings_file::provider_names;
 use shed_desktop_core::delivery::source;
 use shed_desktop_core::delivery::source::delivery::{ServiceCheck, SourceCheck};
 use shed_desktop_core::delivery::source::ServerTarget;
-use shed_desktop_core::delivery::{DeliveryOptions, DeliveryRuntime, DiskReader};
+use shed_desktop_core::delivery::{DeliveryOptions, DeliveryRuntime, DiskReader, PreviewOf};
 
 use crate::env::Env;
 
@@ -206,22 +206,61 @@ pub fn set(rt: &DeliveryRuntime, provider: &str, config: &Value) -> Result<Value
     rt.set(provider, config)
 }
 
-/// `delivery.preview`: with a shed, its document is read from `server` first.
+/// What a `delivery.preview` names: a shed on the server, or a new shed's backend and
+/// repository (the Credentials view's Check), or neither (everything the providers have).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PreviewParams<'a> {
+    pub shed: Option<&'a str>,
+    pub backend: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    /// The commands the person was told would run: a preview whose settings would run
+    /// others runs nothing (`settings_changed`).
+    pub expect_runs: Option<Vec<String>>,
+}
+
+/// A shed document that could not be read for a preview, as a code and fixed words:
+/// never the server's text.
+fn shed_read_failure(e: &shed_core::http::ApiFailure) -> OpError {
+    let (code, _) = failure(e);
+    let words = match code.as_str() {
+        "not_found" => "the server has no shed by that name",
+        "server_refused" => "the server refused to send the shed",
+        _ => "the server could not be reached, or its answer could not be read",
+    };
+    (code, words.to_string())
+}
+
+/// `delivery.preview`: with a shed, its document is read from `server` first; with a
+/// backend (and a repository, or none), the request a new shed of that kind would draw;
+/// a shed and a backend together are refused, as is a repository with no backend.
 pub async fn preview(
     rt: &DeliveryRuntime,
     backend: &Backend,
     server: &str,
-    shed: Option<&str>,
+    p: PreviewParams<'_>,
 ) -> Result<Value, OpError> {
     let c = client(backend, server)?;
-    let doc = match shed {
-        None => None,
-        Some(name) => {
+    let of = match (p.shed, p.backend) {
+        (Some(_), Some(_)) => return Err(bad("name a shed, or a backend and a repo, not both")),
+        (Some(name), None) => {
+            if p.repo.is_some() {
+                return Err(bad("a shed's repo is its own"));
+            }
             shed_param(name)?;
-            Some(c.shed_document(name).await.map_err(|e| failure(&e))?)
+            PreviewOf::Shed(
+                c.shed_document(name)
+                    .await
+                    .map_err(|e| shed_read_failure(&e))?,
+            )
         }
+        (None, Some(b)) => PreviewOf::Target {
+            backend: b.to_string(),
+            repo: p.repo.map(str::to_string),
+        },
+        (None, None) if p.repo.is_some() => return Err(bad("a repo needs a backend")),
+        (None, None) => PreviewOf::Everything,
     };
-    rt.preview(server, doc).await
+    rt.preview(server, of, p.expect_runs).await
 }
 
 /// `shed.delivery`: the delivery record of the shed's document (null for a server
@@ -388,41 +427,34 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, OpError> {
         .ok_or_else(|| bad(format!("missing '{key}'")))
 }
 
-/// Where a UI door's event goes: the dashboard (`Main`, raised first) or an open
-/// Preferences window (`Prefs`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum DoorTarget {
-    Main,
-    Prefs,
-}
-
-/// The provisioning UI's doors (plan 039 A7): the event to emit, its payload and where
-/// it goes, or the refusal. Opening and closing a shed's detail and scrolling
-/// Preferences to a section are what a person's click does, and are open; the doors
-/// that type, press, preview or deliver are presses a harness has no pointer for, and
-/// are TEST-MODE ONLY, the `ui.press_source_use` rule: each acts on the real control in
-/// the open window (typing sets the input's value and fires its own input event), so
-/// a disabled control takes no press.
+/// The provisioning UI's doors (plan 039 A7, re-hosted on the Credentials view in plan
+/// 040 §3.9): the event to emit (to the dashboard, which holds the Credentials view) and
+/// its payload, or the refusal. Opening and closing a shed's detail are what a person's
+/// click does, and are open; the doors that type, press, check or deliver are
+/// presses a harness has no pointer for, and are TEST-MODE ONLY, the
+/// `ui.press_source_use` rule: each acts on the real control in the Credentials view
+/// (typing sets the input's value and fires its own input event), so a disabled or
+/// missing control takes no press.
 ///
 /// | op | params | event |
 /// |---|---|---|
-/// | `ui.prefs_section` | `section` | `prefs-section` |
 /// | `ui.show_shed_delivery` | `server`, `shed` | `show-shed-delivery` |
 /// | `ui.close_shed_delivery` | — | `close-shed-delivery` |
 /// | `ui.press_deliver_again` | `server`, `shed` | `press-deliver-again` (test) |
-/// | `ui.press_delivery_toggle` | `provider` | `press-delivery-toggle` (test) |
 /// | `ui.press_delivery_button` | `provider`, `button` | `press-delivery-button` (test) |
 /// | `ui.type_delivery_field` | `provider`, `field`, `index`?, `value` | `type-delivery-field` (test) |
-/// | `ui.preview_delivery` | `server`, `shed`? | `preview-delivery` (test) |
+/// | `ui.fill_check` | `field` (by, shed, server, backend, repo), `value` | `fill-check` (test) |
+/// | `ui.press_check` | `button` (run, details) | `press-check` (test) |
+/// The Check form's controls a `ui.fill_check` fills: which kind of Check (`by`: `shed`
+/// or `target`), the shed picked (`<server>/<shed>`), the server, the backend, the repo.
+const CHECK_FIELDS: &[&str] = &["by", "shed", "server", "backend", "repo"];
+
 pub fn ui_door(
     test_mode: bool,
     op: &str,
     params: &Value,
-) -> Result<(&'static str, Value, DoorTarget), OpError> {
-    let gated = !matches!(
-        op,
-        "ui.prefs_section" | "ui.show_shed_delivery" | "ui.close_shed_delivery"
-    );
+) -> Result<(&'static str, Value), OpError> {
+    let gated = !matches!(op, "ui.show_shed_delivery" | "ui.close_shed_delivery");
     if gated && !test_mode {
         return Err((
             "not_enabled".to_string(),
@@ -436,25 +468,12 @@ pub fn ui_door(
         Ok(json!({ "server": server, "shed": shed }))
     };
     match op {
-        "ui.prefs_section" => Ok((
-            "prefs-section",
-            json!({ "section": str_param(params, "section")? }),
-            DoorTarget::Prefs,
-        )),
-        "ui.show_shed_delivery" => Ok(("show-shed-delivery", shed_pair(params)?, DoorTarget::Main)),
-        "ui.close_shed_delivery" => Ok(("close-shed-delivery", json!({}), DoorTarget::Main)),
-        "ui.press_deliver_again" => {
-            Ok(("press-deliver-again", shed_pair(params)?, DoorTarget::Main))
-        }
-        "ui.press_delivery_toggle" => Ok((
-            "press-delivery-toggle",
-            json!({ "provider": provider_param(params)? }),
-            DoorTarget::Prefs,
-        )),
+        "ui.show_shed_delivery" => Ok(("show-shed-delivery", shed_pair(params)?)),
+        "ui.close_shed_delivery" => Ok(("close-shed-delivery", json!({}))),
+        "ui.press_deliver_again" => Ok(("press-deliver-again", shed_pair(params)?)),
         "ui.press_delivery_button" => Ok((
             "press-delivery-button",
             json!({ "provider": provider_param(params)?, "button": str_param(params, "button")? }),
-            DoorTarget::Prefs,
         )),
         "ui.type_delivery_field" => {
             let provider = provider_param(params)?;
@@ -472,24 +491,28 @@ pub fn ui_door(
             Ok((
                 "type-delivery-field",
                 json!({ "provider": provider, "field": field, "index": index, "value": value }),
-                DoorTarget::Prefs,
             ))
         }
-        "ui.preview_delivery" => {
-            let server = str_param(params, "server")?;
-            let shed = match params.get("shed") {
-                None | Some(Value::Null) => "",
-                Some(Value::String(s)) => s.as_str(),
-                Some(_) => return Err(bad("'shed' must be a string")),
-            };
-            if !shed.is_empty() {
-                shed_param(shed)?;
+        "ui.fill_check" => {
+            let field = str_param(params, "field")?;
+            if !CHECK_FIELDS.contains(&field) {
+                return Err(bad(format!(
+                    "'field' is one of {}",
+                    CHECK_FIELDS.join(", ")
+                )));
             }
-            Ok((
-                "preview-delivery",
-                json!({ "server": server, "shed": shed }),
-                DoorTarget::Prefs,
-            ))
+            let value = params
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("'value' must be a string"))?;
+            Ok(("fill-check", json!({ "field": field, "value": value })))
+        }
+        "ui.press_check" => {
+            let button = str_param(params, "button")?;
+            if !matches!(button, "run" | "details") {
+                return Err(bad("'button' is run or details"));
+            }
+            Ok(("press-check", json!({ "button": button })))
         }
         other => Err(("unknown_op".to_string(), format!("unknown op: {other}"))),
     }
@@ -503,30 +526,30 @@ mod tests {
     fn the_ui_doors_are_gated_and_validated() {
         let p = json!({ "provider": "github" });
         for op in [
-            "ui.press_delivery_toggle",
             "ui.press_delivery_button",
             "ui.type_delivery_field",
-            "ui.preview_delivery",
+            "ui.fill_check",
             "ui.press_deliver_again",
         ] {
             let e = ui_door(false, op, &p).unwrap_err();
             assert_eq!(e.0, "not_enabled", "{op}");
         }
-        let (ev, payload, to) = ui_door(
-            false,
+        // The switch, the Preferences preview and its section scroll are gone with the
+        // Provisioning pane.
+        for op in [
+            "ui.press_delivery_toggle",
+            "ui.preview_delivery",
             "ui.prefs_section",
-            &json!({"section": "provisioning"}),
-        )
-        .unwrap();
-        assert_eq!((ev, to), ("prefs-section", DoorTarget::Prefs));
-        assert_eq!(payload["section"], "provisioning");
-        let (ev, payload, to) = ui_door(
+        ] {
+            assert_eq!(ui_door(true, op, &p).unwrap_err().0, "unknown_op", "{op}");
+        }
+        let (ev, payload) = ui_door(
             false,
             "ui.show_shed_delivery",
             &json!({"server": "mock", "shed": "w"}),
         )
         .unwrap();
-        assert_eq!((ev, to), ("show-shed-delivery", DoorTarget::Main));
+        assert_eq!(ev, "show-shed-delivery");
         assert_eq!(payload, json!({"server": "mock", "shed": "w"}));
         assert_eq!(
             ui_door(false, "ui.close_shed_delivery", &json!({}))
@@ -545,17 +568,7 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(
-            ui_door(
-                true,
-                "ui.press_delivery_toggle",
-                &json!({"provider": "nope"})
-            )
-            .unwrap_err()
-            .0,
-            "bad_request"
-        );
-        let (_, typed, _) = ui_door(
+        let (_, typed) = ui_door(
             true,
             "ui.type_delivery_field",
             &json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"}),
@@ -565,7 +578,7 @@ mod tests {
             typed,
             json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"})
         );
-        let (_, typed, _) = ui_door(
+        let (_, typed) = ui_door(
             true,
             "ui.type_delivery_field",
             &json!({"provider": "ssh-key", "field": "key_file", "value": ""}),
@@ -577,13 +590,14 @@ mod tests {
             json!({"provider": "ssh-key", "field": "x", "value": ["a"]}),
             json!({"provider": "ssh-key", "field": "x", "index": -1, "value": "a"}),
             json!({"provider": "ssh-key", "value": "a"}),
+            json!({"provider": "nope", "field": "x", "value": "a"}),
         ] {
             assert!(
                 ui_door(true, "ui.type_delivery_field", &bad).is_err(),
                 "{bad}"
             );
         }
-        let (_, press, _) = ui_door(
+        let (_, press) = ui_door(
             true,
             "ui.press_delivery_button",
             &json!({"provider": "files", "button": "add:files"}),
@@ -596,20 +610,45 @@ mod tests {
             &json!({"provider": "files"})
         )
         .is_err());
-        let (_, pv, _) = ui_door(true, "ui.preview_delivery", &json!({"server": "mock"})).unwrap();
-        assert_eq!(pv, json!({"server": "mock", "shed": ""}));
-        assert!(ui_door(
+        // Check: its controls filled and pressed one by one, as a person does.
+        let (ev, fill) = ui_door(
             true,
-            "ui.preview_delivery",
-            &json!({"server": "mock", "shed": "../x"})
+            "ui.fill_check",
+            &json!({"field": "repo", "value": "a/b"}),
         )
-        .is_err());
-        assert!(ui_door(
-            true,
-            "ui.preview_delivery",
-            &json!({"server": "mock", "shed": 3})
-        )
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            (ev, fill),
+            ("fill-check", json!({"field": "repo", "value": "a/b"}))
+        );
+        let (ev, press) = ui_door(true, "ui.press_check", &json!({"button": "run"})).unwrap();
+        assert_eq!((ev, press), ("press-check", json!({"button": "run"})));
+        for (op, bad) in [
+            ("ui.fill_check", json!({"field": "shed"})),
+            ("ui.fill_check", json!({"field": "nope", "value": "x"})),
+            ("ui.fill_check", json!({"field": "repo", "value": 3})),
+            ("ui.press_check", json!({"button": "save"})),
+            ("ui.press_check", json!({})),
+        ] {
+            assert_eq!(
+                ui_door(true, op, &bad).unwrap_err().0,
+                "bad_request",
+                "{op} {bad}"
+            );
+        }
+        for op in ["ui.fill_check", "ui.press_check"] {
+            assert_eq!(ui_door(false, op, &json!({})).unwrap_err().0, "not_enabled");
+        }
+        assert_eq!(
+            ui_door(
+                true,
+                "ui.run_check",
+                &json!({"server": "mock", "shed": "w"})
+            )
+            .unwrap_err()
+            .0,
+            "unknown_op"
+        );
     }
 
     /// The re-check of a stream settled on the account service reads the sources
@@ -755,6 +794,50 @@ mod tests {
             e.1,
             "'provider' is one of ssh-key, github, api-keys, envsecrets-login, files"
         );
+    }
+
+    /// The Credentials view's view-model tests (`ui/test/credentials.test.mjs`) draw their
+    /// forms from a copy of `delivery.describe`: it is this answer exactly.
+    /// `UPDATE_DESCRIBE_FIXTURE=1` rewrites it.
+    #[test]
+    fn the_ui_tests_describe_fixture_is_the_answer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ui/test/fixtures/describe.json");
+        let want = serde_json::to_string_pretty(&describe()).unwrap() + "\n";
+        if std::env::var_os("UPDATE_DESCRIBE_FIXTURE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &want).unwrap();
+        }
+        let got = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            got,
+            want,
+            "{} differs from delivery.describe: run with UPDATE_DESCRIBE_FIXTURE=1",
+            path.display()
+        );
+    }
+
+    /// A shed that could not be read for a Check is a code and fixed words: the
+    /// server's message never comes through.
+    #[test]
+    fn a_shed_read_failure_is_fixed_words() {
+        for (status, code) in [
+            (Some(404), "not_found"),
+            (Some(500), "server_refused"),
+            (None, "action_failed"),
+        ] {
+            let e = shed_core::http::ApiFailure {
+                status,
+                code: "SHED_NOT_FOUND".into(),
+                message: "SERVER SENTINEL".into(),
+            };
+            let (c, m) = shed_read_failure(&e);
+            assert_eq!(c, code);
+            assert!(
+                !m.contains("SENTINEL") && !m.contains("SHED_NOT_FOUND"),
+                "{m}"
+            );
+        }
     }
 
     #[test]
