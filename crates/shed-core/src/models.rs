@@ -710,16 +710,47 @@ where
     })
 }
 
-/// The `kind` of a [`SourceRef`] this client understands: one machine.
+/// The `kind` of a [`SourceRef`] naming one machine.
 pub const SOURCE_REF_MACHINE: &str = "machine";
 
-/// One slot of a binding: what answers. In this cut always `{"kind":"machine","id":…}`.
+/// The `kind` of a delivery [`SourceRef`] naming the account service: on a directory
+/// server, a directory user's credentials come from it and from no machine
+/// (`{"kind":"service","url":…}`, with `"state":"not_delivering"` while the service does
+/// not deliver to that server).
+pub const SOURCE_REF_SERVICE: &str = "service";
+
+/// A service [`SourceRef`]'s `state` while the account service does not deliver to the
+/// server.
+pub const SOURCE_STATE_NOT_DELIVERING: &str = "not_delivering";
+
+/// The code every source route answers `409` with for a user the account service answers
+/// for.
+pub const SOURCE_IS_SERVICE: &str = "SOURCE_IS_SERVICE";
+
+/// One slot of a binding: what answers. A machine is `{"kind":"machine","id":…}`; the
+/// account service, in the delivery slot only, `{"kind":"service","url":…,"state"?}`.
+/// `url` and `state` are additive: an older server sends neither, and an older reader
+/// ignores them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct SourceRef {
     #[serde(default, deserialize_with = "lenient")]
     pub kind: String,
     #[serde(default, deserialize_with = "lenient")]
     pub id: String,
+    /// The account service's URL (a service ref only).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub url: String,
+    /// `not_delivering`, or empty (a service ref only).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub state: String,
 }
 
 /// Which machine answers for the user: the delivery slot (who receives requests) and the
@@ -817,6 +848,16 @@ impl SourceDocument {
     /// The machine entry with this id, if the server listed one.
     pub fn machine(&self, id: &str) -> Option<&SourceMachine> {
         self.machines.iter().find(|m| m.id == id)
+    }
+
+    /// The account service, when it answers for the user: the FIRST delivery slot, when
+    /// that slot is a service reference with a URL.
+    pub fn service(&self) -> Option<&SourceRef> {
+        self.binding
+            .as_ref()?
+            .delivery
+            .first()
+            .filter(|r| r.kind == SOURCE_REF_SERVICE && !r.url.is_empty())
     }
 }
 
@@ -1588,6 +1629,51 @@ mod tests {
             serde_json::from_str(r#"{"binding":{"signing":[{"kind":"machine","id":""}]}}"#)
                 .unwrap();
         assert_eq!(doc.source_machine_id(), None);
+    }
+
+    /// A directory user's document (plan 040, section 3.2; the fixtures the server's API
+    /// tests and the desktop harness also read): no machine and no signing slot, the
+    /// account service in the delivery slot with its URL, and `not_delivering` while the
+    /// service does not deliver to the server. No machine is the source.
+    #[test]
+    fn source_document_reads_the_account_service() {
+        for (text, state) in [
+            (include_str!("../../fixtures/sources/service.json"), ""),
+            (
+                include_str!("../../fixtures/sources/service-not-delivering.json"),
+                SOURCE_STATE_NOT_DELIVERING,
+            ),
+        ] {
+            let doc: SourceDocument = serde_json::from_str(text).unwrap();
+            assert_eq!(doc.user, "ada");
+            assert!(doc.machines.is_empty());
+            assert_eq!(doc.source_machine_id(), None);
+            let svc = doc.service().expect("the account service answers");
+            assert_eq!(svc.kind, SOURCE_REF_SERVICE);
+            assert_eq!(svc.url, "https://accounts.example.test");
+            assert_eq!(svc.state, state);
+            // Encoded again, it is the document the server sent.
+            let again: serde_json::Value = serde_json::to_value(&doc).unwrap();
+            let delivery = &again["binding"]["delivery"][0];
+            assert_eq!(delivery["kind"], "service");
+            assert_eq!(delivery["url"], "https://accounts.example.test");
+        }
+        // A machine's document has no service, and its refs encode as before.
+        let doc: SourceDocument = serde_json::from_str(&format!(
+            r#"{{"binding":{{"delivery":[{{"kind":"machine","id":"{SOURCE_B}"}}]}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(doc.service(), None);
+        assert_eq!(
+            serde_json::to_string(&doc.binding.unwrap().delivery[0]).unwrap(),
+            format!(r#"{{"kind":"machine","id":"{SOURCE_B}"}}"#)
+        );
+        // The 409 every source route answers for such a user names its code.
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/sources/source-is-service.json"
+        ))
+        .unwrap();
+        assert_eq!(body["error"]["code"], SOURCE_IS_SERVICE);
     }
 
     /// A malformed slot keeps its position: with `[null, {machine B}]` the first slot

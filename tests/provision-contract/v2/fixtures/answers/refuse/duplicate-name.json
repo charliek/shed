@@ -1,0 +1,33 @@
+{
+  "name": "duplicate-name",
+  "description": "Two items with one name.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY_A",
+        "value": "v",
+        "fingerprint": "fp-k"
+      },
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY_B",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_name"
+  }
+}

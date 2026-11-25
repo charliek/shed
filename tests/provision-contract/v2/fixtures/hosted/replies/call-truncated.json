@@ -1,0 +1,19 @@
+{
+  "name": "call-truncated",
+  "description": "A 200 that ends before its body is complete: source_disconnected.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "truncated"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_disconnected"
+  }
+}

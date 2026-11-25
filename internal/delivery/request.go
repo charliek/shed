@@ -11,7 +11,17 @@ type Reason string
 const (
 	ReasonCreate    Reason = "create"
 	ReasonProvision Reason = "provision"
+	// ReasonStart and ReasonRefresh are delivery at a shed's start and to a
+	// running shed. A source accepts them; this server sends neither yet.
+	ReasonStart   Reason = "start"
+	ReasonRefresh Reason = "refresh"
 )
+
+// Reasons is every Reason, in the contract's order.
+var Reasons = []Reason{ReasonCreate, ReasonProvision, ReasonStart, ReasonRefresh}
+
+// ValidReason reports whether r is one of the contract's reasons.
+func ValidReason(r Reason) bool { return containsT(Reasons, r) }
 
 // The backends a request's shed may be on.
 const (
@@ -83,7 +93,7 @@ func ParseRequest(body []byte) (*Request, *Refusal) {
 	if r := checkTypes(root, "", requestMembers, requestKinds); r != nil {
 		return nil, r
 	}
-	if root.get("version").text != "1" {
+	if root.get("version").text != "2" {
 		return nil, refuse(RuleUnsupportedVer, "version")
 	}
 	req := &Request{
@@ -96,7 +106,7 @@ func ParseRequest(body []byte) (*Request, *Refusal) {
 	if !ValidID(req.ID) {
 		return nil, refuse(RuleBadID, "id")
 	}
-	if req.Reason != ReasonCreate && req.Reason != ReasonProvision {
+	if !ValidReason(req.Reason) {
 		return nil, refuse(ruleRequestValue, "reason")
 	}
 	if !ValidTime(req.Deadline) {

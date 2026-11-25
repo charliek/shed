@@ -83,6 +83,7 @@ closed_list!(
         SourceOffline => "source_offline",
         SourceTimeout => "source_timeout",
         SourceDisconnected => "source_disconnected",
+        SourceRefused => "source_refused",
         AnswerRefused => "answer_refused",
         WriteFailed => "write_failed",
         ImageTooOld => "image_too_old",
@@ -182,8 +183,8 @@ pub struct Last {
     pub outcome: Outcome,
     /// Why it failed, when it did.
     pub failure: Option<Failure>,
-    /// The machine asked.
-    pub source: Option<SourceMachine>,
+    /// The source asked.
+    pub source: Option<Source>,
     /// The answer's problems (never an empty list).
     pub problems: Vec<Problem>,
 }
@@ -199,6 +200,24 @@ pub struct Failure {
     pub item: Option<String>,
     /// The writer's result (`write_failed` only).
     pub result: Option<ItemResult>,
+}
+
+closed_list!(
+    /// The kind of source a record names.
+    SourceKind {
+        Machine => "machine",
+        Service => "service",
+    }
+);
+
+/// The source a record says was asked: its kind and, for a machine, the
+/// machine (`CONTRACT.md`, section 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// `machine` or `service`.
+    pub kind: SourceKind,
+    /// The machine asked: present exactly when the kind is `machine`.
+    pub machine: Option<SourceMachine>,
 }
 
 /// The machine a request went to.
@@ -298,6 +317,7 @@ fn fail_reasons(step: &str) -> &'static [StepReason] {
             SourceOffline,
             SourceTimeout,
             SourceDisconnected,
+            SourceRefused,
             AnswerRefused,
             WriteFailed,
         ],
@@ -338,9 +358,12 @@ const FAILURE_TYPES: &[(&str, Kind)] = &[
     ("item", Kind::String),
     ("result", Kind::String),
 ];
-const SOURCE_MEMBERS: &[&str] = &["machine_id", "machine_name"];
-const SOURCE_TYPES: &[(&str, Kind)] =
-    &[("machine_id", Kind::String), ("machine_name", Kind::String)];
+const SOURCE_MEMBERS: &[&str] = &["kind", "machine_id", "machine_name"];
+const SOURCE_TYPES: &[(&str, Kind)] = &[
+    ("kind", Kind::String),
+    ("machine_id", Kind::String),
+    ("machine_name", Kind::String),
+];
 const RITEM_MEMBERS: &[&str] = &[
     "name",
     "provider",
@@ -518,11 +541,8 @@ fn parse_last(n: &Node) -> Result<Last, Refusal> {
     if !valid_time(&at) {
         return Err(Refusal::new(Rule::BadTime, "last.at"));
     }
-    let reason = match text(n, "reason").as_str() {
-        "create" => Reason::Create,
-        "provision" => Reason::Provision,
-        _ => return Err(Refusal::new(Rule::BadLastReason, "last.reason")),
-    };
+    let reason = Reason::parse(&text(n, "reason"))
+        .ok_or_else(|| Refusal::new(Rule::BadLastReason, "last.reason"))?;
     let outcome = Outcome::from_name(&text(n, "outcome"))
         .ok_or_else(|| Refusal::new(Rule::BadOutcome, "last.outcome"))?;
     let allowed: &[StepReason] = match outcome {
@@ -532,6 +552,7 @@ fn parse_last(n: &Node) -> Result<Last, Refusal> {
             StepReason::SourceOffline,
             StepReason::SourceTimeout,
             StepReason::SourceDisconnected,
+            StepReason::SourceRefused,
         ],
         Outcome::NotRequested => &[StepReason::ImageTooOld],
     };
@@ -591,29 +612,49 @@ fn parse_last(n: &Node) -> Result<Last, Refusal> {
         last.failure = Some(failure);
     }
 
-    // source: required when an answer came.
-    if matches!(outcome, Outcome::Accepted | Outcome::Refused) {
+    // source, by the outcome (the contract's table "Outcomes"): required
+    // when an answer came, and with source_refused (only a hosted source
+    // refuses); absent when no request was made; otherwise optional (a
+    // machine source as in version 1, a hosted one whenever it was chosen).
+    let refused_by_source = last
+        .failure
+        .as_ref()
+        .is_some_and(|f| f.reason == StepReason::SourceRefused);
+    if matches!(outcome, Outcome::Accepted | Outcome::Refused) || refused_by_source {
         presence(n, AT, "source", true)?;
+    } else if outcome == Outcome::NotRequested {
+        presence(n, AT, "source", false)?;
     }
     if let Some(snode) = n.get("source") {
-        check_object(
-            snode,
-            "last.source",
-            SOURCE_MEMBERS,
-            SOURCE_MEMBERS,
-            SOURCE_TYPES,
-        )?;
-        let s = SourceMachine {
-            machine_id: text(snode, "machine_id"),
-            machine_name: text(snode, "machine_name"),
+        const SW: &str = "last.source";
+        check_object(snode, SW, SOURCE_MEMBERS, &["kind"], SOURCE_TYPES)?;
+        let kind = SourceKind::from_name(&text(snode, "kind"))
+            .filter(|k| !refused_by_source || *k == SourceKind::Service)
+            .ok_or_else(|| Refusal::new(Rule::BadSource, format!("{SW}.kind")))?;
+        let is_machine = kind == SourceKind::Machine;
+        presence(snode, SW, "machine_id", is_machine)?;
+        presence(snode, SW, "machine_name", is_machine)?;
+        let mut source = Source {
+            kind,
+            machine: None,
         };
-        if !valid_id(&s.machine_id) {
-            return Err(Refusal::new(Rule::BadMachine, "last.source.machine_id"));
+        if is_machine {
+            let m = SourceMachine {
+                machine_id: text(snode, "machine_id"),
+                machine_name: text(snode, "machine_name"),
+            };
+            if !valid_id(&m.machine_id) {
+                return Err(Refusal::new(Rule::BadSource, format!("{SW}.machine_id")));
+            }
+            if m.machine_name.is_empty()
+                || m.machine_name.len() > 63
+                || has_control(&m.machine_name)
+            {
+                return Err(Refusal::new(Rule::BadSource, format!("{SW}.machine_name")));
+            }
+            source.machine = Some(m);
         }
-        if s.machine_name.is_empty() || s.machine_name.len() > 63 || has_control(&s.machine_name) {
-            return Err(Refusal::new(Rule::BadMachine, "last.source.machine_name"));
-        }
-        last.source = Some(s);
+        last.source = Some(source);
     }
 
     // problems: only with an accepted answer, and never an empty list.

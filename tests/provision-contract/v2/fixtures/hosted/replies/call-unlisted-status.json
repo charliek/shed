@@ -1,0 +1,24 @@
+{
+  "name": "call-unlisted-status",
+  "description": "418, a status the table does not list: source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 418,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "TEAPOT",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

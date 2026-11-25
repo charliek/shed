@@ -1,0 +1,14 @@
+{
+  "name": "call-unreachable",
+  "description": "The service refuses the connection: source_offline.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "unreachable": true
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

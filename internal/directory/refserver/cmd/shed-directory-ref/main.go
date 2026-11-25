@@ -41,8 +41,10 @@ const usage = `usage: shed-directory-ref --control <dir> [--listen 127.0.0.1:0] 
 
 Serves the directory contract over plain HTTP on a loopback address, for
 tests. All state (enrolled servers, spent codes, the replay ledger) is in
-memory; users, codes, disabled servers and an outage are read from the
-control directory on each request. After the clock moves back, an assertion
+memory; users, codes, disabled servers, the servers that may not ask for
+deliveries (no-deliveries), each person's delivery source (deliveries.json:
+the provision contract's hosted source, POST /v1/deliveries) and an outage
+are read from the control directory on each request. After the clock moves back, an assertion
 whose acceptance window ended before the latest time the server has seen is
 refused until the clock catches up.
 
@@ -65,7 +67,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fs.PrintDefaults()
 	}
 	listen := fs.String("listen", "127.0.0.1:0", "the loopback address and port to listen on")
-	control := fs.String("control", "", "the control directory (users.json, codes, disabled, outage)")
+	control := fs.String("control", "", "the control directory (users.json, codes, disabled, no-deliveries, deliveries.json, outage)")
 	org := fs.String("organization", "example", "the organization's slug")
 	keyFile := fs.String("signing-key", "", "a PKCS#8 PEM RSA key to sign access tokens with (default: a new key)")
 	keyID := fs.String("key-id", "", "the signing key's key id (with --signing-key)")

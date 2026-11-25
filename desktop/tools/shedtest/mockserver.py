@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 # A non-zero GET /api/system/df payload (M7) so the System pane renders real numbers.
@@ -86,7 +87,7 @@ DEFAULT_INFO = {
 # delivery transport, the provision route and the activity feed.
 #
 # Shapes are the server's, pinned against the provision contract
-# (`tests/provision-contract/v1/`, `CONTRACT.md` §3-4) and the Go handlers
+# (`tests/provision-contract/v2/`, `CONTRACT.md` §3-4) and the Go handlers
 # (`internal/api/delivery_handlers.go`, `provision.go`, `activity.go`):
 #   * the stream: `GET /api/delivery/requests`, `200` with `Content-Type:
 #     text/event-stream`, `Cache-Control: no-store` and `X-Shed-Delivery-Stream:
@@ -117,7 +118,7 @@ DELIVERED_RECORD = {
     "steps": {"stage1": {"state": "done"}, "clone": {"state": "done"},
               "stage2": {"state": "done"}, "install": {"state": "done"}},
     "last": {"at": "2026-11-23T10:00:00Z", "reason": "create", "outcome": "accepted",
-             "source": {"machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+             "source": {"kind": "machine", "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
                         "machine_name": "ada-laptop"}},
     "items": [
         {"name": "ssh-key", "provider": "ssh-key", "stage": 1, "kind": "file", "base": "home",
@@ -138,6 +139,16 @@ DELIVERED_RECORD = {
          "written_at": "2026-11-23T10:00:02Z", "result": "ok"},
     ],
 }
+#: The shapes the source routes answer for a user the account service answers for (plan
+#: 040 §3.2): `GET /api/sources` with the service in the delivery slot (and its
+#: `not_delivering` form), and the `409 SOURCE_IS_SERVICE` body. Read from the fixtures the
+#: server's API tests and shed-core's `SourceDocument` test also read.
+_SOURCE_SHAPES = Path(__file__).resolve().parents[3] / "crates" / "fixtures" / "sources"
+SERVICE_SOURCE_DOCUMENT = json.loads((_SOURCE_SHAPES / "service.json").read_text())
+SERVICE_NOT_DELIVERING_DOCUMENT = json.loads(
+    (_SOURCE_SHAPES / "service-not-delivering.json").read_text())
+SOURCE_IS_SERVICE_BODY = json.loads((_SOURCE_SHAPES / "source-is-service.json").read_text())
+
 #: The contract's `records/accept/none.json` record: a shed from before delivery.
 NONE_RECORD = {"state": "none"}
 
@@ -317,6 +328,8 @@ class MockShedServer:
         self._port = 0
         # ---- credential sources (plan 035 §3.4); all under _dlv_cond ----
         self._src_armed = False
+        # The account service answers (None: machines do): "" or "not_delivering".
+        self._src_service: str | None = None
         self._src_bound: str | None = None  # the bound machine's id
         self._src_generation = 0
         # id -> {"name", "first_seen", "connected" (None: its live slots decide)}
@@ -558,6 +571,15 @@ class MockShedServer:
                 "name": machine_name, "first_seen": "2026-11-16T09:00:00Z",
                 "connected": connected}
 
+    def serve_service_source(self, state: str = "") -> None:
+        """Become a directory server on which the account service answers for this user
+        (plan 040 §3.2): `GET /api/sources` answers the fixture's document, with
+        `"state": "not_delivering"` when `state` says so. Call before the app launches."""
+        assert state in ("", "not_delivering"), state
+        with self._dlv_cond:
+            self._src_armed = True
+            self._src_service = state
+
     def know_machine(self, machine_id: str, machine_name: str) -> None:
         """Record a machine as seen for this user — what a delivery stream from it
         does on the real server (a move to an unseen machine is 404)."""
@@ -621,6 +643,9 @@ class MockShedServer:
 
     def _src_document(self) -> dict:
         """The GET/POST answer (caller holds _dlv_cond)."""
+        if self._src_service is not None:
+            doc = SERVICE_NOT_DELIVERING_DOCUMENT if self._src_service else SERVICE_SOURCE_DOCUMENT
+            return json.loads(json.dumps(doc))
         binding = None
         if self._src_bound is not None:
             ref = [{"kind": "machine", "id": self._src_bound}]
@@ -789,7 +814,7 @@ class MockShedServer:
         if project_dir:
             req_shed["project_dir"] = project_dir
         deadline = time.time() + deadline_s
-        req = {"version": 1, "id": secrets.token_hex(16), "reason": reason,
+        req = {"version": 2, "id": secrets.token_hex(16), "reason": reason,
                "deadline": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(deadline)),
                "user": user, "shed": req_shed}
         live = self.live_delivery_stream(timeout)

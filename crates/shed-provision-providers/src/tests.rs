@@ -112,7 +112,7 @@ only = { repos = ["example/widgets"] }
 
 fn request(extra: &str) -> Request {
     let body = format!(
-        "{{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"create\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"ada\",\"shed\":{{\"name\":\"widgets\",\"id\":\"q6c3\",\"backend\":\"remote\"{extra}}}}}"
+        "{{\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"create\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"ada\",\"shed\":{{\"name\":\"widgets\",\"id\":\"q6c3\",\"backend\":\"remote\"{extra}}}}}"
     );
     parse_request(body.as_bytes()).unwrap()
 }

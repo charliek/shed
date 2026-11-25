@@ -1,0 +1,39 @@
+{
+  "name": "source-refused-with-rule",
+  "description": "source_refused carrying a rule, which only answer_refused takes.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "source_refused"
+      },
+      "clone": {
+        "state": "failed",
+        "reason": "clone_failed"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "no_answer",
+      "source": {
+        "kind": "service"
+      },
+      "failure": {
+        "reason": "source_refused",
+        "rule": "not_json"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "unexpected_member"
+  }
+}

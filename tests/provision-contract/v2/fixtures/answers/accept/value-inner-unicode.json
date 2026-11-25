@@ -1,0 +1,23 @@
+{
+  "name": "value-inner-unicode",
+  "description": "Non-ASCII letters, punctuation, symbols and an inner U+0020 in a value: all printable, valid.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "unicode",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "UNICODE_VALUE",
+        "value": "caf\u00e9 cr\u00e8me \u2014 \u65e5\u672c \u20ac\u00b1",
+        "fingerprint": "fp-unicode"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

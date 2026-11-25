@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "SOURCE_IS_SERVICE",
+    "message": "the account service is this user's credential source on this server: no machine answers here"
+  }
+}

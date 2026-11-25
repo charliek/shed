@@ -1,0 +1,24 @@
+{
+  "name": "call-bad-request",
+  "description": "400 BAD_REQUEST: source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 400,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "BAD_REQUEST",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

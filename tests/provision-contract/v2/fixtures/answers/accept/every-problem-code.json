@@ -1,0 +1,55 @@
+{
+  "name": "every-problem-code",
+  "description": "One problem of each code in the closed list.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "missing_input",
+        "message": "missing input"
+      },
+      {
+        "provider": "p",
+        "code": "unreadable",
+        "message": "unreadable"
+      },
+      {
+        "provider": "p",
+        "code": "signed_out",
+        "message": "signed out"
+      },
+      {
+        "provider": "p",
+        "code": "passphrase_protected",
+        "message": "passphrase protected"
+      },
+      {
+        "provider": "p",
+        "code": "conflict",
+        "message": "conflict"
+      },
+      {
+        "provider": "p",
+        "code": "command_failed",
+        "message": "command failed"
+      },
+      {
+        "provider": "p",
+        "code": "timed_out",
+        "message": "timed out"
+      },
+      {
+        "provider": "p",
+        "code": "expired",
+        "message": "expired"
+      }
+    ]
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

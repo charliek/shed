@@ -1,0 +1,21 @@
+{
+  "name": "start-repo",
+  "description": "A request a server sends when a shed starts (the reason start; shed-server in this version sends none).",
+  "request": {
+    "version": 2,
+    "id": "456789abcdef0123456789abcdef0123",
+    "reason": "start",
+    "deadline": "2026-11-23T10:00:30Z",
+    "user": "ada",
+    "shed": {
+      "name": "widgets",
+      "id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "backend": "vz",
+      "repo": {
+        "url": "git@git.example.test:example/widgets.git",
+        "name": "example/widgets"
+      },
+      "project_dir": "/home/shed/widgets"
+    }
+  }
+}

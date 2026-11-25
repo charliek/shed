@@ -1,9 +1,0 @@
-{
-  "name": "escaped-member-names",
-  "description": "Member names and values written with JSON escapes (\\u0076ersion is version): read after unescaping, the same document as written plainly.",
-  "request": "create-repo",
-  "answer_text": "{\"\\u0076ersion\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"esc\",\"provider\":\"files\",\"kind\":\"env\",\"variable\":\"ESC_\\u0041\",\"value\":\"a\\u00e9\\ud83d\\ude00b\",\"fingerprint\":\"f\"}],\"problems\":[]}",
-  "expect": {
-    "result": "accepted"
-  }
-}

@@ -1,7 +1,7 @@
 package api
 
 // The provision contract's transport for a machine source
-// (tests/provision-contract/v1/CONTRACT.md, section 3): the delivery request
+// (tests/provision-contract/v2/CONTRACT.md, section 3): the delivery request
 // stream and the answer route. The machine is admitted for its user by the
 // pin (plugin.Registry.SubscribeDelivery, under the user's gate, as a bus
 // subscription is); the requests, their binding and the judgement of an

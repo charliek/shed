@@ -1,0 +1,32 @@
+{
+  "name": "token-granted",
+  "description": "A granted delivery token, then an answer: accepted.",
+  "request": "create-repo",
+  "token": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Pragma": "no-cache"
+    },
+    "body": {
+      "access_token": "opaque-delivery-token",
+      "token_type": "bearer",
+      "expires_in": 600,
+      "scope": "deliveries:request"
+    }
+  },
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "answer": "accept/typical"
+    }
+  ],
+  "expect": {
+    "result": "accepted"
+  }
+}

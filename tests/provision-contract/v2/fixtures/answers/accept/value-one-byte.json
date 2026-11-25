@@ -1,0 +1,23 @@
+{
+  "name": "value-one-byte",
+  "description": "A value of one byte: the shortest allowed.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "short",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "SHORT_VALUE",
+        "value": "1",
+        "fingerprint": "fp-short"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

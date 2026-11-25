@@ -1,0 +1,93 @@
+{
+  "name": "empty-problems",
+  "description": "An empty problems list.",
+  "record": {
+    "state": "delivered",
+    "steps": {
+      "stage1": {
+        "state": "done"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "done"
+      },
+      "install": {
+        "state": "done"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "accepted",
+      "source": {
+        "kind": "machine",
+        "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+        "machine_name": "ada-laptop"
+      },
+      "problems": []
+    },
+    "items": [
+      {
+        "name": "ssh-key",
+        "provider": "ssh-key",
+        "stage": 1,
+        "kind": "file",
+        "base": "home",
+        "target": ".ssh/id_ed25519",
+        "fingerprint": "k3y-fp_01",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      },
+      {
+        "name": "ssh-key.pub",
+        "provider": "ssh-key",
+        "stage": 1,
+        "kind": "file",
+        "base": "home",
+        "target": ".ssh/id_ed25519.pub",
+        "fingerprint": "k3y-fp_01",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      },
+      {
+        "name": "github",
+        "provider": "github",
+        "stage": 1,
+        "kind": "file",
+        "base": "home",
+        "target": ".config/gh/hosts.yml",
+        "fingerprint": "gh-fp-1",
+        "expires_at": "2026-12-23T10:00:00Z",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      },
+      {
+        "name": "example-api-key",
+        "provider": "api-keys",
+        "stage": 1,
+        "kind": "env",
+        "target": "EXAMPLE_API_KEY",
+        "fingerprint": "api-fp-1",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      },
+      {
+        "name": "project-env",
+        "provider": "files",
+        "stage": 2,
+        "kind": "file",
+        "base": "project",
+        "target": ".envrc",
+        "fingerprint": "proj-fp-1",
+        "written_at": "2026-11-23T10:00:02Z",
+        "result": "ok"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "empty_list"
+  }
+}

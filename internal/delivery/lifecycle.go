@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -67,6 +68,118 @@ func ResetRecord(prior *Record) *Record {
 	}
 	r.State = DeriveState(r)
 	return r
+}
+
+// NormalizeLegacy brings a record this server wrote under version 1 of the
+// contract (v0.11) to version 2, in place: a machine source, the only kind
+// version 1 had, is given its kind. doc is the JSON document the record was
+// decoded from, which holds it as its top-level member "delivery" (a
+// backend's metadata or record file). A backend calls it on every record it
+// loads, before the record is used or validated; every save writes the
+// kind, so a record normalised once stays so.
+//
+// It repairs only a record v0.11 could have written, judged on the record's
+// own text, never on what a lenient decoder kept of it: the text must pass
+// the contract's strict reader (no member named twice, no null, no
+// unpaired surrogate), its source must have exactly the two machine members
+// and no "kind" ("kind": "" and "kind": null are not repaired), its
+// last.reason must be one v0.11 wrote (create or provision), and the same
+// text with "kind": "machine" put into the source must then be a record
+// ParseRecord accepts (so an unknown member anywhere, or any other broken
+// rule, leaves it unrepaired). The record becomes that parsed record.
+// Anything else is left as it was, and fails validation as any malformed
+// record does. ParseRecord itself is not lenient: a document with no kind
+// is refused there, as any reader of version 2 must refuse it.
+func NormalizeLegacy(r *Record, doc []byte) {
+	if r == nil || r.Last == nil || r.Last.Source == nil || r.Last.Source.Kind != "" {
+		return
+	}
+	var outer struct {
+		Delivery json.RawMessage `json:"delivery"`
+	}
+	if json.Unmarshal(doc, &outer) != nil || len(outer.Delivery) == 0 {
+		return
+	}
+	root, refusal := parseDocument(outer.Delivery)
+	if refusal != nil {
+		return
+	}
+	last := root.get("last")
+	if last == nil || last.kind != kindObject {
+		return
+	}
+	if reason := last.get("reason"); reason == nil || reason.kind != kindString ||
+		(Reason(reason.text) != ReasonCreate && Reason(reason.text) != ReasonProvision) {
+		return
+	}
+	src := last.get("source")
+	if src == nil || src.kind != kindObject || len(src.members) != 2 ||
+		src.get("machine_id") == nil || src.get("machine_name") == nil {
+		return
+	}
+	src.members = append([]member{{name: "kind", val: &node{kind: kindString, text: string(SourceKindMachine)}}}, src.members...)
+	var b bytes.Buffer
+	if !writeNode(&b, root) {
+		return
+	}
+	parsed, refusal := ParseRecord(b.Bytes())
+	if refusal != nil {
+		return
+	}
+	*r = *parsed
+}
+
+// writeNode writes a strictly parsed tree back as JSON: objects in their
+// members' order, numbers as written. It reports false for a node it cannot
+// write.
+func writeNode(b *bytes.Buffer, n *node) bool {
+	switch n.kind {
+	case kindObject:
+		b.WriteByte('{')
+		for i, m := range n.members {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			name, err := json.Marshal(m.name)
+			if err != nil {
+				return false
+			}
+			b.Write(name)
+			b.WriteByte(':')
+			if !writeNode(b, m.val) {
+				return false
+			}
+		}
+		b.WriteByte('}')
+	case kindArray:
+		b.WriteByte('[')
+		for i, e := range n.elems {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if !writeNode(b, e) {
+				return false
+			}
+		}
+		b.WriteByte(']')
+	case kindString:
+		s, err := json.Marshal(n.text)
+		if err != nil {
+			return false
+		}
+		b.Write(s)
+	case kindNumber:
+		b.WriteString(n.text)
+	case kindBool:
+		if n.b {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // Clone is a deep copy of r (nil for nil).

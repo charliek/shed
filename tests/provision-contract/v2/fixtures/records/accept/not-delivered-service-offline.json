@@ -1,0 +1,37 @@
+{
+  "name": "not-delivered-service-offline",
+  "description": "A refresh whose hosted source could not be reached: no_answer, source_offline, the source {kind: service}.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "source_offline"
+      },
+      "clone": {
+        "state": "failed",
+        "reason": "clone_failed"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "refresh",
+      "outcome": "no_answer",
+      "source": {
+        "kind": "service"
+      },
+      "failure": {
+        "reason": "source_offline"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

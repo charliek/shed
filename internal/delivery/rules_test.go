@@ -181,7 +181,7 @@ func TestRuleStatus(t *testing.T) {
 			t.Errorf("%s: %d, want %d", r, r.Status(), want)
 		}
 	}
-	if len(Rules) != 47 {
+	if len(Rules) != 48 {
 		t.Errorf("%d rules", len(Rules))
 	}
 }
@@ -195,9 +195,9 @@ func TestRefusalNamesNoSourceText(t *testing.T) {
 		body string
 		want Rule
 	}{
-		{"unknown at the top", `{"version":1,"id":"` + id + `","items":[],"problems":[],"sk-secret":1}`, RuleUnknownMember},
-		{"duplicate unknown", `{"version":1,"id":"` + id + `","items":[],"problems":[],"sk-secret":1,"sk-secret":2}`, RuleDuplicateMember},
-		{"null under an unknown", `{"version":1,"id":"` + id + `","items":[],"problems":[],"sk-secret":{"a":null}}`, RuleNullValue},
+		{"unknown at the top", `{"version":2,"id":"` + id + `","items":[],"problems":[],"sk-secret":1}`, RuleUnknownMember},
+		{"duplicate unknown", `{"version":2,"id":"` + id + `","items":[],"problems":[],"sk-secret":1,"sk-secret":2}`, RuleDuplicateMember},
+		{"null under an unknown", `{"version":2,"id":"` + id + `","items":[],"problems":[],"sk-secret":{"a":null}}`, RuleNullValue},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

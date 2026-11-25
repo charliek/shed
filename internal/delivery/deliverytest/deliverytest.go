@@ -170,7 +170,7 @@ func (st *stream) Offer(o delivery.Outgoing) bool {
 
 // EmptyAnswer is an answer with no items and no problems.
 func EmptyAnswer(id string) []byte {
-	return []byte(fmt.Sprintf(`{"version":1,"id":%q,"items":[],"problems":[]}`, id))
+	return []byte(fmt.Sprintf(`{"version":2,"id":%q,"items":[],"problems":[]}`, id))
 }
 
 // FileItem is a file item for an answer.
@@ -217,7 +217,7 @@ func AnswerOf(id string, files []FileItem, envs []EnvItem, problems []delivery.P
 	if problems == nil {
 		problems = []delivery.Problem{}
 	}
-	b, err := json.Marshal(map[string]any{"version": 1, "id": id, "items": items, "problems": problems})
+	b, err := json.Marshal(map[string]any{"version": delivery.Version, "id": id, "items": items, "problems": problems})
 	if err != nil {
 		panic(err)
 	}

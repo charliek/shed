@@ -28,7 +28,7 @@ func deliveredRecord() *delivery.Record {
 		},
 		Last: &delivery.Last{At: "2026-11-23T10:00:00Z", Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeAccepted,
 			Failure:  &delivery.Failure{Reason: delivery.ReasonWriteFailed, Item: "github", Result: delivery.ResultIsDirectory},
-			Source:   &delivery.SourceMachine{MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"},
+			Source:   &delivery.Source{Kind: delivery.SourceKindMachine, MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"},
 			Problems: []delivery.Problem{{Provider: "api-keys", Code: "missing_input", Message: "no providers.toml"}}},
 		Items: []delivery.RecordItem{
 			{Name: "ssh-key", Provider: "ssh-key", Stage: 1, Kind: delivery.KindFile, Base: delivery.BaseHome, Target: ".ssh/id_ed25519", Fingerprint: "k1", WrittenAt: "2026-11-23T10:00:02Z", Result: delivery.ResultOK},

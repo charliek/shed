@@ -52,7 +52,7 @@ func TestRunOnce(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-Shed-Delivery-Stream", stream)
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `event: request`+"\n"+`data: {"version":1,"id":"`+reqID+`","reason":"create","deadline":"2026-11-23T10:00:30Z","user":"ada","shed":{"name":"w","id":"abc","backend":"vz"}}`+"\n\n")
+		_, _ = io.WriteString(w, `event: request`+"\n"+`data: {"version":2,"id":"`+reqID+`","reason":"create","deadline":"2026-11-23T10:00:30Z","user":"ada","shed":{"name":"w","id":"abc","backend":"vz"}}`+"\n\n")
 		w.(http.Flusher).Flush()
 		select {
 		case <-answered:

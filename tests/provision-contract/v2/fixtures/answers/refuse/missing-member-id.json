@@ -1,0 +1,15 @@
+{
+  "name": "missing-member-id",
+  "description": "No id.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "items": [],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "missing_member"
+  }
+}

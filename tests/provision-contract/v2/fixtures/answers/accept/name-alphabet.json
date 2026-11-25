@@ -1,0 +1,39 @@
+{
+  "name": "name-alphabet",
+  "description": "Names and providers at the edges of their alphabet: one character, all of . _ -, and 64 characters.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "a",
+        "provider": "p",
+        "kind": "env",
+        "variable": "A1",
+        "value": "x",
+        "fingerprint": "fp-a"
+      },
+      {
+        "name": "0.9_x-y",
+        "provider": "0.9_x-y",
+        "kind": "env",
+        "variable": "A2",
+        "value": "x",
+        "fingerprint": "fp-0-9_x-y"
+      },
+      {
+        "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+        "provider": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+        "kind": "env",
+        "variable": "A3",
+        "value": "x",
+        "fingerprint": "fp-nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

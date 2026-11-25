@@ -1,0 +1,15 @@
+{
+  "name": "missing-member-problems",
+  "description": "No problems member: both lists are required, empty or not.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "missing_member"
+  }
+}

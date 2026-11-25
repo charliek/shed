@@ -3,7 +3,7 @@
 A shed-server asks a person's credential source (their bound machine) for a
 bundle of files and environment values at create and at `shed provision`, and
 writes it into the shed in two stages around the clone (plan 039;
-`tests/provision-contract/v1/CONTRACT.md`). The suite plays the machine with
+`tests/provision-contract/v2/CONTRACT.md`). The suite plays the machine with
 the contract's reference source, `bin/test/shed-provision-ref` (`make
 provision-ref`), run as a subprocess (`RefSource`):
 
@@ -57,7 +57,7 @@ from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence, Un
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REF_SOURCE_BIN = REPO_ROOT / "bin" / "test" / "shed-provision-ref"
-CONTRACT_DIR = REPO_ROOT / "tests" / "provision-contract" / "v1"
+CONTRACT_DIR = REPO_ROOT / "tests" / "provision-contract" / "v2"
 REFUSE_DIR = CONTRACT_DIR / "fixtures" / "answers" / "refuse"
 
 # The shed user's home, where `base: home` items land.

@@ -99,9 +99,10 @@ type Result struct {
 	Reason StepReason
 	// Rule is the rule an answer broke (answer_refused only).
 	Rule Rule
-	// Source is the machine the request went to, or the bound machine
-	// that was not connected. Nil when no machine was asked.
-	Source *SourceMachine
+	// Source is the source asked, as the record names it: the machine the
+	// request went to, or the bound machine that was not connected. Nil
+	// when no source was asked.
+	Source *Source
 	// At is when the delivery ended.
 	At time.Time
 	// Bundle is the accepted answer (accepted only).
@@ -242,7 +243,7 @@ func (s *Service) Request(ctx context.Context, p Params) (Result, error) {
 			src := bound
 			log.Printf("delivery: request for shed %q%s not sent: its source, machine %s (%q), is not connected",
 				p.Shed.Name, forUser(p.User), src.MachineID, src.MachineName)
-			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceOffline, Source: &src, At: time.Now().UTC()}, nil
+			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceOffline, Source: src.Record(), At: time.Now().UTC()}, nil
 		}
 		e = &entry{
 			id: req.ID, req: req, user: p.User, machine: st.Machine(), gen: st.Generation(),
@@ -266,7 +267,7 @@ func (s *Service) Request(ctx context.Context, p Params) (Result, error) {
 			src := st.Machine()
 			log.Printf("delivery: request for shed %q%s not sent: the user had %d requests waiting until its deadline",
 				p.Shed.Name, forUser(p.User), maxActivePerUser)
-			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceTimeout, Source: &src, At: time.Now().UTC()}, nil
+			return Result{Outcome: OutcomeNoAnswer, Reason: ReasonSourceTimeout, Source: src.Record(), At: time.Now().UTC()}, nil
 		case <-ctx.Done():
 			timer.Stop()
 			return Result{}, ctx.Err()
@@ -274,7 +275,7 @@ func (s *Service) Request(ctx context.Context, p Params) (Result, error) {
 	}
 
 	src := st.Machine()
-	res := Result{RequestID: req.ID, Source: &src}
+	res := Result{RequestID: req.ID, Source: src.Record()}
 	id := req.ID
 	if !st.Offer(Outgoing{ID: id, Line: line, Live: func() bool { return s.table.live(id) }}) {
 		s.table.endUnanswered(e, false)

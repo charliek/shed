@@ -61,7 +61,7 @@ func publicProblems(text string) []string {
 	return out
 }
 
-// TestContractNamesNoHost checks the folder (README and v1/) names no host
+// TestContractNamesNoHost checks the folder (README and v2/) names no host
 // or address outside example.test and 127.0.0.1.
 func TestContractNamesNoHost(t *testing.T) {
 	n := 0

@@ -1,0 +1,14 @@
+{
+  "user": "ada",
+  "binding": {
+    "delivery": [
+      {
+        "kind": "service",
+        "url": "https://accounts.example.test",
+        "state": "not_delivering"
+      }
+    ],
+    "signing": []
+  },
+  "machines": []
+}

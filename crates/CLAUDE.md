@@ -122,7 +122,7 @@ shedctl (no internal deps)
   links those). `shed-source` reaches only `shed-core`/`shed-lane`/`shed-provision` and no
   `saphyr-parser`, and the same mobile crates do not reach it.
 - **`shed-provision`** (plan 039) — the source side of the provision contract
-  `tests/provision-contract/v1/`: the documents and every rule that judges
+  `tests/provision-contract/v2/`: the documents and every rule that judges
   them, matching `internal/delivery` rule for rule and in order (requests,
   answers, records; printable = Go's `unicode.IsPrint`, from a table
   `gen/printable.go` generates with Go), the stream's SSE framing, the

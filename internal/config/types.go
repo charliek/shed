@@ -1556,11 +1556,19 @@ const (
 	// source on this server; the body's top-level "source" object
 	// ({"machine_id","machine_name"}) names the machine that is.
 	ErrSourceNotBound = "SOURCE_NOT_BOUND"
+	// ErrSourceIsService (409) means the target user's credentials come from
+	// the account service on this server (a directory user): no machine
+	// answers, binds or holds a stream for them. The message is
+	// SourceIsServiceMessage. The body is pinned by
+	// crates/fixtures/sources/source-is-service.json.
+	ErrSourceIsService = "SOURCE_IS_SERVICE"
 	// ErrSourceDuplicateStream (409) means the user's source machine already
 	// holds a subscription to the namespace (another process with the same
 	// machine id, or a stream not yet reaped). Retryable for a broker that
 	// sends a machine id; only such a broker can get it.
 	ErrSourceDuplicateStream = "SOURCE_DUPLICATE_STREAM"
+	// SourceIsServiceMessage is ErrSourceIsService's one fixed message.
+	SourceIsServiceMessage = "the account service is this user's credential source on this server: no machine answers here"
 	// ErrSourceRateLimited (429, with Retry-After) means the user has made
 	// too many admissions that change the source records (a new machine id,
 	// a changed name or key fingerprint) lately. Retryable.

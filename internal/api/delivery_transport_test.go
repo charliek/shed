@@ -36,7 +36,7 @@ import (
 // real one, on the real registry.
 
 // provisionFixtures is the contract's fixture folder.
-var provisionFixtures = filepath.Join("..", "..", "tests", "provision-contract", "v1", "fixtures")
+var provisionFixtures = filepath.Join("..", "..", "tests", "provision-contract", "v2", "fixtures")
 
 // deliveryHarness is an mtls server with the delivery routes, its CA, and
 // the users alice, bob and root (an admin).
@@ -222,7 +222,7 @@ func post(t *testing.T, client *http.Client, server, machine, stream, id, body s
 }
 
 func emptyAnswer(id string) string {
-	return fmt.Sprintf(`{"version":1,"id":%q,"items":[],"problems":[]}`, id)
+	return fmt.Sprintf(`{"version":2,"id":%q,"items":[],"problems":[]}`, id)
 }
 
 // waitNoStream waits until user holds no delivery stream.
@@ -325,7 +325,7 @@ func TestDeliveryTransportRefuseFixtures(t *testing.T) {
 	if len(names) < 100 {
 		t.Fatalf("found %d refuse fixtures, want the contract's", len(names))
 	}
-	huge := `{"version":1,"id":"` + refsource.FixtureRequestID + `","items":[],"problems":[],"pad":"` + strings.Repeat("a", delivery.MaxBodyBytes) + `"}`
+	huge := `{"version":2,"id":"` + refsource.FixtureRequestID + `","items":[],"problems":[],"pad":"` + strings.Repeat("a", delivery.MaxBodyBytes) + `"}`
 	fixtures := map[string]*refsource.AnswerFixture{
 		"(transport) body over 6 MiB": {Name: "body-over-6mib", Request: "create-repo", AnswerText: &huge,
 			Expect: refsource.Expect{Result: "refused", Status: http.StatusRequestEntityTooLarge, Rule: string(delivery.RuleBodyTooLarge)}},

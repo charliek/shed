@@ -1,26 +1,26 @@
 # The provision contract
 
-The provision contract is what shed-server and a person's credential source promise each other: the request the server sends, the answer a source returns, the rules every item must meet, the transport, and the record the server keeps. It is a versioned folder in this repository, `tests/provision-contract/v1/`, and that folder is the **source of truth**. This page is a pointer and a summary, not a copy.
+The provision contract is what shed-server and a person's credential source promise each other: the request the server sends, the answer a source returns, the rules every item must meet, the transport, and the record the server keeps. It is a versioned folder in this repository, `tests/provision-contract/v2/`, and that folder is the **source of truth**. This page is a pointer and a summary, not a copy.
 
 | File | Holds |
 |---|---|
 | `CONTRACT.md` | the conventions, the documents, the rules, the transport and the record |
 | `MANIFEST.sha256` | a checksum of every file in the folder |
-| fixtures | answers (accept and refuse), requests, records and stream transcripts |
+| fixtures | answers (accept and refuse), requests, records, stream transcripts, and the hosted source's exchanges and replies |
 
 ## Rules for changing it
 
 - A file changes only by a reviewed pull request. A changed fixture is a contract change.
-- A breaking change is `v2/`, beside `v1/`. Version 1 has no optional growth: an unknown member refuses a document.
+- A breaking change is a new version, which replaces the old one: version 2 replaced version 1. The contract has no optional growth: an unknown member refuses a document.
 - `UPDATE_CONTRACT=1 go test ./internal/delivery/ -run Manifest` rewrites the manifest after an intended change.
 
 ## A second implementation
 
-A source or a server written elsewhere copies `v1/` whole from a shed commit and holds itself to every fixture. The Go tests in `internal/delivery` and the Rust test in `shed-provision` read the same folder, which is how the two sides stay in step. `make provision-ref` builds the in-tree reference source into `bin/test/` (in no release): it connects as a machine, holds the request stream and answers from canned items, and can stay silent, answer late or twice, or send any refuse fixture.
+A source or a server written elsewhere copies `v2/` whole from a shed commit and holds itself to every fixture. The Go tests in `internal/delivery` and the Rust test in `shed-provision` read the same folder, which is how the two sides stay in step. `make provision-ref` builds the in-tree reference source into `bin/test/` (in no release): it connects as a machine, holds the request stream and answers from canned items, and can stay silent, answer late or twice, or send any refuse fixture.
 
 ## Transport summary
 
-A version 1 source is a **machine source**: a program on one of the person's machines that holds a stream open to the server.
+A source is a **machine source**, a program on one of the person's machines that holds a stream open to the server (below), or a **hosted source**, the account service, which the server calls once per request (the contract's section 3b).
 
 | Route | Purpose |
 |---|---|

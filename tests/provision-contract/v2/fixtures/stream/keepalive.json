@@ -1,0 +1,35 @@
+{
+  "name": "keepalive",
+  "description": "An idle stream: a comment line every 15 seconds, a request between two of them, and the comments ignored by the source.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+      "X-Shed-Delivery-Stream": "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    }
+  },
+  "chunks": [
+    {
+      "at_ms": 15000,
+      "text": ": keepalive\n\n"
+    },
+    {
+      "at_ms": 20000,
+      "text": "event: request\ndata: {\"version\":2,\"id\":\"0123456789abcdef0123456789abcdef\",\"reason\":\"create\",\"deadline\":\"2026-11-23T10:00:30Z\",\"user\":\"ada\",\"shed\":{\"name\":\"widgets\",\"id\":\"q6c3g4ymb5m2dkxwe7kyz5hhzu\",\"backend\":\"firecracker\",\"repo\":{\"url\":\"git@git.example.test:example/widgets.git\",\"name\":\"example/widgets\"},\"project_dir\":\"/home/shed/widgets\"}}\n\n"
+    },
+    {
+      "at_ms": 30000,
+      "text": ": keepalive\n\n"
+    },
+    {
+      "at_ms": 45000,
+      "text": ": keepalive\n\n"
+    }
+  ],
+  "expect": {
+    "requests": [
+      "0123456789abcdef0123456789abcdef"
+    ]
+  }
+}

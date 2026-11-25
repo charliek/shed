@@ -1,0 +1,23 @@
+{
+  "name": "call-no-source",
+  "description": "404 NO_SOURCE: not_applicable, with no warning.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "NO_SOURCE",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "not_applicable"
+  }
+}

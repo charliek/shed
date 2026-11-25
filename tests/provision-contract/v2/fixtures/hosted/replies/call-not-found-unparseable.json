@@ -1,0 +1,18 @@
+{
+  "name": "call-not-found-unparseable",
+  "description": "404 whose body is not JSON: the status alone, without NO_SOURCE. source_refused.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "text/html"
+      },
+      "text": "<html>not found</html>"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

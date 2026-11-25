@@ -845,7 +845,7 @@ per-user admission limit (8 admissions that write its store, then one every
 
 At create and at `shed provision`, shed-server asks the shed user's credential
 source for a bundle of files and environment values and writes it in two
-stages around the clone (plan 039; `tests/provision-contract/v1/CONTRACT.md`).
+stages around the clone (plan 039; `tests/provision-contract/v2/CONTRACT.md`).
 `test_delivery.py` plays alice's machine with the contract's reference source
 (`make provision-ref`), a subprocess in a throwaway HOME with a throwaway
 credentials certificate, on loopback to the server under test (an `ssh -L`

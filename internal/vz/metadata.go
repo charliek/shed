@@ -189,6 +189,7 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 	if meta.Version < MetadataVersion {
 		return nil, fmt.Errorf("%w (shed=%q, version=%d)", ErrLegacyMetadata, name, meta.Version)
 	}
+	delivery.NormalizeLegacy(meta.Delivery, data)
 
 	return &meta, nil
 }

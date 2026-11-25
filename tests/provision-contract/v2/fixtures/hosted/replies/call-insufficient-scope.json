@@ -1,0 +1,23 @@
+{
+  "name": "call-insufficient-scope",
+  "description": "403 INSUFFICIENT_SCOPE: the grant was removed after the token was issued. not_applicable; the token is forgotten.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INSUFFICIENT_SCOPE",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "not_applicable"
+  }
+}

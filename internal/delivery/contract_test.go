@@ -9,14 +9,14 @@ import (
 // contractRoot is tests/provision-contract/ from this package's directory.
 const contractRoot = "../../tests/provision-contract"
 
-// contractDir is the version 1 contract.
-var contractDir = filepath.Join(contractRoot, "v1")
+// contractDir is the version 2 contract.
+var contractDir = filepath.Join(contractRoot, "v2")
 
 // updating reports whether this run records values instead of checking
 // them: UPDATE_CONTRACT=1 rewrites the manifest.
 func updating() bool { return os.Getenv("UPDATE_CONTRACT") == "1" }
 
-// readContractFile reads a file of the contract, by its path under v1/.
+// readContractFile reads a file of the contract, by its path under v2/.
 func readContractFile(t *testing.T, rel string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(contractDir, filepath.FromSlash(rel)))
@@ -26,8 +26,8 @@ func readContractFile(t *testing.T, rel string) []byte {
 	return b
 }
 
-// fixtureFiles lists the .json files directly under v1/<dir>, by their paths
-// under v1/, and fails when there are none (a check over an empty folder
+// fixtureFiles lists the .json files directly under v2/<dir>, by their paths
+// under v2/, and fails when there are none (a check over an empty folder
 // would pass vacuously).
 func fixtureFiles(t *testing.T, dir string) []string {
 	t.Helper()

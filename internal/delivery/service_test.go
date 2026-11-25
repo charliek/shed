@@ -152,7 +152,7 @@ func owner(st *fakeStream, user string) Answerer {
 }
 
 func answerBody(id, items string) []byte {
-	return []byte(fmt.Sprintf(`{"version":1,"id":%q,"items":[%s],"problems":[]}`, id, items))
+	return []byte(fmt.Sprintf(`{"version":2,"id":%q,"items":[%s],"problems":[]}`, id, items))
 }
 
 func setVar[T any](t *testing.T, p *T, v T) {
@@ -722,7 +722,7 @@ func okReply(in *WriterInput) string {
 
 // bundleOf is an accepted bundle of items.
 func bundleOf(items ...Item) *Bundle {
-	return &Bundle{answer: &Answer{Version: 1, Items: items}}
+	return &Bundle{answer: &Answer{Version: 2, Items: items}}
 }
 
 func fileItem(name string, stage int, base Base, path string) Item {
@@ -978,7 +978,7 @@ func TestSentinelValuesNeverLeak(t *testing.T) {
 	ch = requestAsync(svc, params("ada", "box"))
 	o = st.next(t)
 	c, _ = svc.Claim(o.ID, owner(st, "ada"))
-	r, _ := c.Judge([]byte(`{"version":1,"id":"` + o.ID + `","items":[{"value":"` + sentinel + `"`))
+	r, _ := c.Judge([]byte(`{"version":2,"id":"` + o.ID + `","items":[{"value":"` + sentinel + `"`))
 	texts = append(texts, r.Error())
 	texts = append(texts, fmt.Sprintf("%+v", resultOf(t, ch)))
 

@@ -1,0 +1,20 @@
+{
+  "name": "token-unavailable",
+  "description": "503 server_error: source_offline.",
+  "request": "create-repo",
+  "token": {
+    "status": 503,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "error": "server_error",
+      "error_description": "fixed text"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

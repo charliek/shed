@@ -147,7 +147,7 @@ func TestResetShedRecreatesUpper(t *testing.T) {
 		Steps: &delivery.Steps{Stage1: delivery.Step{State: delivery.StepDone}, Clone: delivery.Step{State: delivery.StepDone},
 			Stage2: delivery.Step{State: delivery.StepSkipped, Reason: delivery.ReasonNoItems}, Install: delivery.Step{State: delivery.StepDone}},
 		Last: &delivery.Last{At: "2026-11-23T10:00:00Z", Reason: delivery.ReasonCreate, Outcome: delivery.OutcomeAccepted,
-			Source: &delivery.SourceMachine{MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"}},
+			Source: &delivery.Source{Kind: delivery.SourceKindMachine, MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"}},
 		Items: []delivery.RecordItem{{Name: "k", Provider: "ssh-key", Stage: 1, Kind: delivery.KindFile, Base: delivery.BaseHome,
 			Target: ".ssh/id_ed25519", Fingerprint: "fp", WrittenAt: "2026-11-23T10:00:01Z", Result: delivery.ResultOK}},
 	}

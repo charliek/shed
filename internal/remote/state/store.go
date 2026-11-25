@@ -257,10 +257,15 @@ func (s *Store) Records() (records []*Record, bad []string, err error) {
 	}
 	for _, p := range paths {
 		var r Record
-		if err := readJSON(p, &r); err != nil || r.Shed.Name == "" {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			err = json.Unmarshal(data, &r)
+		}
+		if err != nil || r.Shed.Name == "" {
 			bad = append(bad, p)
 			continue
 		}
+		delivery.NormalizeLegacy(r.Delivery, data)
 		records = append(records, &r)
 	}
 	sort.Slice(records, func(a, b int) bool { return records[a].Shed.Name < records[b].Shed.Name })

@@ -1,0 +1,28 @@
+{
+  "name": "project-reaches-authorized-keys",
+  "description": "A repository named .ssh is cloned into /home/shed/.ssh, so project:authorized_keys is ~/.ssh/authorized_keys: refused.",
+  "request": "create-repo-dot-ssh",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "f",
+        "provider": "files",
+        "kind": "file",
+        "stage": 2,
+        "base": "project",
+        "path": "authorized_keys",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-f"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "refused_target"
+  }
+}

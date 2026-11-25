@@ -634,7 +634,7 @@ def test_create_delivers_a_canned_bundle(delivery_env, main_shed):
         last = rec.get("last") or {}
         assert (last.get("reason"), last.get("outcome")) == ("create", "accepted"), last
         assert "failure" not in last and not last.get("problems"), last
-        assert last.get("source") == {"machine_id": d.machine.id, "machine_name": d.machine.name}, last
+        assert last.get("source") == {"kind": "machine", "machine_id": d.machine.id, "machine_name": d.machine.name}, last
         _assert_items(rec, items, name)
         assert not rec.get("owed") and not rec.get("expired"), rec
 
@@ -727,7 +727,7 @@ def test_offline_source_at_create_then_provision_finishes_it(delivery_env):
         last = rec.get("last") or {}
         assert (last.get("reason"), last.get("outcome"), last.get("failure")) == (
             "create", "no_answer", {"reason": "source_offline"}), last
-        assert last.get("source") == {"machine_id": d.machine.id, "machine_name": d.machine.name}, last
+        assert last.get("source") == {"kind": "machine", "machine_id": d.machine.id, "machine_name": d.machine.name}, last
         assert not rec.get("items"), rec
 
         with d.start(items, label="offline-provision") as src:
@@ -950,7 +950,7 @@ def test_a_pin_move_fails_the_pending_request_and_the_old_machines_answer(delive
         took = time.monotonic() - t0
         d.keep(out, err)
         ended = src.wait_for(lambda e: e["event"] == "end", 15)
-        answer = {"version": 1, "id": req["id"], "items": [], "problems": []}
+        answer = {"version": 2, "id": req["id"], "items": [], "problems": []}
         late = pinned_request(alice.host, d.cert.https_port, f"/api/delivery/requests/{req['id']}", d.cert.pin,
                               d.cert.pair, method="POST", body=answer,
                               headers={**d.machine.headers, "X-Shed-Delivery-Stream": req["stream"]})

@@ -1,0 +1,20 @@
+{
+  "name": "token-invalid-client-400",
+  "description": "400 invalid_client: source_refused.",
+  "request": "create-repo",
+  "token": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "error": "invalid_client",
+      "error_description": "fixed text"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

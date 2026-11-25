@@ -46,7 +46,7 @@ pub(crate) fn target(url: &str) -> ServerTarget {
 /// A `request` event for request `id`, deadline `deadline`.
 pub(crate) fn request_event(id: &str, deadline: &str) -> String {
     format!(
-        "event: request\ndata: {{\"version\":1,\"id\":\"{id}\",\"reason\":\"create\",\"deadline\":\"{deadline}\",\"user\":\"ada\",\"shed\":{{\"name\":\"widgets\",\"id\":\"q6c3g4ymb5m2dkxwe7kyz5hhzu\",\"backend\":\"firecracker\"}}}}\n\n"
+        "event: request\ndata: {{\"version\":2,\"id\":\"{id}\",\"reason\":\"create\",\"deadline\":\"{deadline}\",\"user\":\"ada\",\"shed\":{{\"name\":\"widgets\",\"id\":\"q6c3g4ymb5m2dkxwe7kyz5hhzu\",\"backend\":\"firecracker\"}}}}\n\n"
     )
 }
 
@@ -145,7 +145,7 @@ async fn a_request_is_answered_on_its_stream_with_the_machine_headers() {
     assert_eq!(post.machine_id.as_deref(), Some(MACHINE_ID));
     let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
     assert_eq!(body["id"], id);
-    assert_eq!(body["version"], 1);
+    assert_eq!(body["version"], 2);
     r.wait_status("answered", |s| s.answered == 1).await;
     let s = r.stop().await;
     assert_eq!((s.streams, s.requests, s.answered), (1, 1, 1));

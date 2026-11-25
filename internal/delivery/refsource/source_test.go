@@ -24,8 +24,8 @@ import (
 	"github.com/charliek/shed/internal/delivery"
 )
 
-// v1 is the version 1 contract, from this package's directory.
-var v1 = filepath.Join("..", "..", "..", "tests", "provision-contract", "v1")
+// v2 is the version 2 contract, from this package's directory.
+var v2 = filepath.Join("..", "..", "..", "tests", "provision-contract", "v2")
 
 const (
 	testMachine  = "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b"
@@ -34,7 +34,7 @@ const (
 
 func transcript(t *testing.T, name string) *Transcript {
 	t.Helper()
-	tr, err := LoadTranscript(filepath.Join(v1, "fixtures", "stream", name+".json"))
+	tr, err := LoadTranscript(filepath.Join(v2, "fixtures", "stream", name+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func transcript(t *testing.T, name string) *Transcript {
 
 func answerFixture(t *testing.T, rel string) *AnswerFixture {
 	t.Helper()
-	f, err := LoadAnswerFixture(filepath.Join(v1, "fixtures", "answers", filepath.FromSlash(rel)+".json"))
+	f, err := LoadAnswerFixture(filepath.Join(v2, "fixtures", "answers", filepath.FromSlash(rel)+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}

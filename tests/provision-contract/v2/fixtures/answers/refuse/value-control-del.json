@@ -1,0 +1,25 @@
+{
+  "name": "value-control-del",
+  "description": "A value holding DEL (U+007F).",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "a\u007fb",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "value_not_printable"
+  }
+}

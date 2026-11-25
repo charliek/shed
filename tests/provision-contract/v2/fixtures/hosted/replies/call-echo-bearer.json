@@ -1,0 +1,20 @@
+{
+  "name": "call-echo-bearer",
+  "description": "A 200 whose answer holds the bearer token the server presented, otherwise valid: answer_refused, rule echoes_credential.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "echo_bearer"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "answer_refused",
+    "rule": "echoes_credential"
+  }
+}

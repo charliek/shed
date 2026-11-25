@@ -1,0 +1,20 @@
+{
+  "name": "token-invalid-request",
+  "description": "400 invalid_request, a status and code that table does not list: source_refused.",
+  "request": "create-repo",
+  "token": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "error": "invalid_request",
+      "error_description": "fixed text"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "reason": "source_refused"
+  }
+}

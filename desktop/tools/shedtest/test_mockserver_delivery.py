@@ -2,7 +2,7 @@
 
 `test_tauri_delivery.py` drives the app against these routes; here the mock speaks
 HTTP to a hand-rolled source (no app), so a mock that drifted from the server's
-contract (`tests/provision-contract/v1/CONTRACT.md` §3-4, `internal/api/
+contract (`tests/provision-contract/v2/CONTRACT.md` §3-4, `internal/api/
 delivery_handlers.go`) fails here and not as a confusing app cell:
 
 * the stream answers `200` with `text/event-stream`, `Cache-Control: no-store` and a
@@ -32,7 +32,7 @@ from mockserver import (DELIVERED_RECORD, DELIVERY_STREAM_HEADER, MACHINE_ID_HEA
 
 MACHINE = "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b"
 OTHER = "fedcba9876543210fedcba9876543210"
-CONTRACT = Path(__file__).resolve().parents[3] / "tests" / "provision-contract" / "v1"
+CONTRACT = Path(__file__).resolve().parents[3] / "tests" / "provision-contract" / "v2"
 
 
 @pytest.fixture
@@ -106,9 +106,9 @@ def test_the_stream_and_an_answer_follow_the_contract(dmock):
         assert re.fullmatch(r"[0-9a-f]{32}", sid)
         sent = mock.push_delivery_request(repo="example/widgets", backend="firecracker")
         got = s.next_request()
-        assert got == sent and got["version"] == 1 and got["shed"]["repo"]["name"] == "example/widgets"
+        assert got == sent and got["version"] == 2 and got["shed"]["repo"]["name"] == "example/widgets"
         rid = got["id"]
-        body = json.dumps({"version": 1, "id": rid, "items": [], "problems": []}).encode()
+        body = json.dumps({"version": 2, "id": rid, "items": [], "problems": []}).encode()
 
         # In the contract's order: another stream, then the right one, then a repeat.
         assert _answer(mock, rid, body, stream="0" * 32)[0:2] == (
@@ -162,7 +162,7 @@ def test_a_request_dies_with_its_stream_and_is_not_replayed(dmock):
     try:
         sid2 = s2.resp.getheader(DELIVERY_STREAM_HEADER)
         assert sid2 != sid
-        body = json.dumps({"version": 1, "id": rid, "items": [], "problems": []}).encode()
+        body = json.dumps({"version": 2, "id": rid, "items": [], "problems": []}).encode()
         for stream in (sid, sid2):
             assert _answer(mock, rid, body, stream=stream)[1]["error"]["code"] == "unknown_request"
         rid2 = mock.push_delivery_request()["id"]

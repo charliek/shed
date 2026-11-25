@@ -1,0 +1,24 @@
+{
+  "name": "call-unavailable",
+  "description": "503 UNAVAILABLE: source_offline.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 503,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "UNAVAILABLE",
+          "message": "fixed text"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "source_offline"
+  }
+}

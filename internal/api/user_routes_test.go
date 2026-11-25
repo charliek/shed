@@ -923,7 +923,7 @@ func walkDeliveryRoute(t *testing.T, s *Server, router http.Handler, be *userFak
 		t.Fatal("no request reached alice's stream")
 	}
 	answerPath := delivery.AnswerPathPrefix + out.ID
-	body := fmt.Sprintf(`{"version":1,"id":%q,"items":[],"problems":[]}`, out.ID)
+	body := fmt.Sprintf(`{"version":2,"id":%q,"items":[],"problems":[]}`, out.ID)
 	for _, who := range []struct{ name, fp string }{{"bob", bobFP}, {"admin", rootFP}, {"alice", aliceFP}} {
 		be.reset()
 		r := do(router, testClientCert(who.fp, "credentials", time.Hour), method, answerPath, body, delivery.HeaderStream, st.ID())

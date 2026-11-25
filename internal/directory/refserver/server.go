@@ -1,7 +1,11 @@
 // Package refserver is a reference implementation of the service side of
 // the directory contract (tests/directory-contract/v1/CONTRACT.md): the
 // enrolment, token and directory endpoints, held to every recorded exchange
-// of the contract by this package's tests.
+// of the contract by this package's tests. It is also a hosted source of
+// the provision contract (tests/provision-contract/v2/CONTRACT.md, section
+// 3b): the delivery scope and POST /v1/deliveries, held to every hosted
+// exchange of that contract, answering from canned items or sending any
+// reply a server must classify (deliveries.go).
 //
 // It is for tests, never for production. All of its state (enrolled
 // servers, spent codes, the replay ledger) is in memory, so a restart is a
@@ -61,18 +65,21 @@ const (
 const (
 	pathEnroll    = "/v1/servers/enroll"
 	pathDirectory = "/v1/directory"
-	pathToken     = "/oauth2/token"
-	pathJWKS      = "/.well-known/jwks.json"
-	pathMetadata  = "/.well-known/oauth-authorization-server"
+	// pathDeliveries is the provision contract's hosted source (its
+	// version 2, section 3b).
+	pathDeliveries = "/v1/deliveries"
+	pathToken      = "/oauth2/token"
+	pathJWKS       = "/.well-known/jwks.json"
+	pathMetadata   = "/.well-known/oauth-authorization-server"
 )
 
 var organizationRx = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
 // Limits are the requests allowed per minute: enrolments and token
-// requests per calling address, directory requests per server. Zero takes
-// the default.
+// requests per calling address, directory and delivery requests per server.
+// Zero takes the default.
 type Limits struct {
-	Enroll, Token, Directory int
+	Enroll, Token, Directory, Deliveries int
 }
 
 // Config is a reference server's configuration.
@@ -177,9 +184,10 @@ func New(cfg Config) (*Server, error) {
 	}
 	l := cfg.Limits
 	s.limits = map[limitKind]*limiter{
-		limitEnroll:    newLimiter(orDefault(l.Enroll, 30)),
-		limitToken:     newLimiter(orDefault(l.Token, 120)),
-		limitDirectory: newLimiter(orDefault(l.Directory, 120)),
+		limitEnroll:     newLimiter(orDefault(l.Enroll, 30)),
+		limitToken:      newLimiter(orDefault(l.Token, 120)),
+		limitDirectory:  newLimiter(orDefault(l.Directory, 120)),
+		limitDeliveries: newLimiter(orDefault(l.Deliveries, 120)),
 	}
 	return s, nil
 }
@@ -218,11 +226,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method  string
 		handler func(http.ResponseWriter, *http.Request)
 	}{
-		pathEnroll:    {http.MethodPost, s.handleEnroll},
-		pathToken:     {http.MethodPost, s.handleToken},
-		pathDirectory: {http.MethodGet, s.handleDirectory},
-		pathJWKS:      {http.MethodGet, s.handleJWKS},
-		pathMetadata:  {http.MethodGet, s.handleMetadata},
+		pathEnroll:     {http.MethodPost, s.handleEnroll},
+		pathToken:      {http.MethodPost, s.handleToken},
+		pathDirectory:  {http.MethodGet, s.handleDirectory},
+		pathDeliveries: {http.MethodPost, s.handleDeliveries},
+		pathJWKS:       {http.MethodGet, s.handleJWKS},
+		pathMetadata:   {http.MethodGet, s.handleMetadata},
 	}[r.URL.Path]
 	switch {
 	case route.handler == nil:
@@ -303,9 +312,10 @@ func randomHex(n int) string {
 type limitKind string
 
 const (
-	limitEnroll    limitKind = "enroll"
-	limitToken     limitKind = "token"
-	limitDirectory limitKind = "directory"
+	limitEnroll     limitKind = "enroll"
+	limitToken      limitKind = "token"
+	limitDirectory  limitKind = "directory"
+	limitDeliveries limitKind = "deliveries"
 )
 
 type limiter struct {

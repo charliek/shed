@@ -4,7 +4,7 @@
 //
 // The contract itself, the source of truth for every implementation, is in
 // tests/provision-contract/ at the root of this repository: the document
-// (v1/CONTRACT.md), its fixtures and its manifest. This package's tests hold
+// (v2/CONTRACT.md), its fixtures and its manifest. This package's tests hold
 // that folder to its manifest, run every answer fixture through
 // ParseAnswer and check the rule it is refused by, decode every request,
 // record and stream fixture, check that the rule names, reasons and results

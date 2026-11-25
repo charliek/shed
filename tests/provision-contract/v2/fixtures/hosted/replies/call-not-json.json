@@ -1,0 +1,20 @@
+{
+  "name": "call-not-json",
+  "description": "A 200 whose body is not JSON: answer_refused, rule not_json.",
+  "request": "create-repo",
+  "calls": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "text": "ok"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "reason": "answer_refused",
+    "rule": "not_json"
+  }
+}

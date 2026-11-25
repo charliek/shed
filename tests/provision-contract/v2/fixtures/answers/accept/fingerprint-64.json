@@ -1,0 +1,23 @@
+{
+  "name": "fingerprint-64",
+  "description": "A fingerprint of 64 characters using the whole alphabet.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "fp",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "FP_VAR",
+        "value": "x",
+        "fingerprint": "AZaz09_-AZaz09_-AZaz09_-AZaz09_-AZaz09_-AZaz09_-AZaz09_-AZaz09_-"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

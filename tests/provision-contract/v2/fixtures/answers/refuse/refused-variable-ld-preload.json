@@ -1,0 +1,25 @@
+{
+  "name": "refused-variable-ld-preload",
+  "description": "LD_PRELOAD: every name starting LD_.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "LD_PRELOAD",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "refused_variable"
+  }
+}

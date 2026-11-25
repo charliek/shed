@@ -1,0 +1,25 @@
+{
+  "name": "refused-variable-https-proxy",
+  "description": "The variable HTTPS_PROXY.",
+  "request": "create-repo",
+  "answer": {
+    "version": 2,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "HTTPS_PROXY",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "refused_variable"
+  }
+}

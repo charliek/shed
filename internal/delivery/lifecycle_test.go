@@ -25,7 +25,7 @@ func TestLifecycleRecords(t *testing.T) {
 
 	delivered := &Record{
 		Steps: &Steps{Stage1: Step{State: StepDone}, Clone: Step{State: StepDone}, Stage2: Step{State: StepDone}, Install: Step{State: StepDone}},
-		Last:  &Last{At: FormatTime(at), Reason: ReasonCreate, Outcome: OutcomeAccepted, Source: &SourceMachine{MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"}},
+		Last:  &Last{At: FormatTime(at), Reason: ReasonCreate, Outcome: OutcomeAccepted, Source: &Source{Kind: SourceKindMachine, MachineID: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b", MachineName: "ada-laptop"}},
 		Items: []RecordItem{
 			{Name: "gh", Provider: "github", Stage: 1, Kind: KindFile, Base: BaseHome, Target: ".config/gh/hosts.yml", Fingerprint: "f1", ExpiresAt: FormatTime(at.Add(time.Hour)), WrittenAt: FormatTime(at), Result: ResultOK},
 			{Name: "old", Provider: "files", Stage: 1, Kind: KindFile, Base: BaseHome, Target: "old", Fingerprint: "f2", ExpiresAt: FormatTime(at.Add(-time.Hour)), WrittenAt: FormatTime(at), Result: ResultNotInLastAnswer},

@@ -1,6 +1,6 @@
 //! # shed-provision
 //!
-//! The source side of the provision contract (`tests/provision-contract/v1/`):
+//! The source side of the provision contract (`tests/provision-contract/v2/`):
 //! when a shed is created or provisioned, shed-server asks the person's
 //! source for the files and environment variables the shed should hold, and
 //! the source answers with items.
@@ -9,7 +9,7 @@
 //!   server's Go implementation rule for rule and in the same order:
 //!   [`parse_request`], [`parse_answer`] (and [`Answer::to_json`],
 //!   [`Answer::validate`]), [`parse_record`], with the rule names in
-//!   [`Rule`]. The reader of `tests/provision-contract/v1/` runs in this
+//!   [`Rule`]. The reader of `tests/provision-contract/v2/` runs in this
 //!   crate's tests.
 //! - The stream's framing: [`stream::EventReader`] and [`stream::read_event`].
 //! - Building an answer: the [`Provider`] and [`Reader`] traits, the
