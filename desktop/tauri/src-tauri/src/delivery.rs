@@ -5,6 +5,8 @@
 //! | op | params | result |
 //! |---|---|---|
 //! | `delivery.status` | — | this machine, each server's stream, recent answers (redacted) |
+//! | `delivery.describe` | — | `{providers}`: each provider's descriptor (title, summary, where it lands, fields) |
+//! | `delivery.recent` | — | `{recent}`: the answers this machine gave, newest first, redacted |
 //! | `delivery.settings` | — | `delivery.toml` as `{path, exists, error, providers}` |
 //! | `delivery.set` | `provider`, `config` (object, or null to remove) | the new settings view |
 //! | `delivery.preview` | `server`, `shed`? | what that shed would get, redacted |
@@ -20,8 +22,12 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use shed_app::Backend;
-use shed_core::http::Client;
+use shed_core::http::{Client, SourceError};
+use shed_core::models::{SourceDocument, SOURCE_IS_SERVICE};
+use shed_desktop_core::delivery::settings_file::provider_names;
 use shed_desktop_core::delivery::source;
+use shed_desktop_core::delivery::source::delivery::{ServiceCheck, SourceCheck};
+use shed_desktop_core::delivery::source::ServerTarget;
 use shed_desktop_core::delivery::{DeliveryOptions, DeliveryRuntime, DiskReader};
 
 use crate::env::Env;
@@ -33,10 +39,80 @@ fn bad(message: impl Into<String>) -> OpError {
     ("bad_request".to_string(), message.into())
 }
 
+/// What a server's `GET /api/sources` says of the account service, for a stream settled
+/// on it: still answering (the document names it, or the route refuses
+/// `SOURCE_IS_SERVICE`), no longer (a machine's document, or a server older than the
+/// route), or unknown (any other failure: ask again at the next re-check).
+pub fn service_check_of(read: &Result<SourceDocument, SourceError>) -> ServiceCheck {
+    match read {
+        Ok(doc) if doc.service().is_some() => ServiceCheck::Service,
+        Ok(_) | Err(SourceError::Unsupported) => ServiceCheck::NotService,
+        Err(SourceError::Api { code, .. }) if code == SOURCE_IS_SERVICE => ServiceCheck::Service,
+        Err(_) => ServiceCheck::Unknown,
+    }
+}
+
+/// Builds the app's control-scope clients from the shed CLI config as it reads NOW (the
+/// same parts the startup Backend was built from).
+pub type FreshBackend = Arc<dyn Fn() -> Backend + Send + Sync>;
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+fn named_client(backend: &Backend, target: &ServerTarget) -> Option<Client> {
+    backend
+        .host_clients()
+        .into_iter()
+        .find(|(name, c)| *name == target.name && same_url(c.base_url(), &target.url))
+        .map(|(_, c)| c)
+}
+
+/// A control-scope client for the stream's CURRENT target: the startup Backend's, when
+/// it has one of the same name at the same endpoint; else one from the config as it
+/// reads now (a server added, or its endpoint changed, since the app started). `None`
+/// when neither has it (then the re-check cannot tell).
+pub fn client_for_target(
+    backend: &Backend,
+    fresh: &dyn Fn() -> Backend,
+    target: &ServerTarget,
+) -> Option<Client> {
+    named_client(backend, target).or_else(|| named_client(&fresh(), target))
+}
+
+/// The source runtime's re-check of a server settled on the account service: `GET
+/// /api/sources` on a control-scope client for the stream's current target
+/// ([`client_for_target`]; the stream's credentials-scope certificate cannot reach the
+/// route). A target no client matches is unknown.
+fn service_check(backend: Arc<Backend>, fresh: FreshBackend) -> SourceCheck {
+    Arc::new(move |target: &ServerTarget| {
+        let (backend, fresh, target) = (backend.clone(), fresh.clone(), target.clone());
+        Box::pin(async move {
+            let client =
+                tokio::task::spawn_blocking(move || client_for_target(&backend, &*fresh, &target))
+                    .await
+                    .ok()
+                    .flatten();
+            match client {
+                Some(c) => service_check_of(&c.source_status().await),
+                None => ServiceCheck::Unknown,
+            }
+        })
+    })
+}
+
 /// Starts the source runtime: this machine's identity (`<state>/broker/machine.json`),
 /// the fingerprint key under the same state directory, a stream per
-/// server of the app's shed config. Blocking file I/O; the setup hook calls it.
-pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime> {
+/// server of the app's shed config, and the re-check a stream settled on the account
+/// service asks through `backend` (or, for a target it does not have, through a client
+/// `fresh` builds from the config as it reads then). Blocking file I/O; the setup hook
+/// calls it.
+pub fn start(
+    env: &Env,
+    handle: &tokio::runtime::Handle,
+    backend: Arc<Backend>,
+    fresh: FreshBackend,
+) -> Arc<DeliveryRuntime> {
     let state = source::paths::state_dir();
     let machine = source::machine::load_or_create().map(|l| l.identity);
     if let Err(e) = &machine {
@@ -57,8 +133,12 @@ pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime>
         unreachable_hosts: env.mock_unreachable_hosts.clone(),
         reader: DiskReader::from_process(),
         rescan: shed_desktop_core::delivery::runtime::RESCAN,
+        service_recheck: env
+            .source_recheck
+            .unwrap_or(source::delivery::SERVICE_RECHECK),
+        paused_path: source::paused::paused_state_path(),
     };
-    let rt = DeliveryRuntime::start(handle, opts, machine);
+    let rt = DeliveryRuntime::start(handle, opts, machine, Some(service_check(backend, fresh)));
     app_info!(
         "shed-desktop-tauri: delivery: settings at {}",
         env.delivery_settings_path.display()
@@ -102,6 +182,20 @@ fn failure(e: &shed_core::http::ApiFailure) -> OpError {
         None => "action_failed",
     };
     (code.to_string(), e.message.clone())
+}
+
+/// `delivery.describe`: every provider's descriptor, in the order they are asked (what a
+/// form is drawn from: title, summary, where its items land, its fields).
+pub fn describe() -> Value {
+    json!({ "providers": shed_desktop_core::delivery::providers::describe() })
+}
+
+/// `delivery.recent`: the answers this machine gave, newest first (at most
+/// [`shed_desktop_core::delivery::runtime::RECENT`]), redacted: when, the server, the
+/// shed, the reason, the items (name, target, size, fingerprint), the problems, and what
+/// the server made of each. No value.
+pub fn recent(rt: &DeliveryRuntime) -> Value {
+    json!({ "recent": rt.recent() })
 }
 
 /// `delivery.set`.
@@ -275,18 +369,14 @@ pub async fn activity(
         .map_err(bad)
 }
 
-/// The five providers, as `ui.*` doors name them.
-const PROVIDERS: [&str; 5] = ["ssh-key", "github", "api-keys", "envsecrets-login", "files"];
-
+/// A provider as `ui.*` doors name one: one of [`provider_names`].
 fn provider_param(params: &Value) -> Result<&str, OpError> {
     let p = params.get("provider").and_then(Value::as_str).unwrap_or("");
-    if PROVIDERS.contains(&p) {
+    let names = provider_names();
+    if names.contains(&p) {
         Ok(p)
     } else {
-        Err(bad(format!(
-            "'provider' is one of {}",
-            PROVIDERS.join(", ")
-        )))
+        Err(bad(format!("'provider' is one of {}", names.join(", "))))
     }
 }
 
@@ -520,6 +610,151 @@ mod tests {
             &json!({"server": "mock", "shed": 3})
         )
         .is_err());
+    }
+
+    /// The re-check of a stream settled on the account service reads the sources
+    /// document (the shared fixtures): the service still answering keeps it settled, a
+    /// machine's document or an older server reopens the stream, and anything else is
+    /// unknown (asked again later, never a reconnect loop).
+    #[test]
+    fn a_settled_stream_is_rechecked_from_the_sources_document() {
+        let doc = |text: &str| -> Result<SourceDocument, SourceError> {
+            Ok(serde_json::from_str(text).unwrap())
+        };
+        let api = |status: u16, code: &str| -> Result<SourceDocument, SourceError> {
+            Err(SourceError::Api {
+                status,
+                code: code.into(),
+                message: "x".into(),
+            })
+        };
+        for text in [
+            include_str!("../../../../crates/fixtures/sources/service.json"),
+            include_str!("../../../../crates/fixtures/sources/service-not-delivering.json"),
+        ] {
+            assert_eq!(service_check_of(&doc(text)), ServiceCheck::Service);
+        }
+        assert_eq!(
+            service_check_of(&api(409, SOURCE_IS_SERVICE)),
+            ServiceCheck::Service
+        );
+        assert_eq!(
+            service_check_of(&doc(
+                r#"{"user":"ada","binding":{"delivery":[{"kind":"machine","id":"fedcba9876543210fedcba9876543210"}]},"machines":[]}"#
+            )),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&doc(r#"{"user":"ada","binding":null,"machines":[]}"#)),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Unsupported)),
+            ServiceCheck::NotService
+        );
+        assert_eq!(
+            service_check_of(&api(403, "FORBIDDEN")),
+            ServiceCheck::Unknown
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Busy {
+                retry_after: None,
+                message: "x".into()
+            })),
+            ServiceCheck::Unknown
+        );
+        assert_eq!(
+            service_check_of(&Err(SourceError::Shed(
+                shed_core::http::ShedError::Transport("refused".into())
+            ))),
+            ServiceCheck::Unknown
+        );
+    }
+
+    /// Finding 5: the re-check asks a client for the stream's current target: the
+    /// startup one at the same endpoint, else one from the config as it reads now (a
+    /// server added since, or an endpoint changed); none when neither matches.
+    #[test]
+    fn the_recheck_client_matches_the_current_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let write = |servers: &[&str]| {
+            let mut text = String::from("servers:\n");
+            for s in servers {
+                text.push_str(&format!("    {s}:\n        host: {s}.example.test\n"));
+            }
+            std::fs::write(&cfg, text).unwrap();
+        };
+        let backend_at = |mock: &str| {
+            Backend::from_env_parts_with_credentials(
+                true,
+                Some(mock),
+                &cfg,
+                None,
+                None,
+                &Default::default(),
+            )
+        };
+        write(&["a"]);
+        let startup = backend_at("http://127.0.0.1:9");
+        let target = |name: &str, url: &str| ServerTarget {
+            name: name.into(),
+            url: url.into(),
+            token: String::new(),
+            tls_fingerprint: String::new(),
+            ssh_host: String::new(),
+            ssh_port: 0,
+            auth_mode: String::new(),
+            user: String::new(),
+            identity_file: String::new(),
+        };
+        let built = std::cell::Cell::new(0);
+        write(&["a", "b"]);
+        let fresh = || {
+            built.set(built.get() + 1);
+            backend_at("http://127.0.0.1:9,a=http://127.0.0.1:7")
+        };
+        // The startup client, as it is: nothing built.
+        let c = client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:9/")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:9");
+        assert_eq!(built.get(), 0);
+        // The endpoint changed: the new one, never the old.
+        let c = client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:7")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:7");
+        // A server added since the start.
+        let c = client_for_target(&startup, &fresh, &target("b", "http://127.0.0.1:9")).unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:9");
+        // Neither knows it.
+        assert!(client_for_target(&startup, &fresh, &target("c", "http://127.0.0.1:9")).is_none());
+        assert!(client_for_target(&startup, &fresh, &target("a", "http://127.0.0.1:5")).is_none());
+    }
+
+    /// The descriptors are the providers' own, in their order: the `ui.*` doors take
+    /// exactly those names.
+    #[test]
+    fn describe_lists_the_providers_the_doors_take() {
+        let d = describe();
+        let names: Vec<&str> = d["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, provider_names());
+        assert_eq!(
+            names,
+            ["ssh-key", "github", "api-keys", "envsecrets-login", "files"]
+        );
+        for p in d["providers"].as_array().unwrap() {
+            assert!(p["title"].as_str().is_some_and(|t| !t.is_empty()), "{p}");
+            assert!(p["fields"].as_array().is_some_and(|f| !f.is_empty()), "{p}");
+            assert!(provider_param(&json!({ "provider": p["name"] })).is_ok());
+        }
+        let e = provider_param(&json!({ "provider": "nope" })).unwrap_err();
+        assert_eq!(
+            e.1,
+            "'provider' is one of ssh-key, github, api-keys, envsecrets-login, files"
+        );
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //! restarted with a new client and a new credential; one that leaves the list is
 //! stopped. [`SourceTasks::stop`] is non-blocking: it flips every task's stop signal, and
 //! [`SourceTasks::join`] waits (bounded) for them to end.
+//!
+//! A stream refused `SOURCE_IS_SERVICE` rests (see [`crate::delivery`]): it is checked
+//! again with the [`SourceCheck`] the tasks were given, on its timer and at once
+//! whenever the server list changes (any server added, removed or changed).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -16,8 +20,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::delivery::{
-    new_status, Answerer, DeliveryClient, ErrorClass, SharedStatus, StreamCredentials, StreamState,
-    StreamStatus, Timing,
+    new_status, Answerer, DeliveryClient, ErrorClass, SharedStatus, SourceCheck, StreamCredentials,
+    StreamState, StreamStatus, Timing,
 };
 use crate::machine::MachineIdentity;
 use crate::target::ServerTarget;
@@ -51,8 +55,14 @@ pub struct SourceTasks {
     answerer: Arc<dyn Answerer>,
     credentials: CredentialsFor,
     timing: Timing,
+    check: Option<SourceCheck>,
+    /// Bumped when the server list changes; every stream watches it.
+    list_changed: watch::Sender<u64>,
     handle: tokio::runtime::Handle,
     running: Mutex<BTreeMap<String, Running>>,
+    /// The tasks told to stop that may still be running, by server: what
+    /// [`Self::wait_stopped`] waits for.
+    stopping: Mutex<BTreeMap<String, Vec<JoinHandle<()>>>>,
     stopped: Mutex<bool>,
 }
 
@@ -70,8 +80,11 @@ impl SourceTasks {
             answerer,
             credentials,
             timing: Timing::default(),
+            check: None,
+            list_changed: watch::channel(0).0,
             handle,
             running: Mutex::new(BTreeMap::new()),
+            stopping: Mutex::new(BTreeMap::new()),
             stopped: Mutex::new(false),
         }
     }
@@ -79,6 +92,13 @@ impl SourceTasks {
     /// The same tasks on other clocks (tests).
     pub fn with_timing(mut self, timing: Timing) -> Self {
         self.timing = timing;
+        self
+    }
+
+    /// The same tasks asking `check`, for a server settled on the account service,
+    /// whether it still answers there.
+    pub fn with_service_check(mut self, check: SourceCheck) -> Self {
+        self.check = Some(check);
         self
     }
 
@@ -94,13 +114,30 @@ impl SourceTasks {
             return;
         }
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = running.len() != targets.len()
+            || targets
+                .iter()
+                .any(|t| running.get(&t.name).is_none_or(|r| r.target != *t));
+        if changed {
+            // Before any new stream subscribes: a settled stream checks at once.
+            self.list_changed.send_modify(|n| *n += 1);
+        }
+        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        stopping.retain(|_, hs| {
+            hs.retain(|h| !h.is_finished());
+            !hs.is_empty()
+        });
         running.retain(|name, r| {
             let keep = targets.iter().any(|t| &t.name == name && *t == r.target);
             if !keep {
                 let _ = r.stop.send(true);
+                if let Some(h) = r.task.take() {
+                    stopping.entry(name.clone()).or_default().push(h);
+                }
             }
             keep
         });
+        drop(stopping);
         for t in targets {
             if running.contains_key(&t.name) {
                 continue;
@@ -115,7 +152,9 @@ impl SourceTasks {
         let creds = (self.credentials)(target, rx.clone());
         let task = match DeliveryClient::new(target, self.machine.clone(), creds) {
             Ok(client) => {
-                let client = client.with_timing(self.timing);
+                let client = client
+                    .with_timing(self.timing)
+                    .with_service_check(self.check.clone(), Some(self.list_changed.subscribe()));
                 let answerer = self.answerer.clone();
                 let st = status.clone();
                 Some(
@@ -147,12 +186,50 @@ impl SourceTasks {
             return false;
         }
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(old) = running.remove(name) else {
+        let Some(mut old) = running.remove(name) else {
             return false;
         };
         let _ = old.stop.send(true);
+        if let Some(h) = old.task.take() {
+            self.stopping
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(name.to_string())
+                .or_default()
+                .push(h);
+        }
         running.insert(name.to_string(), self.spawn(&old.target));
         true
+    }
+
+    /// Waits, at most `bound`, until every stream task of `name` told to stop has ended
+    /// (so no attempt of it is still on its way to the server); `true` when they all
+    /// have, or there were none. A task still running at the bound is kept, to be
+    /// waited for again.
+    pub async fn wait_stopped(&self, name: &str, bound: Duration) -> bool {
+        let handles = self
+            .stopping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut left = Vec::new();
+        for mut h in handles {
+            if tokio::time::timeout_at(deadline, &mut h).await.is_err() {
+                left.push(h);
+            }
+        }
+        if left.is_empty() {
+            return true;
+        }
+        self.stopping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .extend(left);
+        false
     }
 
     /// Every server's status, by name.
@@ -195,13 +272,18 @@ impl SourceTasks {
     /// [`Self::stop`], then waits up to `bound` for every task to end; `true` when all did.
     pub async fn join(&self, bound: Duration) -> bool {
         self.stop();
-        let tasks: Vec<JoinHandle<()>> = self
+        let mut tasks: Vec<JoinHandle<()>> = self
             .running
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values_mut()
             .filter_map(|r| r.task.take())
             .collect();
+        tasks.extend(
+            std::mem::take(&mut *self.stopping.lock().unwrap_or_else(|e| e.into_inner()))
+                .into_values()
+                .flatten(),
+        );
         tokio::time::timeout(bound, async {
             for t in tasks {
                 let _ = t.await;
@@ -216,8 +298,11 @@ impl SourceTasks {
 mod tests {
     use super::*;
     use crate::delivery::fake::Fake;
-    use crate::delivery::tests::{fast, machine, request_event, target, Recorder, FAR};
-    use crate::delivery::NoCredentials;
+    use crate::delivery::tests::{
+        fast, machine, request_event, scripted_check, target, Recorder, FAR, SOURCE_IS_SERVICE_BODY,
+    };
+    use crate::delivery::{NoCredentials, ServiceCheck};
+    use std::sync::atomic::Ordering;
 
     fn tasks() -> SourceTasks {
         SourceTasks::new(
@@ -339,6 +424,118 @@ mod tests {
         assert_eq!(s[0].status.state, StreamState::Offline);
         assert_eq!(s[0].status.last_error, Some(ErrorClass::Config));
         assert!(t.join(Duration::from_secs(1)).await);
+    }
+
+    /// A server settled on the account service is checked at once when the server list
+    /// changes (here, another server is added), not at its five-minute timer; an
+    /// unchanged list (the rescan) checks nothing.
+    #[tokio::test]
+    async fn a_server_list_change_rechecks_a_settled_server() {
+        let a = Fake::start().await;
+        let b = Fake::start().await;
+        a.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+        let (check, calls) = scripted_check(Vec::new(), ServiceCheck::NotService);
+        let t = SourceTasks::new(
+            tokio::runtime::Handle::current(),
+            machine(),
+            Arc::new(Recorder::default()),
+            Arc::new(|_: &ServerTarget, _: watch::Receiver<bool>| {
+                Arc::new(NoCredentials) as Arc<dyn StreamCredentials>
+            }),
+        )
+        .with_timing(fast())
+        .with_service_check(check);
+        // The check's script names the server "mini": the settled one keeps that name.
+        let ta = target(&a.url);
+        let mut tb = target(&b.url);
+        tb.name = "b".into();
+        t.reconcile(std::slice::from_ref(&ta));
+        wait_state(&t, "mini", StreamState::Service).await;
+        t.reconcile(std::slice::from_ref(&ta));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unchanged list is no change"
+        );
+        t.reconcile(&[ta, tb]);
+        a.wait_streams(1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        wait_state(&t, "mini", StreamState::Connected).await;
+        assert!(t.join(Duration::from_secs(10)).await);
+    }
+
+    /// A stream told to stop is waited for: once `wait_stopped` says so, its task has
+    /// ended and nothing of it reaches the server again.
+    #[tokio::test]
+    async fn a_stopped_stream_is_waited_for() {
+        let a = Fake::start().await;
+        let t = tasks();
+        let ta = target(&a.url);
+        t.reconcile(std::slice::from_ref(&ta));
+        a.wait_streams(1).await;
+        assert!(
+            t.wait_stopped("mini", Duration::from_secs(1)).await,
+            "none to wait for"
+        );
+        let status = t.running.lock().unwrap()["mini"].status.clone();
+        t.reconcile(&[]);
+        assert!(t.wait_stopped("mini", Duration::from_secs(10)).await);
+        // The task itself has ended: its last act is to say so.
+        assert_eq!(status.lock().unwrap().state, StreamState::Stopped);
+        assert!(t.stopping.lock().unwrap().is_empty());
+        let seen = a.streams().len();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(a.streams().len(), seen, "no attempt after it stopped");
+        // A restart's old task is waited for the same way.
+        t.reconcile(std::slice::from_ref(&ta));
+        a.wait_streams(2).await;
+        assert!(t.restart("mini"));
+        assert!(t.wait_stopped("mini", Duration::from_secs(10)).await);
+        assert!(t.join(Duration::from_secs(10)).await);
+    }
+
+    /// The re-check is asked about the stream's CURRENT target: after the server's
+    /// endpoint changes, the check sees the new one.
+    #[tokio::test]
+    async fn the_recheck_asks_about_the_current_endpoint() {
+        let a = Fake::start().await;
+        let b = Fake::start().await;
+        for f in [&a, &b] {
+            f.refuse_next_stream(409, SOURCE_IS_SERVICE_BODY, &[]);
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let check: crate::delivery::SourceCheck = Arc::new(move |t: &ServerTarget| {
+            record.lock().unwrap().push(t.url.clone());
+            Box::pin(async { ServiceCheck::Service })
+        });
+        let t = SourceTasks::new(
+            tokio::runtime::Handle::current(),
+            machine(),
+            Arc::new(Recorder::default()),
+            Arc::new(|_: &ServerTarget, _: watch::Receiver<bool>| {
+                Arc::new(NoCredentials) as Arc<dyn StreamCredentials>
+            }),
+        )
+        .with_timing(Timing {
+            service_recheck: Duration::from_millis(50),
+            ..fast()
+        })
+        .with_service_check(check);
+        t.reconcile(&[target(&a.url)]);
+        wait_state(&t, "mini", StreamState::Service).await;
+        t.reconcile(&[target(&b.url)]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !seen.lock().unwrap().contains(&b.url) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{:?}",
+                seen.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(t.join(Duration::from_secs(10)).await);
     }
 
     #[tokio::test]

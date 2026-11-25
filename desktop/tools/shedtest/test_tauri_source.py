@@ -28,13 +28,16 @@ from pathlib import Path
 
 import pytest
 
+import hermetic
 import ui
 from client import ShedError, TauriClient, scaled_timeout
-from mockserver import MockShedServer
+from mockserver import SOURCE_IS_SERVICE_BODY, MockShedServer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CONFIG = FIXTURES / "config.yaml"
 MTLS_CONFIG = FIXTURES / "config-mtls.yaml"
+SOURCES_CONFIG = FIXTURES / "config-sources.yaml"
+SERVICE_URL = "https://accounts.example.test"
 
 # The machine the armed mock binds by default (`mockserver.NOT_SOURCE_ACTIVE`).
 OTHER_MACHINE = "fedcba9876543210fedcba9876543210"
@@ -59,6 +62,9 @@ def _source_app(
     block_state_dir: bool = False,
     runtime_dir: Path | None = None,
     before_launch=None,
+    mock: MockShedServer | None = None,
+    mock_base_url: str | None = None,
+    source_recheck_ms: int | None = None,
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `runtime_dir` and
@@ -74,13 +80,20 @@ def _source_app(
       throwaway one, so a cell can relaunch over the same prefs, login item and
       machine identity.
     * `before_launch` — called with the runtime dir just before the spawn.
+    * `mock` — a mock the caller made and started (it is stopped here); `mock_base_url`
+      — the launch's mock URL instead of that mock's own (per-server overrides,
+      `hermetic.mock_url`).
+    * `source_recheck_ms` — how often a stream settled on the account service is
+      checked again (`SHED_TAURI_SOURCE_RECHECK_MS`).
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    mock = MockShedServer()
-    mock.start()
+    if mock is None:
+        mock = MockShedServer()
+        mock.start()
+    base_url = mock_base_url or mock.base_url
     if source is not None:
         mock.arm_source(**source)
     owned = runtime_dir is None
@@ -90,8 +103,9 @@ def _source_app(
         if block_state_dir:
             # `hermetic.overrides` points SHED_BROKER_STATE_DIR here.
             (runtime_dir / "broker-state").write_text("not a directory\n")
-        env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-                             config_path=shed_config_path)
+        env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=base_url,
+                             config_path=shed_config_path,
+                             source_recheck_ms=source_recheck_ms)
         if before_launch is not None:
             before_launch(runtime_dir)
         sock = runtime_dir / cfg.sock_rel
@@ -100,7 +114,7 @@ def _source_app(
         proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
         info["proc"] = proc
         try:
-            ui.await_hermetic("tauri", sock=sock, mock_base_url=mock.base_url, proc=proc, log=log)
+            ui.await_hermetic("tauri", sock=sock, mock_base_url=base_url, proc=proc, log=log)
             client = TauriClient(sock)
             try:
                 client.wait_until(lambda: client.current_pane() is not None,
@@ -273,10 +287,10 @@ def test_unarmed_server_has_no_source_rows():
 
 
 def test_refused_moves_show_their_messages():
-    """A move the server refuses is reported in its words: a 403 under the
-    Preferences row (pressed through the real button, the row flips back), a 500 as
-    "could not confirm", an unknown server as a bad request — each one request, never
-    retried."""
+    """A move the server refuses is reported in fixed words, never the server's: a 403
+    under the Preferences row (pressed through the real button, the row flips back), a
+    500 as "could not confirm", an unknown server as a bad request — each one request,
+    never retried."""
     with _source_app(source={}) as (client, mock, _i):
         client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
                           what="the source row")
@@ -288,8 +302,8 @@ def test_refused_moves_show_their_messages():
         client.wait_until(lambda: (_prefs_source(client) or {}).get("error"),
                           timeout=15, what="the refusal under the row")
         row = _prefs_source(client)
-        assert "refused the move: a script key cannot see or move a credential source" \
-            in row["error"], row
+        assert "does not let this client change its credential source" in row["error"], row
+        assert "script key" not in row["error"], row
         assert row["this_machine"] is False and row["busy"] is False, row
         assert len(mock.source_use_requests()) == 1
 
@@ -679,3 +693,258 @@ def test_login_item_not_turned_on_when_prefs_unwritable():
                     timeout=15, what=f"the could-not-record line (launch {launch})")
     finally:
         shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+
+# ---------------------------------------------------------------------------
+# The Credentials view's Rust side (plan 040 §3.9, B1): who answers on each server,
+# the account service as a settled state, and "Stop answering from here"
+# ---------------------------------------------------------------------------
+
+def _list_row(client, host: str) -> dict:
+    return next(r for r in client.sources_list()["servers"] if r["server"] == host)
+
+
+def test_sources_list_says_who_answers_on_each_server():
+    """`sources.list` has one row per configured server, saying who answers there:
+    this machine (with its stream's state), another machine by name, the account
+    service with its URL (and `not_delivering` when the server says so), nobody, or a
+    server older than sources. Where the account service answers, this machine's
+    stream is settled on it (`service`), not retrying."""
+    mocks = {name: MockShedServer() for name in
+             ("here", "desk", "account", "paused", "fresh", "old")}
+    for m in mocks.values():
+        m.start()
+    try:
+        mocks["here"].arm_source_unbound()
+        mocks["desk"].arm_source()
+        mocks["account"].serve_service_source()
+        mocks["paused"].serve_service_source("not_delivering")
+        mocks["fresh"].arm_source_unbound()
+        mocks["fresh"].refuse_delivery_stream(503, "DELIVERY_DISABLED", times=1000)
+        url = hermetic.mock_url(mocks["here"].base_url,
+                                {n: m.base_url for n, m in mocks.items() if n != "here"})
+        with _source_app(mock=mocks.pop("here"), mock_base_url=url,
+                         shed_config_path=SOURCES_CONFIG) as (client, here, _i):
+            mocks["here"] = here
+            client.wait_until(lambda: _stream(client, "here")["state"] == "connected",
+                              timeout=30, what="this machine bound on here")
+            client.wait_until(lambda: _stream(client, "desk")["state"] == "not_bound",
+                              timeout=30, what="desk's stream refused")
+            for name in ("account", "paused"):
+                client.wait_until(lambda n=name: _stream(client, n)["state"] == "service",
+                                  timeout=30, what=f"{name}'s stream settled on the service")
+            machine = _machine(client)
+            listed = client.sources_list()
+            assert listed["this_machine"] == {"id": machine["id"], "name": machine["name"]}
+            assert listed["this_machine_error"] is None
+            rows = {r["server"]: r for r in listed["servers"]}
+            assert list(rows) == sorted(rows) == ["account", "desk", "fresh", "here", "old",
+                                                  "paused"], rows
+            kinds = {n: r["kind"] for n, r in rows.items()}
+            assert kinds == {"here": "this_machine", "desk": "other_machine",
+                             "account": "service", "paused": "service",
+                             "fresh": "nobody", "old": "unsupported"}, kinds
+
+            assert rows["here"]["machine"] == {"id": machine["id"], "name": machine["name"]}
+            assert rows["here"]["stream"]["state"] == "connected", rows["here"]
+            assert rows["desk"]["machine"] == {"id": OTHER_MACHINE, "name": "desk"}
+            assert rows["desk"]["stream"]["state"] == "not_bound", rows["desk"]
+            for name, state in (("account", None), ("paused", "not_delivering")):
+                r = rows[name]
+                assert (r["url"], r["state"], r["machine"]) == (SERVICE_URL, state, None), r
+                assert r["stream"]["state"] == "service", r
+                assert r["stream"]["last_error"] == "source_is_service", r
+            for name in ("here", "desk", "fresh", "old"):
+                assert (rows[name]["url"], rows[name]["state"]) == (None, None), rows[name]
+            assert rows["fresh"]["machine"] is None and rows["fresh"]["error"] is None
+            assert rows["old"]["error"] is None
+            for r in rows.values():
+                assert (r["busy"], r["unreachable"]) == (False, False), r
+            # Settled, not retrying: the one refused attempt, and no more.
+            for name in ("account", "paused"):
+                attempts = len(mocks[name].delivery_attempts())
+                assert attempts == 1, (name, attempts)
+            # `source.status` carries the same: the service on its rows, nothing else.
+            status = {r["host"]: r for r in client.source_status()["rows"]}
+            assert status["account"]["service"] == {"url": SERVICE_URL, "state": None}
+            assert status["paused"]["service"]["state"] == "not_delivering"
+            assert "service" not in status["here"], status["here"]
+            # A move or an unbind there is refused in fixed words, and reaches the server.
+            for call in (client.source_use, client.source_unbind):
+                with pytest.raises(ShedError) as e:
+                    call("account")
+                assert e.value.code == "source_is_service", e.value
+                assert e.value.message == ("the account service answers for you on "
+                                           "account; no machine does there"), e.value
+                assert SOURCE_IS_SERVICE_BODY["error"]["message"] not in e.value.message
+            assert len(mocks["account"].source_use_requests()) == 1
+            assert mocks["account"].source_unbind_requests() == [{}]
+            assert len(mocks["account"].delivery_attempts()) == 1
+    finally:
+        for m in mocks.values():
+            m.stop()
+
+
+def test_the_account_service_stops_the_stream_and_a_recheck_reopens_it():
+    """Criterion 15: on `409 SOURCE_IS_SERVICE` the stream stops reconnecting. It
+    re-checks `GET /api/sources` on its timer (shortened here) and, while the service
+    still answers, opens no stream at all. When the service stops answering (the name
+    moved to the server's local admins), the next re-check opens the stream, which is
+    bound and connected."""
+    mock = MockShedServer()
+    mock.start()
+    mock.serve_service_source()
+    with _source_app(mock=mock, source_recheck_ms=400) as (client, mock, _i):
+        client.wait_until(lambda: _stream(client)["state"] == "service",
+                          timeout=30, what="the stream settled on the service")
+        stream = _stream(client)
+        assert stream["last_error"] == "source_is_service", stream
+        gets = mock.source_gets()
+        # Re-checks come on the timer; each is a sources read, and none is a stream.
+        client.wait_until(lambda: _stream(client)["service_checks"] >= 3,
+                          timeout=30, what="three re-checks")
+        client.wait_until(lambda: mock.source_gets() >= gets + 2, timeout=10,
+                          what="the re-checks' sources reads")
+        assert len(mock.delivery_attempts()) == 1, mock.delivery_attempts()
+        assert mock.delivery_streams() == []
+        assert _stream(client)["state"] == "service"
+
+        mock.stop_service_source()
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="the stream reopened after the service stopped")
+        assert len(mock.delivery_attempts()) == 2, mock.delivery_attempts()
+        machine = _machine(client)
+        assert mock.source_bound() == machine["id"]
+        assert _list_row(client, "mock")["kind"] == "this_machine"
+
+
+def test_stop_answering_from_here_sticks_until_answer_from_here():
+    """`source.unbind` ("Stop answering from here") clears the binding on that server
+    and stops this machine answering there: the server ends the stream and, though it
+    would bind the first machine to connect, this one does not come back — not on its
+    backoff, not after a relaunch. `sources.list` says nobody answers and that this
+    machine is paused there. `source.use` ("Answer from here") takes the pause away: the
+    stream returns and this machine is the source again. A refused unbind pauses
+    nothing; an unknown server is a bad request."""
+    home = Path(tempfile.mkdtemp(prefix="shed-src-pause-"))
+    try:
+        with _source_app(source={}, runtime_dir=home) as (client, mock, _i):
+            client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+            machine = _machine(client)
+            client.source_use("mock")
+            client.wait_until(lambda: _stream(client)["state"] == "connected",
+                              timeout=30, what="this machine the source")
+            done = client.source_unbind("mock")
+            assert done == {"server": "mock", "unbound": True,
+                            "previous": {"id": machine["id"], "name": machine["name"]},
+                            "previous_was_this_machine": True, "forgotten_machines": 2,
+                            "paused": True, "verified": True}, done
+            assert mock.source_unbind_requests() == [{}]
+            client.wait_until(lambda: _stream(client)["state"] is None, timeout=10,
+                              what="no stream runs for the server")
+            attempts = len(mock.delivery_attempts())
+            # Several backoff floors (1 s): no reconnect, so nothing binds this machine.
+            _holds(lambda: len(mock.delivery_attempts()) == attempts
+                   and mock.source_bound() is None, 3.5, "no reconnect after the unbind")
+            row = _list_row(client, "mock")
+            assert (row["kind"], row["paused"], row["stream"]) == ("nobody", True, None), row
+            assert client.call("delivery.status")["paused"] == ["mock"]
+
+            with pytest.raises(ShedError) as e:
+                client.source_unbind("no-such-server")
+            assert e.value.code == "bad_request", e.value
+            with pytest.raises(ShedError) as e:
+                client.call("source.unbind", {})
+            assert e.value.code == "bad_request", e.value
+            assert len(mock.source_unbind_requests()) == 1
+
+        # Across a relaunch over the same HOME: still no stream for it.
+        fresh = MockShedServer()
+        fresh.start()
+        fresh.arm_source_unbound()
+        with _source_app(mock=fresh, runtime_dir=home) as (client, mock, _i):
+            assert _machine(client)["id"] == machine["id"]
+            _holds(lambda: mock.delivery_attempts() == [], 2.5, "no stream after the relaunch")
+            assert _list_row(client, "mock")["paused"] is True
+            # "Answer from here": the stream returns, and this machine is the source.
+            used = client.source_use("mock")
+            assert used["row"]["this_machine"] is True, used
+            client.wait_until(lambda: _stream(client)["state"] == "connected",
+                              timeout=30, what="the stream back after source.use")
+            assert mock.source_bound() == machine["id"]
+            row = _list_row(client, "mock")
+            assert (row["kind"], row["paused"]) == ("this_machine", False), row
+            assert client.call("delivery.status")["paused"] == []
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+    # A server older than sources refuses the unbind: nothing is paused.
+    with _source_app() as (client, mock, _i):
+        mock.live_delivery_stream(timeout=scaled_timeout(20))
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock")
+        assert e.value.code == "unsupported", e.value
+        row = _list_row(client, "mock")
+        assert (row["kind"], row["paused"]) == ("unsupported", False), row
+        client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
+                          what="the stream still runs")
+
+
+
+def test_an_unusable_paused_file_starts_no_stream():
+    """Finding 1: a paused-servers file that exists and cannot be parsed fails closed —
+    no stream starts, every server reads as paused, and `sources.list` says why with a
+    class. "Answer from here" writes it afresh and the stream starts."""
+    def corrupt(home: Path) -> None:
+        broker = home / "broker-state" / "broker"
+        broker.mkdir(parents=True, exist_ok=True)
+        (broker / "paused-servers.json").write_text("{not json")
+
+    with _source_app(source={}, before_launch=corrupt) as (client, mock, _i):
+        client.wait_until(lambda: client.sources_list()["paused_error"] == "unparseable",
+                          timeout=20, what="the paused file's error")
+        _holds(lambda: mock.delivery_attempts() == [], 2.0, "no stream while it fails closed")
+        row = _list_row(client, "mock")
+        assert (row["paused"], row["stream"]) == (True, None), row
+        assert client.call("delivery.status")["paused_error"] == "unparseable"
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
+                          what="the stream after Answer from here")
+        assert client.sources_list()["paused_error"] is None
+        assert _list_row(client, "mock")["paused"] is False
+
+
+
+def test_a_late_admission_after_an_unbind_is_unbound_again_or_reported():
+    """A stream attempt the server received before the unbind can be admitted after it
+    and bind this machine again. `source.unbind` reads the sources once afterwards: bound
+    again, it unbinds once more (and says `verified`); still bound after that, it is the
+    fixed refusal `rebound`, and this machine stays paused there."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        machine = _machine(client)
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source")
+
+        mock.admit_after_unbind(machine["id"], machine["name"])
+        done = client.source_unbind("mock")
+        assert done["unbound"] is True and done["verified"] is True, done
+        assert len(mock.source_unbind_requests()) == 2, "the late admission unbound again"
+        assert mock.source_bound() is None
+
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source again")
+        mock.admit_after_unbind(machine["id"], machine["name"], times=2)
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock")
+        assert e.value.code == "rebound", e.value
+        assert e.value.message == ("mock bound this machine again after the unbind; it "
+                                   "stays stopped here: try again"), e.value
+        assert len(mock.source_unbind_requests()) == 4
+        assert mock.source_bound() == machine["id"]
+        row = _list_row(client, "mock")
+        assert (row["paused"], row["stream"]) == (True, None), row
+        _holds(lambda: _stream(client)["state"] is None, 2.0, "no stream after rebound")

@@ -87,6 +87,11 @@ pub struct Env {
     /// else `~/.config/shed/delivery.toml`. The harness overrides it to keep a run
     /// hermetic.
     pub delivery_settings_path: PathBuf,
+    /// TEST-ONLY: how often a delivery stream settled on the account service
+    /// (`409 SOURCE_IS_SERVICE`) is checked again — `SHED_TAURI_SOURCE_RECHECK_MS`, so a
+    /// harness cell need not wait out the five minutes. `None` (the default, and always
+    /// outside test mode): [`shed_desktop_core::delivery::source::delivery::SERVICE_RECHECK`].
+    pub source_recheck: Option<std::time::Duration>,
     /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
     /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
     /// `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log`.
@@ -188,6 +193,10 @@ impl Env {
             delivery_settings_path: var("SHED_TAURI_DELIVERY_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_delivery_path),
+            source_recheck: test_only(test_mode, var("SHED_TAURI_SOURCE_RECHECK_MS"))
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
             log_file: crate::applog::resolve_path(
                 crate::applog::MAC,
                 var("SHED_TAURI_LOG_FILE").as_deref(),

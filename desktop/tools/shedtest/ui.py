@@ -241,7 +241,8 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 roost_session_bin: object | None = None,
                 craze_home: object | None = None,
                 craze_runtime_dir: object | None = None,
-                delivery_config: object | None = None) -> dict[str, str]:
+                delivery_config: object | None = None,
+                source_recheck_ms: int | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME/XDG_STATE_HOME are
@@ -297,6 +298,9 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #    by a cell that writes its own (inside runtime_dir, `hermetic.validate`
     #    holds it there), else cleared so the default under the throwaway HOME is
     #    read and an inherited one never points a run at the developer's settings.
+    #  * SOURCE_RECHECK_MS — how often a delivery stream settled on the account
+    #    service (`409 SOURCE_IS_SERVICE`) is checked again (plan 040 §3.9), so a
+    #    cell need not wait out five minutes; cleared otherwise.
     #  * LOG_FILE — cleared unconditionally, like SOCKET (#414): an inherited
     #    one would send a hermetic run's log into the developer's file (or
     #    theirs into this run's), and `app_log_path` would no longer say where
@@ -315,6 +319,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         "SOCKET": None,
         "LOG_FILE": None,
         "DELIVERY_CONFIG": str(delivery_config) if delivery_config else None,
+        "SOURCE_RECHECK_MS": str(source_recheck_ms) if source_recheck_ms else None,
     }
     for suffix, value in managed.items():
         key = f"{cfg.env_prefix}_{suffix}"

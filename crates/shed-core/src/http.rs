@@ -385,6 +385,11 @@ impl Clone for Client {
 }
 
 impl Client {
+    /// The server's base URL this client sends to (as it was given).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// `base_url` is injected by the app. `token` is the static open-mode config
     /// token (sent only when there's no minter). `pin` (`sha256:<hex>`) enables
     /// leaf pinning; a pin on a non-https URL is refused (fail-closed). `minter`,

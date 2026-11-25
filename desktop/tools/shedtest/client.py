@@ -282,6 +282,20 @@ class TauriClient(_RcOps, IPCClient):
         `forbidden`, `unsupported`, `action_failed`."""
         return self.call("source.use", {"host": host})
 
+    def sources_list(self) -> dict:
+        """`{servers, this_machine, this_machine_error}`: one row per configured server
+        (by name) — `{server, kind, machine, connected, url, state, stream, busy,
+        unreachable, error}`, `kind` one of `this_machine`, `other_machine`, `service`,
+        `nobody`, `unsupported`, `unknown` (plan 040 §3.9)."""
+        return self.call("sources.list")
+
+    def source_unbind(self, host: str) -> dict:
+        """Clear this user's credential source on `host` ("Stop answering from here");
+        `{server, unbound, previous, previous_was_this_machine, forgotten_machines}`.
+        Raises `ShedError`: `bad_request`, `source_is_service`, `unsupported`,
+        `forbidden`, `action_failed`."""
+        return self.call("source.unbind", {"host": host})
+
     def press_source_use(self, host: str) -> None:
         """Press the open Preferences window's own "Use this machine" button for `host`
         (the `button[data-source-use="<host>"]` it renders) — test mode only. A press on

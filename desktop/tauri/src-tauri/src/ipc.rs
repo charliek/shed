@@ -1071,6 +1071,14 @@ impl Handler {
                 Ok(crate::source::status(&self.backend, rt.as_deref()).await)
             }
             "source.use" => self.source_use(params).await,
+            // -- the Credentials view's Rust side (plan 040 §3.9) --
+            "sources.list" => {
+                let rt = self.delivery_rt().ok();
+                Ok(crate::source::list(&self.backend, rt.as_deref()).await)
+            }
+            "source.unbind" => self.source_unbind(params).await,
+            "delivery.describe" => Ok(crate::delivery::describe()),
+            "delivery.recent" => Ok(crate::delivery::recent(&*self.delivery_rt()?)),
             // -- provisioning by delivery (plan 039 A6; `crate::delivery`) --
             "delivery.status" => Ok(self.delivery_rt()?.status()),
             "delivery.settings" => Ok(self.delivery_rt()?.settings()),
@@ -2128,6 +2136,19 @@ impl Handler {
         res
     }
 
+    /// `source.unbind {host}` → clear this user's credential source on `host` ("Stop
+    /// answering from here"), and tell an open Preferences window to read the rows
+    /// again. See [`crate::source::unbind`] for the answer and the refusals.
+    async fn source_unbind(&self, params: &Value) -> Result<Value, (String, String)> {
+        let host = req_str(params, "host")?;
+        let rt = self.delivery_rt().ok();
+        let res = crate::source::unbind(&self.backend, rt.as_deref(), host).await;
+        if res.is_ok() {
+            self.emit_prefs_changed();
+        }
+        res
+    }
+
     /// `app.screenshot` → shell out to a platform tool and return `{png (base64),
     /// width, height}`. The capture is blocking, so run it off the async worker.
     async fn screenshot(&self) -> Result<Value, (String, String)> {
@@ -2502,6 +2523,7 @@ mod tests {
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             delivery_settings_path: PathBuf::from("/run/user/0/shed/delivery.toml"),
+            source_recheck: None,
             log_file: None,
             log_debug: false,
         }

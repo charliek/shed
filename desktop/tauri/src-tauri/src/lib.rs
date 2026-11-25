@@ -899,6 +899,32 @@ async fn source_use(
         .map_err(|(_, message)| message)
 }
 
+/// Who answers on each configured server (this machine, another machine, the account
+/// service, nobody) and this machine's stream there. Mirrors the `sources.list` IPC op
+/// (see [`source::list`]).
+#[tauri::command]
+async fn sources_list(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+) -> Result<serde_json::Value, String> {
+    let rt = delivery_runtime(&app).ok();
+    Ok(source::list(&backend, rt.as_deref()).await)
+}
+
+/// "Stop answering from here": clear this user's credential source on `host`. Mirrors
+/// the `source.unbind` IPC op (see [`source::unbind`]).
+#[tauri::command]
+async fn source_unbind(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+    host: String,
+) -> Result<serde_json::Value, String> {
+    let rt = delivery_runtime(&app).ok();
+    source::unbind(&backend, rt.as_deref(), &host)
+        .await
+        .map_err(|(_, message)| message)
+}
+
 // -- provisioning by delivery (plan 039 A6): the same ops as the IPC socket's -------
 
 fn delivery_runtime(
@@ -913,6 +939,18 @@ fn delivery_runtime(
 #[tauri::command]
 fn delivery_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     Ok(delivery_runtime(&app)?.status())
+}
+
+/// `delivery.describe`.
+#[tauri::command]
+fn delivery_describe() -> serde_json::Value {
+    delivery::describe()
+}
+
+/// `delivery.recent`.
+#[tauri::command]
+fn delivery_recent(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    Ok(delivery::recent(&*delivery_runtime(&app)?))
 }
 
 /// `delivery.settings`.
@@ -1203,7 +1241,11 @@ pub fn run() {
             loginitem_set,
             source_status,
             source_use,
+            sources_list,
+            source_unbind,
             delivery_status,
+            delivery_describe,
+            delivery_recent,
             delivery_settings,
             delivery_set,
             delivery_preview,
@@ -1285,7 +1327,7 @@ pub fn run() {
                 &env.mock_unreachable_hosts,
             ));
             app.manage(backend.clone());
-            app.manage(auth_modes);
+            app.manage(auth_modes.clone());
 
             // Shed hosts and agent lanes (plan 038): one runtime owns both,
             // the spawn gate, and the orderly shutdown. Sheds are probed as
@@ -1313,7 +1355,21 @@ pub fn run() {
             let delivery_rt = tauri::async_runtime::block_on(async {
                 let handle = tokio::runtime::Handle::current();
                 let env = env.clone();
-                tokio::task::spawn_blocking(move || delivery::start(&env, &handle))
+                let backend = backend.clone();
+                let fresh: delivery::FreshBackend = {
+                    let (env, minter, modes) = (env.clone(), minter.clone(), auth_modes.clone());
+                    Arc::new(move || {
+                        Backend::from_env_parts_with_credentials(
+                            env.test_mode,
+                            env.mock_base_url.as_deref(),
+                            &env.config_path,
+                            Some(&minter),
+                            Some(&modes),
+                            &env.mock_unreachable_hosts,
+                        )
+                    })
+                };
+                tokio::task::spawn_blocking(move || delivery::start(&env, &handle, backend, fresh))
                     .await
                     .expect("the delivery runtime starts")
             });

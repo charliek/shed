@@ -38,9 +38,12 @@ use shed_provision::{
     valid_message, Answer, FingerprintKey, PreviewItem, Problem, ProblemCode, Reason, Request,
 };
 use shed_source::credentials::SourceCredentials;
-use shed_source::delivery::{AnswerOutcome, Answerer, NoCredentials, StreamCredentials};
+use shed_source::delivery::{
+    AnswerOutcome, Answerer, NoCredentials, SourceCheck, StreamCredentials, Timing,
+};
 use shed_source::machine::MachineIdentity;
 use shed_source::minter::{CredentialMinter, Minter};
+use shed_source::paused::{PausedError, PausedServers};
 use shed_source::tasks::SourceTasks;
 use shed_source::ServerTarget;
 use tokio::sync::watch;
@@ -78,6 +81,12 @@ pub struct DeliveryOptions {
     pub reader: DiskReader,
     /// How often the server list is read again.
     pub rescan: Duration,
+    /// How often a server settled on the account service is checked again
+    /// ([`shed_source::delivery::SERVICE_RECHECK`]).
+    pub service_recheck: Duration,
+    /// The servers this machine does not answer on
+    /// ([`shed_source::paused::paused_state_path`]).
+    pub paused_path: PathBuf,
 }
 
 /// One answer, redacted.
@@ -250,7 +259,14 @@ pub struct DeliveryRuntime {
     machine: Result<MachineIdentity, String>,
     answerer: Arc<SourceAnswerer>,
     tasks: Option<Arc<SourceTasks>>,
+    /// Why the config could not be read last; its lock also serializes every change of
+    /// the streams (a rescan, a pause, a resume), so a rescan that read the set before a
+    /// pause cannot restart the paused server's stream after it.
     config_error: Arc<Mutex<Option<String>>>,
+    /// The servers this machine does not answer on ("Stop answering from here").
+    paused: PausedServers,
+    /// The config's servers as last read.
+    targets: Mutex<Vec<ServerTarget>>,
     stop: watch::Sender<bool>,
 }
 
@@ -259,11 +275,15 @@ impl DeliveryRuntime {
     /// the caller with `shed_source::machine::load_or_create`) and the fingerprint key,
     /// reads the servers and starts a stream for each, and reads the list again every
     /// [`DeliveryOptions::rescan`]. Without an identity no stream runs (the status says
-    /// why). Blocking file I/O: call it off an async worker.
+    /// why). A stream refused `SOURCE_IS_SERVICE` asks `service_check` (the shell's
+    /// `GET /api/sources`) whether the account service still answers there, every
+    /// [`DeliveryOptions::service_recheck`] and when the server list changes. Blocking
+    /// file I/O: call it off an async worker.
     pub fn start(
         handle: &tokio::runtime::Handle,
         opts: DeliveryOptions,
         machine: Result<MachineIdentity, String>,
+        service_check: Option<SourceCheck>,
     ) -> Arc<Self> {
         let key = super::key::load_or_create(&opts.key_path);
         let answerer = Arc::new(SourceAnswerer {
@@ -286,19 +306,30 @@ impl DeliveryRuntime {
                     }
                 },
             );
-            Arc::new(SourceTasks::new(
+            let tasks = SourceTasks::new(
                 handle.clone(),
                 m.clone(),
                 Arc::new(Answering(answerer.clone())),
                 credentials,
-            ))
+            )
+            .with_timing(Timing {
+                service_recheck: opts.service_recheck,
+                ..Timing::default()
+            });
+            Arc::new(match service_check {
+                Some(check) => tasks.with_service_check(check),
+                None => tasks,
+            })
         });
+        let paused = PausedServers::load(opts.paused_path.clone());
         let rt = Arc::new(DeliveryRuntime {
             opts,
             machine,
             answerer,
             tasks,
             config_error: Arc::new(Mutex::new(None)),
+            paused,
+            targets: Mutex::new(Vec::new()),
             stop,
         });
         if let Some(tasks) = rt.tasks.clone() {
@@ -330,16 +361,119 @@ impl DeliveryRuntime {
         self.apply(tasks, targets_of(&self.opts));
     }
 
+    /// A new read of the config: a server that left it leaves the paused set, and a
+    /// stream runs for every server that is not paused.
     fn apply(&self, tasks: &SourceTasks, targets: Result<Vec<ServerTarget>, String>) {
         let mut err = self.config_error.lock().unwrap_or_else(|e| e.into_inner());
         match targets {
             Ok(t) => {
                 *err = None;
-                tasks.reconcile(&t);
+                let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+                // A failed write keeps the set as it was: the server stays paused in
+                // memory and on disk, and is dropped at a later reconcile.
+                let _ = self.paused.retain(&names);
+                *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = t;
+                self.reconcile_unpaused(tasks);
             }
             // A config that cannot be read keeps the streams that run.
             Err(e) => *err = Some(e),
         }
+    }
+
+    /// Runs a stream for every server last read that is not paused (the caller holds
+    /// the `config_error` lock).
+    fn reconcile_unpaused(&self, tasks: &SourceTasks) {
+        let wanted: Vec<ServerTarget> = self
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|t| !self.paused.contains(&t.name))
+            .cloned()
+            .collect();
+        tasks.reconcile(&wanted);
+    }
+
+    /// The config's servers as last read, by name.
+    fn configured(&self) -> Vec<String> {
+        self.targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    /// "Stop answering from here": `server` joins the paused set (written first) and its
+    /// stream is told to stop; none runs for it until [`Self::resume`], across restarts.
+    /// [`Self::wait_stopped`] waits for the stream to have ended.
+    pub fn pause(&self, server: &str) -> Result<(), String> {
+        let _serial = self.config_error.lock().unwrap_or_else(|e| e.into_inner());
+        let configured = self.configured();
+        let names: Vec<&str> = configured.iter().map(String::as_str).collect();
+        self.paused.pause(server, &names)?;
+        if let Some(tasks) = &self.tasks {
+            self.reconcile_unpaused(tasks);
+        }
+        Ok(())
+    }
+
+    /// Waits, at most `bound`, until every stream of `server` told to stop has ended:
+    /// no attempt of it can still reach the server. `true` when none runs.
+    pub async fn wait_stopped(&self, server: &str, bound: Duration) -> bool {
+        match &self.tasks {
+            Some(t) => {
+                t.wait_stopped(server, bound).await && !t.servers().iter().any(|s| s == server)
+            }
+            None => true,
+        }
+    }
+
+    /// "Answer from here": `server` leaves the paused set and, when the config lists it,
+    /// its stream starts again; `true` when it was paused.
+    pub fn resume(&self, server: &str) -> Result<bool, String> {
+        let _serial = self.config_error.lock().unwrap_or_else(|e| e.into_inner());
+        let was = self.paused.contains(server);
+        let configured = self.configured();
+        let names: Vec<&str> = configured.iter().map(String::as_str).collect();
+        self.paused.resume(server, &names)?;
+        if let Some(tasks) = &self.tasks {
+            self.reconcile_unpaused(tasks);
+        }
+        Ok(was)
+    }
+
+    /// What is wrong with the paused set, if anything ([`PausedError`]: a closed list).
+    pub fn paused_error(&self) -> Option<PausedError> {
+        self.paused.error()
+    }
+
+    /// Waits, at most `bound`, until `server`'s stream has made its first attempt (its
+    /// state is no longer `connecting`); `false` when it had not by then, or none runs.
+    pub async fn wait_first_attempt(&self, server: &str, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let state = self
+                .streams()
+                .into_iter()
+                .find(|s| s.server == server)
+                .map(|s| s.status.state);
+            match state {
+                None => return false,
+                Some(shed_source::delivery::StreamState::Connecting) => {}
+                Some(_) => return true,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Whether this machine does not answer on `server` (every server, while the
+    /// paused set's file cannot be used).
+    pub fn is_paused(&self, server: &str) -> bool {
+        self.paused.contains(server)
     }
 
     /// Opens `server`'s delivery stream again at once (after "Use this machine" made
@@ -353,6 +487,26 @@ impl DeliveryRuntime {
         self.machine.clone()
     }
 
+    /// The answers this machine gave, newest first, redacted (`delivery.recent`): when,
+    /// to which server, for which shed, the items by name, target, size and fingerprint,
+    /// the problems, and what the server made of each. No value.
+    pub fn recent(&self) -> Vec<Answered> {
+        self.answerer
+            .recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    /// Each server's stream, by name ([`shed_source::tasks::ServerStatus`]); none
+    /// without an identity.
+    pub fn streams(&self) -> Vec<shed_source::tasks::ServerStatus> {
+        self.tasks.as_ref().map(|t| t.status()).unwrap_or_default()
+    }
+
     /// `delivery.status`: this machine, the settings file, each server's stream, and the
     /// recent answers, redacted.
     pub fn status(&self) -> Value {
@@ -360,25 +514,19 @@ impl DeliveryRuntime {
             Ok(m) => (json!({"id": m.id, "name": m.name}), Value::Null),
             Err(e) => (Value::Null, Value::from(e.clone())),
         };
-        let servers = self
-            .tasks
-            .as_ref()
-            .map(|t| serde_json::to_value(t.status()).unwrap_or_default())
-            .unwrap_or_else(|| json!([]));
-        let recent: Vec<Answered> = self
-            .answerer
-            .recent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .rev()
-            .cloned()
-            .collect();
+        let servers = serde_json::to_value(self.streams()).unwrap_or_else(|_| json!([]));
+        let recent = self.recent();
         json!({
             "machine": machine,
             "machine_error": machine_error,
             "key_error": self.answerer.key.as_ref().err(),
             "config_error": self.config_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            "paused": self
+                .configured()
+                .into_iter()
+                .filter(|n| self.paused.contains(n))
+                .collect::<Vec<_>>(),
+            "paused_error": self.paused.error(),
             "settings_path": self.opts.settings_path.to_string_lossy(),
             "servers": servers,
             "recent": recent,
@@ -592,6 +740,8 @@ mod tests {
             unreachable_hosts: ["b".to_string()].into_iter().collect(),
             reader: DiskReader::new(dir.path(), None),
             rescan: RESCAN,
+            service_recheck: shed_source::delivery::SERVICE_RECHECK,
+            paused_path: dir.path().join("paused.json"),
         };
         let t = targets_of(&opts).unwrap();
         assert_eq!(t[0].url, "http://127.0.0.1:9");
@@ -626,6 +776,8 @@ mod tests {
             unreachable_hosts: Default::default(),
             reader: DiskReader::new(dir.path(), None),
             rescan: RESCAN,
+            service_recheck: shed_source::delivery::SERVICE_RECHECK,
+            paused_path: dir.path().join("paused.json"),
         };
         let t = targets_of(&opts).unwrap();
         let port = |n: &str| t.iter().find(|x| x.name == n).map(|x| x.ssh_port);
@@ -677,5 +829,170 @@ mod tests {
         r.deadline = shed_provision::format_time(shed_source::time::now_unix() + 60);
         let (answer, _) = answerer.build("work", &r);
         assert_eq!(answer.problems[0].code, ProblemCode::MissingInput);
+    }
+
+    /// `delivery.recent` is the answers this machine gave, newest first, capped at
+    /// [`RECENT`]: names, targets, sizes and fingerprints, never a value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recent_answers_are_newest_first_and_carry_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("npmrc");
+        std::fs::write(&f, "SENTINEL-RECENT").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let settings_path = dir.path().join("delivery.toml");
+        std::fs::write(
+            &settings_path,
+            "[files]\nenabled = true\n[[files.file]]\nfrom = \"~/npmrc\"\nto = \".npmrc\"\n",
+        )
+        .unwrap();
+        let opts = DeliveryOptions {
+            shed_config_path: PathBuf::new(),
+            settings_path,
+            key_path: dir.path().join("key"),
+            known_hosts: String::new(),
+            mock_base_url: None,
+            unreachable_hosts: Default::default(),
+            reader: DiskReader::new(dir.path(), None),
+            rescan: RESCAN,
+            service_recheck: shed_source::delivery::SERVICE_RECHECK,
+            paused_path: dir.path().join("paused.json"),
+        };
+        let machine = MachineIdentity {
+            id: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b".into(),
+            name: "ada laptop".into(),
+        };
+        let rt = tokio::task::spawn_blocking(move || {
+            DeliveryRuntime::start(&tokio::runtime::Handle::current(), opts, Ok(machine), None)
+        })
+        .await
+        .unwrap();
+        assert!(rt.recent().is_empty());
+        assert!(rt.streams().is_empty(), "no server is configured");
+        let answering = Answering(rt.answerer.clone());
+        for (i, shed) in ["first", "second"].into_iter().enumerate() {
+            let mut r = request(None);
+            r.id = format!("{i:032x}");
+            r.shed.name = shed.into();
+            assert!(answering.answer("mini", r).await.is_some());
+        }
+        answering.outcome("mini", &format!("{:032x}", 1), &AnswerOutcome::Accepted);
+        let recent = rt.recent();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(
+            (recent[0].shed.as_str(), recent[1].shed.as_str()),
+            ("second", "first")
+        );
+        assert_eq!(recent[0].items[0].target, ".npmrc");
+        assert_eq!(recent[0].outcome, json!({"outcome": "accepted"}));
+        assert_eq!(recent[1].outcome, json!({"outcome": "pending"}));
+        let shown = serde_json::to_string(&recent).unwrap();
+        assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert_eq!(
+            rt.status()["recent"],
+            serde_json::to_value(&recent).unwrap()
+        );
+        rt.drain();
+    }
+
+    fn two_server_opts(dir: &std::path::Path, servers: &[&str]) -> DeliveryOptions {
+        let cfg = dir.join("config.yaml");
+        let mut text = String::from("servers:\n");
+        for s in servers {
+            text.push_str(&format!("    {s}:\n        host: {s}.example.test\n"));
+        }
+        std::fs::write(&cfg, text).unwrap();
+        DeliveryOptions {
+            shed_config_path: cfg,
+            settings_path: dir.join("delivery.toml"),
+            key_path: dir.join("key"),
+            known_hosts: String::new(),
+            // A closed port: the streams run (and fail), which is all this needs.
+            mock_base_url: Some("http://127.0.0.1:1".into()),
+            unreachable_hosts: Default::default(),
+            reader: DiskReader::new(dir, None),
+            rescan: RESCAN,
+            service_recheck: shed_source::delivery::SERVICE_RECHECK,
+            paused_path: dir.join("broker").join("paused-servers.json"),
+        }
+    }
+
+    async fn started(opts: DeliveryOptions) -> Arc<DeliveryRuntime> {
+        let machine = MachineIdentity {
+            id: "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b".into(),
+            name: "ada laptop".into(),
+        };
+        tokio::task::spawn_blocking(move || {
+            DeliveryRuntime::start(&tokio::runtime::Handle::current(), opts, Ok(machine), None)
+        })
+        .await
+        .unwrap()
+    }
+
+    fn running(rt: &DeliveryRuntime) -> Vec<String> {
+        rt.streams().into_iter().map(|s| s.server).collect()
+    }
+
+    /// "Stop answering from here" stops that server's stream and keeps it stopped: across
+    /// a rescan, across a restart (the set is on disk), until "Answer from here". A
+    /// server that leaves the config leaves the set, so one added back answers again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paused_server_runs_no_stream_until_it_is_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = two_server_opts(dir.path(), &["a", "b"]);
+        let rt = started(opts.clone()).await;
+        assert_eq!(running(&rt), ["a", "b"]);
+
+        rt.pause("a").unwrap();
+        assert!(rt.is_paused("a") && !rt.is_paused("b"));
+        assert!(rt.wait_stopped("a", Duration::from_secs(10)).await);
+        assert_eq!(running(&rt), ["b"]);
+        assert_eq!(rt.status()["paused"], json!(["a"]));
+        // A rescan of the same config does not bring it back.
+        rt.reconcile(rt.tasks.as_ref().unwrap());
+        assert_eq!(running(&rt), ["b"]);
+        rt.drain();
+
+        // A restart reads the set back.
+        let rt = started(opts.clone()).await;
+        assert_eq!(running(&rt), ["b"]);
+        rt.resume("a").unwrap();
+        assert_eq!(running(&rt), ["a", "b"]);
+        assert!(!rt.is_paused("a"));
+
+        // A server that leaves the config leaves the set; added back, it answers.
+        rt.pause("a").unwrap();
+        two_server_opts(dir.path(), &["b"]);
+        rt.reconcile(rt.tasks.as_ref().unwrap());
+        assert_eq!(running(&rt), ["b"]);
+        assert!(!rt.is_paused("a"), "dropped with the server");
+        two_server_opts(dir.path(), &["a", "b"]);
+        rt.reconcile(rt.tasks.as_ref().unwrap());
+        assert_eq!(running(&rt), ["a", "b"]);
+        rt.drain();
+        assert_eq!(
+            shed_source::paused::PausedServers::load(opts.paused_path).names(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Finding 1: a paused set whose file exists and cannot be used starts no stream at
+    /// all, and says why; "Answer from here" on one server writes the file afresh and
+    /// starts that server only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_paused_file_starts_no_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = two_server_opts(dir.path(), &["a", "b"]);
+        std::fs::create_dir_all(opts.paused_path.parent().unwrap()).unwrap();
+        std::fs::write(&opts.paused_path, "{not json").unwrap();
+        let rt = started(opts.clone()).await;
+        assert!(running(&rt).is_empty());
+        assert_eq!(rt.paused_error(), Some(PausedError::Unparseable));
+        assert_eq!(rt.status()["paused"], json!(["a", "b"]));
+        assert_eq!(rt.status()["paused_error"], json!("unparseable"));
+        assert!(rt.resume("b").unwrap());
+        assert_eq!(running(&rt), ["b"]);
+        assert_eq!(rt.paused_error(), None);
+        assert_eq!(rt.status()["paused"], json!(["a"]));
+        rt.drain();
     }
 }

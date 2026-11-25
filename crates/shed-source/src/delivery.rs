@@ -33,11 +33,22 @@
 //!   resolving only to loopback); anything else must be `https://` with a pinned
 //!   certificate fingerprint. Every mode, test mode included.
 //!
+//! * **The account service is a settled state** (plan 040 §3.9). On a directory server
+//!   the account service, not a machine, answers for a directory user, and the stream
+//!   route refuses `409 SOURCE_IS_SERVICE`. That is no failure to retry: the client stops
+//!   reconnecting ([`StreamState::Service`]) and asks again only when its
+//!   [`SourceCheck`] (the shell's `GET /api/sources`, which needs the control scope this
+//!   client does not hold) says the service no longer answers, checked every
+//!   [`SERVICE_RECHECK`] and whenever the server list changes. With no check, the
+//!   stream itself is tried again on that schedule.
+//!
 //! [`StreamStatus`] is what a shell shows: a state, a last error CLASS (never a server's
 //! message or a value), and counters. An answer's refusal is reported by the contract's
 //! closed lists of codes and rule names only ([`known_code`], [`known_rule`]): anything
 //! else a server sends there is `unknown`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,8 +92,30 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const REFRESH_CHECK: Duration = Duration::from_secs(30);
 /// One answer POST's bound, from send to the response's end.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a server whose stream was refused `SOURCE_IS_SERVICE` is checked again.
+pub const SERVICE_RECHECK: Duration = Duration::from_secs(300);
 /// How much of a refusal's body is read.
 const MAX_ERROR_BODY: usize = 4 << 10;
+
+/// What a re-check of a server settled on the account service found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceCheck {
+    /// The account service still answers for the user there: stay settled.
+    Service,
+    /// It no longer does (a machine answers, or nobody yet): open the stream again.
+    NotService,
+    /// The check could not tell (the server could not be reached or read): stay
+    /// settled and ask at the next re-check.
+    Unknown,
+}
+
+/// A [`SourceCheck`]'s answer.
+pub type CheckFuture = Pin<Box<dyn Future<Output = ServiceCheck> + Send>>;
+
+/// Asks whether the account service still answers for this user on the server the
+/// stream reads from (its current target: name and endpoint), through the shell's
+/// `GET /api/sources` on a control-scope client for that same endpoint.
+pub type SourceCheck = Arc<dyn Fn(&ServerTarget) -> CheckFuture + Send + Sync>;
 
 /// The wait before the next stream: the floor after a stream that held
 /// [`HELD_RESET`] (or before any), else double the last wait, at most [`MAX_BACKOFF`];
@@ -110,6 +143,8 @@ pub struct Timing {
     pub answer_timeout: Duration,
     pub header_timeout: Duration,
     pub refresh_check: Duration,
+    /// How often a server settled on the account service is checked again.
+    pub service_recheck: Duration,
 }
 
 impl Default for Timing {
@@ -122,6 +157,7 @@ impl Default for Timing {
             answer_timeout: ANSWER_TIMEOUT,
             header_timeout: HEADER_TIMEOUT,
             refresh_check: REFRESH_CHECK,
+            service_recheck: SERVICE_RECHECK,
         }
     }
 }
@@ -208,6 +244,9 @@ pub enum StreamState {
     NotBound,
     /// The server says this machine holds a stream already (`SOURCE_DUPLICATE_STREAM`).
     Duplicate,
+    /// The account service answers for this user on the server (`SOURCE_IS_SERVICE`):
+    /// no stream is held, and none is tried until a re-check finds otherwise.
+    Service,
     /// The last attempt failed for another reason ([`StreamStatus::last_error`]).
     Offline,
     /// Stopped (shutdown, or the server left the config).
@@ -232,6 +271,8 @@ pub enum ErrorClass {
     NotBound,
     /// `409 SOURCE_DUPLICATE_STREAM`.
     Duplicate,
+    /// `409 SOURCE_IS_SERVICE`: the account service answers for this user there.
+    SourceIsService,
     /// `429 SOURCE_RATE_LIMITED`.
     RateLimited,
     /// `403 SOURCE_MACHINE_ID_REQUIRED`.
@@ -267,6 +308,7 @@ pub const KNOWN_CODES: &[&str] = &[
     "SOURCE_RATE_LIMITED",
     "SOURCE_NOT_BOUND",
     "SOURCE_DUPLICATE_STREAM",
+    "SOURCE_IS_SERVICE",
     "DELIVERY_DISABLED",
     "INTERNAL_ERROR",
     "INVALID_REQUEST",
@@ -300,6 +342,7 @@ impl ErrorClass {
         match self {
             ErrorClass::NotBound => StreamState::NotBound,
             ErrorClass::Duplicate => StreamState::Duplicate,
+            ErrorClass::SourceIsService => StreamState::Service,
             ErrorClass::Rotated => StreamState::Connecting,
             _ => StreamState::Offline,
         }
@@ -326,6 +369,8 @@ pub struct StreamStatus {
     pub refused: u64,
     /// Answers not posted: their stream ended, or their deadline passed.
     pub dropped: u64,
+    /// Re-checks made while settled on the account service.
+    pub service_checks: u64,
 }
 
 /// A status shared between a stream's task and its readers.
@@ -487,11 +532,17 @@ struct OpenStream {
 #[derive(Clone)]
 pub struct DeliveryClient {
     server: String,
+    /// The target the client was built for (what a re-check asks about).
+    target: ServerTarget,
     base_url: String,
     endpoint: Endpoint,
     machine: MachineIdentity,
     creds: Arc<dyn StreamCredentials>,
     timing: Timing,
+    /// Asks whether the account service still answers, while settled on it.
+    check: Option<SourceCheck>,
+    /// Bumped when the server list changes: a settled client checks at once.
+    recheck: Option<watch::Receiver<u64>>,
 }
 
 impl DeliveryClient {
@@ -554,17 +605,32 @@ impl DeliveryClient {
         transport(&endpoint, None).map_err(|e| format!("server {}: {e}", target.name))?;
         Ok(DeliveryClient {
             server: target.name.clone(),
+            target: target.clone(),
             base_url,
             endpoint,
             machine,
             creds,
             timing: Timing::default(),
+            check: None,
+            recheck: None,
         })
     }
 
     /// The same client on other clocks (tests).
     pub fn with_timing(mut self, timing: Timing) -> Self {
         self.timing = timing;
+        self
+    }
+
+    /// The same client asking `check` while settled on the account service, and
+    /// checking at once whenever `recheck` changes (the server list did).
+    pub fn with_service_check(
+        mut self,
+        check: Option<SourceCheck>,
+        recheck: Option<watch::Receiver<u64>>,
+    ) -> Self {
+        self.check = check;
+        self.recheck = recheck;
         self
     }
 
@@ -577,12 +643,24 @@ impl DeliveryClient {
         shutdown: watch::Receiver<bool>,
     ) {
         let mut last: Option<Duration> = None;
+        let mut recheck = self.recheck.clone();
         loop {
             if *shutdown.borrow() {
                 break;
             }
             let end = self.one_stream(&answerer, &status, shutdown.clone()).await;
             let Some(class) = end.class else { break };
+            if class == ErrorClass::SourceIsService {
+                // Settled: no backoff, no reconnect, until a re-check finds the account
+                // service no longer answers here.
+                set_state(&status, StreamState::Service, Some(class));
+                if !self.settle(&status, &shutdown, &mut recheck).await {
+                    break;
+                }
+                set_state(&status, StreamState::Connecting, None);
+                last = None;
+                continue;
+            }
             if class == ErrorClass::Unauthorized {
                 self.creds.refused();
             }
@@ -600,6 +678,50 @@ impl DeliveryClient {
             }
         }
         set_state(&status, StreamState::Stopped, None);
+    }
+
+    /// Waits while the account service answers here: checks every
+    /// [`Timing::service_recheck`] and whenever `recheck` changes, and returns `true`
+    /// once a check says it no longer answers (with no check, at the first of those),
+    /// `false` at shutdown. A change of `recheck` seen before settling is not one.
+    async fn settle(
+        &self,
+        status: &SharedStatus,
+        shutdown: &watch::Receiver<bool>,
+        recheck: &mut Option<watch::Receiver<u64>>,
+    ) -> bool {
+        if let Some(r) = recheck.as_mut() {
+            r.borrow_and_update();
+        }
+        loop {
+            let mut sd = shutdown.clone();
+            let list_changed = async {
+                let changed = match recheck.as_mut() {
+                    Some(r) => r.changed().await.is_ok(),
+                    None => false,
+                };
+                if !changed {
+                    // No list, or its sender is gone: only the timer wakes.
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = sd.wait_for(|v| *v) => return false,
+                _ = tokio::time::sleep(self.timing.service_recheck) => {}
+                _ = list_changed => {}
+            }
+            bump(status, |s| s.service_checks += 1);
+            let Some(check) = &self.check else {
+                return true;
+            };
+            let found = tokio::select! {
+                _ = sd.wait_for(|v| *v) => return false,
+                f = check(&self.target) => f,
+            };
+            if found == ServiceCheck::NotService {
+                return true;
+            }
+        }
     }
 
     fn with_machine(&self, req: reqwest::RequestBuilder, bearer: &str) -> reqwest::RequestBuilder {
@@ -857,6 +979,7 @@ pub fn classify_refusal(status: u16, body: &[u8]) -> ErrorClass {
         (403, "SOURCE_MACHINE_ID_REQUIRED") => ErrorClass::MachineIdRequired,
         (403, _) => ErrorClass::Forbidden,
         (409, "SOURCE_DUPLICATE_STREAM") => ErrorClass::Duplicate,
+        (409, "SOURCE_IS_SERVICE") => ErrorClass::SourceIsService,
         (429, _) => ErrorClass::RateLimited,
         (404, _) => ErrorClass::Unsupported,
         (503, _) => ErrorClass::Unavailable,
