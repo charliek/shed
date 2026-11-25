@@ -1294,23 +1294,26 @@ def test_the_sheet_renders_crazes_options_in_order(app, created, rig):
     """**The create sheet** (plan 025 §3.8) renders craze's own createOptions,
     in craze's order: cursor UNAVAILABLE (no cursor-agent on the rig's PATH),
     claude UNAVAILABLE (craze 0.4.0's fourth provider, no adapter on the rig's
+    PATH), antigravity UNAVAILABLE (craze 0.5.0's fifth, no `agy` on the rig's
     PATH) and native NEEDS_SETUP (no key) all dimmed, each with craze's reason and
     fix, and NOT selectable — a click on one is refused; grok ready and
     preselected as craze's default. The recent directories are craze's (the
     created session's), one tap each."""
     d = _open_sheet(app)
     assert d["state"] == "idle", d
-    assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "claude", "native"], d["providers"]
-    cursor, grok, claude, native = d["providers"]
+    assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "claude", "antigravity", "native"], d["providers"]
+    cursor, grok, claude, antigravity, native = d["providers"]
     assert cursor["state"] == "unavailable" and cursor["dimmed"] is True, cursor
     assert cursor["reason"] == "cursor-agent not found on PATH", cursor
     assert "install cursor-agent" in (cursor["fix"] or ""), cursor
     assert claude["state"] == "unavailable" and claude["dimmed"] is True, claude
+    assert antigravity["state"] == "unavailable" and antigravity["dimmed"] is True, antigravity
+    assert antigravity["reason"] == "agy not found on PATH", antigravity
     assert native["state"] == "needs_setup" and native["dimmed"] is True, native
     assert native["reason"] and native["fix"], native
     assert grok["dimmed"] is False and grok["selected"] is True, grok
     assert d["preselected"] == "grok" == d["default_provider"], d
-    assert not cursor["selected"] and not claude["selected"] and not native["selected"]
+    assert not any(p["selected"] for p in (cursor, claude, antigravity, native))
 
     # A dimmed provider refuses the click (the prompt, typed in the same fill,
     # proves the click was delivered before it).
@@ -4091,7 +4094,7 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
         app.wait_until(loaded, timeout=WAIT, what="the sheet's options")
         d = seen[-1]
         assert d["state"] == "idle", d
-        assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "claude", "native"], d["providers"]
+        assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "claude", "antigravity", "native"], d["providers"]
         # The roster has dialled, and is held: still unlisted, still dormant.
         app.wait_until(lambda: (jail.root / "held").exists(), timeout=WAIT,
                        what="the roster's bridge --hub to be held")

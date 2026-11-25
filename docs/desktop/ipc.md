@@ -145,7 +145,7 @@ sessions, and the Sheds pane offers the bootstrap.
 
 Each running shed has a **craze
 source**: its craze hub's live session list (craze is the provider abstraction for cursor,
-grok, claude and native sessions). Its rows ride `rc.list` beside roost's, stamped
+grok, claude, antigravity and native sessions). Its rows ride `rc.list` beside roost's, stamped
 `source: "craze"`, `kind: "craze"`, with `slug` = the session's **hostId**, the hub's own
 facts (`provider`, `model`, `doing`, `head_ask_summary`, `last_reply`, `attached`,
 `start_error`, `pending_approvals` — a count here — `permission_mode`,

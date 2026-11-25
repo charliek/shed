@@ -163,7 +163,7 @@ shedctl (no internal deps)
 
 - **`shed-craze`** — the **craze adapter** for `shed_lane` (plan 025 C7+, shed#392):
   one machine's craze **hub** — craze's per-machine process that lists every cursor, grok,
-  claude and native session, says what a create can start, starts one, and splices a client
+  claude, antigravity and native session, says what a create can start, starts one, and splices a client
   through to a session's host — as an `AgentSource`, `CrazeSource`. **The transport is the
   client's** (P8): every connection is a fresh duplex to `craze bridge --hub` from a
   client-supplied `CrazeDial` — `ProcessDial` (a local `/bin/sh -c '<ladder>'`, run by

@@ -19,6 +19,14 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+- **Images: the `base` and `full` images bake craze 0.5.0** (0.11.0 baked 0.4.1), and the
+  tests run against it. In a shed built from them, the desktop's create sheet lists craze's
+  `antigravity` provider (Google's Antigravity CLI, `agy`), which craze 0.5.0 added between
+  `claude` and `native`, dimmed until `agy` is installed. A shed keeps the craze its image
+  baked; recreate it to pick up the new one.
+
 ## v0.11.0 — 2026-11-24
 
 **Ships:** server, desktop

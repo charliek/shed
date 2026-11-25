@@ -219,7 +219,8 @@ desktop and phone clients drive:
   CI, shared by both repos so their craze SHAs can't drift apart.
 - **`CRAZE_RELEASE`** — the craze release the shed images actually bake
   (bare `X.Y.Z`), or empty before a bake lands. First set to `0.1.0` by plan
-  025 §3.9 / C13; `0.1.1` in plan 029 C1; `0.2.0` after it; `0.4.1` since.
+  025 §3.9 / C13; `0.1.1` in plan 029 C1; `0.2.0` after it; `0.4.1` after
+  that; `0.5.0` since.
 
 `craze-pin.env` is never sourced as shell by anything that reads it — every
 consumer (the Makefile targets, `check-craze-pin.sh`, the composite action,
@@ -255,8 +256,9 @@ includes `server`** (the images ship with the server component), in both
 the mandatory local pre-tag run and CI's `release-plan` job.
 
 > **Consequence.** The craze bake landed in plan 025 §3.9 / C13 (craze
-> 0.1.0), moved to 0.1.1 in plan 029 C1, to 0.2.0 after it and to 0.4.1 since:
-> `CRAZE_RELEASE=0.4.1` and `CRAZE_TEST_SHA` equals v0.4.1's tag commit, so
+> 0.1.0), moved to 0.1.1 in plan 029 C1, to 0.2.0 after it, to 0.4.1 after
+> that and to 0.5.0 since: `CRAZE_RELEASE=0.5.0` and `CRAZE_TEST_SHA` equals
+> v0.5.0's tag commit, so
 > this check passes against the real tag. Before the bake landed,
 > `CRAZE_RELEASE` was empty and **every** stable tag that ships `server`
 > from `main`, a hotfix included, was refused — that was the rule working
