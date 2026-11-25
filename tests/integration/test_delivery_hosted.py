@@ -853,7 +853,9 @@ def _heal(h: HostedEnv, name: str, what: str) -> None:
     assert dl.delivery_warnings(r.stdout + r.stderr) == [], f"healed after {what}: {r.stderr}"
     assert h.asks(name) == asks + 1, f"healed after {what}: {h.asks(name) - asks} requests"
     rec = _record(h, name)
-    assert rec.get("state") == "delivered", f"healed after {what}: {rec}"
+    # The healthy answer carries a problem, so the record is "partial" (a record
+    # whose last answer has problems is partial; delivery.DeriveState).
+    assert rec.get("state") == "partial", f"healed after {what}: {rec}"
     bad = dl.step_problems(rec, {"stage1": ("done", None), "clone": ("done", None), "stage2": ("done", None),
                                  "install": ("skipped", "no_hook")})
     assert not bad, f"healed after {what}: {bad}"
