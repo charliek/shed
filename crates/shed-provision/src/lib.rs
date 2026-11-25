@@ -53,8 +53,8 @@ pub use bundle::{
 };
 pub use fingerprint::{fingerprint, fingerprint_body, FingerprintKey};
 pub use only::{repo_pattern_matches, valid_repo_pattern, Only};
-pub use provider::{Context, Contribution, Draft, GitSection, ProblemDraft, Provider};
-pub use reader::{Command, CommandOutput, FileData, ReadError, Reader, RunError};
+pub use provider::{Context, Contribution, Draft, GitSection, Prepared, ProblemDraft, Provider};
+pub use reader::{Command, CommandOutput, FileData, NoReader, ReadError, Reader, RunError};
 pub use record::{
     derive_state, parse_record, Failure, ItemResult, Last, Outcome, Record, RecordItem,
     SourceMachine, State, Step, StepReason, StepState, Steps, STEP_NAMES,

@@ -9,14 +9,16 @@
 //! trimming); one trailing `\r` is a line end. Blank lines, and lines whose
 //! first non-blank character is `#`, are skipped.
 
+use std::fmt;
+
 use shed_provision::{
     check_value, check_variable, limits::MAX_ENV_FILE_BYTES, limits::MAX_FILE_BYTES, valid_name,
-    Base, Context, Contribution, Draft, EnvItem, FileItem, ItemBody, Mode, Only, ProblemCode,
-    ProblemDraft, Provider, Reader, Rule, Stage,
+    Base, Context, Contribution, Mode, ProblemCode, ProblemDraft, Reader, Rule,
 };
 
-use crate::common::read_setting_file;
+use crate::common::{desktop_provider, env_draft, file_draft, read_setting_file, Redacted};
 use crate::settings::ApiKeysSettings;
+use crate::Gathered;
 
 /// The provider's name.
 pub const NAME: &str = "api-keys";
@@ -24,21 +26,60 @@ pub const NAME: &str = "api-keys";
 /// craze's API key file, under home on both sides.
 pub const CRAZE_PROVIDERS: &str = ".craze/native/providers.toml";
 
+/// The craze file's item name.
+pub const CRAZE_ITEM: &str = "api-keys.craze";
+
 /// The most line problems one env file reports before it sums up the rest.
 const LINE_PROBLEMS: usize = 3;
 
-/// The `api-keys` provider.
-#[derive(Debug, Clone)]
-pub struct ApiKeys {
-    settings: ApiKeysSettings,
+/// One environment variable to deliver.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvInput {
+    /// The item's name.
+    pub name: String,
+    /// The variable.
+    pub variable: String,
+    /// Its value.
+    pub value: String,
 }
 
-impl ApiKeys {
-    /// The provider for these settings.
-    pub fn new(settings: ApiKeysSettings) -> ApiKeys {
-        ApiKeys { settings }
+impl fmt::Debug for EnvInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvInput")
+            .field("name", &self.name)
+            .field("variable", &self.variable)
+            .field("value", &Redacted(self.value.len()))
+            .finish()
     }
 }
+
+/// What the provider delivers from: craze's `providers.toml`, if any, then
+/// the variables, in order.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Inputs {
+    /// craze's `providers.toml`, delivered as [`CRAZE_ITEM`].
+    pub craze_providers: Option<Vec<u8>>,
+    /// The variables.
+    pub env: Vec<EnvInput>,
+}
+
+impl fmt::Debug for Inputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inputs")
+            .field(
+                "craze_providers",
+                &self.craze_providers.as_ref().map(|b| Redacted(b.len())),
+            )
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+desktop_provider!(
+    /// The `api-keys` provider.
+    ApiKeys,
+    ApiKeysSettings
+);
 
 fn line_problem(file: usize, line: usize, rule: Rule) -> String {
     let what = match rule {
@@ -53,8 +94,13 @@ fn line_problem(file: usize, line: usize, rule: Rule) -> String {
     format!("api-keys.env_files[{file}] line {line}: {what}; it was not delivered")
 }
 
-/// The env items of one env file's text, and its problems.
-fn parse_env_file(file: usize, text: &str, c: &mut Contribution) {
+/// The variables of one env file's text, and its problems.
+fn parse_env_file(
+    file: usize,
+    text: &str,
+    env: &mut Vec<EnvInput>,
+    problems: &mut Vec<ProblemDraft>,
+) {
     let mut bad = 0usize;
     for (n, raw) in text.split('\n').enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -76,19 +122,16 @@ fn parse_env_file(file: usize, text: &str, c: &mut Contribution) {
                 } else {
                     format!("{NAME}.f{file}l{}", n + 1)
                 };
-                c.items.push(Draft {
+                env.push(EnvInput {
                     name,
-                    body: ItemBody::Env(EnvItem {
-                        variable: key.to_string(),
-                        value: value.to_string(),
-                    }),
-                    expires_at: None,
+                    variable: key.to_string(),
+                    value: value.to_string(),
                 });
             }
             Err(rule) => {
                 bad += 1;
                 if bad <= LINE_PROBLEMS {
-                    c.problems.push(ProblemDraft::new(
+                    problems.push(ProblemDraft::new(
                         ProblemCode::Unreadable,
                         line_problem(file, n + 1, rule),
                     ));
@@ -97,7 +140,7 @@ fn parse_env_file(file: usize, text: &str, c: &mut Contribution) {
         }
     }
     if bad > LINE_PROBLEMS {
-        c.problems.push(ProblemDraft::new(
+        problems.push(ProblemDraft::new(
             ProblemCode::Unreadable,
             format!(
                 "api-keys.env_files[{file}]: {} more lines break the env rules and were not delivered",
@@ -107,63 +150,99 @@ fn parse_env_file(file: usize, text: &str, c: &mut Contribution) {
     }
 }
 
-impl Provider for ApiKeys {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn only(&self) -> Option<&Only> {
-        self.settings.only.as_ref()
-    }
-
-    fn provide(&self, _ctx: &Context<'_>, reader: &dyn Reader) -> Contribution {
-        let mut c = Contribution::default();
-        if self.settings.craze_providers {
-            match read_setting_file(
-                reader,
-                &format!("~/{CRAZE_PROVIDERS}"),
-                MAX_FILE_BYTES,
-                "~/.craze/native/providers.toml",
-            ) {
-                Ok(f) => c.items.push(Draft {
-                    name: format!("{NAME}.craze"),
-                    body: ItemBody::File(FileItem {
-                        stage: Stage::One,
-                        base: Base::Home,
-                        path: CRAZE_PROVIDERS.into(),
-                        mode: Mode::M0600,
-                        content: f.bytes,
-                    }),
-                    expires_at: None,
-                }),
-                Err(e) => c.problems.extend(e.problems),
-            }
+/// Reads craze's file (when `craze_providers` is on) and each env file, in
+/// order. A file that cannot be read, is readable by others or is not text
+/// is a problem, and the others are kept; a line that breaks the env rules
+/// is a problem and the file's other lines are kept. A variable is named
+/// `api-keys.<variable lower-cased>`, or by its file index and line number
+/// when that is not a valid name.
+pub fn gather(
+    settings: &ApiKeysSettings,
+    ctx: &Context<'_>,
+    reader: &dyn Reader,
+) -> Gathered<Inputs> {
+    let mut inputs = Inputs::default();
+    let mut problems = Vec::new();
+    if settings.craze_providers {
+        match read_setting_file(
+            ctx,
+            reader,
+            &format!("~/{CRAZE_PROVIDERS}"),
+            MAX_FILE_BYTES,
+            "~/.craze/native/providers.toml",
+        ) {
+            Ok(f) => inputs.craze_providers = Some(f.bytes),
+            Err(e) => problems.extend(e.problems),
         }
-        for (i, path) in self.settings.env_files.iter().enumerate() {
-            let what = format!("api-keys.env_files[{i}]");
-            let f = match read_setting_file(reader, path, MAX_ENV_FILE_BYTES, &what) {
-                Ok(f) => f,
-                Err(e) => {
-                    c.problems.extend(e.problems);
-                    continue;
-                }
-            };
-            if !f.owner_only() {
-                c.problems.push(ProblemDraft::new(
-                    ProblemCode::Unreadable,
-                    format!("{what} can be read by others; set its mode to 0600"),
-                ));
+    }
+    for (i, path) in settings.env_files.iter().enumerate() {
+        let what = format!("api-keys.env_files[{i}]");
+        let f = match read_setting_file(ctx, reader, path, MAX_ENV_FILE_BYTES, &what) {
+            Ok(f) => f,
+            Err(e) => {
+                problems.extend(e.problems);
                 continue;
             }
-            let Ok(text) = std::str::from_utf8(&f.bytes) else {
-                c.problems.push(ProblemDraft::new(
-                    ProblemCode::Unreadable,
-                    format!("{what} is not UTF-8 text"),
-                ));
-                continue;
-            };
-            parse_env_file(i, text, &mut c);
+        };
+        if !f.owner_only() {
+            problems.push(ProblemDraft::new(
+                ProblemCode::Unreadable,
+                format!("{what} can be read by others; set its mode to 0600"),
+            ));
+            continue;
         }
-        c
+        let Ok(text) = std::str::from_utf8(&f.bytes) else {
+            problems.push(ProblemDraft::new(
+                ProblemCode::Unreadable,
+                format!("{what} is not UTF-8 text"),
+            ));
+            continue;
+        };
+        parse_env_file(i, text, &mut inputs.env, &mut problems);
+    }
+    Gathered {
+        inputs: Some(inputs),
+        problems,
+    }
+}
+
+/// The items `inputs` make: craze's file first, then one env item per
+/// variable. Each variable and value is held to the env rules where the
+/// answer is assembled, as every env item is.
+pub fn build(inputs: &Inputs, _ctx: &Context<'_>) -> Contribution {
+    let craze = inputs
+        .craze_providers
+        .as_deref()
+        .map(|b| file_draft(CRAZE_ITEM, Base::Home, CRAZE_PROVIDERS, Mode::M0600, b));
+    let env = inputs
+        .env
+        .iter()
+        .map(|e| env_draft(&e.name, &e.variable, &e.value));
+    Contribution {
+        items: craze.into_iter().chain(env).collect(),
+        ..Contribution::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_carries_no_value() {
+        let i = Inputs {
+            craze_providers: Some(b"SENTINEL-craze".to_vec()),
+            env: vec![EnvInput {
+                name: "api-keys.k".into(),
+                variable: "K".into(),
+                value: "SENTINEL-value".into(),
+            }],
+        };
+        let shown = format!("{i:?}");
+        assert!(!shown.contains("SENTINEL"), "{shown}");
+        assert!(
+            shown.contains("K") && shown.contains("<14 bytes>"),
+            "{shown}"
+        );
     }
 }

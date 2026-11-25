@@ -52,6 +52,9 @@ use super::settings_file;
 pub const RESCAN: Duration = Duration::from_secs(30);
 /// How many answers [`DeliveryRuntime::status`] keeps.
 pub const RECENT: usize = 32;
+/// What an answer's budget leaves before the request's deadline: the time to post the
+/// answer and for the server to take it.
+pub const ANSWER_MARGIN: Duration = Duration::from_secs(2);
 /// The provider name of the runtime's own problems (the settings file, the key).
 pub const RUNTIME_PROVIDER: &str = "delivery";
 
@@ -98,6 +101,20 @@ struct SourceAnswerer {
     recent: Mutex<VecDeque<Answered>>,
 }
 
+/// The instant an answer must be built by: the request's deadline (`deadline`, the
+/// contract's time form, judged against `now`, the host's wall clock in Unix seconds)
+/// less [`ANSWER_MARGIN`]. A deadline already that close, or one that cannot be read,
+/// leaves no time at all.
+fn budget(now: i64, deadline: &str) -> std::time::Instant {
+    let start = std::time::Instant::now();
+    let left = shed_provision::parse_time(deadline)
+        .map(|d| d.saturating_sub(now))
+        .filter(|s| *s > 0)
+        .map(|s| Duration::from_secs(s as u64).saturating_sub(ANSWER_MARGIN))
+        .unwrap_or(Duration::ZERO);
+    start + left
+}
+
 fn runtime_problem(message: &str) -> Problem {
     Problem {
         provider: RUNTIME_PROVIDER.into(),
@@ -135,8 +152,16 @@ impl SourceAnswerer {
             Ok(s) => s,
             Err(e) => return empty(runtime_problem(&e)),
         };
-        match shed_provision_providers::build_answer(&settings, request, server, &self.reader, key)
-        {
+        let now = shed_source::time::now_unix();
+        match shed_provision_providers::build_answer(
+            &settings,
+            request,
+            server,
+            now,
+            Some(budget(now, &request.deadline)),
+            &self.reader,
+            key,
+        ) {
             Ok(built) => (built.answer, built.preview.items),
             // The builder exists to keep the rules; a refusal is a bug, said plainly.
             Err(_) => empty(runtime_problem(
@@ -393,18 +418,27 @@ impl DeliveryRuntime {
                 .map_err(|e| ("settings_unreadable".to_string(), e))?;
             match doc {
                 None => {
-                    let p = shed_provision_providers::preview(&settings, &answerer.reader, &key);
+                    let p = shed_provision_providers::preview(
+                        &settings,
+                        shed_source::time::now_unix(),
+                        &answerer.reader,
+                        &key,
+                    );
                     Ok(json!({"server": server, "shed": null, "preview": p}))
                 }
                 Some(doc) => {
-                    let deadline =
-                        shed_provision::format_time(shed_source::time::now_unix() + 3600);
+                    let now = shed_source::time::now_unix();
+                    let deadline = shed_provision::format_time(now + 3600);
                     let request = super::preview::request_for(&doc, Reason::Provision, &deadline)
                         .map_err(|e| ("bad_shed".to_string(), e))?;
+                    // A preview is asked for by a person and bounded by each command's own
+                    // timeout, as before: it has no budget.
                     let built = shed_provision_providers::build_answer(
                         &settings,
                         &request,
                         &server,
+                        now,
+                        None,
                         &answerer.reader,
                         &key,
                     )
@@ -597,5 +631,51 @@ mod tests {
         let port = |n: &str| t.iter().find(|x| x.name == n).map(|x| x.ssh_port);
         assert_eq!(port("a"), Some(2222));
         assert_eq!(port("b"), Some(0));
+    }
+
+    #[test]
+    fn the_budget_is_the_deadline_less_the_margin() {
+        let now = 1_795_428_000;
+        let at = |deadline: &str| {
+            budget(now, deadline).saturating_duration_since(std::time::Instant::now())
+        };
+        let left = at(&shed_provision::format_time(now + 30));
+        assert!(
+            left <= Duration::from_secs(28) && left > Duration::from_secs(27),
+            "{left:?}"
+        );
+        // A deadline within the margin, past, or unreadable leaves nothing.
+        assert_eq!(at(&shed_provision::format_time(now + 1)), Duration::ZERO);
+        assert_eq!(at(&shed_provision::format_time(now - 5)), Duration::ZERO);
+        assert_eq!(at("soon"), Duration::ZERO);
+    }
+
+    /// An answer whose deadline is already within the margin starts no provider: each
+    /// one is a `timed_out` problem.
+    #[test]
+    fn an_answer_with_no_time_left_is_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("delivery.toml");
+        std::fs::write(
+            &settings_path,
+            "[github]\nenabled = true\ngh = \"/nonexistent/gh\"\n",
+        )
+        .unwrap();
+        let answerer = SourceAnswerer {
+            settings_path,
+            reader: DiskReader::new(dir.path(), None),
+            key: Ok(shed_provision::FingerprintKey::from_bytes([1; 32])),
+            recent: Mutex::new(VecDeque::new()),
+        };
+        let mut r = request(None);
+        r.deadline = shed_provision::format_time(shed_source::time::now_unix());
+        let (answer, _) = answerer.build("work", &r);
+        assert!(answer.items.is_empty());
+        assert_eq!(answer.problems.len(), 1);
+        assert_eq!(answer.problems[0].code, ProblemCode::TimedOut);
+        // With time, the provider runs (and finds no gh).
+        r.deadline = shed_provision::format_time(shed_source::time::now_unix() + 60);
+        let (answer, _) = answerer.build("work", &r);
+        assert_eq!(answer.problems[0].code, ProblemCode::MissingInput);
     }
 }

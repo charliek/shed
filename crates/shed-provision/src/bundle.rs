@@ -2,7 +2,9 @@
 //! answer that keeps the contract's rules (so the server never refuses what
 //! the source sends), and a redacted preview of it.
 //!
-//! In order: each provider whose `only` matches runs; each item it drafts is
+//! In order: the providers whose `only` matches are selected; each one is
+//! started only while the budget lasts (one it cannot start in time is a
+//! `timed_out` problem and is skipped); each item it drafts is
 //! held to the item rules, and one that breaks a rule becomes a problem;
 //! the git config fragments are merged into one `.config/git/config` item
 //! that replaces the file whole; `base: project` items are left out when
@@ -16,6 +18,7 @@
 //! encoded and parsed against the request, as the server will.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -116,7 +119,9 @@ impl PreviewItem {
 pub struct ProviderReport {
     /// The provider.
     pub provider: String,
-    /// Whether it ran: false when its `only` rules left this delivery out.
+    /// Whether it ran: false when its `only` rules left this delivery out,
+    /// or when it could not be started before the budget passed (a
+    /// `timed_out` problem says so).
     pub ran: bool,
     /// Whether it has `only` rules (a preview does not judge them).
     pub restricted: bool,
@@ -124,17 +129,22 @@ pub struct ProviderReport {
 
 /// Builds the answer to `request`, from the server named `server`, out of
 /// `providers` (the enabled ones, in order), reading through `reader` and
-/// fingerprinting under `key`. An error is a refusal of the built answer
-/// by the contract's own rules, which the builder exists to prevent: a bug,
-/// not a person's mistake.
+/// fingerprinting under `key`. `now` is the host's wall clock (Unix
+/// seconds) and `budget` the instant by which the answer must be given
+/// (the request's deadline less a margin; `None` for no bound): a provider
+/// that cannot be started before it is skipped with a `timed_out` problem.
+/// An error is a refusal of the built answer by the contract's own rules,
+/// which the builder exists to prevent: a bug, not a person's mistake.
 pub fn build_answer(
     request: &Request,
     server: &str,
+    now: i64,
+    budget: Option<Instant>,
     providers: &[&dyn Provider],
     reader: &dyn Reader,
     key: &FingerprintKey,
 ) -> Result<Built, Refusal> {
-    let ctx = Context::answer(server, request);
+    let ctx = Context::answer(server, request, now, budget);
     let assembled = assemble(&ctx, providers, reader, key);
     let mut problems = assembled.problems;
     problems.truncate(MAX_PROBLEMS);
@@ -152,11 +162,17 @@ pub fn build_answer(
     Ok(Built { answer, preview })
 }
 
-/// What `providers` would deliver, with no request: every `only` rule is let
-/// through (the report says which providers have them), project items are
-/// kept, and every problem is kept.
-pub fn preview(providers: &[&dyn Provider], reader: &dyn Reader, key: &FingerprintKey) -> Preview {
-    let assembled = assemble(&Context::preview(), providers, reader, key);
+/// What `providers` would deliver, with no request, at `now` (Unix seconds):
+/// every `only` rule is let through (the report says which providers have
+/// them), project items are kept, every problem is kept, and there is no
+/// budget.
+pub fn preview(
+    now: i64,
+    providers: &[&dyn Provider],
+    reader: &dyn Reader,
+    key: &FingerprintKey,
+) -> Preview {
+    let assembled = assemble(&Context::preview(now), providers, reader, key);
     Preview {
         items: assembled.items.iter().map(PreviewItem::of).collect(),
         problems: assembled.problems,
@@ -206,16 +222,31 @@ fn assemble(
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut git: Vec<(String, Vec<GitSection>)> = Vec::new();
 
-    for p in providers {
+    // Select first: which providers this delivery asks, by their `only`
+    // rules alone.
+    let selected: Vec<(&dyn Provider, bool)> = providers
+        .iter()
+        .map(|p| (*p, p.only().is_none_or(|o| ctx.allows(o))))
+        .collect();
+    for (p, chosen) in selected {
         let name = p.name().to_string();
         let restricted = p.only().is_some();
-        let ran = p.only().is_none_or(|o| ctx.allows(o));
+        // The budget is checked before each provider starts: one it cannot
+        // start in time is skipped, and says so.
+        let late = chosen && ctx.out_of_time();
         reports.push(ProviderReport {
             provider: name.clone(),
-            ran,
+            ran: chosen && !late,
             restricted,
         });
-        if !ran {
+        if late {
+            problems.push(problem(
+                &name,
+                ProblemCode::TimedOut,
+                "the request's time ran out before this provider could start",
+            ));
+        }
+        if !chosen || late {
             continue;
         }
         let c = p.provide(ctx, reader);
@@ -592,6 +623,9 @@ mod tests {
         request(",\"repo\":{\"url\":\"git@git.example.test:example/widgets.git\",\"name\":\"example/widgets\"},\"project_dir\":\"/home/shed/widgets\"")
     }
 
+    /// The host's clock in these tests: the request's day.
+    const NOW: i64 = 1_795_428_000;
+
     fn key() -> FingerprintKey {
         FingerprintKey::from_bytes([7; 32])
     }
@@ -600,6 +634,8 @@ mod tests {
         build_answer(
             req,
             "work",
+            NOW,
+            None,
             providers,
             &FakeReader::new("/home/ada"),
             &key(),
@@ -720,7 +756,7 @@ mod tests {
         let local = request(",\"local_dir\":\"widgets\",\"project_dir\":\"/home/shed/widgets\"");
         assert_eq!(names(&build(&[&p], &local)), vec!["files.rc"]);
         // A preview keeps them.
-        let pv = preview(&[&p], &FakeReader::new("/home/ada"), &key());
+        let pv = preview(NOW, &[&p], &FakeReader::new("/home/ada"), &key());
         assert_eq!(pv.items.len(), 2);
     }
 
@@ -847,7 +883,7 @@ mod tests {
                 restricted: true
             }]
         );
-        let pv = preview(&[&p], &FakeReader::new("/home/ada"), &key());
+        let pv = preview(NOW, &[&p], &FakeReader::new("/home/ada"), &key());
         assert_eq!(pv.items.len(), 1);
         assert!(pv.providers[0].ran && pv.providers[0].restricted);
     }
@@ -870,6 +906,8 @@ mod tests {
         let other = build_answer(
             &repo_request(),
             "work",
+            NOW,
+            None,
             &[&p],
             &FakeReader::new("/h"),
             &FingerprintKey::from_bytes([8; 32]),
@@ -881,5 +919,188 @@ mod tests {
         );
         assert_eq!(built.preview.items[0].size, "sentinel-value".len());
         assert_eq!(built.preview.items[0].target, "V");
+    }
+
+    /// A provider that counts its calls and, when asked, takes `sleep` to
+    /// answer.
+    struct Slow {
+        name: &'static str,
+        sleep: std::time::Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Provider for Slow {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn only(&self) -> Option<&Only> {
+            None
+        }
+        fn provide(&self, _ctx: &Context<'_>, _reader: &dyn Reader) -> Contribution {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.sleep);
+            Contribution {
+                items: vec![env(
+                    &format!("{}.v", self.name),
+                    &self.name.to_uppercase(),
+                    "x",
+                )],
+                ..Contribution::default()
+            }
+        }
+    }
+
+    fn slow(name: &'static str, sleep_ms: u64) -> Slow {
+        Slow {
+            name,
+            sleep: std::time::Duration::from_millis(sleep_ms),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn a_provider_that_cannot_start_in_time_is_skipped_with_timed_out() {
+        // The first runs past the budget; the second is never started.
+        let (a, b) = (slow("a", 300), slow("b", 0));
+        let budget = Instant::now() + std::time::Duration::from_millis(100);
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            Some(budget),
+            &[&a, &b],
+            &FakeReader::new("/home/ada"),
+            &key(),
+        )
+        .unwrap();
+        assert_eq!(names(&built), vec!["a.v"]);
+        assert_eq!(codes(&built), vec![("b", ProblemCode::TimedOut)]);
+        assert_eq!(b.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let report = |n: &str| {
+            built
+                .preview
+                .providers
+                .iter()
+                .find(|r| r.provider == n)
+                .unwrap()
+                .ran
+        };
+        assert!(report("a") && !report("b"));
+        // A budget already past starts nothing; one ahead starts everything.
+        let past = Instant::now();
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            Some(past),
+            &[&b],
+            &FakeReader::new("/home/ada"),
+            &key(),
+        )
+        .unwrap();
+        assert_eq!(codes(&built), vec![("b", ProblemCode::TimedOut)]);
+        let ahead = Instant::now() + std::time::Duration::from_secs(60);
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            Some(ahead),
+            &[&b],
+            &FakeReader::new("/home/ada"),
+            &key(),
+        )
+        .unwrap();
+        assert_eq!(names(&built), vec!["b.v"]);
+        // A provider its `only` rules leave out is not timed out, however late.
+        let mut limited = toy("c", vec![env("c.v", "C", "x")]);
+        limited.only = Some(Only {
+            servers: Some(vec!["home".into()]),
+            ..Only::default()
+        });
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            Some(past),
+            &[&limited],
+            &FakeReader::new("/home/ada"),
+            &key(),
+        )
+        .unwrap();
+        assert!(built.answer.problems.is_empty());
+    }
+
+    #[test]
+    fn a_drafts_expiry_reaches_the_item_and_the_preview() {
+        let mut d = env("p.v", "V", "x");
+        d.expires_at = Some("2026-11-23T11:00:00Z".into());
+        let built = build(&[&toy("p", vec![d])], &repo_request());
+        assert_eq!(
+            built.answer.items[0].expires_at.as_deref(),
+            Some("2026-11-23T11:00:00Z")
+        );
+        assert_eq!(
+            built.preview.items[0].expires_at.as_deref(),
+            Some("2026-11-23T11:00:00Z")
+        );
+        let text = String::from_utf8(built.answer.to_json()).unwrap();
+        assert!(
+            text.contains("\"expires_at\":\"2026-11-23T11:00:00Z\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_prepared_contribution_is_built_like_any_other_and_reads_nothing() {
+        let p = crate::provider::Prepared {
+            name: "files".into(),
+            only: Some(Only {
+                backends: Some(vec![crate::request::Backend::Firecracker]),
+                ..Only::default()
+            }),
+            contribution: Contribution {
+                items: vec![file("files.rc", Base::Home, ".rc", 2)],
+                ..Contribution::default()
+            },
+        };
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            None,
+            &[&p],
+            &crate::reader::NoReader,
+            &key(),
+        )
+        .unwrap();
+        assert_eq!(names(&built), vec!["files.rc"]);
+        assert_eq!(built.answer.items[0].provider, "files");
+        let mut vz = p.clone();
+        vz.only = Some(Only {
+            backends: Some(vec![crate::request::Backend::Vz]),
+            ..Only::default()
+        });
+        let built = build_answer(
+            &repo_request(),
+            "work",
+            NOW,
+            None,
+            &[&vz],
+            &crate::reader::NoReader,
+            &key(),
+        )
+        .unwrap();
+        assert!(built.answer.items.is_empty());
+    }
+
+    #[test]
+    fn no_reader_refuses_everything() {
+        use crate::reader::{Command, NoReader, ReadError, RunError};
+        let r = NoReader;
+        assert_eq!(
+            r.read_file(&r.expand("~/.ssh/id"), 10),
+            Err(ReadError::Denied)
+        );
+        assert_eq!(r.run(&Command::new("gh", ["auth"])), Err(RunError::Failed));
     }
 }

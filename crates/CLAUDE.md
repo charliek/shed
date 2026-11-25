@@ -140,7 +140,23 @@ shedctl (no internal deps)
   parser: the envsecrets config's two flat keys are read with a strict line
   pattern. A `.pub` is exactly one key line, re-written, and must match the
   private key (OpenSSH, or derived from PEM/PKCS#8 RSA, ECDSA, DSA). Problem
-  messages are fixed text, never a value or a command's output. The `Reader`
+  messages are fixed text, never a value or a command's output. Plan 040 split
+  each provider into `Inputs` (ordered, item names carried, a redacting
+  `Debug`), a pure `build(&Inputs, &Context)` (all judging; shared with a
+  hosted source) and the desktop's `gather(&settings, &Context, &dyn Reader)`
+  (reads, keeps partial results, stops before a command that would not run
+  today); a desktop `Provider` is gather then build, and
+  `tests/golden.rs` holds its answers byte for byte to v0.11.0's
+  (`fixtures/golden-v0.11.0.json`, written once by v0.11.0; shed-desktop-core's
+  `tests/delivery_golden.rs` does the same on disk). `Context` carries the
+  host's `now` and a `budget` instant: the builder starts no provider past it
+  (`timed_out`), a gather starts no read or command past it and caps commands
+  at what is left. A host with inputs passes `shed_provision::Prepared` and
+  `NoReader`. `describe()` is the providers' descriptors (`Serialize`), and
+  the desktop's settings view is built from them and `Settings::table`; the
+  walk takes the keys it allows from them, and a test holds each to a key the
+  walk reads. `ssh_key::public_line` and `encode_ed25519` read and write OpenSSH
+  keys with no cryptography. The `Reader`
   follows links on purpose; its docs say what a disk reader must do (open
   non-blocking, check the opened descriptor is a regular file, read at most
   the limit). Default member. `shed-desktop-core` depends on

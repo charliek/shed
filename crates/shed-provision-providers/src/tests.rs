@@ -10,6 +10,7 @@ use shed_provision::{
     RunError, Stage, GIT_CONFIG_NAME,
 };
 
+use crate::ssh_key::put;
 use crate::{build_answer, preview, Settings};
 
 const HOME: &str = "/home/ada";
@@ -20,11 +21,6 @@ const GCS: &str = "eyJTRU5USU5FTCI6MX0=";
 
 fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
-}
-
-fn put(b: &mut Vec<u8>, s: &[u8]) {
-    b.extend((s.len() as u32).to_be_bytes());
-    b.extend_from_slice(s);
 }
 
 /// A made-up OpenSSH key pair (not a key): the container a real one has,
@@ -125,9 +121,12 @@ fn key() -> FingerprintKey {
     FingerprintKey::from_bytes([3; 32])
 }
 
+/// The host's clock in these tests: the request's day.
+const NOW: i64 = 1_795_428_000;
+
 fn build_with(settings: &str, reader: &FakeReader, req: &Request) -> Built {
     let s = Settings::parse(settings).unwrap_or_else(|e| panic!("{e}"));
-    build_answer(&s, req, "work", reader, &key()).unwrap()
+    build_answer(&s, req, "work", NOW, None, reader, &key()).unwrap()
 }
 
 /// (name, target, stage, mode) of each item.
@@ -611,7 +610,7 @@ fn files_conflicts_and_stage_2() {
 fn preview_has_no_values_and_disabled_providers_do_not_run() {
     let r = home();
     let s = Settings::parse(SETTINGS).unwrap();
-    let pv = preview(&s, &r, &key());
+    let pv = preview(&s, NOW, &r, &key());
     let json = serde_json::to_string(&pv).unwrap();
     assert!(
         !json.contains("SENTINEL") && !json.contains(TOKEN) && !json.contains(PASSPHRASE),
@@ -622,11 +621,124 @@ fn preview_has_no_values_and_disabled_providers_do_not_run() {
     let off = SETTINGS.replace("[github]\nenabled = true", "[github]\nenabled = false");
     let r = home();
     let s = Settings::parse(&off).unwrap();
-    let pv = preview(&s, &r, &key());
+    let pv = preview(&s, NOW, &r, &key());
     assert!(pv.providers.iter().all(|p| p.provider != "github"));
     assert!(r.ran().is_empty(), "a disabled provider ran a command");
     // The same content gives the same fingerprint on one machine.
-    let a = preview(&s, &home(), &key());
-    let b = preview(&s, &home(), &key());
+    let a = preview(&s, NOW, &home(), &key());
+    let b = preview(&s, NOW, &home(), &key());
     assert_eq!(a, b);
+}
+
+mod golden;
+
+/// A host that holds the inputs itself (an account service) builds each
+/// provider's contribution with `build` and hands it over as a `Prepared`,
+/// reading nothing: the answer is the desktop's, byte for byte.
+#[test]
+fn a_host_with_inputs_answers_as_the_desktop_does() {
+    use shed_provision::{Context, NoReader, Prepared, Provider};
+    let s = Settings::parse(SETTINGS).unwrap();
+    let req = widgets();
+    let r = home();
+    let ctx = Context::answer("work", &req, NOW, None);
+    let ssh = crate::ssh_key::gather(s.ssh_key.as_ref().unwrap(), &ctx, &r);
+    let gh = crate::github::gather(s.github.as_ref().unwrap(), &ctx, &r);
+    let api = crate::api_keys::gather(s.api_keys.as_ref().unwrap(), &ctx, &r);
+    let env = crate::envsecrets::gather(s.envsecrets_login.as_ref().unwrap(), &ctx, &r);
+    let files = crate::files::gather(s.files.as_ref().unwrap(), &ctx, &r);
+    for problems in [
+        &ssh.problems,
+        &gh.problems,
+        &api.problems,
+        &env.problems,
+        &files.problems,
+    ] {
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+    // What the host holds: inputs only. Its Debug shows no value.
+    let shown = format!(
+        "{:?} {:?} {:?} {:?} {:?}",
+        ssh.inputs, gh.inputs, api.inputs, env.inputs, files.inputs
+    );
+    assert!(
+        !shown.contains("SENTINEL") && !shown.contains(TOKEN),
+        "{shown}"
+    );
+    let prepared = |name: &str, c| Prepared {
+        name: name.into(),
+        only: None,
+        contribution: c,
+    };
+    let list = [
+        prepared(
+            "ssh-key",
+            crate::ssh_key::build(ssh.inputs.as_ref().unwrap(), &ctx),
+        ),
+        prepared(
+            "github",
+            crate::github::build(gh.inputs.as_ref().unwrap(), &ctx),
+        ),
+        prepared(
+            "api-keys",
+            crate::api_keys::build(api.inputs.as_ref().unwrap(), &ctx),
+        ),
+        prepared(
+            "envsecrets-login",
+            crate::envsecrets::build(env.inputs.as_ref().unwrap(), &ctx),
+        ),
+        prepared(
+            "files",
+            crate::files::build(files.inputs.as_ref().unwrap(), &ctx),
+        ),
+    ];
+    let dyns: Vec<&dyn Provider> = list.iter().map(|p| p as &dyn Provider).collect();
+    let hosted =
+        shed_provision::build_answer(&req, "work", NOW, None, &dyns, &NoReader, &key()).unwrap();
+    let desktop = build_with(SETTINGS, &home(), &req);
+    assert_eq!(hosted.answer.to_json(), desktop.answer.to_json());
+}
+
+/// The budget is checked before each read and each command, and a command
+/// runs for no longer than what is left.
+#[test]
+fn gather_keeps_to_the_budget() {
+    use shed_provision::Context;
+    use std::time::{Duration, Instant};
+    let s = Settings::parse(SETTINGS).unwrap();
+    let req = widgets();
+    // Already past: nothing is read and nothing is run.
+    let r = home();
+    let late = Context::answer("work", &req, NOW, Some(Instant::now()));
+    let g = crate::github::gather(s.github.as_ref().unwrap(), &late, &r);
+    assert!(g.inputs.is_none());
+    assert_eq!(g.problems[0].code, ProblemCode::TimedOut);
+    assert!(r.ran().is_empty());
+    let g = crate::files::gather(s.files.as_ref().unwrap(), &late, &r);
+    assert_eq!(g.inputs.unwrap().files.len(), 0);
+    assert_eq!(
+        g.problems.iter().map(|p| p.code).collect::<Vec<_>>(),
+        vec![ProblemCode::TimedOut, ProblemCode::TimedOut]
+    );
+    // Five seconds left: each command is capped at it.
+    let soon = Context::answer(
+        "work",
+        &req,
+        NOW,
+        Some(Instant::now() + Duration::from_secs(5)),
+    );
+    let g = crate::github::gather(s.github.as_ref().unwrap(), &soon, &r);
+    assert!(g.inputs.is_some());
+    assert_eq!(r.ran().len(), 2);
+    assert!(r.ran().iter().all(|c| c.timeout <= Duration::from_secs(5)));
+    // A command stopped by that cap is timed out, not failed.
+    let gh = ["gh", "auth", "token", "--hostname", "github.com"];
+    let r = FakeReader::new(HOME).command_error(&gh, RunError::TimedOut);
+    let g = crate::github::gather(s.github.as_ref().unwrap(), &soon, &r);
+    assert_eq!(g.problems[0].code, ProblemCode::TimedOut);
+    // With no budget, the command's own timeout stands and its end is a failure.
+    let open = Context::answer("work", &req, NOW, None);
+    let g = crate::github::gather(s.github.as_ref().unwrap(), &open, &r);
+    assert_eq!(g.problems[0].code, ProblemCode::CommandFailed);
+    assert_eq!(r.ran()[1].timeout, shed_provision::Command::DEFAULT_TIMEOUT);
 }

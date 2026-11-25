@@ -18,6 +18,9 @@ shed-provision = { path = "../shed-provision" }
 toml = { workspace = true }
 # The OpenSSH private key container is base64: read to tell an encrypted key.
 base64 = { workspace = true }
+# The providers' descriptors are handed to forms as JSON (already in the tree
+# through shed-provision).
+serde = { workspace = true }
 
 [dev-dependencies]
 # The preview is checked as the JSON a shell would be handed.

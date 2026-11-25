@@ -1,0 +1,156 @@
+{
+  "answer": "{\"version\":V,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"ssh-key\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519\",\"mode\":\"0600\",\"content\":\"LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpReU5UVXhPUUFBQUNCYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXZ0FBQUJWVFJVNVVTVTVGClRDMXdjbWwyWVhSbExYQmhjblE9Ci0tLS0tRU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo=\",\"fingerprint\":\"bWA7YbGlZ5hcWYQm_pbSDESp\"},{\"name\":\"ssh-key.pub\",\"provider\":\"ssh-key\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".ssh/id_ed25519.pub\",\"mode\":\"0644\",\"content\":\"c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGFXbHBhV2xwYVdscGEgYWRhQGV4YW1wbGUudGVzdAo=\",\"fingerprint\":\"fw91YNp8I8UQ2TkMJ-woXidL\"},{\"name\":\"github\",\"provider\":\"github\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/gh/hosts.yml\",\"mode\":\"0600\",\"content\":\"Z2l0aHViLmNvbToKICAgIHVzZXJzOgogICAgICAgIGFkYS1leGFtcGxlOgogICAgICAgICAgICBvYXV0aF90b2tlbjogZ2hvX1NFTlRJTkVMdG9rZW4wMDAKICAgIGdpdF9wcm90b2NvbDogaHR0cHMKICAgIG9hdXRoX3Rva2VuOiBnaG9fU0VOVElORUx0b2tlbjAwMAogICAgdXNlcjogYWRhLWV4YW1wbGUK\",\"fingerprint\":\"tN2KUgf5ACG8PuECyB4i0sbx\"},{\"name\":\"api-keys.craze\",\"provider\":\"api-keys\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".craze/native/providers.toml\",\"mode\":\"0600\",\"content\":\"W29wZW5haV0KYXBpX2tleSA9ICJTRU5USU5FTC1jcmF6ZSIK\",\"fingerprint\":\"Zd1oc0ZD-A-a8o834ec8y-TP\"},{\"name\":\"api-keys.example_api_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"EXAMPLE_API_KEY\",\"value\":\"sk-SENTINEL \\\"q\\\" $D\",\"fingerprint\":\"jXl5iZHNPiDmJMMTkY39Uz1r\"},{\"name\":\"api-keys.other_key\",\"provider\":\"api-keys\",\"kind\":\"env\",\"variable\":\"OTHER_KEY\",\"value\":\"two\",\"fingerprint\":\"fub3i7t2k0epVKRrf2pP51Ta\"},{\"name\":\"envsecrets-login.config\",\"provider\":\"envsecrets-login\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".envsecrets/config.yaml\",\"mode\":\"0600\",\"content\":\"YnVja2V0OiBleGFtcGxlCnBhc3NwaHJhc2VfZW52OiBFTlZTRUNSRVRTX1BBU1NQSFJBU0UKZ2NzX2NyZWRlbnRpYWxzOiBleUpUUlU1VVNVNUZUQ0k2TVgwPQo=\",\"fingerprint\":\"Gh0UPfvlrUTQUDXM2zb90dbp\"},{\"name\":\"envsecrets-login.passphrase\",\"provider\":\"envsecrets-login\",\"kind\":\"env\",\"variable\":\"ENVSECRETS_PASSPHRASE\",\"value\":\"SENTINEL-passphrase\",\"fingerprint\":\"lmHwYMo46O6VPFJd65475DU6\"},{\"name\":\"files..npmrc\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".npmrc\",\"mode\":\"0600\",\"content\":\"Ly9yZWdpc3RyeS5leGFtcGxlLnRlc3QvOl9hdXRoVG9rZW49U0VOVElORUwtbnBtCg==\",\"fingerprint\":\"HCVVjTLnYCQGu0Bp-eShYX3O\"},{\"name\":\"files..env\",\"provider\":\"files\",\"kind\":\"file\",\"stage\":2,\"base\":\"project\",\"path\":\".env\",\"mode\":\"0400\",\"content\":\"REI9U0VOVElORUwtZGIK\",\"fingerprint\":\"6PsbNQ-LaiqgxdHVcIEeIwEc\"},{\"name\":\"git-config\",\"provider\":\"git-config\",\"kind\":\"file\",\"stage\":1,\"base\":\"home\",\"path\":\".config/git/config\",\"mode\":\"0600\",\"content\":\"IyBXcml0dGVuIGJ5IHNoZWQgZGVsaXZlcnk7IHJlcGxhY2VkIHdob2xlIGF0IGV2ZXJ5IGRlbGl2ZXJ5LgpbZ3BnXQoJZm9ybWF0ID0gc3NoClt1c2VyXQoJc2lnbmluZ2tleSA9IC9ob21lL3NoZWQvLnNzaC9pZF9lZDI1NTE5Cltjb21taXRdCglncGdzaWduID0gdHJ1ZQpbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXRodWIuY29tIl0KCWhlbHBlciA9CgloZWxwZXIgPSAhZ2ggYXV0aCBnaXQtY3JlZGVudGlhbApbY3JlZGVudGlhbCAiaHR0cHM6Ly9naXN0LmdpdGh1Yi5jb20iXQoJaGVscGVyID0KCWhlbHBlciA9ICFnaCBhdXRoIGdpdC1jcmVkZW50aWFsCg==\",\"fingerprint\":\"OGAT9k946L6d3aIeZn7TdqRU\"}],\"problems\":[{\"provider\":\"api-keys\",\"code\":\"missing_input\",\"message\":\"api-keys.env_files[1] does not exist\"}]}",
+  "preview": {
+    "items": [
+      {
+        "base": "home",
+        "fingerprint": "bWA7YbGlZ5hcWYQm_pbSDESp",
+        "kind": "file",
+        "mode": "0600",
+        "name": "ssh-key",
+        "provider": "ssh-key",
+        "size": 233,
+        "stage": 1,
+        "target": ".ssh/id_ed25519"
+      },
+      {
+        "base": "home",
+        "fingerprint": "fw91YNp8I8UQ2TkMJ-woXidL",
+        "kind": "file",
+        "mode": "0644",
+        "name": "ssh-key.pub",
+        "provider": "ssh-key",
+        "size": 98,
+        "stage": 1,
+        "target": ".ssh/id_ed25519.pub"
+      },
+      {
+        "base": "home",
+        "fingerprint": "tN2KUgf5ACG8PuECyB4i0sbx",
+        "kind": "file",
+        "mode": "0600",
+        "name": "github",
+        "provider": "github",
+        "size": 174,
+        "stage": 1,
+        "target": ".config/gh/hosts.yml"
+      },
+      {
+        "base": "home",
+        "fingerprint": "Zd1oc0ZD-A-a8o834ec8y-TP",
+        "kind": "file",
+        "mode": "0600",
+        "name": "api-keys.craze",
+        "provider": "api-keys",
+        "size": 36,
+        "stage": 1,
+        "target": ".craze/native/providers.toml"
+      },
+      {
+        "fingerprint": "jXl5iZHNPiDmJMMTkY39Uz1r",
+        "kind": "env",
+        "name": "api-keys.example_api_key",
+        "provider": "api-keys",
+        "size": 18,
+        "stage": 1,
+        "target": "EXAMPLE_API_KEY"
+      },
+      {
+        "fingerprint": "fub3i7t2k0epVKRrf2pP51Ta",
+        "kind": "env",
+        "name": "api-keys.other_key",
+        "provider": "api-keys",
+        "size": 3,
+        "stage": 1,
+        "target": "OTHER_KEY"
+      },
+      {
+        "base": "home",
+        "fingerprint": "Gh0UPfvlrUTQUDXM2zb90dbp",
+        "kind": "file",
+        "mode": "0600",
+        "name": "envsecrets-login.config",
+        "provider": "envsecrets-login",
+        "size": 92,
+        "stage": 1,
+        "target": ".envsecrets/config.yaml"
+      },
+      {
+        "fingerprint": "lmHwYMo46O6VPFJd65475DU6",
+        "kind": "env",
+        "name": "envsecrets-login.passphrase",
+        "provider": "envsecrets-login",
+        "size": 19,
+        "stage": 1,
+        "target": "ENVSECRETS_PASSPHRASE"
+      },
+      {
+        "base": "home",
+        "fingerprint": "HCVVjTLnYCQGu0Bp-eShYX3O",
+        "kind": "file",
+        "mode": "0600",
+        "name": "files..npmrc",
+        "provider": "files",
+        "size": 49,
+        "stage": 1,
+        "target": ".npmrc"
+      },
+      {
+        "base": "project",
+        "fingerprint": "6PsbNQ-LaiqgxdHVcIEeIwEc",
+        "kind": "file",
+        "mode": "0400",
+        "name": "files..env",
+        "provider": "files",
+        "size": 15,
+        "stage": 2,
+        "target": ".env"
+      },
+      {
+        "base": "home",
+        "fingerprint": "OGAT9k946L6d3aIeZn7TdqRU",
+        "kind": "file",
+        "mode": "0600",
+        "name": "git-config",
+        "provider": "git-config",
+        "size": 316,
+        "stage": 1,
+        "target": ".config/git/config"
+      }
+    ],
+    "problems": [
+      {
+        "code": "missing_input",
+        "message": "api-keys.env_files[1] does not exist",
+        "provider": "api-keys"
+      }
+    ],
+    "providers": [
+      {
+        "provider": "ssh-key",
+        "ran": true,
+        "restricted": false
+      },
+      {
+        "provider": "github",
+        "ran": true,
+        "restricted": false
+      },
+      {
+        "provider": "api-keys",
+        "ran": true,
+        "restricted": false
+      },
+      {
+        "provider": "envsecrets-login",
+        "ran": true,
+        "restricted": false
+      },
+      {
+        "provider": "files",
+        "ran": true,
+        "restricted": false
+      }
+    ]
+  }
+}
