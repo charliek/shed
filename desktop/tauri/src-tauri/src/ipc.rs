@@ -1056,13 +1056,15 @@ impl Handler {
             // -- credential sources (plan 035 §3.4) --
             "source.status" => {
                 let rt = self.delivery_rt().ok();
-                Ok(crate::source::status(&self.backend, rt.as_deref()).await)
+                let servers = self.resolver().now().await;
+                Ok(crate::source::status(&servers, rt.as_deref()).await)
             }
             "source.use" => self.source_use(params).await,
             // -- the Credentials view's Rust side (plan 040 §3.9) --
             "sources.list" => {
                 let rt = self.delivery_rt().ok();
-                Ok(crate::source::list(&self.backend, rt.as_deref()).await)
+                let servers = self.resolver().now().await;
+                Ok(crate::source::list(&servers, rt.as_deref()).await)
             }
             "source.unbind" => self.source_unbind(params).await,
             "delivery.describe" => Ok(crate::delivery::describe()),
@@ -2142,11 +2144,20 @@ impl Handler {
     async fn source_use(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = req_str(params, "host")?;
         let rt = self.delivery_rt().ok();
-        let res = crate::source::use_this_machine(&self.backend, rt.as_deref(), host).await;
+        let res = crate::source::use_this_machine(&self.resolver(), rt.as_deref(), host).await;
         if res.is_ok() {
             self.emit_prefs_changed();
         }
         res
+    }
+
+    /// How the source doors resolve the servers ([`crate::source::Resolver`]).
+    fn resolver(&self) -> crate::source::Resolver {
+        let current = self
+            .app
+            .try_state::<Arc<crate::source::CurrentServers>>()
+            .map(|s| s.inner().clone());
+        crate::source::Resolver::new(current, self.backend.clone())
     }
 
     /// `source.unbind {host}` → clear this user's credential source on `host` ("Stop
@@ -2155,7 +2166,7 @@ impl Handler {
     async fn source_unbind(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = req_str(params, "host")?;
         let rt = self.delivery_rt().ok();
-        let res = crate::source::unbind(&self.backend, rt.as_deref(), host).await;
+        let res = crate::source::unbind(&self.resolver(), rt.as_deref(), host).await;
         if res.is_ok() {
             self.emit_prefs_changed();
         }

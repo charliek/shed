@@ -217,11 +217,14 @@ export function restartRetries(state: SourcesState): SourcesState {
   return state.unreachableTries === 0 ? state : { ...state, unreachableTries: 0 };
 }
 
-/** Whether `host`'s "Use this machine" can be pressed: an identity to send, no move
- *  of its own in flight, and this machine not already the source there — the one
- *  rule behind the button's presence, its `disabled`, and the reported `can_use`. */
+/** Whether `host`'s "Answer from here" can be pressed: an identity to send, no move
+ *  of its own in flight, and this machine not already answering there (bound there
+ *  but stopped counts as not answering) — the one rule behind the button's
+ *  `disabled` and the reported `can_use`. */
 export function canUse(state: SourcesState, host: string): boolean {
-  return !!state.thisMachine && !state.moving[host] && !state.rows[host]?.this_machine;
+  const row = state.rows[host];
+  // Bound here but stopped (an uncertain stop): answering again is what undoes it.
+  return !!state.thisMachine && !state.moving[host] && (!row?.this_machine || !!row?.paused);
 }
 
 /** A press: `null` when it cannot start ([canUse]), else the state with the row

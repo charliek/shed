@@ -409,6 +409,30 @@ impl DeliveryRuntime {
         tasks.reconcile(&wanted);
     }
 
+    /// Reads the shed config again now and reconciles the streams with it, as the
+    /// periodic rescan does: a server added runs, one removed stops, one whose endpoint,
+    /// pin or identity changed is restarted on the new target. A config that cannot be
+    /// read keeps the streams that run and is the error.
+    pub fn rescan_now(&self) -> Result<(), String> {
+        let targets = targets_of(&self.opts);
+        let out = targets.as_ref().map(|_| ()).map_err(Clone::clone);
+        match &self.tasks {
+            Some(tasks) => self.apply(tasks, targets),
+            None => {
+                if let Ok(t) = targets {
+                    *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = t;
+                }
+            }
+        }
+        out
+    }
+
+    /// The target `server`'s stream runs on (endpoint, pin, identity), or `None` when
+    /// none runs for it.
+    pub fn stream_target(&self, server: &str) -> Option<ServerTarget> {
+        self.tasks.as_ref().and_then(|t| t.target_of(server))
+    }
+
     /// The config's servers as last read, by name.
     fn configured(&self) -> Vec<String> {
         self.targets
@@ -1052,6 +1076,50 @@ mod tests {
             service_recheck: shed_source::delivery::SERVICE_RECHECK,
             paused_path: dir.join("broker").join("paused-servers.json"),
         }
+    }
+
+    /// "Answer from here" after the server's endpoint changed: a rescan first, and the
+    /// resumed stream runs on the new endpoint only. Without it (the negative control)
+    /// the stream comes back on the endpoint the runtime last read.
+    #[tokio::test]
+    async fn a_rescan_before_resume_opens_the_stream_on_the_current_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = two_server_opts(dir.path(), &["x"]);
+        opts.mock_base_url = None;
+        let cfg = opts.shed_config_path.clone();
+        let at = |host: &str| {
+            std::fs::write(&cfg, format!("servers:\n    x:\n        host: {host}\n")).unwrap()
+        };
+        at("a.example.test");
+        let rt = started(opts).await;
+        let url = |rt: &DeliveryRuntime| rt.stream_target("x").map(|t| t.url);
+        assert!(url(&rt).unwrap().contains("a.example.test"));
+        rt.pause("x").unwrap();
+        assert!(rt.wait_stopped("x", Duration::from_secs(5)).await);
+        at("b.example.test");
+        // Negative control: resumed on what was last read, the old endpoint.
+        rt.resume("x").unwrap();
+        assert!(url(&rt).unwrap().contains("a.example.test"));
+        rt.pause("x").unwrap();
+        assert!(rt.wait_stopped("x", Duration::from_secs(5)).await);
+        // Reconciled first, then resumed: the new endpoint only.
+        rt.rescan_now().unwrap();
+        assert_eq!(url(&rt), None, "still paused: no stream");
+        rt.resume("x").unwrap();
+        let now = url(&rt).unwrap();
+        assert!(
+            now.contains("b.example.test") && !now.contains("a.example.test"),
+            "{now}"
+        );
+        // A config that cannot be read is the error, and the stream keeps running.
+        std::fs::write(
+            &cfg,
+            "servers:\n    x:\n        host: b.example.test\nservers:\n",
+        )
+        .unwrap();
+        assert!(rt.rescan_now().is_err());
+        assert!(url(&rt).unwrap().contains("b.example.test"));
+        rt.drain();
     }
 
     async fn started(opts: DeliveryOptions) -> Arc<DeliveryRuntime> {

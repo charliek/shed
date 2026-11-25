@@ -9,6 +9,7 @@ import {
   COMMAND_KEPT,
   EMPTY_CHECK,
   checkErrorText,
+  configErrorText,
   checkNote,
   checkRequest,
   checkRuns,
@@ -23,6 +24,7 @@ import {
   missing,
   onlyOf,
   outcomeText,
+  pausedErrorText,
   readDescriptors,
   recentRows,
   redactedConfig,
@@ -75,19 +77,19 @@ test("every kind of sources.list row reads, and says who answers", () => {
   const v = Object.fromEntries(st.rows.map((r) => [r.host, whereView(r, { moving: false, canUse: !r.this_machine, refusal: null })]));
   assert.equal(v.here.who, "This machine answers here");
   assert.equal(v.here.detail, "connected");
-  assert.deepEqual(v.here.action, { id: "unbind", label: "Stop answering from here", enabled: true });
+  assert.deepEqual(v.here.actions[0], { id: "unbind", label: "Stop answering from here", enabled: true });
   assert.equal(v.desk.who, "Another machine answers here:");
   assert.equal(v.desk.name, "deskx", "a name from elsewhere is cleaned");
-  assert.deepEqual(v.desk.action, { id: "use", label: "Answer from here", enabled: true });
+  assert.deepEqual(v.desk.actions[0], { id: "use", label: "Answer from here", enabled: true });
   assert.equal(v.account.who, "The account service answers here");
   assert.equal(v.account.url, "https://accounts.example.test");
-  assert.equal(v.account.action, null, "no action where the account service answers");
+  assert.deepEqual(v.account.actions, [], "no action where the account service answers");
   assert.equal(v.account.notDelivering, false);
   assert.equal(v.paused.notDelivering, true);
   assert.equal(v.paused.detail, "It is not delivering to this server.");
   assert.equal(v.fresh.who, "Nobody answers here");
   assert.equal(v.stopped.detail, "This machine stopped answering here.");
-  assert.equal(v.old.action, null);
+  assert.deepEqual(v.old.actions, []);
   assert.equal(v.locked.kind, "unknown");
   assert.equal(v.locked.error, "The server does not let this client see who answers.");
   assert.equal(JSON.stringify(v).includes("SERVER TEXT"), false, "never the server's words");
@@ -101,12 +103,12 @@ test("a row kept while the server cannot say, and a move or stop in flight", () 
   const busy = whereView({ ...r, busy: true }, { moving: false, canUse: true, refusal: null });
   assert.equal(busy.retrying, true);
   const moving = whereView({ ...r, kind: "this_machine", this_machine: true }, { moving: true, canUse: false, refusal: null });
-  assert.deepEqual(moving.action, { id: "unbind", label: "Switching…", enabled: false });
+  assert.deepEqual(moving.actions[0], { id: "unbind", label: "Switching…", enabled: false });
   const stopping = whereView({ ...r, kind: "nobody", this_machine: false, source: null, paused: true },
     { moving: true, canUse: false, refusal: null });
-  assert.deepEqual(stopping.action, { id: "use", label: "Stopping…", enabled: false });
+  assert.deepEqual(stopping.actions[0], { id: "use", label: "Stopping…", enabled: false });
   const noIdentity = whereView(r, { moving: false, canUse: false, refusal: null });
-  assert.equal(noIdentity.action.enabled, false);
+  assert.equal(noIdentity.actions[0].enabled, false);
   const refused = whereView(r, { moving: false, canUse: true, refusal: "no" });
   assert.equal(refused.error, "no");
 });
@@ -126,6 +128,41 @@ test("a pause shows on every kind of row, and an unreachable server has its own"
   assert.equal(u.who, "This server cannot be reached");
   assert.equal(u.detail, "Nothing is known of it yet.");
   assert.deepEqual(serverTicks([off], null), ["o"], "its scope tick is offered");
+});
+
+test("an uncertain stop can be undone from the view; an unreachable server offers nothing", () => {
+  const bound = whereRowOf(listRow("a", "this_machine", { machine: ME, paused: true }));
+  const v = whereView(bound, { moving: false, canUse: true, refusal: null });
+  assert.deepEqual(v.actions.map((a) => [a.id, a.label, a.enabled]),
+    [["use", "Answer from here", true], ["unbind", "Stop answering from here", true]]);
+  // Negative control: answering here, not paused, offers only the stop.
+  const live = whereView(whereRowOf(listRow("a", "this_machine", { machine: ME })), { moving: false, canUse: false, refusal: null });
+  assert.deepEqual(live.actions.map((a) => a.id), ["unbind"]);
+  const gone = whereView({ ...whereRowOf(listRow("d", "other_machine", { machine: DESK })), unreachable: true },
+    { moving: false, canUse: true, refusal: null });
+  assert.deepEqual(gone.actions, []);
+});
+
+test("a shed config that cannot be read keeps the rows it last listed, and says so", () => {
+  const st = whereStatusOf({ servers: [listRow("a", "nobody")], this_machine: ME, config_error: "unreadable" });
+  assert.equal(st.config_error, "unreadable");
+  assert.equal(st.rows.length, 1, "the last servers, never dropped");
+  assert.match(configErrorText(st.config_error), /cannot be read, so these are the servers it last listed/);
+  assert.match(refusalText("config_unreadable", "a", "use"), /cannot be read/);
+  // Negative control: a config read fine says nothing.
+  assert.equal(configErrorText(whereStatusOf({ servers: [], this_machine: ME }).config_error), null);
+});
+
+test("a pause file that cannot be written is not one that cannot be read", () => {
+  assert.equal(pausedErrorText(null), null);
+  const write = pausedErrorText("write_failed");
+  assert.match(write, /could not be saved/);
+  assert.match(write, /answers wherever it has not stopped/);
+  assert.doesNotMatch(write, /answers on none/);
+  // Negative control: a load failure still says every server is paused.
+  for (const e of ["unreadable", "unparseable", "unknown_version"]) {
+    assert.match(pausedErrorText(e), /answers on none of them/, e);
+  }
 });
 
 test("a move's answer is this machine's row", () => {
@@ -212,9 +249,13 @@ test("scope: every server writes no servers, the ticks write exactly the ticked"
 });
 
 test("scope in words, and the servers it can be ticked for", () => {
-  assert.equal(scopeWords(null), "every server");
+  // Each reads as a phrase of its own, with no prefix before it.
+  assert.equal(scopeWords(null), "On every server");
+  assert.equal(scopeWords({ servers: ["mini3"] }), "Only on mini3");
   assert.equal(scopeWords({ servers: ["a", "b"], backends: ["vz", "remote"], repos: ["x/*"] }),
-    "only on a and b · VZ and Cloud sheds · repos x/*");
+    "Only on a and b · VZ and Cloud sheds only · repos matching x/*");
+  assert.equal(scopeWords({ servers: [] }), "On no server");
+  assert.equal(scopeWords({ repos: ["a/*", "b/c"] }), "On every server · repos matching a/* and b/c");
   const rows = [
     whereRowOf(listRow("a", "this_machine", { machine: ME })),
     whereRowOf(listRow("acct", "service", { url: "https://x.example.test" })),
@@ -252,7 +293,7 @@ test("each provider row says its state, scope, where it lands and its actions", 
   assert.equal(v.scope, null);
   v = whatView(D["ssh-key"], set("ssh-key", { enabled: true, key_file: "~/k", only: { backends: ["vz"] } }));
   assert.deepEqual(v.actions, ["edit", "turn_off", "remove"]);
-  assert.equal(v.scope, "every server · VZ sheds");
+  assert.equal(v.scope, "On every server · VZ sheds only");
   v = whatView(D["ssh-key"], set("ssh-key", { enabled: false, key_file: "~/k" }, false));
   assert.deepEqual(v.actions, ["turn_on", "edit", "remove"]);
   v = whatView(D["ssh-key"], set("ssh-key", { enabled: false }, false));

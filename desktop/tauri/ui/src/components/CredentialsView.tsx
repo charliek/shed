@@ -38,7 +38,7 @@ import {
 import {
   ACTION_LABEL, BACKENDS, BACKEND_LABEL, EMPTY_CHECK, EVERY_SERVER, ONLY_THESE,
   checkErrorText, checkNote, checkRequest, checkResult, checkRuns, sameRuns, choiceOptions, clean, configFromDraft, draftFromConfig, edit,
-  entryFields, fieldControl, machineFields, missing, pausedErrorText, readDescriptors, recentRows,
+  configErrorText, entryFields, fieldControl, machineFields, missing, pausedErrorText, readDescriptors, recentRows,
   redactedConfig, refusalCode, refusalText, saveEnabled, saveLabel, serverTicks, shedPick, switched,
   whatView, whereRowOfMove, whereStatusOf, whereView,
   type CheckForm, type CheckResult, type ProviderDesc, type ProviderDraft, type ProviderSetting,
@@ -64,6 +64,8 @@ export type CredentialSources = {
   /** A read of the servers has landed (answered or failed). */
   settled: boolean;
   pausedError: string | null;
+  /** The shed config could not be read at the last read (`config_error`). */
+  configError: string | null;
   use: (host: string) => void;
   stop: (host: string) => void;
 };
@@ -76,6 +78,7 @@ export function useCredentialSources(active: boolean, shown: number): Credential
   const srcRef = useRef<SourcesState>(EMPTY_SOURCES);
   const [src, setSrc] = useState<SourcesState>(EMPTY_SOURCES);
   const [pausedError, setPausedError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [settled, setSettled] = useState(false);
   const seq = useRef(0);
   const reader = useRef<SourceReader | null>(null);
@@ -87,7 +90,10 @@ export function useCredentialSources(active: boolean, shown: number): Credential
     const r = createSourceReader({
       fetch: async () => {
         const st = whereStatusOf(await listSources());
-        if (st) setPausedError(st.paused_error);
+        if (st) {
+          setPausedError(st.paused_error);
+          setConfigError(st.config_error);
+        }
         setSettled(true);
         return st;
       },
@@ -156,7 +162,7 @@ export function useCredentialSources(active: boolean, shown: number): Credential
       },
     );
   }, [commit]);
-  return { src, settled, pausedError, use, stop };
+  return { src, settled, pausedError, configError, use, stop };
 }
 
 /* ---- the view ---------------------------------------------------------------- */
@@ -171,7 +177,7 @@ export function CredentialsView({ sources, sheds, shown }: {
   shown: number;
 }) {
   const root = useRef<HTMLDivElement>(null);
-  const { src, settled, pausedError } = sources;
+  const { src, settled, pausedError, configError } = sources;
   const [descs, setDescs] = useState<ProviderDesc[]>([]);
   const [settings, setSettings] = useState<DeliverySettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -193,6 +199,8 @@ export function CredentialsView({ sources, sheds, shown }: {
   // How many Check doors (`ui.fill_check`, `ui.press_check`) this view has taken: the
   // harness's proof that one landed.
   const [checksTaken, setChecksTaken] = useState(0);
+  // How many Checks have started (a press on a disabled button starts none).
+  const [checksStarted, setChecksStarted] = useState(0);
 
   const load = useCallback(() => {
     const gen = ++loadGen.current;
@@ -297,6 +305,7 @@ export function CredentialsView({ sources, sheds, shown }: {
   // preview itself is held to the same commands (`settings_changed`). Errors are fixed
   // words by code.
   const runCheck = (f: CheckForm) => {
+    setChecksStarted((n) => n + 1);
     const req = checkRequest(f);
     setDetails(false);
     if ("error" in req) {
@@ -401,8 +410,8 @@ export function CredentialsView({ sources, sheds, shown }: {
 
   // Report what the view rendered, read back off its own nodes after the commit.
   const reportKey = JSON.stringify([
-    src, pausedError, descs, settings, loadError, busy, errors, notices, form, hosts, check, checkOut, checkError,
-    checkBusy, details, recent, recentError, doorsReady, checksTaken,
+    src, pausedError, configError, descs, settings, loadError, busy, errors, notices, form, hosts, check, checkOut, checkError,
+    checkBusy, details, recent, recentError, doorsReady, checksTaken, checksStarted,
   ]);
   const lastReport = useRef("");
   useEffect(() => {
@@ -439,6 +448,8 @@ export function CredentialsView({ sources, sheds, shown }: {
         can_use: !!r.querySelector("button[data-source-use]:not([disabled])"),
         can_stop: !!r.querySelector("button[data-source-unbind]:not([disabled])"),
         action: btn ? { id: btn.dataset.sourceUse !== undefined ? "use" : "unbind", label: btn.textContent, enabled: !btn.disabled } : null,
+        actions: Array.from(r.querySelectorAll<HTMLButtonElement>("button[data-source-use], button[data-source-unbind]"))
+          .map((b) => ({ id: b.dataset.sourceUse !== undefined ? "use" : "unbind", label: b.textContent, enabled: !b.disabled })),
         error: text("[data-source-error]", r),
         text: r.textContent,
       };
@@ -484,6 +495,7 @@ export function CredentialsView({ sources, sheds, shown }: {
         this_machine_name: text("[data-source-this-machine-name]"),
         this_machine_error: src.thisMachineError,
         paused_error: text("[data-source-paused-error]"),
+        config_error: text("[data-source-config-error]"),
         rows: where,
       },
       what: {
@@ -533,6 +545,7 @@ export function CredentialsView({ sources, sheds, shown }: {
         })(),
         busy: checkBusy,
         taken: checksTaken,
+        started: checksStarted,
         error: text("[data-check-error]"),
         about: pv ? text("[data-check-about]") : null,
         items: Array.from(el.querySelectorAll<HTMLElement>("[data-check-item]")).map((r) => ({ name: r.dataset.checkItem, ...cells(r) })),
@@ -558,6 +571,7 @@ export function CredentialsView({ sources, sheds, shown }: {
   const fileError = settings?.error ?? null;
   const note = checkNote(checkRuns(providers));
   const pausedWords = pausedErrorText(pausedError);
+  const configWords = configErrorText(configError);
 
   return (
     <div ref={root} data-scroll-anchor="credentials">
@@ -583,6 +597,11 @@ export function CredentialsView({ sources, sheds, shown }: {
           {pausedWords && (
             <div className="mt-1 font-medium" style={{ color: "var(--shed-warn-fg)" }} data-source-paused-error>
               {pausedWords}
+            </div>
+          )}
+          {configWords && (
+            <div className="mt-1 font-medium" style={{ color: "var(--shed-warn-fg)" }} data-source-config-error>
+              {configWords}
             </div>
           )}
         </div>
@@ -645,7 +664,7 @@ export function CredentialsView({ sources, sheds, shown }: {
                   </div>
                   {v.scope && (
                     <div className="mt-0.5 text-[11.5px] text-shed-text-secondary">
-                      For <span data-what-scope>{v.scope}</span>
+                      <span data-what-scope>{v.scope}</span>
                     </div>
                   )}
                   {v.missing.length > 0 && !open && (
@@ -709,7 +728,15 @@ export function CredentialsView({ sources, sheds, shown }: {
             <Segmented
               options={[["shed", "A shed"], ["target", "A server"]]}
               value={check.by}
-              set={(v) => setCheck((c) => ({ ...c, by: v === "target" ? "target" : "shed" }))}
+              set={(v) => {
+                const by = v === "target" ? "target" : "shed";
+                if (by === check.by) return;
+                // Another kind of Check: the last one's result is not about it.
+                setCheck((c) => ({ ...c, by }));
+                setCheckOut(null);
+                setCheckError(null);
+                setDetails(false);
+              }}
               mark="check-by"
             />
           </div>
@@ -864,7 +891,6 @@ function WhereLine({ row, src, onUse, onStop }: {
     canUse: canUse(src, row.host),
     refusal: src.errors[row.host] ?? null,
   });
-  const action = v.action;
   return (
     <div className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5" data-source-row={row.host} data-kind={v.kind}>
       <div className="min-w-0 flex-1">
@@ -888,8 +914,9 @@ function WhereLine({ row, src, onUse, onStop }: {
         )}
         {v.error && <div className="mt-1 text-[12px] font-medium text-shed-danger" data-source-error>{v.error}</div>}
       </div>
-      {action && (
+      {v.actions.map((action) => (
         <button
+          key={action.id}
           type="button"
           onClick={action.id === "use" ? onUse : onStop}
           disabled={!action.enabled}
@@ -899,7 +926,7 @@ function WhereLine({ row, src, onUse, onStop }: {
         >
           {action.label}
         </button>
-      )}
+      ))}
     </div>
   );
 }

@@ -801,16 +801,21 @@ def test_sources_list_says_who_answers_on_each_server():
             assert rows["old"]["error"] is None
             for r in rows.values():
                 assert (r["busy"], r["unreachable"]) == (False, False), r
-            # Settled, not retrying: the one refused attempt, and no more.
+            # Settled, not retrying: the one refused attempt, and no more, held.
             for name in ("account", "paused"):
-                attempts = len(mocks[name].delivery_attempts())
-                assert attempts == 1, (name, attempts)
+                client.wait_until(lambda n=name: len(mocks[n].delivery_attempts()) >= 1,
+                                  timeout=10, what=f"{name}'s refused attempt")
+            _holds(lambda: all(len(mocks[n].delivery_attempts()) == 1
+                               for n in ("account", "paused")), 1.5,
+                   "one refused attempt each, and no reconnect")
             # `source.status` carries the same: the service on its rows, nothing else.
             status = {r["host"]: r for r in client.source_status()["rows"]}
             assert status["account"]["service"] == {"url": SERVICE_URL, "state": None}
             assert status["paused"]["service"]["state"] == "not_delivering"
             assert "service" not in status["here"], status["here"]
-            # A move or an unbind there is refused in fixed words, and reaches the server.
+            # A move or an unbind there is refused in fixed words. The move reaches the
+            # server; the unbind is refused before anything is paused or sent, so the
+            # settled stream is not stopped and started again.
             for call in (client.source_use, client.source_unbind):
                 with pytest.raises(ShedError) as e:
                     call("account")
@@ -819,8 +824,11 @@ def test_sources_list_says_who_answers_on_each_server():
                                            "account; no machine does there"), e.value
                 assert SOURCE_IS_SERVICE_BODY["error"]["message"] not in e.value.message
             assert len(mocks["account"].source_use_requests()) == 1
-            assert mocks["account"].source_unbind_requests() == [{}]
-            assert len(mocks["account"].delivery_attempts()) == 1
+            assert mocks["account"].source_unbind_requests() == []
+            assert _stream(client, "account")["state"] == "service"
+            assert client.call("delivery.status")["paused"] == []
+            _holds(lambda: len(mocks["account"].delivery_attempts()) == 1, 1.5,
+                   "no stream restarted by the refused unbind")
 
             # Criterion 15: the Credentials view's Where part draws each state, says
             # "not delivering" where the server says so, and offers no action where the
@@ -1014,6 +1022,90 @@ def test_stop_answering_from_here_through_the_view():
         row = _view_row(client)
         assert row["error"] == ("mock bound this machine again after the stop; it stays "
                                 "stopped here. Try again."), row
+        # Bound here and yet stopped (the uncertain stop): the row offers Answer from
+        # here, which undoes the pause, beside Stop answering from here.
+        client.navigate("credentials")
+        client.wait_until(
+            lambda: (lambda r: r and r["kind"] == "this_machine" and r["paused"])(
+                _view_row(client)), timeout=20, what="this machine bound and paused")
+        row = _view_row(client)
+        assert [(a["id"], a["label"], a["enabled"]) for a in row["actions"]] == [
+            ("use", "Answer from here", True),
+            ("unbind", "Stop answering from here", True)], row
+        client.press_source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
+                          what="the stream back after Answer from here")
+        client.navigate("credentials")
+        client.wait_until(
+            lambda: (lambda r: r and r["kind"] == "this_machine" and not r["paused"]
+                     and [a["id"] for a in r["actions"]] == ["unbind"])(_view_row(client)),
+            timeout=20, what="answering here again, with only the stop offered")
+
+
+def test_a_server_added_while_the_app_runs_is_listed_and_actionable(tmp_path):
+    """The sources are the shed config's as it reads now, not as it read at start: a
+    server added while the app runs is listed (IPC and the view) and can be stopped on;
+    removed again, it is gone and an unbind naming it is a bad request."""
+    cfg = tmp_path / "config.yaml"
+    base = CONFIG.read_text()
+    cfg.write_text(base)
+    with _source_app(source={}, shed_config_path=cfg) as (client, mock, _i):
+        hosts = lambda: [r["server"] for r in client.sources_list()["servers"]]
+        assert hosts() == ["mock"]
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock2")
+        assert e.value.code == "bad_request", e.value
+        cfg.write_text(base.replace(
+            "default_server: mock",
+            "    mock2:\n        host: 127.0.0.1\n        http_port: 8081\n"
+            "        ssh_port: 2222\ndefault_server: mock"))
+        assert hosts() == ["mock", "mock2"]
+        _open_view(client)
+        client.wait_until(lambda: _view_row(client, "mock2") is not None, timeout=20,
+                          what="the added server's row")
+        done = client.source_unbind("mock2")
+        assert done["server"] == "mock2" and done["unbound"] is True, done
+        assert mock.source_unbind_requests() == [{}]
+        # Gone from the config: gone from the list, and refused again.
+        cfg.write_text(base)
+        assert hosts() == ["mock"]
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock2")
+        assert e.value.code == "bad_request", e.value
+        assert len(mock.source_unbind_requests()) == 1
+
+
+def test_a_config_that_cannot_be_read_keeps_the_rows_it_last_listed(tmp_path):
+    """A shed config the reader refuses is not an empty one: the servers it last listed
+    stay (IPC and the view), with a fixed line saying the config cannot be read, and an
+    action is refused `config_unreadable` with nothing sent. Read again, all is as it
+    was."""
+    cfg = tmp_path / "config.yaml"
+    base = CONFIG.read_text()
+    cfg.write_text(base)
+    with _source_app(source={}, shed_config_path=cfg) as (client, mock, _i):
+        assert [r["server"] for r in client.sources_list()["servers"]] == ["mock"]
+        cfg.write_text(base + "servers:\n")  # a second `servers:` key: refused whole
+        listed = client.sources_list()
+        assert listed["config_error"] == "unreadable", listed
+        assert [r["server"] for r in listed["servers"]] == ["mock"], "never dropped"
+        for call in (client.source_unbind, client.source_use):
+            with pytest.raises(ShedError) as e:
+                call("mock")
+            assert e.value.code == "config_unreadable", e.value
+        assert mock.source_unbind_requests() == [] and mock.source_use_requests() == []
+        _open_view(client)
+        client.wait_until(lambda: (_where(client).get("config_error") or "").startswith(
+            "Your shed config cannot be read"), timeout=20, what="the config line")
+        assert _view_row(client, "mock") is not None
+        # Negative control: read fine again, no line and no refusal.
+        cfg.write_text(base)
+        assert client.sources_list()["config_error"] is None
+        client.navigate("credentials")
+        client.wait_until(lambda: _where(client).get("config_error") is None, timeout=20,
+                          what="the config line gone")
+        client.source_unbind("mock")
+        assert mock.source_unbind_requests() == [{}]
 
 
 def test_a_server_unreachable_from_the_start_has_a_row_and_a_tick(tmp_path):

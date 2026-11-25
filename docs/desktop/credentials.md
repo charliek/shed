@@ -17,15 +17,15 @@ One row per configured server, saying who answers there for you:
 
 | Row says | Meaning | Action |
 |---|---|---|
-| This machine | This machine is your source; the row shows the stream's state | **Stop answering from here** |
+| This machine | This machine is your source; the row shows the stream's state | **Stop answering from here** (and **Answer from here** when this machine stopped answering there but the server still names it: a stop whose outcome was uncertain) |
 | Another machine, by name | A different machine of yours is bound | **Answer from here** |
 | The account service | The account service answers; with its URL, and "not delivering to this server" when the server says so | none |
 | Nobody | No source is bound there | **Answer from here** |
-| Cannot be reached | The server did not answer, or its answer could not be read | none until it answers |
+| Cannot be reached | The server did not answer, or its answer could not be read: the row keeps what was last known, or says nothing is known yet | none until it answers |
 
-Each row also says whether this machine is **paused** there.
+Each row also says whether this machine is **paused** there, whoever answers there now. A row offers no action while its server cannot be reached, whatever it last showed: the server could not take the action. The rows are the servers your shed config lists now, read again each time the view is shown: a server you add while the app runs appears, and its actions work. If the config cannot be read, the view keeps the servers it last listed and says so, and both actions are refused until it reads again: an action is never sent to a server the config may no longer name, or at an endpoint it may have changed.
 
-**Answer from here** is the pin `shed source use` makes. **Stop answering from here** is `shed source unbind` plus a pause that sticks: the server binds the first of your machines to connect, so an unbind alone would be undone within seconds by this app's own stream. The app keeps the servers it is paused on in `paused-servers.json` beside `machine.json` (mode `0600`), stops that server's stream first, then unbinds. A stop therefore survives restarts, and only **Answer from here** (or removing the server from your config) lifts it. If the file cannot be read, every server is treated as paused and the view says so. A server that answers for you through the account service has no action: its answer is not this machine's to give or withhold.
+**Answer from here** is the pin `shed source use` makes. **Stop answering from here** is `shed source unbind` plus a pause that sticks: the server binds the first of your machines to connect, so an unbind alone would be undone within seconds by this app's own stream. The app keeps the servers it is paused on in `paused-servers.json` beside `machine.json` (mode `0600`), stops that server's stream first, then unbinds. A stop therefore survives restarts, and only **Answer from here** (or removing the server from your config) lifts it. If the file cannot be read, every server is treated as paused and the view says so. If a change to it cannot be saved, the view says that instead: the list in use still holds, so this machine keeps answering wherever it has not stopped, but the change may not survive a restart. A server that answers for you through the account service has no action: its answer is not this machine's to give or withhold.
 
 ### What
 

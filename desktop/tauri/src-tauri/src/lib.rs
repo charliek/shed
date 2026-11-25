@@ -881,6 +881,14 @@ fn coded_refusal((code, message): (String, String)) -> serde_json::Value {
     serde_json::json!({ "code": code, "message": message })
 }
 
+/// How the source doors resolve the servers ([`source::Resolver`]).
+fn resolver(app: &tauri::AppHandle, backend: &Arc<Backend>) -> source::Resolver {
+    let current = app
+        .try_state::<Arc<source::CurrentServers>>()
+        .map(|s| s.inner().clone());
+    source::Resolver::new(current, backend.clone())
+}
+
 /// "Answer from here": make this machine the source on `host` (and reopen its delivery
 /// stream there). The error is `{code, message}` ([`coded_refusal`]). Mirrors the
 /// `source.use` IPC op (see [`source::use_this_machine`]).
@@ -891,7 +899,7 @@ async fn source_use(
     host: String,
 ) -> Result<serde_json::Value, serde_json::Value> {
     let rt = delivery_runtime(&app).ok();
-    source::use_this_machine(&backend, rt.as_deref(), &host)
+    source::use_this_machine(&resolver(&app, &backend), rt.as_deref(), &host)
         .await
         .map_err(coded_refusal)
 }
@@ -905,7 +913,8 @@ async fn sources_list(
     backend: tauri::State<'_, Arc<Backend>>,
 ) -> Result<serde_json::Value, String> {
     let rt = delivery_runtime(&app).ok();
-    Ok(source::list(&backend, rt.as_deref()).await)
+    let servers = resolver(&app, &backend).now().await;
+    Ok(source::list(&servers, rt.as_deref()).await)
 }
 
 /// "Stop answering from here": clear this user's credential source on `host`. The error
@@ -918,7 +927,7 @@ async fn source_unbind(
     host: String,
 ) -> Result<serde_json::Value, serde_json::Value> {
     let rt = delivery_runtime(&app).ok();
-    source::unbind(&backend, rt.as_deref(), &host)
+    source::unbind(&resolver(&app, &backend), rt.as_deref(), &host)
         .await
         .map_err(coded_refusal)
 }
@@ -1336,6 +1345,38 @@ pub fn run() {
             ));
             app.manage(backend.clone());
             app.manage(auth_modes.clone());
+            // The servers the source doors read: the config as it reads at each call,
+            // each server's client kept while its whole entry is unchanged
+            // (`source::CurrentServers`).
+            {
+                let build: source::BuildClients = {
+                    let (env, minter, modes) = (env.clone(), minter.clone(), auth_modes.clone());
+                    Arc::new(move |config: &shed_core::config::ShedConfig| {
+                        let mock = if env.test_mode {
+                            env.mock_base_url.as_deref()
+                        } else {
+                            None
+                        };
+                        if env.test_mode && mock.is_none() {
+                            return Backend::from_config(&Default::default(), None);
+                        }
+                        modes.seed_from_config(config);
+                        Backend::from_config_with_credentials(
+                            config,
+                            mock,
+                            Some(&minter),
+                            Some(&modes),
+                            &env.mock_unreachable_hosts,
+                        )
+                    })
+                };
+                app.manage(Arc::new(source::CurrentServers::new(
+                    env.config_path.clone(),
+                    build,
+                    &backend,
+                    &shed_core::config::ShedConfig::load(&env.config_path.to_string_lossy()),
+                )));
+            }
 
             // Shed hosts and agent lanes (plan 038): one runtime owns both,
             // the spawn gate, and the orderly shutdown. Sheds are probed as

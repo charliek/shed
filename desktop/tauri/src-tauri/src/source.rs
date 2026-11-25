@@ -5,9 +5,12 @@
 //! `source.use` / `source.unbind` IPC ops and the app's commands of the same names
 //! (`sources_list`, `source_use`, `source_unbind`), so the two doors cannot disagree.
 //!
-//! The calls go out on the Backend's ordinary control-scope client per server (the
-//! credential the app uses for shed lifecycle calls), never the source's
-//! credentials-scope certificate. The id a move sends is THIS machine's: the identity
+//! The servers are the shed config's as it reads NOW ([`CurrentServers`]), as the source
+//! runtime reloads them: a server added while the app runs is listed and can be acted
+//! on, and a changed endpoint is asked at its new address. The calls go out on an
+//! ordinary control-scope client per server (the credential the app uses for shed
+//! lifecycle calls; the startup Backend's where it has one for that server at that
+//! endpoint), never the source's credentials-scope certificate. The id a move sends is THIS machine's: the identity
 //! the source runtime ([`DeliveryRuntime`]) loaded at start from `shed-source`
 //! (`<state>/broker/machine.json`), or, before it started, the one that file holds.
 //!
@@ -17,11 +20,189 @@
 
 use serde_json::{json, Value};
 
-use shed_app::{source_error_class, Backend, HostSource};
-use shed_core::http::{SourceError, SOURCE_MACHINE_NOT_FOUND};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use shed_app::{source_error_class, source_error_words, Backend, HostSource};
+use shed_core::config::{ShedConfig, ShedServerEntry};
+use shed_core::http::{Client, SourceError, SOURCE_MACHINE_NOT_FOUND};
 use shed_core::models::{display_source_text, SOURCE_IS_SERVICE, SOURCE_TEXT_MAX_BYTES};
 use shed_desktop_core::delivery::source::machine::{self, MachineIdentity};
 use shed_desktop_core::delivery::DeliveryRuntime;
+
+/// Makes the app's control-scope clients for a parsed shed config, as the startup
+/// Backend was made (test mode, the minter and the auth modes captured).
+pub type BuildClients = Arc<dyn Fn(&ShedConfig) -> Backend + Send + Sync>;
+
+/// The shed config's servers as they read now, each with a control-scope client, managed
+/// as app state so every door into the sources reads the same servers. A client is
+/// kept, with its credentials in hand, only while the server's WHOLE entry is unchanged
+/// (endpoint, ports, TLS pin, auth mode, certificate, user, identity file); any change
+/// makes a new one. When the config cannot be read, the servers last read stay, marked.
+pub struct CurrentServers {
+    config_path: PathBuf,
+    build: BuildClients,
+    known: std::sync::Mutex<Vec<(ShedServerEntry, Client)>>,
+}
+
+/// The servers as last resolved, and whether the config could be read this time
+/// (`config_unreadable`: these are the servers it last listed).
+#[derive(Clone)]
+pub struct Servers {
+    pub clients: Vec<(String, Client)>,
+    pub config_unreadable: bool,
+}
+
+/// The shed config at `path`: a missing file is no servers, one that cannot be read
+/// (or that the reader refuses whole) is `None` — the source runtime's own rule
+/// (`shed_source::discovery::load_servers`).
+fn read_config(path: &Path) -> Option<ShedConfig> {
+    if path.as_os_str().is_empty() {
+        return Some(ShedConfig::default());
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(ShedConfig::parse(&text)).filter(|c| c.refused.is_none()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(ShedConfig::default()),
+        Err(_) => None,
+    }
+}
+
+impl CurrentServers {
+    /// Seeded with the startup Backend's clients and the config they were made from.
+    pub fn new(
+        config_path: PathBuf,
+        build: BuildClients,
+        startup: &Backend,
+        startup_config: &ShedConfig,
+    ) -> CurrentServers {
+        let known = startup
+            .host_clients()
+            .into_iter()
+            .filter_map(|(name, c)| {
+                startup_config
+                    .servers
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| (e.clone(), c))
+            })
+            .collect();
+        CurrentServers {
+            config_path,
+            build,
+            known: std::sync::Mutex::new(known),
+        }
+    }
+
+    /// Reads the config now (blocking file I/O).
+    pub fn read(&self) -> Servers {
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(config) = read_config(&self.config_path) else {
+            return Servers {
+                clients: known
+                    .iter()
+                    .map(|(e, c)| (e.name.clone(), c.clone()))
+                    .collect(),
+                config_unreadable: true,
+            };
+        };
+        let mut next = Vec::new();
+        for (name, fresh) in (self.build)(&config).host_clients() {
+            let Some(entry) = config.servers.iter().find(|e| e.name == name) else {
+                continue;
+            };
+            let client = known
+                .iter()
+                .find(|(e, _)| e == entry)
+                .map(|(_, c)| c.clone())
+                .unwrap_or(fresh);
+            next.push((entry.clone(), client));
+        }
+        *known = next;
+        Servers {
+            clients: known
+                .iter()
+                .map(|(e, c)| (e.name.clone(), c.clone()))
+                .collect(),
+            config_unreadable: false,
+        }
+    }
+}
+
+/// How the source doors resolve the servers: from [`CurrentServers`], or, before setup
+/// finished, the startup Backend's.
+#[derive(Clone)]
+pub struct Resolver {
+    current: Option<Arc<CurrentServers>>,
+    startup: Arc<Backend>,
+}
+
+impl Resolver {
+    pub fn new(current: Option<Arc<CurrentServers>>, startup: Arc<Backend>) -> Resolver {
+        Resolver { current, startup }
+    }
+
+    /// The servers the shed config lists now.
+    pub async fn now(&self) -> Servers {
+        let fallback = || Servers {
+            clients: self.startup.host_clients(),
+            config_unreadable: false,
+        };
+        match &self.current {
+            None => fallback(),
+            Some(c) => {
+                let c = c.clone();
+                tokio::task::spawn_blocking(move || c.read())
+                    .await
+                    .unwrap_or_else(|_| fallback())
+            }
+        }
+    }
+
+    /// `host`'s client among the servers listed now: refused `config_unreadable` while
+    /// the config cannot be read (the safer choice: an action is never sent to a server
+    /// the config may no longer name, or at an endpoint it may have changed), and
+    /// `bad_request` for a server it does not list.
+    async fn client(&self, host: &str) -> Result<Client, (String, String)> {
+        let servers = self.now().await;
+        if servers.config_unreadable {
+            return Err(err(
+                "config_unreadable",
+                "the shed config cannot be read; fix it, then try again",
+            ));
+        }
+        client_of(&servers.clients, host)
+            .cloned()
+            .ok_or_else(|| err("bad_request", format!("unknown server: {host:?}")))
+    }
+}
+
+fn client_of<'a>(servers: &'a [(String, Client)], host: &str) -> Option<&'a Client> {
+    servers.iter().find(|(n, _)| n == host).map(|(_, c)| c)
+}
+
+/// Each server's row (`GET /api/sources` on each, concurrently, in the servers' order),
+/// as seen from the machine whose id is `me`.
+async fn rows_of(servers: &[(String, Client)], me: Option<&str>) -> Vec<HostSource> {
+    let tasks: Vec<_> = servers
+        .iter()
+        .map(|(_, c)| {
+            let c = c.clone();
+            tokio::spawn(async move { c.source_status().await })
+        })
+        .collect();
+    let mut rows = Vec::with_capacity(tasks.len());
+    for ((host, _), t) in servers.iter().zip(tasks) {
+        rows.push(match t.await {
+            Ok(Ok(doc)) => HostSource::from_document(host.clone(), &doc, me),
+            Ok(Err(e)) => HostSource::from_error(host.clone(), &e),
+            Err(_) => HostSource::from_error(
+                host.clone(),
+                &SourceError::Shed(shed_core::http::ShedError::Transport("task".into())),
+            ),
+        });
+    }
+    rows
+}
 
 fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
@@ -46,16 +227,15 @@ async fn this_machine(rt: Option<&DeliveryRuntime>) -> Result<MachineIdentity, S
 /// that could not be reached or read is `unreachable` (unknown, not unsupported).
 /// `this_machine` is `{id, name}` or null, with `this_machine_error` saying why it is
 /// null.
-pub async fn status(backend: &Backend, rt: Option<&DeliveryRuntime>) -> Value {
+pub async fn status(servers: &Servers, rt: Option<&DeliveryRuntime>) -> Value {
     let me = this_machine(rt).await;
-    let rows = backend
-        .source_status(me.as_ref().ok().map(|m| m.id.as_str()))
-        .await;
+    let rows = rows_of(&servers.clients, me.as_ref().ok().map(|m| m.id.as_str())).await;
     let (this_machine, this_machine_error) = identity_json(&me);
     json!({
         "rows": rows,
         "this_machine": this_machine,
         "this_machine_error": this_machine_error,
+        "config_error": servers.config_unreadable.then_some("unreadable"),
     })
 }
 
@@ -102,22 +282,8 @@ fn list_row(row: &HostSource, stream: Option<Value>, paused: bool) -> Value {
         "busy": row.busy,
         "unreachable": row.unreachable,
         "error": row.error_class,
-        "error_message": row.error_class.map(list_error_message),
+        "error_message": row.error_class.map(source_error_words),
     })
-}
-
-/// The fixed words for a row's error class ([`shed_app::SOURCE_ERROR_CLASSES`]): never
-/// the server's.
-fn list_error_message(class: &str) -> &'static str {
-    match class {
-        "unreachable" => "the server could not be reached, or its answer could not be read",
-        "busy" => "the server is busy; it is asked again later",
-        "unauthorized" => "the server refused this app's credentials",
-        "forbidden" => "the server does not let this client see its credential source",
-        "source_is_service" => "the account service answers for you on this server",
-        "refused" => "the server refused to say who answers",
-        _ => "the server could not be asked who answers",
-    }
 }
 
 /// `sources.list` → `{servers, this_machine, this_machine_error, paused_error}`: one row
@@ -127,15 +293,15 @@ fn list_error_message(class: &str) -> &'static str {
 /// from [`shed_app::SOURCE_ERROR_CLASSES`] and `error_message` its fixed words, never the
 /// server's) — this machine's `{id, name}` (or why there is none), and `paused_error`,
 /// what is wrong with the paused set ([`shed_desktop_core::delivery::source::paused::PausedError`],
-/// e.g. `unparseable`: every server is then paused), or null. Every name, id and URL
-/// came from the server and is cleaned for display.
-pub async fn list(backend: &Backend, rt: Option<&DeliveryRuntime>) -> Value {
+/// e.g. `unparseable`: every server is then paused), or null; and `config_error`,
+/// `unreadable` while the shed config cannot be read (the rows are then the servers it
+/// last listed), or null. Every name, id and URL came from the server and is cleaned for
+/// display.
+pub async fn list(servers: &Servers, rt: Option<&DeliveryRuntime>) -> Value {
     let me = this_machine(rt).await;
-    let rows = backend
-        .source_status(me.as_ref().ok().map(|m| m.id.as_str()))
-        .await;
+    let rows = rows_of(&servers.clients, me.as_ref().ok().map(|m| m.id.as_str())).await;
     let streams = rt.map(|rt| rt.streams()).unwrap_or_default();
-    let servers: Vec<Value> = rows
+    let listed: Vec<Value> = rows
         .iter()
         .map(|row| {
             let stream = streams
@@ -147,10 +313,11 @@ pub async fn list(backend: &Backend, rt: Option<&DeliveryRuntime>) -> Value {
         .collect();
     let (this_machine, this_machine_error) = identity_json(&me);
     json!({
-        "servers": servers,
+        "servers": listed,
         "this_machine": this_machine,
         "this_machine_error": this_machine_error,
         "paused_error": rt.and_then(|rt| rt.paused_error()),
+        "config_error": servers.config_unreadable.then_some("unreadable"),
     })
 }
 
@@ -187,17 +354,23 @@ fn identity_json(me: &Result<MachineIdentity, String>) -> (Value, Value) {
 /// that cannot be read, a server error) it stays, since the unbind may have happened.
 /// One request, never retried; refusals in fixed words ([`refusal`]).
 pub async fn unbind(
-    backend: &Backend,
+    servers: &Resolver,
     rt: Option<&DeliveryRuntime>,
     host: &str,
 ) -> Result<Value, (String, String)> {
-    if !backend.host_names().iter().any(|h| h == host) {
-        return Err(err("bad_request", format!("unknown server: {host:?}")));
-    }
+    servers.client(host).await?;
     // One move or unbind per server at a time: a second waits for the first, so its
-    // stream wait and its rollback are its own.
+    // stream wait and its rollback are its own. The server is resolved again once the
+    // lock is held: one removed (or changed) while this waited is not acted on.
     let lock = server_lock(host);
     let _held = lock.lock().await;
+    let client = &servers.client(host).await?;
+    // Where the account service answers there is no machine to stop: refused before
+    // anything changes (no pause, so no stream is stopped and started again), and no
+    // unbind is sent.
+    if answers_by_service(&client.source_status().await) {
+        return Err(service_refusal(host));
+    }
     let was_paused = rt.is_some_and(|rt| rt.is_paused(host));
     if let Some(rt) = rt {
         rt.pause(host).map_err(|_| {
@@ -216,7 +389,7 @@ pub async fn unbind(
             ));
         }
     }
-    let done = match backend.source_unbind(host).await {
+    let done = match client.source_unbind().await {
         Ok(done) => done,
         Err(e) => {
             if let (Some(rt), false, true) = (rt, was_paused, refusal_changed_nothing(&e)) {
@@ -230,10 +403,10 @@ pub async fn unbind(
     // after it and bind this machine again. Look once; if so, unbind once more; if it
     // is still bound then, say so (the pause stays).
     let verified = match me.as_ref() {
-        Some(m) => match still_bound(backend, host, &m.id).await {
+        Some(m) => match still_bound(client, &m.id).await {
             Some(true) => {
-                let _ = backend.source_unbind(host).await;
-                match still_bound(backend, host, &m.id).await {
+                let _ = client.source_unbind().await;
+                match still_bound(client, &m.id).await {
                     Some(true) => {
                         return Err(err(
                             "rebound",
@@ -269,13 +442,20 @@ pub async fn unbind(
     }))
 }
 
+/// Whether a read of a server's sources says the account service answers there: its
+/// document names the service, or the route refuses `SOURCE_IS_SERVICE`. Anything else
+/// (a machine, nobody, a read that failed) is not.
+fn answers_by_service(read: &Result<shed_core::models::SourceDocument, SourceError>) -> bool {
+    match read {
+        Ok(doc) => doc.service().is_some(),
+        Err(SourceError::Api { code, .. }) => code == SOURCE_IS_SERVICE,
+        Err(_) => false,
+    }
+}
+
 /// Whether `host`'s sources document binds the machine `id` (one `GET /api/sources`);
 /// `None` when it could not be read.
-async fn still_bound(backend: &Backend, host: &str, id: &str) -> Option<bool> {
-    let (_, client) = backend
-        .host_clients()
-        .into_iter()
-        .find(|(n, _)| n == host)?;
+async fn still_bound(client: &Client, id: &str) -> Option<bool> {
     client
         .source_status()
         .await
@@ -387,15 +567,25 @@ fn refusal(host: &str, e: &SourceError, what: &str) -> (String, String) {
 /// One request, never retried: a refusal is reported in fixed words ([`refusal`]). An unknown `host` is `bad_request`; no identity is
 /// `machine_identity_unavailable`, with the reason, and nothing is sent.
 pub async fn use_this_machine(
-    backend: &Backend,
+    servers: &Resolver,
     rt: Option<&DeliveryRuntime>,
     host: &str,
 ) -> Result<Value, (String, String)> {
-    if !backend.host_names().iter().any(|h| h == host) {
-        return Err(err("bad_request", format!("unknown server: {host:?}")));
-    }
+    servers.client(host).await?;
     let lock = server_lock(host);
     let _held = lock.lock().await;
+    // Resolved again under the lock (a server removed while this waited is refused),
+    // and the runtime reconciled with the same config before its stream is resumed, so
+    // the resumed stream and the move go to the same, current endpoint.
+    let client = servers.client(host).await?;
+    if let Some(rt) = rt {
+        rt.rescan_now().map_err(|_| {
+            err(
+                "config_unreadable",
+                "the shed config cannot be read; fix it, then try again",
+            )
+        })?;
+    }
     let me = this_machine(rt).await.map_err(|why| {
         err(
             "machine_identity_unavailable",
@@ -418,10 +608,11 @@ pub async fn use_this_machine(
             rt.wait_first_attempt(host, RESUME_FIRST_ATTEMPT).await;
         }
     }
-    let row = backend
-        .source_use(host, &me.id)
+    let doc = client
+        .source_use(&me.id)
         .await
         .map_err(|e| refusal(host, &e, "move"))?;
+    let row = HostSource::from_document(host.to_string(), &doc, Some(&me.id));
     let woke_source = rt.is_some_and(|rt| rt.retry_now(host));
     Ok(json!({ "row": row, "woke_source": woke_source }))
 }
@@ -452,6 +643,146 @@ mod tests {
         format!(
             r#"{{"user":"ada","binding":{binding},"machines":[{{"id":"{ME}","name":"box","connected":true}},{{"id":"{DESK}","name":"desk","connected":false}}]}}"#
         )
+    }
+
+    /// Builds clients for a config the way the app does in test mode, each server at
+    /// `http://127.0.0.1:<port>`, a new port per build: a kept client keeps its port.
+    fn counting_build() -> BuildClients {
+        let n = Arc::new(std::sync::atomic::AtomicU16::new(9000));
+        Arc::new(move |config: &ShedConfig| {
+            let port = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Backend::from_config(config, Some(&format!("http://127.0.0.1:{port}")))
+        })
+    }
+
+    fn write_config(path: &Path, servers: &[(&str, &str)]) {
+        let mut text = String::from("servers:\n");
+        for (name, extra) in servers {
+            text.push_str(&format!(
+                "    {name}:\n        host: {name}.example.test\n{extra}"
+            ));
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn urls(s: &Servers) -> Vec<(String, String)> {
+        s.clients
+            .iter()
+            .map(|(n, c)| (n.clone(), c.base_url().to_string()))
+            .collect()
+    }
+
+    /// Finding 1: a client is kept only while the server's whole entry is unchanged; a
+    /// changed TLS pin (same URL), user or identity file makes a new one. A server added
+    /// is there, one removed is gone.
+    #[test]
+    fn a_client_is_kept_only_while_its_whole_entry_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        write_config(&cfg, &[("a", ""), ("gone", "")]);
+        let build = counting_build();
+        let startup_config = ShedConfig::load(&cfg.to_string_lossy());
+        let startup = build(&startup_config); // port 9000
+        let cs = CurrentServers::new(cfg.clone(), build, &startup, &startup_config);
+        write_config(&cfg, &[("a", ""), ("b", "")]);
+        let now = cs.read(); // built on 9001
+        assert!(!now.config_unreadable);
+        assert_eq!(
+            urls(&now),
+            [
+                ("a".into(), "http://127.0.0.1:9000".into()),
+                ("b".into(), "http://127.0.0.1:9001".into())
+            ],
+            "a unchanged keeps the startup client; b added has its own"
+        );
+        for extra in [
+            "        tls_cert_fingerprint: sha256:00\n",
+            "        user: other\n",
+            "        identity_file: ~/.ssh/other\n",
+            "        auth_mode: mtls\n",
+        ] {
+            let before = urls(&cs.read())[0].1.clone();
+            write_config(&cfg, &[("a", extra), ("b", "")]);
+            let after = urls(&cs.read())[0].1.clone();
+            assert_ne!(before, after, "a changed ({extra:?}) gets a new client");
+            // Negative control: read again unchanged, the same client.
+            assert_eq!(urls(&cs.read())[0].1, after);
+        }
+    }
+
+    /// Finding 3: a config that cannot be read is not an empty one: the servers last
+    /// read stay, marked, and an action is refused `config_unreadable`; an empty config
+    /// read fine lists nothing.
+    #[tokio::test]
+    async fn an_unreadable_config_keeps_the_last_servers_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        write_config(&cfg, &[("a", "")]);
+        let build = counting_build();
+        let startup_config = ShedConfig::load(&cfg.to_string_lossy());
+        let startup = Arc::new(build(&startup_config));
+        let cs = Arc::new(CurrentServers::new(
+            cfg.clone(),
+            build,
+            &startup,
+            &startup_config,
+        ));
+        let r = Resolver::new(Some(cs), startup);
+        // A second `servers:` key: the reader refuses the whole file.
+        std::fs::write(&cfg, "servers:\n    b:\n        host: b\nservers:\n").unwrap();
+        let now = r.now().await;
+        assert!(now.config_unreadable);
+        assert_eq!(urls(&now)[0].0, "a", "the last servers, never dropped");
+        let e = use_this_machine(&r, None, "a").await.unwrap_err();
+        assert_eq!(e.0, "config_unreadable");
+        let e = unbind(&r, None, "a").await.unwrap_err();
+        assert_eq!(e.0, "config_unreadable");
+        let shown = list(&now, None).await;
+        assert_eq!(shown["config_error"], "unreadable");
+        // Negative control: an empty config read fine is no servers, and no error.
+        std::fs::write(&cfg, "servers:\n").unwrap();
+        let now = r.now().await;
+        assert!(!now.config_unreadable && now.clients.is_empty());
+        assert_eq!(list(&now, None).await["config_error"], Value::Null);
+    }
+
+    /// Finding 4: a move or an unbind waiting for the server's lock resolves the server
+    /// again once it holds it: one removed meanwhile is refused `bad_request`.
+    #[tokio::test]
+    async fn a_server_removed_while_an_action_waits_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        write_config(&cfg, &[("lockwait", "")]);
+        let build = counting_build();
+        let startup_config = ShedConfig::load(&cfg.to_string_lossy());
+        let startup = Arc::new(build(&startup_config));
+        let cs = Arc::new(CurrentServers::new(
+            cfg.clone(),
+            build,
+            &startup,
+            &startup_config,
+        ));
+        let r = Resolver::new(Some(cs), startup);
+        for unbinding in [false, true] {
+            write_config(&cfg, &[("lockwait", "")]);
+            let lock = server_lock("lockwait");
+            let held = lock.lock().await;
+            let r2 = r.clone();
+            let waiting = tokio::spawn(async move {
+                if unbinding {
+                    unbind(&r2, None, "lockwait").await
+                } else {
+                    use_this_machine(&r2, None, "lockwait").await
+                }
+            });
+            // It is past its first check and waiting for the lock.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!waiting.is_finished());
+            write_config(&cfg, &[("other", "")]);
+            drop(held);
+            let e = waiting.await.unwrap().unwrap_err();
+            assert_eq!(e.0, "bad_request", "unbinding={unbinding}");
+        }
     }
 
     /// Each "Where" state of the Credentials view, from the server's document (the
@@ -615,6 +946,25 @@ mod tests {
         );
     }
 
+    /// An unbind where the account service answers is refused before any pause: from
+    /// the service's document (the shared fixtures) or its `SOURCE_IS_SERVICE` refusal;
+    /// a machine's document, nobody, or a failed read is not the service.
+    #[test]
+    fn the_service_is_told_from_the_sources_read() {
+        let doc = |t: &str| Ok(serde_json::from_str::<SourceDocument>(t).unwrap());
+        for t in [
+            include_str!("../../../../crates/fixtures/sources/service.json"),
+            include_str!("../../../../crates/fixtures/sources/service-not-delivering.json"),
+        ] {
+            assert!(answers_by_service(&doc(t)));
+        }
+        assert!(answers_by_service(&Err(api(409, SOURCE_IS_SERVICE, "x"))));
+        assert!(!answers_by_service(&doc(&machine_doc(Some(ME)))));
+        assert!(!answers_by_service(&doc(&machine_doc(None))));
+        assert!(!answers_by_service(&Err(api(403, "FORBIDDEN", "x"))));
+        assert!(!answers_by_service(&Err(SourceError::Unsupported)));
+    }
+
     /// Finding 2: an unbind's pause is taken back only after a refusal the server gives
     /// before it changes anything.
     #[test]
@@ -660,7 +1010,7 @@ mod tests {
         );
         assert!(!shown.to_string().contains("SENTINEL"), "{shown}");
         for class in shed_app::SOURCE_ERROR_CLASSES {
-            assert!(!list_error_message(class).is_empty());
+            assert!(!source_error_words(class).is_empty());
         }
     }
 

@@ -123,7 +123,9 @@ export function whereRowOf(raw: unknown): WhereRow | null {
 }
 
 /** `sources.list` as the source reader's status: the rows, and this machine. */
-export function whereStatusOf(raw: unknown): (SourceStatus & { paused_error: string | null }) | undefined {
+export function whereStatusOf(
+  raw: unknown,
+): (SourceStatus & { paused_error: string | null; config_error: string | null }) | undefined {
   const o = obj(raw);
   if (!o || !Array.isArray(o.servers)) return undefined;
   return {
@@ -131,7 +133,16 @@ export function whereStatusOf(raw: unknown): (SourceStatus & { paused_error: str
     this_machine: machine(o.this_machine),
     this_machine_error: str(o.this_machine_error),
     paused_error: str(o.paused_error),
+    config_error: str(o.config_error),
   };
+}
+
+/** The words for a shed config that could not be read (`config_error`), or null: the
+ *  rows are then the servers it last listed, and nothing is sent until it reads. */
+export function configErrorText(e: string | null): string | null {
+  return e
+    ? "Your shed config cannot be read, so these are the servers it last listed. Fix it; until it reads, Answer from here and Stop answering from here are refused."
+    : null;
 }
 
 /** A move's answer (`source.use`'s `row`, the server's document after the move) as a
@@ -207,11 +218,16 @@ export type WhereView = {
   retrying: boolean;
   /** This machine stopped answering on that server, whoever answers there now. */
   paused: boolean;
-  /** The one action the row offers, or none. */
-  action: { id: "use" | "unbind"; label: string; enabled: boolean } | null;
+  /** The actions the row offers, in order (none, one, or, for a stop whose outcome is
+   *  uncertain, Answer from here before Stop answering from here). */
+  actions: WhereAction[];
   /** Why the row is in error: fixed words. */
   error: string | null;
 };
+
+/** One action of a Where row: "Answer from here" (`use`) or "Stop answering from here"
+ *  (`unbind`). */
+export type WhereAction = { id: "use" | "unbind"; label: string; enabled: boolean };
 
 /** One row as the view draws it. `moving`: a move or a stop of this row is in flight
  *  (the row shows its optimistic result); `canUse`: this machine has an identity and
@@ -255,11 +271,18 @@ export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; re
   if (r.unreachable && kind === "unknown") detail = "Nothing is known of it yet.";
   else if (r.unreachable) detail = detail ? `${detail} · cannot reach the server` : "cannot reach the server";
   else if (r.busy) detail = detail ? `${detail} · the server is busy, retrying` : "the server is busy, retrying";
-  let action: WhereView["action"] = null;
-  if (kind === "this_machine") {
-    action = { id: "unbind", label: o.moving ? "Switching…" : "Stop answering from here", enabled: !o.moving };
-  } else if (kind !== "service" && kind !== "unsupported") {
-    action = { id: "use", label: o.moving ? "Stopping…" : "Answer from here", enabled: !o.moving && o.canUse };
+  // No action where the account service answers, on a server older than sources, or
+  // on one that cannot be reached now (the server could not take it). Where this
+  // machine is bound and yet stopped answering (a stop whose outcome was uncertain),
+  // "Answer from here" undoes the pause, and "Stop answering from here" tries again.
+  const actions: WhereAction[] = [];
+  if (r.unreachable || kind === "service" || kind === "unsupported") {
+    // none
+  } else if (kind === "this_machine") {
+    if (r.paused && !o.moving) actions.push({ id: "use", label: "Answer from here", enabled: o.canUse });
+    actions.push({ id: "unbind", label: o.moving ? "Switching…" : "Stop answering from here", enabled: !o.moving });
+  } else {
+    actions.push({ id: "use", label: o.moving ? "Stopping…" : "Answer from here", enabled: !o.moving && o.canUse });
   }
   return {
     server: r.host,
@@ -272,7 +295,7 @@ export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; re
     unreachable: !!r.unreachable,
     retrying: r.busy,
     paused: !!r.paused,
-    action,
+    actions,
     error: o.refusal ?? r.error,
   };
 }
@@ -301,6 +324,8 @@ export function refusalText(code: string, server: string, what: "use" | "unbind"
       return `This machine's stream to ${server} did not stop in time, so nothing was sent. Try again.`;
     case "bad_request":
       return `${server} is not in your shed config.`;
+    case "config_unreadable":
+      return "Your shed config cannot be read; fix it, then try again.";
     default:
       return `${server} could not confirm the ${act}; check who answers before trying again.`;
   }
@@ -315,9 +340,14 @@ export function refusalCode(e: unknown): string {
 /** The words for what is wrong with the list of servers this machine stopped
  *  answering on (`paused_error`), or null. */
 export function pausedErrorText(e: string | null): string | null {
-  return e
-    ? "The list of servers this machine stopped answering on cannot be read, so it answers on none of them. Answer from here on a server to start again."
-    : null;
+  if (!e) return null;
+  // A change that could not be saved: the list in use still holds, so this machine
+  // keeps answering wherever it has not stopped; the change may not outlive the app.
+  if (e === "write_failed") {
+    return "A change to the list of servers this machine stopped answering on could not be saved. The list in use still holds: this machine answers wherever it has not stopped, but the change may not survive a restart.";
+  }
+  // The file could not be read: every server is paused until a write.
+  return "The list of servers this machine stopped answering on cannot be read, so it answers on none of them. Answer from here on a server to start again.";
 }
 
 /* ---- 2. What: the descriptors ------------------------------------------------- */
@@ -488,12 +518,13 @@ function joinWords(xs: string[]): string {
   return `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
 }
 
-/** A scope in words: `every server · VZ and Cloud sheds · repos example/*`. */
+/** A scope in words, a phrase of its own: `On every server · VZ and Cloud sheds only ·
+ *  repos matching example/*`, `Only on a and b`. */
 export function scopeWords(only: unknown): string {
   const s = scopeOf(only);
-  const parts = [s.every ? "every server" : s.servers.length ? `only on ${joinWords(s.servers)}` : "no server"];
-  if (s.backends.length) parts.push(`${joinWords(s.backends.map((b) => BACKEND_LABEL[b] ?? b))} sheds`);
-  if (s.repos.length) parts.push(`repos ${s.repos.join(", ")}`);
+  const parts = [s.every ? "On every server" : s.servers.length ? `Only on ${joinWords(s.servers)}` : "On no server"];
+  if (s.backends.length) parts.push(`${joinWords(s.backends.map((b) => BACKEND_LABEL[b] ?? b))} sheds only`);
+  if (s.repos.length) parts.push(`repos matching ${joinWords(s.repos)}`);
   return parts.join(" · ");
 }
 

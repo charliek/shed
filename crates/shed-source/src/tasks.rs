@@ -245,6 +245,16 @@ impl SourceTasks {
             .collect()
     }
 
+    /// The target `server`'s stream was started for (its endpoint, pin and identity), or
+    /// `None` when none runs for it.
+    pub fn target_of(&self, server: &str) -> Option<ServerTarget> {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server)
+            .map(|r| r.target.clone())
+    }
+
     /// The servers being served, by name.
     pub fn servers(&self) -> Vec<String> {
         self.running

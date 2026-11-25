@@ -463,7 +463,7 @@ def test_turning_a_provider_off_and_on_writes_delivery_toml(r):
     gh = _provider(c, "github")
     assert gh["state"] == "on" and gh["state_text"] == "On", gh
     assert gh["actions"] == ["edit", "turn_off", "remove"], gh
-    assert gh["title"] == "GitHub" and gh["scope"] == "every server", gh
+    assert gh["title"] == "GitHub" and gh["scope"] == "On every server", gh
     assert gh["lands"].startswith("~/.config/gh/hosts.yml"), gh
     _press(c, "github", "turn_off")
     c.wait_until(lambda: _provider(c, "github").get("enabled") is False, timeout=15,
@@ -498,7 +498,7 @@ def test_the_ssh_key_form_writes_its_fields_and_scope(r):
     _press(c, "ssh-key", "add:only.repos")
     _type(c, "ssh-key", "only.repos", "example/*", 0)
     _save(c, "ssh-key")
-    assert _provider(c, "ssh-key")["scope"] == "every server · VZ sheds · repos example/*"
+    assert _provider(c, "ssh-key")["scope"] == "On every server · VZ sheds only · repos matching example/*"
     ssh = _stored(r)["ssh-key"]
     assert ssh["key_file"] == "~/.ssh/id_work,1" and ssh["sign_commits"] is True, ssh
     assert ssh["only"] == {"backends": ["vz"], "repos": ["example/*"]} and ssh["enabled"] is True
@@ -536,14 +536,14 @@ def test_scope_ticks_write_only_servers_exactly(r):
     _tick(c, "github", "server:mock")
     _save(c, "github")
     assert _stored(r)["github"]["only"] == {"servers": ["mock"]}
-    assert _provider(c, "github")["scope"] == "only on mock"
+    assert _provider(c, "github")["scope"] == "Only on mock"
     # Every server again: no `only` at all.
     _edit(c, "github")
     _press(c, "github", "scope:every")
     c.wait_until(lambda: _values(c).get("scope:every") is True, timeout=10, what="every server")
     _save(c, "github")
     assert "only" not in _stored(r)["github"], _stored(r)["github"]
-    assert _provider(c, "github")["scope"] == "every server"
+    assert _provider(c, "github")["scope"] == "On every server"
     # A server named in the file but not configured keeps its tick, ticked.
     _write(r.settings, _settings(r.home, github_only='only = { servers = ["lab"] }'))
     _fresh(c, lambda w: (_cfg(w, "github").get("only") or {}).get("servers") == ["lab"], "only lab")
@@ -740,12 +740,14 @@ def _fill(c: TauriClient, field: str, value: str) -> None:
 
 def _press_check(c: TauriClient) -> dict:
     """Press the real Check button and wait for what it rendered."""
-    taken = _check(c).get("taken") or 0
+    started = _check(c).get("started") or 0
     c.wait_until(lambda: (_check(c).get("run") or {}).get("enabled"), timeout=15,
                  what="the Check button enabled")
     c.call("ui.press_check", {"button": "run"})
-    c.wait_until(lambda: (_check(c).get("taken") or 0) > taken, timeout=15,
-                 what="the view took the press")
+    # A Check started (not just a press taken): what is read next is its own outcome,
+    # never the one before it.
+    c.wait_until(lambda: (_check(c).get("started") or 0) > started, timeout=15,
+                 what="the press started a Check")
     c.wait_until(lambda: not _check(c).get("busy")
                  and (_check(c).get("items") or _check(c).get("error") or _check(c).get("about")),
                  timeout=30, what="the check rendered")
@@ -866,6 +868,11 @@ def test_check_from_a_server_backend_and_repo(r):
     assert {"ssh-key", "github", "files..npmrc"} <= set(items)
     _no_value(json.dumps(c.credentials_dump()), r.key_lines)
     _shot(c, "check-target.png", "credentials-check")
+    # Switching to "A shed" clears the result: it was about another Check.
+    _fill(c, "by", "shed")
+    c.wait_until(lambda: not _check(c).get("items") and _check(c).get("about") is None
+                 and _check(c).get("error") is None and _check(c).get("details") is False,
+                 timeout=10, what="the result cleared on the switch")
     # No repo: the repo-scoped file is left out.
     pv = _run(c, backend="vz")
     assert pv["about"] == "A new VZ shed on mock with no repo", pv

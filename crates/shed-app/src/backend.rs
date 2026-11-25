@@ -790,10 +790,11 @@ pub struct HostSource {
     /// why; whoever shows the row keeps what it last knew for this host, notes that the
     /// server cannot be reached, and reads again later.
     pub unreachable: bool,
+    /// Why the row is in error: the fixed words of [`Self::error_class`]
+    /// ([`source_error_words`]), never the server's text or a decode error's.
     pub error: Option<String>,
-    /// `error` as a closed classification, for a view that must not show a server's
-    /// words ([`SOURCE_ERROR_CLASSES`]); `None` when there is no error. Not serialized:
-    /// the `source.status` shape is unchanged.
+    /// `error` as a closed classification ([`SOURCE_ERROR_CLASSES`]); `None` when there
+    /// is no error. Not serialized: the `source.status` shape is unchanged.
     #[serde(skip)]
     pub error_class: Option<&'static str>,
 }
@@ -830,6 +831,19 @@ pub fn source_error_class(e: &SourceError) -> Option<&'static str> {
         SourceError::Api { .. } => "refused",
         SourceError::Shed(_) => "failed",
     })
+}
+
+/// The fixed words for a [`source_error_class`]: never a server's.
+pub fn source_error_words(class: &str) -> &'static str {
+    match class {
+        "unreachable" => "the server could not be reached, or its answer could not be read",
+        "busy" => "the server is busy; it is asked again later",
+        "unauthorized" => "the server refused this app's credentials",
+        "forbidden" => "the server does not let this client see its credential source",
+        "source_is_service" => "the account service answers for you on this server",
+        "refused" => "the server refused to say who answers",
+        _ => "the server could not be asked who answers",
+    }
 }
 
 /// A machine as a source row shows it. Both strings came from other machines by way of
@@ -890,14 +904,18 @@ impl HostSource {
     /// server that could not be reached or read is `unreachable` — unknown, not
     /// unsupported.
     pub fn from_error(host: String, e: &SourceError) -> Self {
+        let class = source_error_class(e);
+        // The class's fixed words: the server's message, a decode error's quoted input
+        // and an echoed token never reach the row.
+        let words = || class.map(|c| source_error_words(c).to_string());
         let (supported, error) = match e {
             SourceError::Unsupported => (false, None),
             // Transient: it has sources, and could not say which right now.
             SourceError::Busy { .. } => (true, None),
             // The server answered the route with a refusal: it has sources, and said
             // why this caller cannot see them.
-            SourceError::Api { .. } => (true, Some(e.to_string())),
-            SourceError::Shed(_) => (false, Some(e.to_string())),
+            SourceError::Api { .. } => (true, words()),
+            SourceError::Shed(_) => (false, words()),
         };
         Self {
             host,
@@ -909,7 +927,7 @@ impl HostSource {
             busy: matches!(e, SourceError::Busy { .. }),
             unreachable: is_unreachable(e),
             error,
-            error_class: source_error_class(e),
+            error_class: class,
         }
     }
 }
@@ -1755,11 +1773,10 @@ mod tests {
 
         let r = row("refusing");
         assert!(r.supported);
-        assert!(
-            r.error
-                .as_deref()
-                .unwrap()
-                .contains("service clients may not"),
+        // The refusal's class in fixed words, never the server's message.
+        assert_eq!(
+            r.error.as_deref(),
+            Some("the server does not let this client see its credential source"),
             "{r:?}"
         );
 
@@ -1969,7 +1986,17 @@ mod tests {
             let got = source_error_class(&e);
             assert_eq!(got, want, "{e:?}");
             assert!(got.is_none_or(|c| SOURCE_ERROR_CLASSES.contains(&c)));
-            assert_eq!(HostSource::from_error("h".into(), &e).error_class, want);
+            let row = HostSource::from_error("h".into(), &e);
+            assert_eq!(row.error_class, want);
+            assert_eq!(
+                row.error.as_deref(),
+                match &e {
+                    SourceError::Unsupported | SourceError::Busy { .. } => None,
+                    _ => want.map(source_error_words),
+                }
+            );
+            let shown = serde_json::to_string(&row).unwrap();
+            assert!(!shown.contains("SENTINEL"), "{shown}");
         }
     }
 

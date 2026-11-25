@@ -508,6 +508,15 @@ test("a move's hold asked for during a read rides on the follow-up", async () =>
   assert.equal([...h.timers.values()][0].ms, SOURCE_RETRY_MS);
 });
 
+test("bound here but stopped: Answer from here can be pressed again", () => {
+  let s = moveConfirmed(beginMove(loaded(), "a"), "a", 2, row("a", ME));
+  assert.equal(canUse(s, "a"), false, "answering here: nothing to move");
+  s = applyRead(s, 3, status(row("a", ME, { paused: true }), row("b", DESK))).state;
+  assert.equal(canUse(s, "a"), true, "an uncertain stop is undone by answering again");
+  const moved = beginMove(s, "a");
+  assert.equal(moved.rows.a.paused, false);
+});
+
 test("a move shows this machine answering, with its stream not known yet", () => {
   const s = beginMove(loaded(), "a");
   assert.deepEqual(
