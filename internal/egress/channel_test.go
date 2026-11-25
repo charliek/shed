@@ -36,6 +36,33 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
+// freePortPair returns a port p such that p and p+1 were both free just now: it binds
+// both (trying again on a fresh p until both bind), then releases them, so a test that
+// needs a two-port range [p, p+1] does not assume the neighbour of a free port is free.
+func freePortPair(t *testing.T) int {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		if p >= 65535 {
+			ln.Close()
+			continue
+		}
+		next, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p+1))
+		ln.Close()
+		if err != nil {
+			continue
+		}
+		next.Close()
+		return p
+	}
+	t.Fatal("no two adjacent free ports found")
+	return 0
+}
+
 // serveControl wires a ProxyServer behind a fresh control UDS and returns a
 // connected Client plus a channel that receives every streamed audit record.
 func serveControl(t *testing.T, ps *ProxyServer) (*Client, <-chan AuditRecord) {

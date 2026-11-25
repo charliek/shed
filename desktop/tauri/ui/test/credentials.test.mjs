@@ -14,6 +14,7 @@ import {
   checkRequest,
   checkRuns,
   sameRuns,
+  stopOutcome,
   stopUnverifiedText,
   checkResult,
   configFromDraft,
@@ -173,9 +174,39 @@ test("a pause file that cannot be written is not one that cannot be read", () =>
   }
 });
 
-test("an unconfirmed stop is fixed words", () => {
+test("an unconfirmed stop is fixed words, and says whether the unbind was sent", () => {
   assert.equal(stopUnverifiedText("mock"),
     "mock's answer could not be confirmed, so nothing was sent; this machine stays stopped there. Try again.");
+  assert.equal(stopUnverifiedText("mock", true),
+    "The stop was sent to mock, but its binding could not be read back; this machine stays stopped there. Try again.");
+  // What each answer of `source.unbind` says happened.
+  assert.equal(stopOutcome({ unbound: true, verified: true }), "confirmed");
+  assert.equal(stopOutcome({ unbound: false, verified: true }), "confirmed", "nobody was bound");
+  assert.equal(stopOutcome({ unbound: true, verified: false }), "sent_unconfirmed", "sent, not read back");
+  assert.equal(stopOutcome({ unbound: false, verified: false, unverified: true }), "unsent");
+  assert.equal(stopOutcome({ unbound: false, verified: false, another_machine_answers: true }), "confirmed");
+});
+
+test("the view offers Stop wherever an unconfirmed stop can be tried again", () => {
+  // Every row kind a machine can answer on, paused after an unconfirmed stop.
+  for (const [kind, extra] of [["other_machine", { machine: DESK }], ["nobody", {}], ["unknown", {}],
+    ["this_machine", { machine: ME }]]) {
+    const r = { ...whereRowOf(listRow("x", kind, extra)), paused: true };
+    const ids = whereView(r, { moving: false, canUse: true, refusal: null, stopUnverified: true }).actions.map((a) => a.id);
+    assert.ok(ids.includes("unbind"), kind);
+  }
+  // Not where nothing can be done.
+  for (const [kind, extra] of [["service", { url: "https://x.example.test" }], ["unsupported", {}]]) {
+    const r = whereRowOf(listRow("x", kind, extra));
+    assert.deepEqual(whereView(r, { moving: false, canUse: true, refusal: null, stopUnverified: true }).actions, [], kind);
+  }
+});
+
+test("an unconfirmed stop of another machine's row offers Stop again", () => {
+  const desk = { ...whereRowOf(listRow("d", "other_machine", { machine: DESK })), paused: true };
+  const ids = (o) => whereView(desk, { moving: false, canUse: true, refusal: null, ...o }).actions.map((a) => a.id);
+  assert.deepEqual(ids({ stopUnverified: true }), ["use", "unbind"]);
+  assert.deepEqual(ids({}), ["use"], "a confirmed pause hides it");
 });
 
 test("a move's answer is this machine's row", () => {

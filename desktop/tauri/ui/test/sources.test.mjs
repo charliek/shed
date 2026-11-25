@@ -25,6 +25,7 @@ import {
   restartRetries,
   shownRows,
   stopConfirmed,
+  stopRetryable,
   stopUnverified,
 } from "../dist-test/sources.js";
 
@@ -574,4 +575,51 @@ test("a stop the server could not confirm keeps the binding it showed, paused, a
   assert.equal(applyRead(s, 2, status(row("a", DESK), row("b", DESK))).state.rows.a.this_machine, true);
   // Negative control: a confirmed stop shows nobody.
   assert.equal(stopConfirmed(stopping, "a", 3).rows.a.kind, "nobody");
+});
+
+test("an unconfirmed pause of another machine's row keeps Stop; a confirmed one hides it", () => {
+  const s = loaded(); // desk answers on "a"
+  const stopping = beginStop(s, "a");
+  // Confirmed: this machine paused there, desk kept; nothing more to stop.
+  const confirmed = stopConfirmed(stopping, "a", 2);
+  assert.equal(confirmed.rows.a.paused, true);
+  assert.equal(canStop(confirmed, "a"), false);
+  // Unconfirmed: the same paused row, and Stop stays available until the next attempt.
+  const unverified = stopUnverified(stopping, "a", 2, "note");
+  assert.deepEqual([unverified.rows.a.source, unverified.rows.a.paused], [DESK, true]);
+  assert.equal(canStop(unverified, "a"), true);
+  // A read keeps it so (the row from the server is paused, the stop still unconfirmed).
+  const read = applyRead(unverified, 3, status(row("a", DESK, { paused: true }), row("b", DESK))).state;
+  assert.equal(canStop(read, "a"), true);
+  // The retry clears it; a confirmed answer then hides Stop again.
+  const again = stopConfirmed(beginStop(read, "a"), "a", 4);
+  assert.equal(canStop(again, "a"), false);
+  assert.equal(again.unverified.a, undefined);
+});
+
+test("a failed attempt after an unconfirmed stop keeps Stop available", () => {
+  const s = stopUnverified(beginStop(loaded(), "a"), "a", 2, "note");
+  assert.equal(canStop(s, "a"), true);
+  // A retried stop refused: Stop is still there.
+  const refusedStop = moveFailed(beginStop(s, "a"), "a", "refused");
+  assert.equal(refusedStop.unverified.a, true);
+  assert.equal(canStop(refusedStop, "a"), true);
+  // An Answer from here refused: the same.
+  const refusedMove = moveFailed(beginMove(s, "a"), "a", "refused");
+  assert.equal(refusedMove.unverified.a, true);
+  assert.equal(canStop(refusedMove, "a"), true);
+  // A confirmed move clears it.
+  const moved = moveConfirmed(beginMove(s, "a"), "a", 3, row("a", ME));
+  assert.equal(moved.unverified.a, undefined);
+});
+
+test("stopRetryable: only where a machine can answer and the server can be reached", () => {
+  const s = stopUnverified(beginStop(loaded(), "a"), "a", 2, "note");
+  assert.equal(stopRetryable(s, "a"), true);
+  for (const extra of [{ unreachable: true }, { kind: "service" }, { kind: "unsupported" }]) {
+    const t = { ...s, rows: { ...s.rows, a: { ...s.rows.a, ...extra } } };
+    assert.equal(stopRetryable(t, "a"), false, JSON.stringify(extra));
+    assert.equal(canStop(t, "a"), false, JSON.stringify(extra));
+  }
+  assert.equal(stopRetryable(loaded(), "a"), false, "no unconfirmed stop");
 });

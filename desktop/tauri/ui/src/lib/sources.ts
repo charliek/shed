@@ -99,6 +99,10 @@ export type SourcesState = {
   moving: Record<string, SourceRow>;
   /** A refused move's words, per host, until that host's next attempt. */
   errors: Record<string, string>;
+  /** Hosts whose last stop could not be confirmed (the backend's `unverified`, or an
+   *  unbind sent and not read back): Stop stays available there until a confirmed
+   *  answer (a stop or a move); an attempt that fails leaves it, so Stop stays. */
+  unverified?: Record<string, true>;
   /** Reads in a row that found a server unreachable, since the last show, focus or
    *  reload; past [UNREACHABLE_RETRY_MS]'s length no further read is asked for. */
   unreachableTries: number;
@@ -114,6 +118,7 @@ export const EMPTY_SOURCES: SourcesState = {
   meSeq: 0,
   moving: {},
   errors: {},
+  unverified: {},
   unreachableTries: 0,
 };
 
@@ -248,15 +253,27 @@ export function beginMove(state: SourcesState, host: string): SourcesState | nul
   };
 }
 
-/** Whether `host`'s "Stop answering from here" can be pressed: this machine answers
- *  there, and no move or stop of that row is in flight. */
+/** Whether the last stop on `host` could not be confirmed and can be tried again: the
+ *  server can be reached, and a machine (not the account service) can answer there.
+ *  The one rule behind [canStop] and the view's Stop on such a row. */
+export function stopRetryable(state: SourcesState, host: string): boolean {
+  const row = state.rows[host];
+  return !!state.unverified?.[host] && !!row && !row.unreachable
+    && row.kind !== "service" && row.kind !== "unsupported";
+}
+
+/** Whether `host`'s "Stop answering from here" can be pressed, with no move or stop of
+ *  that row in flight: this machine answers there; another machine does and this one
+ *  has not stopped there; or the last stop there could not be confirmed (try again). */
 export function canStop(state: SourcesState, host: string): boolean {
   const row = state.rows[host];
   if (state.moving[host] || !row) return false;
   // Where another machine answers, this machine can still stop answering there (a pause
   // only: that machine's binding is never cleared), while the server can be reached.
   const other = !row.this_machine && !!row.source && row.kind !== "service";
-  return row.this_machine || (other && !row.paused && !row.unreachable);
+  // A stop that could not be confirmed can be tried again, paused or not.
+  const retry = stopRetryable(state, host);
+  return row.this_machine || retry || (other && !row.paused && !row.unreachable);
 }
 
 /** A "Stop answering from here" press: `null` when it cannot start ([canStop]), else
@@ -287,8 +304,11 @@ export function beginStop(state: SourcesState, host: string): SourcesState | nul
 export function stopConfirmed(state: SourcesState, host: string, seq: number): SourcesState {
   const moving = { ...state.moving };
   delete moving[host];
+  const unverified = { ...(state.unverified ?? {}) };
+  delete unverified[host];
   return {
     ...state,
+    unverified,
     applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
     moving,
   };
@@ -308,6 +328,7 @@ export function stopUnverified(state: SourcesState, host: string, seq: number, n
     applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
     moving,
     errors: { ...state.errors, [host]: note },
+    unverified: { ...(state.unverified ?? {}), [host]: true },
   };
 }
 
@@ -317,8 +338,11 @@ export function stopUnverified(state: SourcesState, host: string, seq: number, n
 export function moveConfirmed(state: SourcesState, host: string, seq: number, row: SourceRow): SourcesState {
   const moving = { ...state.moving };
   delete moving[host];
+  const unverified = { ...(state.unverified ?? {}) };
+  delete unverified[host];
   return {
     ...state,
+    unverified,
     rows: { ...state.rows, [host]: row },
     applied: { ...state.applied, [host]: Math.max(seq, state.applied[host] ?? 0) },
     moving,

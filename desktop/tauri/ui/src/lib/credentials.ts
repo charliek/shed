@@ -234,7 +234,10 @@ export type WhereAction = { id: "use" | "unbind"; label: string; enabled: boolea
  *  is not already the source (`sources.ts`'s rule); `refusal`: the last refused action's
  *  fixed words. Where the account service answers there is no action, and none on a
  *  server older than sources. */
-export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; refusal: string | null }): WhereView {
+export function whereView(
+  r: WhereRow,
+  o: { moving: boolean; canUse: boolean; refusal: string | null; stopUnverified?: boolean },
+): WhereView {
   const kind = whereKind(r);
   const name = r.source ? r.source.name || "an unnamed machine" : null;
   let who: string;
@@ -285,7 +288,10 @@ export function whereView(r: WhereRow, o: { moving: boolean; canUse: boolean; re
     actions.push({ id: "unbind", label: o.moving ? "Switching…" : "Stop answering from here", enabled: !o.moving });
   } else {
     actions.push({ id: "use", label: o.moving ? "Stopping…" : "Answer from here", enabled: !o.moving && o.canUse });
-    if (kind === "other_machine" && !r.paused && !o.moving) {
+    // Where another machine answers and this one has not stopped there; and on any
+    // row whose last stop could not be confirmed (`stopUnverified`, `sources.ts`'s
+    // `stopRetryable`: the same rule as `canStop`), to try again.
+    if (((kind === "other_machine" && !r.paused) || o.stopUnverified) && !o.moving) {
       actions.push({ id: "unbind", label: "Stop answering from here", enabled: true });
     }
   }
@@ -336,10 +342,24 @@ export function refusalText(code: string, server: string, what: "use" | "unbind"
   }
 }
 
-/** The note under a row whose stop could not be confirmed (`source.unbind`'s
- *  `unverified`): fixed words. */
-export function stopUnverifiedText(server: string): string {
-  return `${server}'s answer could not be confirmed, so nothing was sent; this machine stays stopped there. Try again.`;
+/** What a stop's answer (`source.unbind`) says happened: `confirmed` (the binding was
+ *  read back, or another machine answers and only this one paused), `unsent` (the
+ *  binding could not be read, so nothing was sent: `unverified`), or `sent_unconfirmed`
+ *  (the unbind was sent and the binding not read back: `verified: false`). */
+export function stopOutcome(done: unknown): "confirmed" | "unsent" | "sent_unconfirmed" {
+  const o = obj(done) ?? {};
+  if (o.unverified === true) return "unsent";
+  if (o.another_machine_answers === true) return "confirmed";
+  if (o.verified === false) return "sent_unconfirmed";
+  return "confirmed";
+}
+
+/** The note under a row whose stop could not be confirmed: fixed words, saying whether
+ *  the unbind was sent. */
+export function stopUnverifiedText(server: string, sent = false): string {
+  return sent
+    ? `The stop was sent to ${server}, but its binding could not be read back; this machine stays stopped there. Try again.`
+    : `${server}'s answer could not be confirmed, so nothing was sent; this machine stays stopped there. Try again.`;
 }
 
 /** A refusal as the app's command throws it (`{code, message}`), reduced to its code. */

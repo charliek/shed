@@ -32,14 +32,14 @@ import {
 } from "@/lib/bridge";
 import {
   EMPTY_SOURCES, beginMove, beginStop, canUse, createSourceReader, moveConfirmed, moveFailed,
-  shownRows, stopConfirmed, stopUnverified,
+  shownRows, stopConfirmed, stopRetryable, stopUnverified,
   type SourceReader, type SourcesState,
 } from "@/lib/sources";
 import {
   ACTION_LABEL, BACKENDS, BACKEND_LABEL, EMPTY_CHECK, EVERY_SERVER, ONLY_THESE,
   checkErrorText, checkNote, checkRequest, checkResult, checkRuns, sameRuns, choiceOptions, clean, configFromDraft, draftFromConfig, edit,
   configErrorText, entryFields, fieldControl, machineFields, missing, pausedErrorText, readDescriptors, recentRows,
-  redactedConfig, refusalCode, refusalText, stopUnverifiedText, saveEnabled, saveLabel, serverTicks, shedPick, switched,
+  redactedConfig, refusalCode, refusalText, stopOutcome, stopUnverifiedText, saveEnabled, saveLabel, serverTicks, shedPick, switched,
   whatView, whereRowOfMove, whereStatusOf, whereView,
   type CheckForm, type CheckResult, type ProviderDesc, type ProviderDraft, type ProviderSetting,
   type RecentView, type ScopeAt, type ScopeDraft, type WhatAction, type WhereRow,
@@ -153,10 +153,13 @@ export function useCredentialSources(active: boolean, shown: number): Credential
     commit(started);
     void stopAnsweringFromHere(host).then(
       (done) => {
-        // Unconfirmed: the binding it showed, paused, with a note; not "nobody".
-        commit(done?.unverified === true
-          ? stopUnverified(srcRef.current, host, ++seq.current, stopUnverifiedText(host))
-          : stopConfirmed(srcRef.current, host, ++seq.current));
+        // Unconfirmed (nothing sent, or sent and not read back): the binding it
+        // showed, paused, with a note saying which, and Stop available; never "nobody".
+        const outcome = stopOutcome(done);
+        commit(outcome === "confirmed"
+          ? stopConfirmed(srcRef.current, host, ++seq.current)
+          : stopUnverified(srcRef.current, host, ++seq.current,
+            stopUnverifiedText(host, outcome === "sent_unconfirmed")));
         reader.current?.read(host);
       },
       (e: unknown) => {
@@ -893,6 +896,7 @@ function WhereLine({ row, src, onUse, onStop }: {
     moving,
     canUse: canUse(src, row.host),
     refusal: src.errors[row.host] ?? null,
+    stopUnverified: stopRetryable(src, row.host),
   });
   return (
     <div className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5" data-source-row={row.host} data-kind={v.kind}>
