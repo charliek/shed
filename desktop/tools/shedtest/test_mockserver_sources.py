@@ -350,7 +350,9 @@ def test_an_unbind_forgets_the_source_and_the_next_machine_is_bound(armed):
     # Nothing left to clear: a success that changed nothing.
     assert _unbind(mock, {}) == (200, {"user": "mock-user", "unbound": False,
                                        "previous": None, "forgotten_machines": 0})
-    assert _unbind(mock, {"machine_id": DESK})[0] == 400
+    # A compare-and-clear naming a machine, with nothing bound: also a no-op success.
+    assert _unbind(mock, {"machine_id": DESK}) == (200, {"user": "mock-user", "unbound": False,
+                                                         "previous": None, "forgotten_machines": 0})
     # First-connect: the next machine's stream is admitted and bound.
     c, admitted = _stream(mock, LAPTOP, "laptop")
     assert admitted.status == 200
