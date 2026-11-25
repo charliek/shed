@@ -368,9 +368,14 @@ pub async fn unbind(
     // Where the account service answers there is no machine to stop: refused before
     // anything changes (no pause, so no stream is stopped and started again), and no
     // unbind is sent.
-    if answers_by_service(&client.source_status().await) {
+    let read = client.source_status().await;
+    if answers_by_service(&read) {
         return Err(service_refusal(host));
     }
+    // Another machine of this user's answers there: this machine stops answering (the
+    // pause), and that machine's binding is never cleared, so no unbind is sent.
+    let me_now = this_machine(rt).await.ok();
+    let other = other_machine_bound(&read, me_now.as_ref().map(|m| m.id.as_str()));
     let was_paused = rt.is_some_and(|rt| rt.is_paused(host));
     if let Some(rt) = rt {
         rt.pause(host).map_err(|_| {
@@ -389,6 +394,38 @@ pub async fn unbind(
             ));
         }
     }
+    // The first read can be stale: a first-connect bind may have made this machine the
+    // source since. Read again now that this machine's stream has stopped; if it names
+    // this machine, the stop is an ordinary unbind (with its re-check below).
+    let other = match other {
+        None => None,
+        Some(first) => {
+            let again = client.source_status().await;
+            let mine = me_now.as_ref().is_some_and(|m| {
+                again.as_ref().ok().and_then(|d| d.source_machine_id()) == Some(m.id.as_str())
+            });
+            if mine {
+                None
+            } else {
+                Some(
+                    other_machine_bound(&again, me_now.as_ref().map(|m| m.id.as_str()))
+                        .unwrap_or(first),
+                )
+            }
+        }
+    };
+    if let Some(other) = other {
+        return Ok(json!({
+            "server": host,
+            "unbound": false,
+            "previous": other,
+            "previous_was_this_machine": false,
+            "forgotten_machines": 0,
+            "paused": rt.is_some(),
+            "verified": false,
+            "another_machine_answers": true,
+        }));
+    }
     let done = match client.source_unbind().await {
         Ok(done) => done,
         Err(e) => {
@@ -398,7 +435,7 @@ pub async fn unbind(
             return Err(refusal(host, &e, "unbind"));
         }
     };
-    let me = this_machine(rt).await.ok();
+    let me = me_now;
     // A stream attempt the server received before the unbind can still be admitted
     // after it and bind this machine again. Look once; if so, unbind once more; if it
     // is still bound then, say so (the pause stays).
@@ -451,6 +488,25 @@ fn answers_by_service(read: &Result<shed_core::models::SourceDocument, SourceErr
         Err(SourceError::Api { code, .. }) => code == SOURCE_IS_SERVICE,
         Err(_) => false,
     }
+}
+
+/// The machine a read of a server's sources names as this user's source when it is NOT
+/// this one (`me`; with no identity, any bound machine is another), as `{id, name}`
+/// cleaned; `None` when this machine is the source, nobody is, or the read failed.
+fn other_machine_bound(
+    read: &Result<shed_core::models::SourceDocument, SourceError>,
+    me: Option<&str>,
+) -> Option<Value> {
+    let doc = read.as_ref().ok()?;
+    let id = doc.source_machine_id()?;
+    if Some(id) == me {
+        return None;
+    }
+    let name = doc.machine(id).map(|m| m.name.as_str()).unwrap_or("");
+    Some(json!({
+        "id": display_source_text(id, SOURCE_TEXT_MAX_BYTES),
+        "name": display_source_text(name, SOURCE_TEXT_MAX_BYTES),
+    }))
 }
 
 /// Whether `host`'s sources document binds the machine `id` (one `GET /api/sources`);
@@ -963,6 +1019,35 @@ mod tests {
         assert!(!answers_by_service(&doc(&machine_doc(None))));
         assert!(!answers_by_service(&Err(api(403, "FORBIDDEN", "x"))));
         assert!(!answers_by_service(&Err(SourceError::Unsupported)));
+    }
+
+    /// A stop where another machine answers pauses this machine only: the other machine
+    /// is told from the read, and its binding is never cleared.
+    #[test]
+    fn another_machine_bound_is_told_from_the_read() {
+        let doc = |t: &str| Ok(serde_json::from_str::<SourceDocument>(t).unwrap());
+        assert_eq!(
+            other_machine_bound(&doc(&machine_doc(Some(DESK))), Some(ME)),
+            Some(json!({"id": DESK, "name": "desk"}))
+        );
+        assert_eq!(
+            other_machine_bound(&doc(&machine_doc(Some(DESK))), None),
+            Some(json!({"id": DESK, "name": "desk"})),
+            "with no identity, any bound machine is another"
+        );
+        // Negative controls: this machine bound, nobody bound, a failed read.
+        assert_eq!(
+            other_machine_bound(&doc(&machine_doc(Some(ME))), Some(ME)),
+            None
+        );
+        assert_eq!(
+            other_machine_bound(&doc(&machine_doc(None)), Some(ME)),
+            None
+        );
+        assert_eq!(
+            other_machine_bound(&Err(SourceError::Unsupported), Some(ME)),
+            None
+        );
     }
 
     /// Finding 2: an unbind's pause is taken back only after a refusal the server gives

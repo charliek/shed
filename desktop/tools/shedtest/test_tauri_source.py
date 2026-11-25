@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -1063,6 +1064,9 @@ def test_a_server_added_while_the_app_runs_is_listed_and_actionable(tmp_path):
         _open_view(client)
         client.wait_until(lambda: _view_row(client, "mock2") is not None, timeout=20,
                           what="the added server's row")
+        # This machine the source there first, so the stop is an unbind (where another
+        # machine answers, a stop sends none).
+        client.source_use("mock2")
         done = client.source_unbind("mock2")
         assert done["server"] == "mock2" and done["unbound"] is True, done
         assert mock.source_unbind_requests() == [{}]
@@ -1104,6 +1108,7 @@ def test_a_config_that_cannot_be_read_keeps_the_rows_it_last_listed(tmp_path):
         client.navigate("credentials")
         client.wait_until(lambda: _where(client).get("config_error") is None, timeout=20,
                           what="the config line gone")
+        client.source_use("mock")
         client.source_unbind("mock")
         assert mock.source_unbind_requests() == [{}]
 
@@ -1159,6 +1164,50 @@ def test_a_pause_shows_whoever_answers():
         assert row["paused"] is True and row["paused_shown"] is True, row
         assert "this machine stopped answering here" in row["detail"], row
         assert row["source_name"] == "desk", row
+
+
+def test_stopping_where_another_machine_answers_pauses_only_this_machine():
+    """"Stop answering from here" where another machine of yours answers stops this
+    machine only: it is paused there, and no unbind is sent, so the other machine's
+    binding stays. "Answer from here" lifts the pause as usual."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        done = client.source_unbind("mock")
+        assert done["unbound"] is False and done["another_machine_answers"] is True, done
+        assert done["previous"] == {"id": OTHER_MACHINE, "name": "desk"}, done
+        assert done["paused"] is True, done
+        assert mock.source_unbind_requests() == [], "another machine's binding is never cleared"
+        assert mock.source_bound() == OTHER_MACHINE
+        row = _list_row(client, "mock")
+        assert (row["kind"], row["paused"], row["stream"]) == ("other_machine", True, None), row
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected", timeout=30,
+                          what="answering again")
+        assert _list_row(client, "mock")["paused"] is False
+
+
+def test_a_stop_whose_first_read_is_stale_unbinds_this_machine():
+    """The read a stop starts with names another machine, and this machine is bound
+    meanwhile (a first-connect bind racing the read): once its stream has stopped, the
+    stop reads again, finds this machine, and unbinds it as usual."""
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        machine = _machine(client)
+        gets = mock.source_gets()
+        mock.source_reads_late(2.0)  # the stop's first read: the document as it arrives
+        out: dict = {}
+        worker = threading.Thread(
+            target=lambda: out.setdefault("done", client.source_unbind("mock")))
+        worker.start()
+        client.wait_until(lambda: mock.source_gets() > gets, timeout=10,
+                          what="the stop's first read at the server")
+        mock.move_source(machine["id"], machine["name"])  # bound here meanwhile
+        worker.join(timeout=60)
+        done = out["done"]
+        assert done["unbound"] is True and done["previous_was_this_machine"] is True, done
+        assert "another_machine_answers" not in done, done
+        assert mock.source_unbind_requests() == [{}]
+        assert mock.source_bound() is None
 
 
 def test_an_unusable_paused_file_starts_no_stream():

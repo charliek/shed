@@ -5,10 +5,11 @@
 //! user's machines whose stream arrives next, and this machine's stream would arrive
 //! within a second. So the desktop keeps the servers a person stopped answering on, by
 //! their name in the shed CLI config, and holds no stream for them until "Answer from
-//! here" takes the server out again. A server that leaves the config leaves the set at
-//! the next reconcile ([`PausedServers::retain`]), so one added back later under the
-//! same name answers again; until that removal is written it is held as pending, apart
-//! from the config, so a failed write is tried again and a re-add never inherits it.
+//! here" takes the server out again. **A pause lasts until then, and nothing else lifts
+//! it**: a server that leaves the config (or whose entry is briefly unreadable, or is
+//! removed and added back) keeps its name in the set. A name no configured server has
+//! is inert; a server added back under it is paused, and says so, until "Answer from
+//! here".
 //!
 //! The file is `{"version":1,"servers":[…]}`, written whole through the credential
 //! store's atomic writer (a `0600` temp file beside it, fsynced, renamed). A missing
@@ -61,18 +62,10 @@ struct OnDisk {
 struct State {
     /// The set as last written (or read).
     set: BTreeSet<String>,
-    /// Servers that left the config and whose removal is not written yet: not paused.
-    pending_drop: BTreeSet<String>,
     /// The file could not be used: every server is paused until a write.
     load_error: Option<PausedError>,
     /// The last write failed.
     write_failed: bool,
-}
-
-impl State {
-    fn effective(&self) -> BTreeSet<String> {
-        self.set.difference(&self.pending_drop).cloned().collect()
-    }
 }
 
 /// The set, held in memory and written through on every change.
@@ -129,13 +122,13 @@ impl PausedServers {
     /// cannot be used).
     pub fn contains(&self, server: &str) -> bool {
         let st = self.lock();
-        st.load_error.is_some() || (st.set.contains(server) && !st.pending_drop.contains(server))
+        st.load_error.is_some() || st.set.contains(server)
     }
 
     /// The servers the file holds as paused, by name (none named while it cannot be
     /// used: then every server is paused).
     pub fn names(&self) -> Vec<String> {
-        self.lock().effective().into_iter().collect()
+        self.lock().set.iter().cloned().collect()
     }
 
     /// What is wrong with the set: the file could not be used (every server paused),
@@ -160,40 +153,6 @@ impl PausedServers {
         self.change(configured, |s| {
             s.remove(server);
         })
-    }
-
-    /// Drops the servers no longer in `configured` (the config's servers now). They
-    /// stop being paused at once; their removal is written now or, should that fail, at
-    /// a later call, whatever the config says by then. Nothing while the file cannot be
-    /// used.
-    pub fn retain(&self, configured: &[&str]) -> Result<(), String> {
-        let mut st = self.lock();
-        if st.load_error.is_some() {
-            return Ok(());
-        }
-        let gone: Vec<String> = st
-            .set
-            .iter()
-            .filter(|n| !configured.contains(&n.as_str()))
-            .cloned()
-            .collect();
-        st.pending_drop.extend(gone);
-        if st.pending_drop.is_empty() {
-            return Ok(());
-        }
-        let next = st.effective();
-        match self.write(&next) {
-            Ok(()) => {
-                st.set = next;
-                st.pending_drop.clear();
-                st.write_failed = false;
-                Ok(())
-            }
-            Err(e) => {
-                st.write_failed = true;
-                Err(e)
-            }
-        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -222,16 +181,15 @@ impl PausedServers {
         let mut st = self.lock();
         let mut next = match st.load_error {
             Some(_) => configured.iter().map(|s| s.to_string()).collect(),
-            None => st.effective(),
+            None => st.set.clone(),
         };
         f(&mut next);
-        if st.load_error.is_none() && st.pending_drop.is_empty() && next == st.set {
+        if st.load_error.is_none() && next == st.set {
             return Ok(());
         }
         match self.write(&next) {
             Ok(()) => {
                 st.set = next;
-                st.pending_drop.clear();
                 st.load_error = None;
                 st.write_failed = false;
                 Ok(())
@@ -276,18 +234,26 @@ mod tests {
         assert_eq!(PausedServers::load(path).names(), ["desk"]);
     }
 
+    /// A pause lasts until it is lifted: a server that leaves the config keeps its name
+    /// in the set (inert while no server has it), and one added back under it is paused.
     #[test]
-    fn a_server_that_left_the_config_leaves_the_set() {
+    fn a_pause_survives_the_server_leaving_the_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PAUSED_FILE_NAME);
         let p = PausedServers::load(path.clone());
         p.pause("gone", ALL).unwrap();
         p.pause("kept", ALL).unwrap();
-        p.retain(&["kept", "gone", "new"]).unwrap();
-        assert!(p.contains("gone"), "all still configured");
-        p.retain(&["kept", "new"]).unwrap();
+        // Another change made while "gone" is not configured keeps it.
+        p.pause("new", &["kept", "new"]).unwrap();
+        assert!(p.contains("gone"));
+        assert_eq!(
+            PausedServers::load(path.clone()).names(),
+            ["gone", "kept", "new"]
+        );
+        // Only "Answer from here" lifts it.
+        p.resume("gone", &["gone", "kept", "new"]).unwrap();
         assert!(!p.contains("gone"));
-        assert_eq!(PausedServers::load(path).names(), ["kept"]);
+        assert_eq!(PausedServers::load(path).names(), ["kept", "new"]);
     }
 
     /// Finding 1: a file that exists and cannot be used fails closed — every server is
@@ -314,9 +280,11 @@ mod tests {
             let p = PausedServers::load(path.clone());
             assert_eq!(p.error(), Some(class), "{text}");
             assert!(p.contains("mini") && p.contains("anything"), "{text}");
-            // A reconcile writes nothing over it.
-            p.retain(&["mini"]).unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "nothing written"
+            );
         }
         let p = PausedServers::load(path.clone());
         p.resume("mini", ALL).unwrap();
@@ -347,31 +315,5 @@ mod tests {
         assert!(p.pause("mini", ALL).is_err());
         assert!(!p.contains("mini"));
         assert_eq!(p.error(), Some(PausedError::WriteFailed));
-    }
-
-    /// Finding 6: a server removed from the config while the write fails is not paused
-    /// any more (a re-add answers), and the removal is written at a later reconcile even
-    /// though the config lists the server again by then.
-    #[test]
-    fn a_removal_whose_write_failed_is_kept_pending_and_tried_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PAUSED_FILE_NAME);
-        let p = PausedServers::load(path.clone());
-        p.pause("a", &["a", "b"]).unwrap();
-        p.pause("b", &["a", "b"]).unwrap();
-        // The file's place is taken by a directory: the removal of "a" cannot be written.
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        assert!(p.retain(&["b"]).is_err());
-        assert_eq!(p.error(), Some(PausedError::WriteFailed));
-        assert!(!p.contains("a") && p.contains("b"));
-        // Re-added before the write succeeds: still not paused, still pending.
-        assert!(p.retain(&["a", "b"]).is_err());
-        assert!(!p.contains("a"));
-        std::fs::remove_dir(&path).unwrap();
-        p.retain(&["a", "b"]).unwrap();
-        assert_eq!(p.error(), None);
-        assert!(!p.contains("a") && p.contains("b"));
-        assert_eq!(PausedServers::load(path).names(), ["b"]);
     }
 }

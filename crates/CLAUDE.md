@@ -108,8 +108,8 @@ shedctl (no internal deps)
   using the app's control-scope client for the server as configured now, not the
   start-up clients. A per-server **paused set** (`paused-servers.json` beside
   `machine.json`, atomic, `0600`; an unreadable file pauses every server and says so)
-  keeps a server's stream from being opened; a server that leaves the config is dropped
-  from it. And `unbind`/`use` are **serialised per server**: unbind pauses first, waits
+  keeps a server's stream from being opened until "Answer from here"; a server that leaves
+  the config keeps its pause (the name is inert), so one added back is still paused. And `unbind`/`use` are **serialised per server**: unbind pauses first, waits
   for that server's stream task to end, sends the unbind, re-reads the binding and
   unbinds once more if a late admission re-bound this machine. Provider forms are
   descriptor-driven (`shed-provision-providers` descriptors through `delivery.describe`),

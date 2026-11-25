@@ -376,17 +376,14 @@ impl DeliveryRuntime {
         self.apply(tasks, targets_of(&self.opts));
     }
 
-    /// A new read of the config: a server that left it leaves the paused set, and a
-    /// stream runs for every server that is not paused.
+    /// A new read of the config: a stream runs for every server that is not paused. The
+    /// paused set is not touched: a pause lasts until "Answer from here", whatever the
+    /// config does meanwhile (a server that leaves it and comes back is still paused).
     fn apply(&self, tasks: &SourceTasks, targets: Result<Vec<ServerTarget>, String>) {
         let mut err = self.config_error.lock().unwrap_or_else(|e| e.into_inner());
         match targets {
             Ok(t) => {
                 *err = None;
-                let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
-                // A failed write keeps the set as it was: the server stays paused in
-                // memory and on disk, and is dropped at a later reconcile.
-                let _ = self.paused.retain(&names);
                 *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = t;
                 self.reconcile_unpaused(tasks);
             }
@@ -1139,8 +1136,8 @@ mod tests {
     }
 
     /// "Stop answering from here" stops that server's stream and keeps it stopped: across
-    /// a rescan, across a restart (the set is on disk), until "Answer from here". A
-    /// server that leaves the config leaves the set, so one added back answers again.
+    /// a rescan, across a restart (the set is on disk), and across the server leaving the
+    /// config and coming back, until "Answer from here".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_paused_server_runs_no_stream_until_it_is_resumed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1165,14 +1162,28 @@ mod tests {
         assert_eq!(running(&rt), ["a", "b"]);
         assert!(!rt.is_paused("a"));
 
-        // A server that leaves the config leaves the set; added back, it answers.
+        // A pause survives the server leaving the config and coming back: it lasts
+        // until "Answer from here", and the name is inert meanwhile.
         rt.pause("a").unwrap();
         two_server_opts(dir.path(), &["b"]);
         rt.reconcile(rt.tasks.as_ref().unwrap());
         assert_eq!(running(&rt), ["b"]);
-        assert!(!rt.is_paused("a"), "dropped with the server");
+        assert!(rt.is_paused("a"), "kept while the server is not configured");
+        assert_eq!(
+            rt.status()["paused"],
+            json!([]),
+            "an inert name lists no server"
+        );
         two_server_opts(dir.path(), &["a", "b"]);
         rt.reconcile(rt.tasks.as_ref().unwrap());
+        assert_eq!(running(&rt), ["b"], "added back, still paused");
+        assert_eq!(rt.status()["paused"], json!(["a"]));
+        assert_eq!(
+            shed_source::paused::PausedServers::load(opts.paused_path.clone()).names(),
+            ["a"]
+        );
+        // Only "Answer from here" lifts it.
+        rt.resume("a").unwrap();
         assert_eq!(running(&rt), ["a", "b"]);
         rt.drain();
         assert_eq!(

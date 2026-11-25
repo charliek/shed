@@ -41,7 +41,8 @@ answers on each server and offers **Answer from here** and **Stop answering from
 The machine's name comes from the `machine.json` the app keeps. If the machine has no identity,
 the view says why and offers no move. **Stop answering from here** records the server in
 `paused-servers.json` beside `machine.json` (mode `0600`), so the stop survives restarts; an
-unreadable file pauses every server. **Answer from here** takes the server out of the file.
+unreadable file pauses every server. **Answer from here** takes the server out of the file, and
+nothing else does: a server removed from the config and added back is still paused.
 Moving the source here fails any delivery request still waiting on the other machine. If the
 server has never seen this machine (its delivery stream has not reached it yet), the app says so
 and does not retry. The same reads and moves are available over IPC as
