@@ -115,10 +115,10 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   server: `host`, `supported`, `source {id,name}|null`, `this_machine`, `connected`, `error`)
   and `source.use {host}` (makes THIS machine the source; `{row, woke_source}`; refusals come
   back as `bad_request`, `machine_identity_unavailable`, `source_machine_not_found`,
-  `forbidden`, `unsupported`, `action_failed`). The Preferences rows live INSIDE the
-  Provisioning section (`prefs.dump`'s `values.sources` / `this_machine_name` /
-  `this_machine_error` carry them). The button is pressed through `ui.press_source_use
-  {host}` (test mode only): the open window clicks its OWN `button[data-source-use="<host>"]`,
+  `forbidden`, `unsupported`, `action_failed`). The rows live in the Credentials
+  view's Where part (`credentials.dump`'s `where`; `sources.list` is the Rust-side truth,
+  with `kind`, `paused` and fixed-words errors; `source.status` still answers). The button is pressed through `ui.press_source_use
+  {host}` (test mode only): the view clicks its OWN `button[data-source-use="<host>"]`,
   so a disabled button takes no press — the dump's `can_use` and the DOM's `disabled` come
   from one rule. The mock is UNARMED by default (`/api/sources` answers chi's plain 404 = an
   older server); `MockShedServer.arm_source(...)` (or `_source_app(source={...})` in
@@ -136,29 +136,38 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   backoff 8 s, no jitter) and asserts the accepted stream came within `_WAKE_BUDGET_S` of the
   last one (`mock.subscribe_times`): 6 s at scale 1, scaled with
   `SHED_TAURI_TEST_TIMEOUT_SCALE` but capped 0.5 s under the backoff — without the reopen it
-  lands at exactly +8 s. Preferences re-reads the rows when a hidden window is shown again
-  (the native `prefs-shown` event, plus the DOM `focus`/`visibilitychange`, throttled to
-  one read per 5 s); under Xvfb either path alone refreshes a reopen.
-- **Provisioning (plan 039 A7).** Preferences → Provisioning holds the five providers'
-  switches and editors, the source rows (`data-source-*` nodes, `values.sources`), and a Preview. Read it back from
-  `prefs.dump`'s `values.provisioning` (built off the rendered nodes: each provider's
-  switch state, `only` line, editor, refusal and notice; `editor`, the open editor's
-  committed input values, passphrase command arguments `redacted`; the open draft as its
-  `delivery.set` config, redacted the same way; the preview's items and problems;
-  `rendered`). Drive it with `ui.prefs_section` (scroll), and in test mode
-  `ui.press_delivery_toggle`, `ui.press_delivery_button` (Edit/Save/Cancel, add/remove an
-  entry, the command's Replace/Clear/Keep) and `ui.type_delivery_field`, which type into
-  and press the REAL controls: wait for `editor.values` to show what was typed before
-  pressing Save. A stored passphrase command is never shown: `delivery.settings` says
-  `"set"`, and `delivery.set` takes `"set"` back as "unchanged". Each shed row has a delivery badge
-  (`dashboard.dump` rows' `delivery_badge`) and a detail opened by `ui.show_shed_delivery`,
-  read by `shed_delivery.dump`, pressed by `ui.press_deliver_again` (test mode).
-  `test_tauri_provisioning.py` launches its own app over the A6 module's throwaway home;
-  `SHED_DELIVERY_SHOTS=<dir>` keeps its screenshots. Two traps: a self-managed launch
-  must wait for `ui.current_pane` to be non-null before its first `ui.navigate`
-  (`frontend_not_ready` otherwise; `await_hermetic` does not wait for it), and the
-  Preferences window re-reads `delivery.toml` only when it is shown again (a `prefs-shown`
-  from `ui.show_preferences`), so a cell that rewrites the file shows the window again.
+  lands at exactly +8 s. The view re-reads the rows when it is shown again and on focus
+  (throttled to one read per 5 s). "Stop answering from here" is `ui.press_source_unbind {host}`;
+  it pauses the server in `paused-servers.json` under the throwaway state dir, so a cell
+  that expects the app to answer again must press `ui.press_source_use` first (the mock
+  has a late-admission switch for the re-bind-after-unbind race).
+- **Credentials view (plan 040 §3.9; was Preferences → Provisioning).** Preferences holds
+  General and Terminal only. Reach the view with `ui.navigate {pane: "credentials"}` (wait for
+  `ui.current_pane` to be non-null first: `frontend_not_ready` otherwise; `await_hermetic`
+  does not wait for it) and read it back from `credentials.dump` (`{where, what, check,
+  recent, rendered}`, off its own nodes; `null` off the view; a passphrase command is never in
+  it). `sidebar.dump` lists the nav `entries`. Doors, all test mode and all pressing or
+  typing into the REAL controls: `ui.press_source_use` / `ui.press_source_unbind {host}`,
+  `ui.press_delivery_button {provider, button}` (Set up/Edit/Save/Cancel, add/remove an
+  entry, the command's Replace/Clear/Keep), `ui.type_delivery_field`, `ui.fill_check
+  {field, value}` and `ui.press_check {button: run|details}`. Wait for `editor.values` to
+  show what was typed before pressing Save. Providers cannot be turned on with required
+  fields empty (the form and `delivery.set` both refuse), and `delivery.describe` is what the
+  forms are drawn from. A stored passphrase command is never shown: `delivery.settings`
+  says `"set"`, and `delivery.set` takes `"set"` back as "unchanged". Each shed row has a
+  delivery badge (`dashboard.dump` rows' `delivery_badge`) and a detail opened by
+  `ui.show_shed_delivery`, read by `shed_delivery.dump`, pressed by `ui.press_deliver_again`.
+  `test_tauri_provisioning.py` and `test_tauri_source.py` launch their own app over the
+  throwaway home; `SHED_DELIVERY_SHOTS=<dir>` keeps screenshots. The old Preferences
+  doors and its shown-again event are gone;
+  a cell that rewrites `delivery.toml` re-reads through `delivery.settings` or navigates
+  away and back.
+- **Trap: the render gate's Docker target volume is shared across trees.** The gate builds
+  into the `shed-tauri-linux-target` volume (`/target`), whatever tree you run from. After
+  building another worktree, the volume can hold a stale crate build whose sources differ
+  from this tree's, and the symptom is `could not find <module> in shed_source` (or another
+  crate) at compile time. Fix: touch this tree's `.rs` files before the run
+  (`find crates desktop -name '*.rs' -exec touch {} +`) so cargo rebuilds them.
 - **Launch at login is on by default** (plan 037 §3.1.4): every hermetic first launch turns
   it on, so the session app reads on (`test_loginitem_probe`). On Linux `auto-launch` writes
   `$HOME/.config/autostart/*.desktop` and ignores `XDG_CONFIG_HOME`, so it lands under the

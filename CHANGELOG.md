@@ -33,6 +33,12 @@ The account service becomes a credential source for the users it lists, and the 
 - **Shed origin.** A shed records whether its user was local or from the directory. A delivery after the name has moved between the sets is `409 SHED_ORIGIN_CHANGED` (`SHED_ORIGIN_UNKNOWN` for a shed with no record). Sheds from before are stamped once at the first start, recorded in `<state_dir>/delivery/origin-migration.json`.
 - Docs: a new guide, [Credentials from the account service](docs/guides/credentials-from-the-account-service.md); the delivery, security, CLI and API references.
 
+**Desktop (PR B).** Read the [v0.11 → v0.12 upgrade guide](docs/upgrades/v0.11-to-v0.12.md): on a directory server a pinned machine stops delivering to directory users when the server is upgraded, and the server and the app move together.
+
+- **A Credentials view.** The desktop app gains a fifth sidebar entry between Agents and Activity: where each server gets your credentials (this machine, another machine, the account service, nobody), what this machine gives (one row per provider from its descriptor, with Set up, Edit, Turn off and Remove, and no way to turn a provider on before its required fields are filled), Check (what a shed or a new backend and repo would get, saying first which commands it runs), and Recent deliveries.
+- **Preferences reduced.** Preferences keeps General and Terminal; Provisioning, Source machine and Preview are gone. IPC: new `delivery.describe`, `sources.list`, `source.unbind`, `delivery.recent`, `credentials.dump`, `sidebar.dump`, `ui.fill_check`, `ui.press_check`, `ui.press_source_unbind`; `delivery.preview` takes a backend and repo; `ui.prefs_section`, `ui.press_delivery_toggle` and `ui.preview_delivery` are removed.
+- **A stop that sticks.** "Stop answering from here" unbinds and pauses that server in `paused-servers.json`, so the app does not bind itself again; "Answer from here" lifts it. A `409 SOURCE_IS_SERVICE` on the delivery stream is a settled state, rechecked every five minutes, not a reconnect loop.
+
 ## v0.11.0 — 2026-11-24
 
 **Ships:** server, desktop

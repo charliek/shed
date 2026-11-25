@@ -126,9 +126,9 @@ removed from the tap and does nothing now: uninstall it with `brew uninstall` (s
 [Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
 v0.10 upgrade guide).
 
-Per-server connection state is visible in Preferences → Provisioning and over IPC
-(`delivery.status`, `source.status`). The app and the servers see one machine identity, and
-Preferences shows which of your machines is the [credential source](../extensions/source-binding.md)
+Per-server connection state is visible in the Credentials view and over IPC
+(`delivery.status`, `sources.list`). The app and the servers see one machine identity, and
+the Credentials view shows which of your machines is the [credential source](../extensions/source-binding.md)
 on each server. Full mechanics are in
 [Architecture → The credential source for delivery](architecture.md#the-credential-source-for-delivery)
-and [Provisioning](provisioning.md).
+and [Credentials](credentials.md).
