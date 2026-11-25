@@ -576,9 +576,16 @@ impl DeliveryRuntime {
     }
 
     /// `delivery.set`: one provider's table replaced (or removed, with null); answers the
-    /// new `delivery.settings` view.
-    pub fn set(&self, provider: &str, config: &Value) -> Result<Value, (String, String)> {
-        settings_file::set(&self.opts.settings_path, provider, config)?;
+    /// new `delivery.settings` view. With `base` (the provider's `config` as the form
+    /// read it) the table must still be that, or it is refused `conflict` unwritten
+    /// ([`settings_file::set_if`]).
+    pub fn set(
+        &self,
+        provider: &str,
+        config: &Value,
+        base: Option<&Value>,
+    ) -> Result<Value, (String, String)> {
+        settings_file::set_if(&self.opts.settings_path, provider, config, base)?;
         Ok(self.settings())
     }
 

@@ -675,12 +675,16 @@ export function getDeliverySettings(): Promise<DeliverySettings> {
   return invokeStrict("delivery_settings");
 }
 
-/** Replace one provider's table (`config` null removes it); answers the new settings. */
+/** Replace one provider's table (`config` null removes it); answers the new settings.
+ *  `base` is the provider's `config` as the form read it, as JSON text (`"null"` for a
+ *  provider not set up): a table changed since is refused `{code: "conflict"}` and
+ *  nothing is written. Errors are `{code, message}`. */
 export function setDeliveryProvider(
   provider: string,
   config: Record<string, unknown> | null,
+  base?: string,
 ): Promise<DeliverySettings> {
-  return invokeStrict("delivery_set", { provider, config });
+  return invokeStrict("delivery_set", base === undefined ? { provider, config } : { provider, config, base });
 }
 
 /** What a shed on `server` would be delivered (the Credentials view's Check): a named

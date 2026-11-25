@@ -373,7 +373,10 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 
 // handleUnbindSource is POST /api/sources/unbind (`shed source unbind`):
 // clear the user's credential source. Body {} (or none) and, for an admin,
-// "user", under the rules of POST /api/sources/use. The unbind is
+// "user", under the rules of POST /api/sources/use, and optionally
+// "machine_id": then the binding is cleared only while it still names that
+// machine (Registry.UnbindIf, checked under the user's gate), and one naming
+// another machine is 409 SOURCE_MOVED with nothing changed. The unbind is
 // Registry.Unbind: the store forgets the user's binding and remembered
 // machines, then, under the user's gate, the user's streams are closed and
 // their requests dropped. Idempotent: a user with no binding is answered 200
@@ -381,10 +384,12 @@ func (s *Server) handleUseSource(w http.ResponseWriter, r *http.Request) {
 // bound (first-connect), so a machine still running reconnects and becomes
 // the source again.
 //
-//	400 INVALID_REQUEST   the body, or an admin naming a user who is not
-//	                      configured
+//	400 INVALID_REQUEST   the body, a malformed machine_id, or an admin
+//	                      naming a user who is not configured
 //	403 FORBIDDEN         as for GET /api/sources
 //	409 SOURCE_IS_SERVICE the target user is a directory user
+//	409 SOURCE_MOVED      machine_id was given and the user's source is
+//	                      another machine: nothing changed
 //	500 INTERNAL_ERROR    the store could not save it: the source in use is
 //	                      unchanged for now, but a save that failed late may
 //	                      still take effect when the server restarts
@@ -396,20 +401,28 @@ func (s *Server) handleUnbindSource(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := decodeSourceUnbind(http.MaxBytesReader(w, r.Body, sourcesBodyLimit))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, `the body must be {} or {"user":"<name>"}: `+err.Error())
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, `the body must be {} or {"user":"<name>","machine_id":"<32 lowercase hex digits>"}, each field optional: `+err.Error())
 		return
 	}
 	user, ok := s.sourceTarget(w, own, admin, req.User)
 	if !ok || s.refuseServiceUser(w, user) {
 		return
 	}
+	if req.MachineID != "" && !source.ValidMachineID(req.MachineID) {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest,
+			"machine_id must be a machine's full id, 32 lowercase hex digits ('shed source ls --json' lists them)")
+		return
+	}
 	if s.sourceBindings(w) == nil {
 		return
 	}
 	by := moverFor(callerFrom(r.Context()), user != own)
-	res, err := s.plugins.Unbind(r.Context(), user, by)
+	res, err := s.plugins.UnbindIf(r.Context(), user, req.MachineID, by)
 	if err != nil {
 		switch {
+		case errors.Is(err, plugin.ErrSourceMoved):
+			writeError(w, http.StatusConflict, config.ErrSourceMoved,
+				fmt.Sprintf("the credential source of %s is not machine %s any more: nothing was cleared; 'shed source ls' shows which machine it is", whoseSources(user, user != own), req.MachineID))
 		case errors.Is(err, plugin.ErrNotPinned):
 			writeError(w, http.StatusServiceUnavailable, "PLUGINS_DISABLED", "credential source bindings not initialized")
 		case r.Context().Err() != nil && errors.Is(err, r.Context().Err()):
@@ -438,11 +451,16 @@ func decodeSourceUse(body io.Reader) (config.SourceUseRequest, error) {
 }
 
 // decodeSourceUnbind reads the body of POST /api/sources/unbind strictly:
-// one JSON object whose only field is "user", or no body at all (the
-// caller's own).
+// one JSON object whose only fields are "user" and "machine_id", or no body
+// at all (the caller's own).
 func decodeSourceUnbind(body io.Reader) (config.SourceUnbindRequest, error) {
 	var req config.SourceUnbindRequest
-	err := decodeSourceFields(body, true, map[string]*string{"user": &req.User})
+	var given map[string]bool
+	err := decodeSourceFieldsGiven(body, true, map[string]*string{"user": &req.User, "machine_id": &req.MachineID}, &given)
+	if err == nil && given["machine_id"] && req.MachineID == "" {
+		// An explicit empty id is not "no condition": refused, never an unconditional clear.
+		err = errors.New(`field "machine_id": empty (leave it out, or give a machine's full id)`)
+	}
 	return req, err
 }
 
@@ -453,6 +471,15 @@ func decodeSourceUnbind(body io.Reader) (config.SourceUnbindRequest, error) {
 // absent), and nothing after the object but white space. With emptyOK, a
 // body with nothing in it but white space is an empty object.
 func decodeSourceFields(body io.Reader, emptyOK bool, fields map[string]*string) error {
+	return decodeSourceFieldsGiven(body, emptyOK, fields, nil)
+}
+
+// decodeSourceFieldsGiven is decodeSourceFields that also reports, in *given
+// (when given is not nil), the fields whose value was a string (not null).
+func decodeSourceFieldsGiven(body io.Reader, emptyOK bool, fields map[string]*string, given *map[string]bool) error {
+	if given != nil {
+		*given = map[string]bool{}
+	}
 	dec := json.NewDecoder(body)
 	tok, err := dec.Token()
 	if emptyOK && errors.Is(err, io.EOF) {
@@ -479,8 +506,15 @@ func decodeSourceFields(body io.Reader, emptyOK bool, fields map[string]*string)
 			return fmt.Errorf("field %q given twice", key)
 		}
 		seen[key] = true
-		if err := dec.Decode(dst); err != nil {
+		var v *string
+		if err := dec.Decode(&v); err != nil {
 			return fmt.Errorf("field %q: %v", key, err)
+		}
+		if v != nil {
+			*dst = *v
+			if given != nil {
+				(*given)[key] = true
+			}
 		}
 	}
 	if _, err := dec.Token(); err != nil { // the closing '}'

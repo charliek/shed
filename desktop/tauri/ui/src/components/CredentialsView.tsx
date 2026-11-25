@@ -46,7 +46,16 @@ import {
 } from "@/lib/credentials";
 
 const errText = (e: unknown): string =>
-  typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  typeof e === "string"
+    ? e
+    : e instanceof Error
+      ? e.message
+      : e && typeof e === "object" && typeof (e as { message?: unknown }).message === "string"
+        ? (e as { message: string }).message
+        : String(e);
+
+/** The notice when a provider's settings changed elsewhere while its form was open. */
+const DISCARDED = "The settings changed while you were editing; your unsaved changes were discarded.";
 
 /** The text a person reads in `el`, without what form controls hold: a textarea's
  *  value is also its text node, and a passphrase command's arguments must never be
@@ -254,17 +263,27 @@ export function CredentialsView({ sources, sheds, shown }: {
   const rows = shownRows(src);
   const descOf = (name: string) => descs.find((d) => d.name === name) ?? null;
 
-  // A provider's table written: the answer is the file as written.
-  const write = (name: string, config: Record<string, unknown> | null, then?: () => void) => {
+  // A provider's table written: the answer is the file as written. With `base` (the
+  // table as the form read it) a table changed since is refused `conflict`, unwritten:
+  // the form is discarded, with the notice, and the settings read again.
+  const write = (name: string, config: Record<string, unknown> | null, then?: () => void, base?: string) => {
     if (busy[name]) return;
     setBusy((b) => ({ ...b, [name]: true }));
     setErrors((e) => ({ ...e, [name]: "" }));
-    void setDeliveryProvider(name, config)
+    void setDeliveryProvider(name, config, base)
       .then((s) => {
         setSettings(s);
         then?.();
       })
-      .catch((e) => setErrors((x) => ({ ...x, [name]: errText(e) })))
+      .catch((e) => {
+        if (refusalCode(e) === "conflict") {
+          setForm((f) => (f?.provider === name ? null : f));
+          setNotices((n) => ({ ...n, [name]: DISCARDED }));
+          void getDeliverySettings().then(setSettings, (x) => setLoadError(errText(x)));
+          return;
+        }
+        setErrors((x) => ({ ...x, [name]: errText(e) }));
+      })
       .finally(() => setBusy((b) => ({ ...b, [name]: false })));
   };
   const act = (name: string, a: WhatAction) => {
@@ -290,7 +309,7 @@ export function CredentialsView({ sources, sheds, shown }: {
     if (JSON.stringify(providerOf(form.provider)?.config ?? null) === form.base) return;
     const name = form.provider;
     setForm(null);
-    setNotices((n) => ({ ...n, [name]: "The settings changed while you were editing; your unsaved changes were discarded." }));
+    setNotices((n) => ({ ...n, [name]: DISCARDED }));
   }, [settings]); // eslint-disable-line react-hooks/exhaustive-deps
   const ticksFor = (scope: ScopeDraft | null) => serverTicks(rows, scope);
   const save = () => {
@@ -299,7 +318,7 @@ export function CredentialsView({ sources, sheds, shown }: {
     if (!d || missing(d, form.draft).length) return;
     const name = form.provider;
     const config = configFromDraft(d, form.draft, saveEnabled(form.mode, providerOf(name)), ticksFor(null));
-    write(name, config, () => setForm(null));
+    write(name, config, () => setForm(null), form.base);
   };
   const setDraft = (f: (d: ProviderDraft) => ProviderDraft) => {
     setForm((x) => (x ? { ...x, draft: f(x.draft) } : x));

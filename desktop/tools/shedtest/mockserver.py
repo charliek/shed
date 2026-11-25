@@ -234,7 +234,10 @@ NOT_SOURCE_ACTIVE = {
 # no machine bound (after an unbind), the first machine whose stream arrives is bound, as
 # on the server. A user the account service answers for (`serve_service_source`, plan
 # 040 §3.2) is refused `409 SOURCE_IS_SERVICE` (the shared fixture's body) on the stream,
-# the answer, the move and the unbind routes.
+# the answer, the move and the unbind routes. An unbind naming a `machine_id` is a
+# compare-and-clear, as on the server: while another machine is bound it is refused
+# `409 SOURCE_MOVED` and nothing changes (`unbind_like_v011` makes it a v0.11 server,
+# which refuses the field `400 INVALID_REQUEST`).
 _SOURCES_PATH = "/api/sources"
 _SOURCES_USE_PATH = "/api/sources/use"
 _SOURCES_UNBIND_PATH = "/api/sources/unbind"
@@ -351,6 +354,11 @@ class MockShedServer:
         # Machines a stream attempt admits just after the next unbinds, one per unbind
         # (`admit_after_unbind`): the late admission an unbind can race.
         self._src_late_admits: list[tuple[str, str]] = []
+        # Per next unbind, a machine the source moves to just before it is applied
+        # (`move_before_unbind`; None: no move): another machine taking over in the
+        # window between the app's last read and its unbind.
+        self._src_pre_unbind: list[tuple[str, str] | None] = []
+        self._src_unbind_v011 = False  # unbind refuses "machine_id", as v0.11 did
         self._src_use_script: list[int] = []  # statuses the next moves answer first
         self._src_use_delay = 0.0  # seconds every move waits before it is applied
         # The next GETs answer 503 SOURCE_BUSY (with this Retry-After) this many times.
@@ -677,6 +685,20 @@ class MockShedServer:
         with self._dlv_cond:
             self._src_late_admits.extend([(machine_id, machine_name)] * times)
 
+    def move_before_unbind(self, machine_id: str, machine_name: str, skip: int = 0) -> None:
+        """Just before the unbind after the next `skip` ones is applied, the source moves
+        to `machine_id` (another machine's `shed source use` landing between the app's
+        last read and its unbind)."""
+        assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
+        with self._dlv_cond:
+            self._src_pre_unbind.extend([None] * skip + [(machine_id, machine_name)])
+
+    def unbind_like_v011(self) -> None:
+        """The unbind route refuses a `machine_id` field `400 INVALID_REQUEST`, as a
+        v0.11 server's strict decoder does."""
+        with self._dlv_cond:
+            self._src_unbind_v011 = True
+
     def source_unbind_requests(self) -> list[dict]:
         """Every `POST /api/sources/unbind` body received, refused ones included."""
         with self._dlv_cond:
@@ -787,17 +809,35 @@ class MockShedServer:
         """An unbind (`shed source unbind`): (status, body), or None when unarmed (a
         plain 404). As the server's `handleUnbindSource`: the binding and every
         remembered machine are forgotten and every stream of the user ends (its pending
-        requests fail); nothing bound is `"unbound": false`."""
+        requests fail); nothing bound is `"unbound": false`. A `machine_id` makes it a
+        compare-and-clear: another machine bound is `409 SOURCE_MOVED`, nothing
+        changed."""
         with self._dlv_cond:
             if not self._src_armed:
                 return None
             self._src_unbind_requests.append(dict(body) if isinstance(body, dict) else {})
             self._dlv_cond.notify_all()
-            if not isinstance(body, dict) or set(body) - {"user"}:
+            fields = {"user"} if self._src_unbind_v011 else {"user", "machine_id"}
+            if not isinstance(body, dict) or set(body) - fields:
                 return 400, _api_error("INVALID_REQUEST",
                                        'the body must be {} or {"user":"<name>"}')
+            want = body.get("machine_id")
+            if want is not None and (not isinstance(want, str)
+                                     or not _MACHINE_ID_RE.fullmatch(want)):
+                return 400, _api_error("INVALID_REQUEST", "machine_id must be a machine's "
+                                       "full id, 32 lowercase hex digits")
             if self._src_service is not None:
                 return 409, _source_is_service()
+            moved = self._src_pre_unbind.pop(0) if self._src_pre_unbind else None
+            if moved is not None:
+                mid, name = moved
+                self._src_machines.setdefault(mid, {
+                    "name": name, "first_seen": "2026-11-16T09:45:00Z", "connected": True})
+                self._src_move_locked(mid)
+            if want and self._src_bound is not None and self._src_bound != want:
+                return 409, _api_error("SOURCE_MOVED", "the credential source of your "
+                                       "user is not that machine any more: nothing was "
+                                       "cleared")
             bound = self._src_bound
             previous = None
             if bound is not None:

@@ -966,14 +966,32 @@ fn delivery_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String>
     Ok(delivery_runtime(&app)?.settings())
 }
 
-/// `delivery.set`.
+/// `delivery.set`. `base` is the provider's `config` as the form read it, as JSON text
+/// (text, so a provider not set up, `"null"`, is told from no base at all); a table
+/// changed since is refused `conflict`. The error is `{code, message}`.
 #[tauri::command]
 fn delivery_set(
     app: tauri::AppHandle,
     provider: String,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    delivery::set(&*delivery_runtime(&app)?, &provider, &config).map_err(|(_, m)| m)
+    base: Option<String>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let rt = delivery_runtime(&app)
+        .map_err(|m| serde_json::json!({ "code": "unavailable", "message": m }))?;
+    let base = match base
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        None => None,
+        Some(Ok(b)) => Some(b),
+        Some(Err(_)) => {
+            return Err(coded_refusal((
+                "bad_request".into(),
+                "base is not JSON".into(),
+            )))
+        }
+    };
+    delivery::set(&rt, &provider, &config, base.as_ref()).map_err(coded_refusal)
 }
 
 /// `delivery.preview` (the Credentials view's Check). The error is `{code, message}`;

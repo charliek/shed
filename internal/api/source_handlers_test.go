@@ -722,6 +722,44 @@ func TestSourcesUnbind(t *testing.T) {
 	}
 }
 
+// TestSourcesUnbindIfMachine: an unbind naming a machine_id is a
+// compare-and-clear. While the binding names another machine it is 409
+// SOURCE_MOVED and nothing changes (the binding, the remembered machines and
+// the bound machine's stream all stay); naming the bound machine clears it as
+// a plain unbind does; with no binding it is 200 "unbound": false. An admin
+// naming a user may give one too.
+func TestSourcesUnbindIfMachine(t *testing.T) {
+	s, router, _ := sourcesServer(t)
+	l := subscribeAs(t, s, "alice", "ssh-agent", aliceA)
+	present(t, s, "alice", aliceB)
+
+	for _, r := range []apiResp{
+		unbindSource(router, aliceFP, fmt.Sprintf(`{"machine_id":%q}`, aliceB.ID)),
+		unbindSource(router, rootFP, fmt.Sprintf(`{"user":"alice","machine_id":%q}`, aliceB.ID)),
+	} {
+		if r.code != http.StatusConflict || r.errCode(t) != config.ErrSourceMoved {
+			t.Fatalf("unbind naming the machine that is not bound = %d %s, want 409 %s", r.code, r.body, config.ErrSourceMoved)
+		}
+	}
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceA.ID {
+		t.Fatalf("a refused compare-and-clear changed the binding: %+v", bd)
+	}
+	if n := len(s.plugins.Bindings().Machines("alice")); n != 2 || closed(l.Done) {
+		t.Fatalf("a refused compare-and-clear forgot machines (%d left) or closed the stream", n)
+	}
+
+	resp := unbound(t, "unbind naming the bound machine", unbindSource(router, aliceFP, fmt.Sprintf(`{"machine_id":%q}`, aliceA.ID)))
+	if !resp.Unbound || resp.Previous == nil || resp.Previous.ID != aliceA.ID || resp.ForgottenMachines != 2 {
+		t.Fatalf("compare-and-clear of the bound machine = %+v", resp)
+	}
+	if _, ok := s.plugins.Bindings().Get("alice"); ok || !closed(l.Done) {
+		t.Fatal("the compare-and-clear left alice's binding or stream")
+	}
+	if again := unbound(t, "compare-and-clear with nothing bound", unbindSource(router, aliceFP, fmt.Sprintf(`{"machine_id":%q}`, aliceB.ID))); again.Unbound || again.Previous != nil {
+		t.Fatalf("compare-and-clear with nothing bound = %+v", again)
+	}
+}
+
 // TestSourcesUnbindRefusals: a malformed body is 400 and changes nothing; a
 // user naming another is 403; an admin naming a user who is not configured
 // is 400; an admin naming alice clears hers, recorded as the admin's.
@@ -729,7 +767,7 @@ func TestSourcesUnbindRefusals(t *testing.T) {
 	s, router, _ := sourcesServer(t)
 	subscribeAs(t, s, "alice", "ssh-agent", aliceA)
 	for _, body := range []string{
-		`[]`, `"alice"`, `{"user":"alice","user":"alice"}`, `{"User":"alice"}`, `{"machine_id":"x"}`,
+		`[]`, `"alice"`, `{"user":"alice","user":"alice"}`, `{"User":"alice"}`, `{"machine_id":"x"}`, `{"machine_id":""}`,
 		`{"user":1}`, `{} {}`, `{`,
 	} {
 		r := unbindSource(router, aliceFP, body)

@@ -926,7 +926,7 @@ def test_stop_answering_from_here_sticks_until_answer_from_here():
                             "previous": {"id": machine["id"], "name": machine["name"]},
                             "previous_was_this_machine": True, "forgotten_machines": 2,
                             "paused": True, "verified": True}, done
-            assert mock.source_unbind_requests() == [{}]
+            assert mock.source_unbind_requests() == [{"machine_id": machine["id"]}]
             client.wait_until(lambda: _stream(client)["state"] is None, timeout=10,
                               what="no stream runs for the server")
             attempts = len(mock.delivery_attempts())
@@ -997,7 +997,7 @@ def test_stop_answering_from_here_through_the_view():
             lambda: (lambda r: r and r["kind"] == "nobody" and r["paused"] and not r["busy"])(
                 _view_row(client)),
             timeout=20, what="the row reading nobody, this machine stopped")
-        assert mock.source_unbind_requests() == [{}]
+        assert mock.source_unbind_requests() == [{"machine_id": machine["id"]}]
         row = _view_row(client)
         assert row["detail"] == "This machine stopped answering here.", row
         assert row["action"] == {"id": "use", "label": "Answer from here", "enabled": True}, row
@@ -1075,7 +1075,7 @@ def test_a_server_added_while_the_app_runs_is_listed_and_actionable(tmp_path):
         client.source_use("mock2")
         done = client.source_unbind("mock2")
         assert done["server"] == "mock2" and done["unbound"] is True, done
-        assert mock.source_unbind_requests() == [{}]
+        assert mock.source_unbind_requests() == [{"machine_id": _machine(client)["id"]}]
         # Gone from the config: gone from the list, and refused again.
         cfg.write_text(base)
         assert hosts() == ["mock"]
@@ -1116,7 +1116,7 @@ def test_a_config_that_cannot_be_read_keeps_the_rows_it_last_listed(tmp_path):
                           what="the config line gone")
         client.source_use("mock")
         client.source_unbind("mock")
-        assert mock.source_unbind_requests() == [{}]
+        assert mock.source_unbind_requests() == [{"machine_id": _machine(client)["id"]}]
 
 
 def test_a_server_unreachable_from_the_start_has_a_row_and_a_tick(tmp_path):
@@ -1228,7 +1228,7 @@ def test_a_stop_whose_first_read_is_stale_unbinds_this_machine():
         done = out["done"]
         assert done["unbound"] is True and done["previous_was_this_machine"] is True, done
         assert "another_machine_answers" not in done, done
-        assert mock.source_unbind_requests() == [{}]
+        assert mock.source_unbind_requests() == [{"machine_id": machine["id"]}]
         assert mock.source_bound() is None
 
 
@@ -1316,3 +1316,54 @@ def test_a_late_admission_after_an_unbind_is_unbound_again_or_reported():
         row = _list_row(client, "mock")
         assert (row["paused"], row["stream"]) == (True, None), row
         _holds(lambda: _stream(client)["state"] is None, 2.0, "no stream after rebound")
+
+
+def test_a_stop_never_clears_a_machine_that_took_over_meanwhile():
+    """Every unbind a stop sends names this machine, and the server clears the binding
+    only while it still names it. Another machine taking over between the stop's last
+    read and its unbind (the first unbind, or the re-check's after a late admission) is
+    refused `409 SOURCE_MOVED`: the stop is the closed class `source_moved`, no further
+    unbind is sent, this machine stays paused, and the other machine stays the source. A
+    v0.11 server, which refuses the field, gets the plain unbind as before."""
+    moved_words = ("another machine took over as your credential source on mock; nothing "
+                   "was cleared, and this machine stays stopped there")
+    with _source_app(source={}) as (client, mock, _i):
+        client.wait_until(lambda: _not_bound(client), timeout=20, what="the stream not_bound")
+        machine = _machine(client)
+        mine = {"machine_id": machine["id"]}
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source")
+
+        mock.move_before_unbind(OTHER_MACHINE, "desk")
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock")
+        assert (e.value.code, e.value.message) == ("source_moved", moved_words), e.value
+        assert mock.source_unbind_requests() == [mine]
+        assert mock.source_bound() == OTHER_MACHINE, "the machine that took over stays"
+        row = _list_row(client, "mock")
+        assert (row["kind"], row["paused"], row["stream"]) == ("other_machine", True, None), row
+
+        # The re-check's unbind: a late admission binds this machine again, and another
+        # machine takes over before the second unbind lands.
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source again")
+        mock.admit_after_unbind(machine["id"], machine["name"])
+        mock.move_before_unbind(OTHER_MACHINE, "desk", skip=1)
+        with pytest.raises(ShedError) as e:
+            client.source_unbind("mock")
+        assert e.value.code == "source_moved", e.value
+        assert mock.source_unbind_requests() == [mine] * 3, "no unbind after SOURCE_MOVED"
+        assert mock.source_bound() == OTHER_MACHINE
+        assert _list_row(client, "mock")["paused"] is True
+
+        # A v0.11 server refuses the field before changing anything: the plain unbind.
+        client.source_use("mock")
+        client.wait_until(lambda: _stream(client)["state"] == "connected",
+                          timeout=30, what="this machine the source once more")
+        mock.unbind_like_v011()
+        done = client.source_unbind("mock")
+        assert done["unbound"] is True and done["verified"] is True, done
+        assert mock.source_unbind_requests()[3:] == [mine, {}]
+        assert mock.source_bound() is None

@@ -221,6 +221,7 @@ test("refusals are fixed words by code, never the server's", () => {
   assert.equal(refusalText("forbidden", "mock", "use"), "mock does not let this client change its credential source.");
   assert.match(refusalText("source_is_service", "mock", "unbind"), /account service answers for you on mock/);
   assert.match(refusalText("rebound", "mock", "unbind"), /stays stopped here/);
+  assert.match(refusalText("source_moved", "mock", "unbind"), /Another machine took over .* on mock; nothing was cleared/);
   assert.match(refusalText("anything else", "mock", "use"), /could not confirm the move/);
   assert.match(refusalText("anything else", "mock", "unbind"), /could not confirm the stop/);
   for (const c of ["unreachable", "busy", "unauthorized", "forbidden", "source_is_service", "refused", "x"]) {
