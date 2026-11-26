@@ -842,6 +842,7 @@ mod tests {
                 status,
                 code: "SHED_NOT_FOUND".into(),
                 message: "SERVER SENTINEL".into(),
+                reason: String::new(),
             };
             let (c, m) = shed_read_failure(&e);
             assert_eq!(c, code);

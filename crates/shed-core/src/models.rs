@@ -112,6 +112,159 @@ pub struct Shed {
     pub started_at: Option<String>,
     #[serde(default, deserialize_with = "null_default")]
     pub active_namespaces: Vec<String>,
+    /// A cloud shed's machine (plan 041): every record of a remote server with
+    /// leases carries it, no other record does. Absent, `null` or not an object →
+    /// `None`; inside it each member decodes on its own ([`ShedCloud::from_value`]),
+    /// so a malformed member never drops the shed or the list.
+    #[serde(
+        default,
+        deserialize_with = "cloud_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cloud: Option<ShedCloud>,
+}
+
+/// A cloud shed's machine as the account service reported it (the server's
+/// `config.ShedCloud`). Times are carried VERBATIM (the clients parse them);
+/// integers are `i64`. Before the service has answered for the machine there is
+/// no `lease` (unknown), and `provider` is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShedCloud {
+    /// A word for display (which cloud); absent until the service answered.
+    pub provider: Option<String>,
+    pub size: ShedCloudSize,
+    /// 0 when not said.
+    pub disk_gb: i64,
+    /// The image the machine was made from ("" when not said).
+    pub image: String,
+    /// When the service made the machine ("" when not said).
+    pub created_at: String,
+    /// The machine's last start and last stop, when known.
+    pub started_at: Option<String>,
+    pub stopped_at: Option<String>,
+    /// `None` while the lease is unknown (the service has not answered yet).
+    pub lease: Option<ShedCloudLease>,
+}
+
+/// A cloud machine's size: its catalog name, vCPUs and memory (0 when not said).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShedCloudSize {
+    pub name: String,
+    pub cpus: i64,
+    pub memory_mb: i64,
+}
+
+/// When the account service deletes a cloud shed's machine, and how far it may be
+/// extended.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShedCloudLease {
+    /// When the machine is deleted, running or stopped ("" when not said).
+    pub expires_at: String,
+    /// The cap: no extend goes past it ("" when not said).
+    pub max_expires_at: String,
+    /// Whether an extend by one hour would be accepted now (`false` unless the
+    /// server said exactly `true`).
+    pub extendable: bool,
+    /// The hours a person is offered to extend by (the integers of the list).
+    pub presets_h: Vec<i64>,
+    /// How long before `expires_at` (seconds) a person is warned: `None` (absent)
+    /// means [`DEFAULT_LEASE_WARN_S`], `Some(0)` no warning.
+    pub warn_s: Option<i64>,
+}
+
+/// The warning time of a lease whose `warn_s` is absent (the server's
+/// `config.DefaultLeaseWarn`, 2 h).
+pub const DEFAULT_LEASE_WARN_S: i64 = 2 * 60 * 60;
+
+/// The most hours one extend may ask for (the server's `MaxExtendHours`).
+pub const MAX_EXTEND_HOURS: i64 = 720;
+
+/// Server feature token for cloud sheds with a lease (`internal/config/cloud.go`
+/// `FeatureLease`): records carry `cloud`, `POST /api/sheds/{name}/extend` and
+/// `GET /api/cloud/usage` answer.
+pub const FEATURE_LEASE: &str = "lease";
+
+impl ShedCloud {
+    /// Decode a `cloud` member tolerantly, member by member: anything but an object
+    /// is `None`; a missing or wrongly typed member takes its default (a string
+    /// `""`, an integer 0, an optional `None`, `extendable` false), a `lease` that is
+    /// not an object is `None` (unknown), and `presets_h` keeps its integers.
+    pub fn from_value(v: &Value) -> Option<ShedCloud> {
+        let o = v.as_object()?;
+        let text = |o: &serde_json::Map<String, Value>, k: &str| -> String {
+            raw_str(o.get(k)).to_string()
+        };
+        let opt_text = |o: &serde_json::Map<String, Value>, k: &str| -> Option<String> {
+            o.get(k).and_then(Value::as_str).map(str::to_string)
+        };
+        let int = |o: &serde_json::Map<String, Value>, k: &str| -> i64 {
+            o.get(k).and_then(Value::as_i64).unwrap_or(0)
+        };
+        let size = o
+            .get("size")
+            .and_then(Value::as_object)
+            .map(|s| ShedCloudSize {
+                name: text(s, "name"),
+                cpus: int(s, "cpus"),
+                memory_mb: int(s, "memory_mb"),
+            })
+            .unwrap_or_default();
+        let lease = o
+            .get("lease")
+            .and_then(Value::as_object)
+            .map(|l| ShedCloudLease {
+                expires_at: text(l, "expires_at"),
+                max_expires_at: text(l, "max_expires_at"),
+                extendable: l.get("extendable").and_then(Value::as_bool) == Some(true),
+                presets_h: l
+                    .get("presets_h")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                    .unwrap_or_default(),
+                warn_s: l.get("warn_s").and_then(Value::as_i64),
+            });
+        Some(ShedCloud {
+            provider: opt_text(o, "provider"),
+            size,
+            disk_gb: int(o, "disk_gb"),
+            image: text(o, "image"),
+            created_at: text(o, "created_at"),
+            started_at: opt_text(o, "started_at"),
+            stopped_at: opt_text(o, "stopped_at"),
+            lease,
+        })
+    }
+}
+
+/// [`Shed::cloud`]'s decoder on the derive path: the same tolerant decode as the
+/// overview path ([`ShedCloud::from_value`]).
+fn cloud_field<'de, D>(d: D) -> Result<Option<ShedCloud>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(ShedCloud::from_value(&Value::deserialize(d)?))
+}
+
+/// One line of `GET /api/cloud/usage`: the machines held, how many run and how
+/// many are stopped, and the limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CloudCounts {
+    pub machines: i64,
+    pub running: i64,
+    pub stopped: i64,
+    pub max: i64,
+}
+
+/// `GET /api/cloud/usage`: the caller's machines against the account service's
+/// limit (`None` for a caller who is not a person of the service: a local admin,
+/// a service client) and the organization's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CloudUsage {
+    #[serde(default, deserialize_with = "lenient")]
+    pub person: Option<CloudCounts>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub org: CloudCounts,
 }
 
 /// The `{"sheds": [...] | null}` wrapper for `GET /api/sheds`. `null` and an
@@ -460,6 +613,7 @@ fn overview_shed_record(obj: &serde_json::Map<String, Value>) -> Shed {
         created_at: opt_verbatim("created_at"),
         started_at: opt_verbatim("started_at"),
         active_namespaces: string_list(obj.get("active_namespaces")),
+        cloud: obj.get("cloud").and_then(ShedCloud::from_value),
     }
 }
 
@@ -1096,6 +1250,132 @@ mod tests {
         assert_eq!(by("nulled").status_reason, None); // explicit null
         assert_eq!(by("odd").status_reason, None); // wrong type degrades
         assert_eq!(by("rebooting").status, ShedStatus::Unknown);
+    }
+
+    // ---- cloud sheds (plan 041): `cloud` on both decode paths, from the answers
+    // shed-server's own handlers gave over the reference compute service
+    // (`crates/fixtures/cloud/`, written by `internal/remote/client_fixtures_test.go`) ----
+
+    fn cloud_list() -> Vec<Shed> {
+        serde_json::from_str::<ShedList>(include_str!("../../fixtures/cloud/sheds.json"))
+            .unwrap()
+            .sheds
+    }
+
+    fn cloud_overview() -> Overview {
+        serde_json::from_str(include_str!("../../fixtures/cloud/overview.json")).unwrap()
+    }
+
+    #[test]
+    fn cloud_decodes_on_the_list_path_from_the_recorded_rows() {
+        let sheds = cloud_list();
+        let by = |n: &str| sheds.iter().find(|s| s.name == n).unwrap();
+        for s in [by("widgets"), by("gadgets")] {
+            let c = s.cloud.as_ref().expect("a remote record carries cloud");
+            assert_eq!(c.provider.as_deref(), Some("ref"));
+            assert_eq!(
+                c.size,
+                ShedCloudSize {
+                    name: "standard".into(),
+                    cpus: 2,
+                    memory_mb: 8192
+                }
+            );
+            assert_eq!(c.disk_gb, 50);
+            assert_eq!(Some(c.image.as_str()), s.image.as_deref());
+            assert!(!c.created_at.is_empty() && c.started_at.is_some());
+            let l = c.lease.as_ref().expect("the lease is known");
+            assert!(!l.expires_at.is_empty() && l.expires_at < l.max_expires_at);
+            assert!(l.extendable);
+            assert_eq!(l.presets_h, vec![6, 12, 24, 48]);
+            assert_eq!(l.warn_s, Some(7200));
+        }
+        // Only the stopped one has a last stop.
+        assert_eq!(by("widgets").status, ShedStatus::Running);
+        assert_eq!(by("widgets").cloud.as_ref().unwrap().stopped_at, None);
+        assert_eq!(by("gadgets").status, ShedStatus::Stopped);
+        assert!(by("gadgets").cloud.as_ref().unwrap().stopped_at.is_some());
+    }
+
+    /// The overview's hand decode reads the same `cloud` as the list's derive, field
+    /// for field (both answers were recorded in one run).
+    #[test]
+    fn cloud_decodes_on_the_overview_path_as_on_the_list_path() {
+        let list = cloud_list();
+        let o = cloud_overview();
+        assert!(o.server.has_feature(FEATURE_LEASE));
+        assert_eq!(o.sheds.len(), list.len());
+        for s in &list {
+            let row = o.sheds.iter().find(|r| r.shed.name == s.name).unwrap();
+            assert!(row.shed.cloud.is_some());
+            assert_eq!(row.shed.cloud, s.cloud, "{}", s.name);
+        }
+    }
+
+    #[test]
+    fn a_record_with_no_cloud_has_none_on_both_paths() {
+        let s: Shed = serde_json::from_str(include_str!("../../fixtures/shed_real.json")).unwrap();
+        assert_eq!(s.cloud, None);
+        assert!(golden_overview()
+            .sheds
+            .iter()
+            .all(|r| r.shed.cloud.is_none()));
+        // And a shed with none serializes as it did: no `cloud` key.
+        assert!(serde_json::to_value(&s).unwrap().get("cloud").is_none());
+    }
+
+    /// Each member decodes on its own: a malformed one takes its default and never
+    /// drops the shed (or the list).
+    #[test]
+    fn a_malformed_cloud_degrades_member_by_member() {
+        for raw in [r#"null"#, r#""cloudy""#, r#"7"#, r#"[]"#] {
+            let s: Shed =
+                serde_json::from_str(&format!(r#"{{"name":"x","cloud":{raw}}}"#)).unwrap();
+            assert_eq!(s.cloud, None, "{raw}");
+        }
+        let raw = r#"{"sheds":[{"name":"x","cloud":{"size":"big","disk_gb":"50","image":3,
+            "created_at":"2026-11-26T09:00:00Z","started_at":null,
+            "lease":{"expires_at":"soon","extendable":"true","presets_h":[6,"12",null,24],
+                     "warn_s":0}}},{"name":"y","cloud":{"lease":"later"}}]}"#;
+        let list: ShedList = serde_json::from_str(raw).unwrap();
+        assert_eq!(list.sheds.len(), 2);
+        let c = list.sheds[0].cloud.clone().unwrap();
+        assert_eq!(c.size, ShedCloudSize::default());
+        assert_eq!((c.disk_gb, c.image.as_str(), c.provider), (0, "", None));
+        assert_eq!(c.created_at, "2026-11-26T09:00:00Z");
+        assert_eq!(c.started_at, None);
+        let l = c.lease.unwrap();
+        assert_eq!(
+            l.expires_at, "soon",
+            "carried verbatim; the client judges it"
+        );
+        assert_eq!(l.max_expires_at, "");
+        assert!(!l.extendable, "only an exact true extends");
+        assert_eq!(l.presets_h, vec![6, 24]);
+        assert_eq!(l.warn_s, Some(0));
+        // A lease that is not an object is unknown.
+        assert_eq!(list.sheds[1].cloud.as_ref().unwrap().lease, None);
+        // The overview path agrees.
+        let o: Overview = serde_json::from_str(raw).unwrap();
+        assert_eq!(o.sheds[0].shed.cloud, list.sheds[0].cloud);
+        assert_eq!(o.sheds[1].shed.cloud, list.sheds[1].cloud);
+    }
+
+    #[test]
+    fn cloud_usage_tolerates_a_missing_person_and_odd_members() {
+        let u: CloudUsage = serde_json::from_str(r#"{"org":{"machines":3,"max":10}}"#).unwrap();
+        assert_eq!(u.person, None);
+        assert_eq!(
+            u.org,
+            CloudCounts {
+                machines: 3,
+                running: 0,
+                stopped: 0,
+                max: 10
+            }
+        );
+        let u: CloudUsage = serde_json::from_str(r#"{"person":"me","org":null}"#).unwrap();
+        assert_eq!(u, CloudUsage::default());
     }
 
     #[test]

@@ -24,8 +24,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use shed_app::{Backend, Reachability};
-use shed_core::models::CreateShedRequest;
+use shed_app::{cloud_row, usage_words, Backend, CloudCaps, CloudFailure, Reachability};
+use shed_core::http::ApiFailure;
+use shed_core::models::{CreateShedRequest, Shed};
+use shed_desktop_core::delivery::source::time::now_unix;
 use shed_desktop_core::{
     failure_json, installed_json, InjectedRow, LaneFailure, ShedDesktopRuntime, ShedHosts, ShedId,
 };
@@ -94,7 +96,16 @@ fn lane_err(failure: LaneFailure) -> (String, String) {
 ///
 /// Each shed carries its `delivery` record (plan 039 §3.6) as its server sent it,
 /// or `null` from a server older than delivery: the row's badge and detail read it.
+///
+/// A cloud shed (plan 041) carries its `cloud` facts as the server sent them and
+/// `cloud_row`, what its row shows and offers ([`shed_app::cloud_row`], decided in
+/// the core so the UI only draws), from its server's features and the time now; any
+/// other shed has `cloud_row: null` and no `cloud`.
 pub(crate) fn sheds_payload(r: &Reachability) -> Value {
+    sheds_payload_at(r, now_unix())
+}
+
+fn sheds_payload_at(r: &Reachability, now: i64) -> Value {
     let sheds: Vec<Value> = r
         .sheds
         .iter()
@@ -107,11 +118,50 @@ pub(crate) fn sheds_payload(r: &Reachability) -> Value {
                     .cloned()
                     .unwrap_or(Value::Null);
                 o.insert("delivery".to_string(), rec);
+                let row = cloud_row(s, r.cloud_caps(&s.host), now);
+                o.insert("cloud_row".to_string(), json!(row));
             }
             v
         })
         .collect();
     json!({ "sheds": sheds, "host_errors": r.host_errors })
+}
+
+/// An extend's `hours` as a whole number. Its range (1 to 720) is checked by
+/// [`Backend::extend`], the one check the Tauri command shares, before anything is
+/// sent.
+fn extend_hours(params: &Value) -> Result<i64, (String, String)> {
+    params
+        .get("hours")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| err("bad_request", "hours is a whole number from 1 to 720"))
+}
+
+/// An extend's answer: the shed as its server answered it, and its row (the server
+/// just extended a lease, so it has them).
+pub(crate) fn extend_answer(shed: &Shed) -> Value {
+    json!({
+        "shed": shed,
+        "cloud_row": cloud_row(shed, CloudCaps { lease: true }, now_unix()),
+    })
+}
+
+/// A failed extend or usage read as the UI and the harness see it
+/// ([`CloudFailure`]: `{code, reason, status, words}`).
+pub(crate) fn cloud_failure(e: &ApiFailure) -> Value {
+    json!(CloudFailure::from_api(e))
+}
+
+/// [`CloudFailure`] as the IPC error envelope: its code and its words.
+fn cloud_err(e: &ApiFailure) -> (String, String) {
+    let f = CloudFailure::from_api(e);
+    (f.code, f.words)
+}
+
+/// A host's cloud usage as the UI and the harness see it: the counts as the server
+/// sent them and the line under the server's heading ([`shed_app::usage_words`]).
+pub(crate) fn usage_answer(host: &str, u: &shed_core::models::CloudUsage) -> Value {
+    json!({ "host": host, "usage": u, "words": usage_words(u) })
 }
 
 /// Refresh reachability and reconcile shed hosts against it.
@@ -950,6 +1000,8 @@ impl Handler {
             "shed.stop" => self.shed_action(params, "stop").await,
             "shed.reset" => self.shed_action(params, "reset").await,
             "shed.delete" => self.shed_action(params, "delete").await,
+            "shed.extend" => self.shed_extend(params).await,
+            "cloud.usage" => self.cloud_usage(params).await,
             "create.start" => self.create_start(params).await,
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
@@ -1410,6 +1462,32 @@ impl Handler {
             .await
             .map(|()| json!({}))
             .map_err(|e| err("action_failed", e.to_string()))
+    }
+
+    /// `shed.extend` → move a cloud shed's lease `{host?, name, hours}` later (plan
+    /// 041): `{shed, cloud_row}`, or the refusal as `(code, words)` (an
+    /// account-service refusal's code with its fixed words).
+    async fn shed_extend(&self, params: &Value) -> Result<Value, (String, String)> {
+        let name = req_str(params, "name")?;
+        let host = params.get("host").and_then(Value::as_str);
+        let hours = extend_hours(params)?;
+        self.backend
+            .extend(host, name, hours)
+            .await
+            .map(|shed| extend_answer(&shed))
+            .map_err(|e| cloud_err(&e))
+    }
+
+    /// `cloud.usage` → `{host, usage, words}` for `{host}`: its cloud machines
+    /// against the account service's limits, or the refusal as `(code, words)` (a
+    /// server without compute answers `FEATURE_UNSUPPORTED`).
+    async fn cloud_usage(&self, params: &Value) -> Result<Value, (String, String)> {
+        let host = req_str(params, "host")?;
+        self.backend
+            .cloud_usage(host)
+            .await
+            .map(|u| usage_answer(host, &u))
+            .map_err(|e| cloud_err(&e))
     }
 
     /// `create.start` → kick off a create on the pure shed-core CreateStore (its
@@ -2451,6 +2529,7 @@ mod tests {
             last_error,
             host_errors,
             delivery: Default::default(),
+            features: Default::default(),
         }
     }
 
@@ -2514,6 +2593,92 @@ mod tests {
         assert_eq!(p["sheds"][0]["delivery"]["owed"], json!(["install"]));
         assert_eq!(p["sheds"][1]["delivery"], Value::Null, "no record: null");
         assert_eq!(p["sheds"][1]["name"], "beta");
+    }
+
+    /// A cloud shed carries its `cloud` and its computed row; any other shed a null
+    /// row and no `cloud`. The row offers an extend only on a server that has leases.
+    #[test]
+    fn sheds_payload_carries_each_cloud_sheds_row() {
+        let mut r = reachability(&[("mock", "alpha")], &[]);
+        let cloud: Shed = serde_json::from_value(json!({
+            "host": "cloud-a", "name": "widgets", "status": "running", "backend": "remote",
+            "cloud": {"size": {"name": "standard", "cpus": 2, "memory_mb": 8192},
+                      "image": "shed-full-1", "created_at": "2026-11-26T06:00:00Z",
+                      "lease": {"expires_at": "2026-11-26T14:10:00Z",
+                                "max_expires_at": "2026-11-30T13:00:00Z",
+                                "extendable": true, "presets_h": [6, 12]}},
+        }))
+        .unwrap();
+        r.sheds.push(cloud);
+        // 2026-11-26T09:00:00Z.
+        let now = 1_795_683_600;
+        let p = sheds_payload_at(&r, now);
+        assert_eq!(p["sheds"][0]["cloud_row"], Value::Null);
+        assert!(p["sheds"][0].get("cloud").is_none());
+        let row = &p["sheds"][1]["cloud_row"];
+        assert_eq!(p["sheds"][1]["cloud"]["size"]["name"], "standard");
+        assert_eq!(row["badge"], "Cloud");
+        assert_eq!(row["size_words"], "2 vCPU · 8 GB");
+        assert_eq!(row["lease_words"], "deleted in 5h 10m");
+        assert_eq!(row["lease_state"], "ok");
+        assert_eq!(
+            row["actions"]["extend"], false,
+            "no features read: fail closed"
+        );
+        r.features
+            .insert("cloud-a".into(), vec!["lease".into(), "overview".into()]);
+        let row = &sheds_payload_at(&r, now)["sheds"][1]["cloud_row"];
+        assert_eq!(row["actions"]["extend"], true);
+        assert_eq!(row["extend_presets_h"], json!([6, 12]));
+    }
+
+    #[test]
+    fn a_cloud_refusal_has_its_code_and_fixed_words() {
+        let refusal = |code: &str, reason: &str, status: Option<u16>| ApiFailure {
+            status,
+            code: code.into(),
+            message: "SERVER TEXT".into(),
+            reason: reason.into(),
+        };
+        let f = cloud_failure(&refusal("LEASE_AT_CAP", "", Some(409)));
+        assert_eq!(f["code"], "LEASE_AT_CAP");
+        assert_eq!(f["status"], 409);
+        assert!(f["words"].as_str().unwrap().contains("past its cap"));
+        let (code, words) = cloud_err(&refusal("COMPUTE_LIMIT_REACHED", "person", Some(503)));
+        assert_eq!(code, "COMPUTE_LIMIT_REACHED");
+        assert!(words.contains("a person"), "{words}");
+        assert!(!words.contains("SERVER TEXT"));
+        // Another code keeps the server's (cleaned) message; no answer is action_failed.
+        assert_eq!(
+            cloud_err(&refusal("FORBIDDEN", "", Some(403))).1,
+            "SERVER TEXT"
+        );
+        assert_eq!(cloud_err(&refusal("", "", None)).0, "action_failed");
+        assert_eq!(
+            extend_hours(&json!({"hours": "6"})).unwrap_err().0,
+            "bad_request"
+        );
+        assert_eq!(extend_hours(&json!({})).unwrap_err().0, "bad_request");
+        assert_eq!(extend_hours(&json!({"hours": 720})).unwrap(), 720);
+    }
+
+    /// Hours out of range are refused by the one check the IPC op and the Tauri
+    /// command share ([`Backend::extend`]), as `bad_request`, before any server is
+    /// asked: this backend has a server that answers nothing.
+    #[tokio::test]
+    async fn out_of_range_hours_are_refused_before_anything_is_sent() {
+        let backend =
+            Backend::from_env_parts(true, Some("http://127.0.0.1:1"), Path::new("/nonexistent"));
+        for hours in [0, -1, 721, i64::from(u32::MAX) + 1] {
+            let e = backend.extend(None, "widgets", hours).await.unwrap_err();
+            let f = cloud_failure(&e);
+            assert_eq!(
+                (f["code"].as_str(), f["status"].is_null()),
+                (Some("bad_request"), true),
+                "{hours}: {f}"
+            );
+            assert_eq!(cloud_err(&e).0, "bad_request");
+        }
     }
 
     #[test]

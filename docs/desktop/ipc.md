@@ -29,7 +29,7 @@ own, documented with them below.
 | op | params | result |
 |----|--------|--------|
 | `identify` | — | `socket_path`, `pid`, `core` (`rust`), `platform` (`tauri`), `test_mode`, `mock_base_url` (`null` outside test mode), `log_path` (the app's log file, `null` when file logging is off) |
-| `sheds.list` | — | `{sheds, host_errors}` — a fresh query of every configured host |
+| `sheds.list` | — | `{sheds, host_errors}` — a fresh query of every configured host; a cloud shed carries its server's `cloud` and `cloud_row` (what its row shows and offers: `badge`, `size_words`, `image`, `lease_words`, `lease_state` `ok`/`soon`/`ended`/`unknown`, `run_words`, `actions` `{start, stop, delete, extend}`, `extend_presets_h`, `extend_max_h`, `expires_words`, `cap_words`, `created_words`), any other shed `cloud_row: null` |
 | `sheds.refresh` | — | `{sheds, host_errors}` — asks the dashboard to re-fetch, waits for it to render, and answers with the listing it committed |
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
 | `hosts.auth` | — | `hosts[]`, each `{name, auth_mode, learned}`: the credential mode per server (`mtls`, or `token` for any other entry: a server older than 0.10.0 still in token mode (removed in 0.10.0), or an entry that records no mode) and whether this session learned it or read it from the config |
@@ -90,6 +90,8 @@ carrying no transport error text.
 | op | params | result |
 |----|--------|--------|
 | `shed.start` / `shed.stop` / `shed.reset` / `shed.delete` | `host?`, `name` | `{}`; a failure is `action_failed` |
+| `shed.extend` | `host?`, `name`, `hours` (1 to 720) | `{shed, cloud_row}`: a cloud shed with its lease moved `hours` later; a refusal is its API code (`LEASE_AT_CAP`, `EXTEND_NOT_ALLOWED`, …) with fixed words, `action_failed` when no server answered |
+| `cloud.usage` | `host` | `{host, usage, words}`: the server's cloud machines against the account service's limits (`usage` is `{person, org}`, `person` null for a caller who is not a person of the service); a server without cloud sheds answers `FEATURE_UNSUPPORTED` |
 | `create.start` | `host?`, `name`, `repo?`, `local_dir?`, `image?`, `backend?`, `cpus?`, `memory_mb?`, `no_provision?` | `create_id` |
 | `create.status` | `create_id` | the create's progress snapshot (poll until `complete`/`error`); `{state: "unknown"}` once it is cancelled or gone |
 | `create.cancel` | `create_id` | `{}` — aborts the create's stream and drops its state (idempotent) |

@@ -49,7 +49,8 @@ shedctl (no internal deps)
   `feed: "activity", watch: false` for an opencode tab. `RELEASE_PIN` lives in
   `src/bootstrap/source.rs`. Android-clean.
 - **`shed-app`** — toolkit-free shed client core: `Backend`, `AuthModeRegistry`,
-  `timefmt`. No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
+  `timefmt`, `cloud` (plan 041: a cloud shed's `CloudRow` from its `cloud`, the
+  server's features and an injected now, so every shell only draws it). No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
   `saphyr-parser`.**
 - **`shed-desktop-core`** — toolkit-free **shed-only** runtime the Tauri shell
   (and a future iced UI) hosts: `ShedId` (`roost:<server>/<shed>`),
@@ -373,7 +374,10 @@ shedctl (no internal deps)
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that the Rust decoders assert against — keep them
-byte-real, not hand-trimmed.
+byte-real, not hand-trimmed. `fixtures/cloud/` is written by shed-server's own handlers
+over the reference compute service (`UPDATE_CLIENT_FIXTURES=1 go test ./internal/remote/
+-run TestCloudClientFixtures`; without the variable the test fails when a file's shape
+no longer matches the server's).
 `fixtures/roost-vectors/` is a **vendored copy** of roost's own golden IPC vectors at the
 pinned rev (see below); its README carries the source sha and roost's never-semantically-edit
 rule.

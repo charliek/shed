@@ -15,15 +15,19 @@ use tokio::runtime::Handle;
 
 use shed_core::config::ShedConfig;
 use shed_core::create::{CreateProgress, CreateStore};
-use shed_core::http::{Client, ShedError, SourceError};
+use shed_core::http::{ApiFailure, Client, ShedError, SourceError};
 use shed_core::models::{
-    display_source_text, CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SourceDocument,
-    SourceUnbound, SystemDiskUsage, SOURCE_TEXT_MAX_BYTES,
+    display_source_text, CloudUsage, CreateShedRequest, EgressProfileInfo, Shed, ShedStatus,
+    SourceDocument, SourceUnbound, SystemDiskUsage, MAX_EXTEND_HOURS, SOURCE_TEXT_MAX_BYTES,
 };
 use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
 
 use crate::auth_modes::AuthModeRegistry;
+
+/// The code [`Backend::extend`] refuses hours outside 1 to [`MAX_EXTEND_HOURS`] with,
+/// before anything is sent: the IPC vocabulary's `bad_request`.
+pub const EXTEND_BAD_HOURS: &str = "bad_request";
 
 /// A per-host egress profiles row's error when the server's egress control is off
 /// (its `/api/egress/profiles` answers 501).
@@ -388,6 +392,45 @@ impl Backend {
         }
     }
 
+    /// Move a cloud shed's lease `hours` later (plan 041) and return the shed as its
+    /// server answered it. As the other actions, it does not refresh: whoever shows
+    /// the rows refreshes after it resolves. A refusal keeps its code and reason
+    /// ([`ApiFailure`]).
+    ///
+    /// `hours` outside 1 to [`MAX_EXTEND_HOURS`] is refused here, never sent:
+    /// [`EXTEND_BAD_HOURS`] with no status. This is the one check every shell's
+    /// entry point goes through (the Tauri command and the IPC op alike).
+    pub async fn extend(
+        &self,
+        host: Option<&str>,
+        name: &str,
+        hours: i64,
+    ) -> Result<Shed, ApiFailure> {
+        let hours = u32::try_from(hours)
+            .ok()
+            .filter(|h| (1..=MAX_EXTEND_HOURS).contains(&i64::from(*h)))
+            .ok_or_else(|| ApiFailure {
+                status: None,
+                code: EXTEND_BAD_HOURS.to_string(),
+                message: format!("hours is a whole number from 1 to {MAX_EXTEND_HOURS}"),
+                reason: String::new(),
+            })?;
+        let client = self
+            .client_for(host)
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        client.extend(name, hours).await
+    }
+
+    /// `host`'s cloud usage (`GET /api/cloud/usage`): the caller's machines and the
+    /// organization's against the account service's limits. `host` names a
+    /// configured server exactly.
+    pub async fn cloud_usage(&self, host: &str) -> Result<CloudUsage, ApiFailure> {
+        let client = self
+            .client_for(Some(host))
+            .map_err(|e| ApiFailure::from_shed(&e))?;
+        client.cloud_usage().await
+    }
+
     // -- create (on the pure shed-core CreateStore) -----------------------
 
     /// Start a create on `host`; the SSE stream runs on `rt` in the background.
@@ -421,12 +464,26 @@ impl Backend {
         let mut sheds = Vec::new();
         let mut host_errors = Vec::new();
         let mut delivery = HashMap::new();
-        for (name, result) in self
-            .per_host(async |c: &Client| c.list_sheds_with_delivery().await)
-            .await
-        {
+        let mut features = HashMap::new();
+        // A server whose rows carry `cloud` (plan 041) has its `/api/info` features
+        // read right after its list, on every refresh: never kept, so a server that
+        // changes is seen on the next one. One that could not be read is left out:
+        // its rows then offer nothing that needs a feature.
+        let list = async |c: &Client| {
+            let rows = c.list_sheds_with_delivery().await?;
+            let host_features = if rows.iter().any(|(s, _)| s.cloud.is_some()) {
+                c.info().await.ok().map(|i| i.features)
+            } else {
+                None
+            };
+            Ok::<_, ShedError>((rows, host_features))
+        };
+        for (name, result) in self.per_host(list).await {
             match result {
-                Ok(rows) => {
+                Ok((rows, host_features)) => {
+                    if let Some(f) = host_features {
+                        features.insert(name, f);
+                    }
                     for (s, d) in rows {
                         if let Some(d) = d {
                             delivery.insert((s.host.clone(), s.name.clone()), d);
@@ -447,6 +504,7 @@ impl Backend {
             last_error,
             host_errors,
             delivery,
+            features,
         }
     }
 
@@ -702,6 +760,22 @@ pub struct Reachability {
     /// its server sent it. A shed from a server older than delivery has none.
     #[serde(skip)]
     pub delivery: HashMap<(String, String), serde_json::Value>,
+    /// The `/api/info` features of each server whose rows carry `cloud` (plan 041),
+    /// by server name; a server that could not be read is absent. What a cloud row
+    /// may offer ([`crate::cloud::CloudCaps::from_features`]).
+    #[serde(skip)]
+    pub features: HashMap<String, Vec<String>>,
+}
+
+impl Reachability {
+    /// What `host`'s cloud rows may offer, from its features (nothing when they
+    /// could not be read: fail closed).
+    pub fn cloud_caps(&self, host: &str) -> crate::cloud::CloudCaps {
+        self.features
+            .get(host)
+            .map(|f| crate::cloud::CloudCaps::from_features(f))
+            .unwrap_or_default()
+    }
 }
 
 /// One host's failure in presentation shape (plan 006 D6 / shed#300): `kind` is
@@ -2114,5 +2188,168 @@ mod tests {
         );
         // an unknown host is a config error, not a silent default.
         assert!(backend.terminal_preview(Some("nope"), "web", None).is_err());
+    }
+
+    // ---- cloud sheds (plan 041) ----
+
+    const CLOUD_SHEDS: &str = include_str!("../../fixtures/cloud/sheds.json");
+    const CLOUD_EXTEND: &str = include_str!("../../fixtures/cloud/extend.json");
+
+    /// `extend` returns the shed its server answered (host stamped), and a refusal
+    /// keeps its status, code and reason.
+    /// Hours outside 1 to 720 are refused here, `bad_request` with no status, and
+    /// nothing is sent: every shell's entry point goes through this one check.
+    #[tokio::test]
+    async fn extend_refuses_out_of_range_hours_before_sending() {
+        let server = MockServer::start_async().await;
+        let any = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/widgets/extend");
+                t.status(200).body(CLOUD_EXTEND);
+            })
+            .await;
+        let backend = backend_with(vec![client_at("cloud-a", server.base_url())]);
+        for hours in [0, -6, MAX_EXTEND_HOURS + 1, i64::from(u32::MAX) + 1] {
+            let e = backend.extend(None, "widgets", hours).await.unwrap_err();
+            assert_eq!(
+                (e.status, e.code.as_str()),
+                (None, EXTEND_BAD_HOURS),
+                "{hours}"
+            );
+        }
+        assert_eq!(any.hits_async().await, 0, "nothing was sent");
+        for hours in [1, MAX_EXTEND_HOURS] {
+            backend.extend(None, "widgets", hours).await.unwrap();
+        }
+        assert_eq!(any.hits_async().await, 2);
+    }
+
+    #[tokio::test]
+    async fn extend_returns_the_updated_shed() {
+        let server = MockServer::start_async().await;
+        let ok = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/widgets/extend")
+                    .body_contains(r#""hours":6"#);
+                t.status(200).body(CLOUD_EXTEND);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/widgets/extend")
+                    .body_contains(r#""hours":720"#);
+                t.status(409)
+                    .body(include_str!("../../fixtures/cloud/extend-at-cap.json"));
+            })
+            .await;
+        let backend = backend_with(vec![client_at("cloud-a", server.base_url())]);
+        let shed = backend.extend(Some("cloud-a"), "widgets", 6).await.unwrap();
+        ok.assert_async().await;
+        assert_eq!(
+            (shed.host.as_str(), shed.name.as_str()),
+            ("cloud-a", "widgets")
+        );
+        let want: Shed = serde_json::from_str(CLOUD_EXTEND).unwrap();
+        assert_eq!(shed.cloud, want.cloud);
+        assert!(shed.cloud.unwrap().lease.unwrap().extendable);
+        let e = backend.extend(None, "widgets", 720).await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(409), "LEASE_AT_CAP"));
+        let e = backend
+            .extend(Some("nope"), "widgets", 6)
+            .await
+            .unwrap_err();
+        assert_eq!(e.status, None);
+        assert!(e.message.contains("no configured host"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn cloud_usage_is_per_host() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/cloud/usage");
+                t.status(200)
+                    .body(include_str!("../../fixtures/cloud/usage-person.json"));
+            })
+            .await;
+        let backend = backend_with(vec![client_at("cloud-a", server.base_url())]);
+        let u = backend.cloud_usage("cloud-a").await.unwrap();
+        assert!(u.person.is_some());
+        assert!(backend.cloud_usage("other").await.is_err());
+    }
+
+    /// A refresh reads the features of a server whose rows carry `cloud`, every time;
+    /// a server with none is not asked.
+    #[tokio::test]
+    async fn refresh_reads_the_features_of_cloud_servers_only() {
+        let cloud = MockServer::start_async().await;
+        cloud
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200).body(CLOUD_SHEDS);
+            })
+            .await;
+        let cloud_info = cloud
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200)
+                    .body(r#"{"name":"c","version":"1","features":["overview","lease"]}"#);
+            })
+            .await;
+        let local = MockServer::start_async().await;
+        local
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200)
+                    .body(r#"{"sheds":[{"name":"x","status":"running","backend":"vz"}]}"#);
+            })
+            .await;
+        let local_info = local
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200).body(r#"{"name":"l","version":"1"}"#);
+            })
+            .await;
+        let backend = backend_with(vec![
+            client_at("cloud-a", cloud.base_url()),
+            client_at("local", local.base_url()),
+        ]);
+        for _ in 0..2 {
+            let r = backend.refresh().await;
+            assert_eq!(r.sheds.len(), 3);
+            assert_eq!(
+                r.features.get("cloud-a").map(Vec::as_slice),
+                Some(&["overview".to_string(), "lease".to_string()][..])
+            );
+            assert!(!r.features.contains_key("local"));
+        }
+        assert_eq!(cloud_info.hits_async().await, 2, "read on each refresh");
+        assert_eq!(local_info.hits_async().await, 0);
+    }
+
+    /// A server whose features cannot be read is left out (its rows offer no
+    /// extend).
+    #[tokio::test]
+    async fn unreadable_features_are_left_out() {
+        let cloud = MockServer::start_async().await;
+        cloud
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200).body(CLOUD_SHEDS);
+            })
+            .await;
+        let info = cloud
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(503);
+            })
+            .await;
+        let backend = backend_with(vec![client_at("cloud-a", cloud.base_url())]);
+        for _ in 0..2 {
+            assert!(backend.refresh().await.features.is_empty());
+        }
+        assert_eq!(info.hits_async().await, 2);
     }
 }

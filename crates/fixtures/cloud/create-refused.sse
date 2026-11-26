@@ -1,0 +1,3 @@
+event: error
+data: {"error":{"code":"COMPUTE_POLICY_REFUSED","message":"compute policy refused (person): only a person of the account service or a service client creates a cloud shed; a local admin can list, stop, delete and extend them","reason":"person"}}
+

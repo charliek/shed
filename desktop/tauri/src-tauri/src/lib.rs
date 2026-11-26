@@ -200,6 +200,43 @@ async fn shed_action(
         .map_err(|e| e.to_string())
 }
 
+/// Move a cloud shed's lease `hours` later (plan 041) from its row's Extend: the
+/// shed as its server answered it and its row (`{shed, cloud_row}`), or the
+/// refusal (`{code, reason, status, words}`; hours outside 1 to 720 are
+/// `bad_request`, refused by [`Backend::extend`] before anything is sent, the same
+/// check as the IPC op's). As for the other actions, the
+/// frontend re-fetches after it resolves; the harness drives the same through
+/// the `shed.extend` IPC op.
+#[tauri::command]
+async fn extend_shed(
+    backend: tauri::State<'_, Arc<Backend>>,
+    name: String,
+    hours: i64,
+    host: Option<String>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    backend
+        .extend(host.as_deref(), &name, hours)
+        .await
+        .map(|shed| ipc::extend_answer(&shed))
+        .map_err(|e| ipc::cloud_failure(&e))
+}
+
+/// A remote server's cloud usage for the line under its heading (plan 041):
+/// `{host, usage, words}`, or the refusal (`{code, reason, status, words}`; a
+/// server without compute answers `FEATURE_UNSUPPORTED`). The harness reads the
+/// same through the `cloud.usage` IPC op.
+#[tauri::command]
+async fn cloud_usage(
+    backend: tauri::State<'_, Arc<Backend>>,
+    host: String,
+) -> Result<serde_json::Value, serde_json::Value> {
+    backend
+        .cloud_usage(&host)
+        .await
+        .map(|u| ipc::usage_answer(&host, &u))
+        .map_err(|e| ipc::cloud_failure(&e))
+}
+
 /// The WebView's live per-host disk usage — `invoke("system_df")` when the System
 /// pane mounts / on its Refresh. Each row is a host's `SystemDiskUsage` or the
 /// error it returned (unreachable hosts are kept, not dropped). The harness reads
@@ -1239,6 +1276,8 @@ pub fn run() {
             list_sheds,
             list_hosts,
             shed_action,
+            extend_shed,
+            cloud_usage,
             system_df,
             egress_profiles,
             create_start,
