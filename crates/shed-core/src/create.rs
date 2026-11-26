@@ -189,6 +189,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn error_event_becomes_error_state() {
         let server = MockServer::start_async().await;
+        // A local server (not remote): its message is shown.
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200)
+                    .body(r#"{"name":"m","version":"1","backend":"vz"}"#);
+            })
+            .await;
         server
             .mock_async(|w, t| {
                 w.method(POST).path("/api/sheds");

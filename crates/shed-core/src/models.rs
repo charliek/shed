@@ -184,6 +184,52 @@ pub const MAX_EXTEND_HOURS: i64 = 720;
 /// `GET /api/cloud/usage` answer.
 pub const FEATURE_LEASE: &str = "lease";
 
+/// The fixed words for one of the account service's refusals, by its code and
+/// reason (the CLI's `computeWords`, word for word): `None` for any other code,
+/// whose server message is shown instead. The server's message for these codes is
+/// never shown: not on an extend or a usage read (`shed-app`'s `CloudFailure`) and
+/// not on a create (the create stream's error, [`crate::http::Client::create_shed`]).
+pub fn refusal_words(code: &str, reason: &str) -> Option<&'static str> {
+    Some(match (code, reason) {
+        ("COMPUTE_LIMIT_REACHED", "person") => "you hold as many cloud machines as the account service allows a person; delete one of your cloud sheds and try again",
+        ("COMPUTE_LIMIT_REACHED", "organization") => "the organization holds as many cloud machines as the account service allows; try again once one is deleted",
+        ("COMPUTE_LIMIT_REACHED", _) => "the account service's limit on cloud machines is reached",
+        ("COMPUTE_POLICY_REFUSED", "size") => "the account service does not allow this size",
+        ("COMPUTE_POLICY_REFUSED", "lease") => "the account service does not allow this lease",
+        ("COMPUTE_POLICY_REFUSED", "image") => "the account service does not offer this image",
+        ("COMPUTE_POLICY_REFUSED", "access") => "the account service offers no way to reach a machine that this server supports",
+        ("COMPUTE_POLICY_REFUSED", "person") => "the account service makes cloud machines only for its own people and for service clients; a local admin can list, stop, delete and extend cloud sheds but not create them",
+        ("COMPUTE_POLICY_REFUSED", "client") => "this service client is not registered with the account service for this server",
+        ("COMPUTE_POLICY_REFUSED", _) => "the account service's policy refused this",
+        ("COMPUTE_DENIED", _) => "the account service does not let this server make cloud machines",
+        ("COMPUTE_UNAVAILABLE", _) => "the account service could not be reached, or this server has not finished reading its machines; try again later",
+        ("COMPUTE_DELETING", _) => "the account service is deleting this cloud shed's machine (its lease ended, or it was deleted at the service)",
+        ("EXTEND_NOT_ALLOWED", _) => "this cloud shed's lease cannot be extended (a service client's shed, or the account service's policy)",
+        ("LEASE_AT_CAP", _) => "the extend would take the lease past its cap; extend by fewer hours",
+        ("LEASE_ENDED", _) => "this cloud shed's lease has ended; its machine is being deleted",
+        ("PERSON_INACTIVE", _) => "the shed's person is no longer active at the account service",
+        ("CLOUD_QUOTA_EXCEEDED", _) => "the cloud's quota does not allow another machine now; try again later",
+        ("ZONE_CAPACITY_UNAVAILABLE", _) => "the cloud has no room for this machine now; try again later",
+        _ => return None,
+    })
+}
+
+/// The words for a cloud create refused with a code [`refusal_words`] has no words
+/// for (any code, from a remote server, or an account-service code,
+/// [`COMPUTE_CODE_PREFIX`], from any): fixed too, naming the code, never the
+/// server's message.
+pub fn unknown_cloud_refusal_words(code: &str) -> String {
+    if code.is_empty() {
+        "the cloud create was refused".to_string()
+    } else {
+        format!("the cloud create was refused ({code})")
+    }
+}
+
+/// The prefix of the account service's refusal codes (`COMPUTE_LIMIT_REACHED`,
+/// `COMPUTE_POLICY_REFUSED`, …).
+pub const COMPUTE_CODE_PREFIX: &str = "COMPUTE_";
+
 impl ShedCloud {
     /// Decode a `cloud` member tolerantly, member by member: anything but an object
     /// is `None`; a missing or wrongly typed member takes its default (a string

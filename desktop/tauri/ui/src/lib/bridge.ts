@@ -503,6 +503,15 @@ export function reportShedCloud(key: "shed_cloud" | "cloud_usage" | "cloud_delet
   void invoke("ui_report", { snapshot: { [key]: value } });
 }
 
+/** What the New-shed sheet rendered (`{phase, name, host, state, error, doors}`: `form`
+ *  or `progress`, its Name and Host, the create's state, the error line it shows, and
+ *  whether its doors' listeners are attached), or null once it closes.
+ *  `create_sheet.dump` relays it. */
+export function reportCreateSheet(value: unknown): void {
+  if (!inTauri()) return;
+  void invoke("ui_report", { snapshot: { create_sheet: value } });
+}
+
 /** Disk-usage shapes (shed-core's df models, serialized). */
 export type DiskSize = { logical_bytes: number; physical_bytes: number };
 export type DiskTotals = {

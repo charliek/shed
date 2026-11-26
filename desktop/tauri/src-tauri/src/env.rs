@@ -92,6 +92,11 @@ pub struct Env {
     /// harness cell need not wait out the five minutes. `None` (the default, and always
     /// outside test mode): [`shed_desktop_core::delivery::source::delivery::SERVICE_RECHECK`].
     pub source_recheck: Option<std::time::Duration>,
+    /// TEST-ONLY: how long after an extend's unknown outcome a lease still at its old
+    /// end settles it as not applied — `SHED_TAURI_EXTEND_SETTLE_S`, so a harness cell
+    /// need not wait out [`shed_app::extend::EXTEND_SETTLE_S`]. `None` (the default,
+    /// and always outside test mode): that constant.
+    pub extend_settle_s: Option<i64>,
     /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
     /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
     /// `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log`.
@@ -197,6 +202,9 @@ impl Env {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|ms| *ms > 0)
                 .map(std::time::Duration::from_millis),
+            extend_settle_s: test_only(test_mode, var("SHED_TAURI_EXTEND_SETTLE_S"))
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|s| *s > 0),
             log_file: crate::applog::resolve_path(
                 crate::applog::MAC,
                 var("SHED_TAURI_LOG_FILE").as_deref(),

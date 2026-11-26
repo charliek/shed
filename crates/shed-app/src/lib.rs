@@ -5,6 +5,7 @@
 pub mod auth_modes;
 pub mod backend;
 pub mod cloud;
+pub mod extend;
 pub mod mock_url;
 pub mod timefmt;
 
@@ -15,7 +16,8 @@ pub use backend::{
     SourceServiceRow, SOURCE_ERROR_CLASSES, SOURCE_SERVICE_URL_MAX_BYTES,
 };
 pub use cloud::{
-    cloud_row, refusal_words, usage_words, CloudActions, CloudCaps, CloudFailure, CloudRow,
-    LeaseState,
+    cloud_row, refusal_words, unresolved_extend_words, usage_words, CloudActions, CloudCaps,
+    CloudFailure, CloudRow, LeaseState, EXTEND_PENDING, EXTEND_PENDING_WORDS, EXTEND_UNKNOWN,
+    EXTEND_UNKNOWN_WORDS,
 };
 pub use mock_url::mock_url_for;

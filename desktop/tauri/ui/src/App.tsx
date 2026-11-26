@@ -56,7 +56,7 @@ import {
 import {
   useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
-  fetchEgressProfiles, reportEgress, inTauri, listServerActivity, reportActivity, reportScrolled,
+  fetchEgressProfiles, reportEgress, reportCreateSheet, inTauri, listServerActivity, reportActivity, reportScrolled,
   openPreferences, setAppearanceState,
   sessionKey, reportAgents, useRcSessions,
   crazeCreate, crazeOpenTerminal, crazeReopen, crazeSaved, laneFailure,
@@ -1275,6 +1275,23 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 
   useEscClose(onClose, !creating);
 
+  // What this sheet rendered, for the harness (`create_sheet.dump`), read off its
+  // own nodes after the commit; `doors` once its doors' listeners are attached.
+  const sheetRoot = useRef<HTMLDivElement>(null);
+  const [doors, setDoors] = useState(false);
+  useEffect(() => {
+    const el = sheetRoot.current;
+    reportCreateSheet({
+      phase: creating ? "progress" : "form",
+      name,
+      host,
+      state: state ?? null,
+      error: el?.querySelector("[data-create-error]")?.textContent ?? null,
+      doors,
+    });
+  }, [creating, state, error, name, host, doors]);
+  useEffect(() => () => reportCreateSheet(null), []);
+
   const submit = async () => {
     if (!name.trim() || submitting) return;
     setSubmitting(true);
@@ -1301,6 +1318,35 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
     if (createId && state !== "complete") void createCancel(createId);
     onClose();
   };
+
+  // The harness's doors (test mode only): the sheet's own Name and Host fields, and
+  // its Create shed, which takes nothing once a create is under way, as a pointer.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  const creatingRef = useRef(creating);
+  creatingRef.current = creating;
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    const uns: Array<() => void> = [];
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      uns.push(await listen<{ name?: unknown; host?: unknown }>("fill-create", (e) => {
+        if (creatingRef.current) return;
+        if (typeof e.payload?.name === "string") setName(e.payload.name);
+        if (typeof e.payload?.host === "string") setHost(e.payload.host);
+      }));
+      uns.push(await listen("press-create", () => {
+        if (!creatingRef.current) void submitRef.current();
+      }));
+      if (cancelled) uns.forEach((u) => u());
+      else setDoors(true);
+    })();
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
 
   const hostOpts = hosts.length ? hosts.map((h) => ({ value: h, label: h })) : [{ value: "", label: "(default)" }];
   const canCreate = name.trim().length > 0 && !submitting;
@@ -1331,6 +1377,7 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 
   return (
     <Scrim onClose={() => { if (!creating) onClose(); }} mark="create">
+      <div ref={sheetRoot} className="contents">
       <DialogShell icon={Plus} title="New shed" sub="Spin up a dev environment on a host." onClose={cancel} width={540} footer={footer}>
         {!creating ? (
           <>
@@ -1360,7 +1407,7 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
               <input id={`${fid}-repo`} value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="owner/repo" className={cn(dialogInput, "font-mono")} />
             </Field>
             {error && (
-              <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
+              <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }} data-create-error>{error}</div>
             )}
           </>
         ) : (
@@ -1380,12 +1427,13 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
               {(progress?.messages ?? []).map((m, i) => (
                 <div key={i}>{m}</div>
               ))}
-              {error && <div style={{ color: "var(--shed-danger)" }}>{error}</div>}
+              {error && <div style={{ color: "var(--shed-danger)" }} data-create-error>{error}</div>}
               {(progress?.messages ?? []).length === 0 && !error && <div className="text-shed-text-muted">Starting…</div>}
             </div>
           </>
         )}
       </DialogShell>
+      </div>
     </Scrim>
   );
 }
@@ -1782,6 +1830,7 @@ export default function App() {
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-create", () => setModal("create")));
+      uns.push(await listen("close-create", () => setModal((m) => (m === "create" ? null : m))));
       // The craze create sheet's door (`ui.show_craze_create {machine}`),
       // the same pattern: it opens from a machine's "New craze session" — a
       // click the harness has none of.

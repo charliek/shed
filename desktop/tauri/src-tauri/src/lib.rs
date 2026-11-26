@@ -1392,14 +1392,18 @@ pub fn run() {
                 &env.config_path.to_string_lossy(),
                 shed_desktop_core::control_mint::KNOWN_HOSTS,
             );
-            let backend = Arc::new(Backend::from_env_parts_with_credentials(
+            let mut backend = Backend::from_env_parts_with_credentials(
                 env.test_mode,
                 env.mock_base_url.as_deref(),
                 &env.config_path,
                 Some(&minter),
                 Some(&auth_modes),
                 &env.mock_unreachable_hosts,
-            ));
+            );
+            if let Some(secs) = env.extend_settle_s {
+                backend = backend.with_extend_settle_s(secs);
+            }
+            let backend = Arc::new(backend);
             app.manage(backend.clone());
             app.manage(auth_modes.clone());
             // The servers the source doors read: the config as it reads at each call,

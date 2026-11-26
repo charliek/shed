@@ -220,9 +220,12 @@ def _detail(c: TauriClient) -> dict | None:
 
 
 def _open(c: TauriClient, shed: str) -> dict:
+    """Open `shed`'s delivery detail and wait until it is drivable: it reports itself
+    before its press listener is attached, and a press sent in between reaches no one
+    (`doors`)."""
     c.call("ui.show_shed_delivery", {"server": SERVER, "shed": shed})
-    c.wait_until(lambda: (_detail(c) or {}).get("shed") == shed, timeout=15,
-                 what=f"{shed}'s delivery detail open")
+    c.wait_until(lambda: (_detail(c) or {}).get("shed") == shed and _detail(c).get("doors") is True,
+                 timeout=15, what=f"{shed}'s delivery detail open, its doors attached")
     return _detail(c)
 
 
@@ -299,7 +302,7 @@ def test_deliver_again_calls_provision_and_updates_the_state(r):
     # A refused provision says so, in the server's words.
     r.mock.provision_should_fail = True
     c.call("ui.press_deliver_again", {"server": SERVER, "shed": "widgets"})
-    c.wait_until(lambda: (_detail(c) or {}).get("result", "").startswith("Could not deliver again"),
+    c.wait_until(lambda: ((_detail(c) or {}).get("result") or "").startswith("Could not deliver again"),
                  timeout=20, what="the refusal shown")
     assert "could not provision widgets" in _detail(c)["result"]
     c.call("ui.close_shed_delivery")

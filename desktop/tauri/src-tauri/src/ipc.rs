@@ -118,7 +118,7 @@ fn sheds_payload_at(r: &Reachability, now: i64) -> Value {
                     .cloned()
                     .unwrap_or(Value::Null);
                 o.insert("delivery".to_string(), rec);
-                let row = cloud_row(s, r.cloud_caps(&s.host), now);
+                let row = r.cloud_row(s, now);
                 o.insert("cloud_row".to_string(), json!(row));
             }
             v
@@ -400,6 +400,43 @@ fn cloud_door(
             Ok(("fill-extend-hours", p))
         }
         "ui.press_extend_custom" => Ok(("press-extend-custom", row(params)?)),
+        other => Err(err("unknown_op", format!("unknown op: {other}"))),
+    }
+}
+
+/// The New-shed sheet's doors: the event to emit and its payload, or the refusal.
+/// **TEST-MODE ONLY**, as [`cloud_door`]: each acts on the sheet's own controls, so a
+/// sheet that is not open takes nothing; `create_sheet.dump` reads back what it
+/// rendered. The production door onto the same create is `create.start`.
+///
+/// * `ui.fill_create {name, host?}` — the Name field, and the Host when given;
+/// * `ui.press_create` — the sheet's Create shed;
+/// * `ui.close_create` — close the sheet (a create under way runs on; `create.cancel`
+///   stops it).
+fn create_door(
+    test_mode: bool,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        "ui.fill_create" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("bad_request", "'name' must be a string"))?;
+            let mut p = json!({ "name": name });
+            match params.get("host") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(h)) => p["host"] = json!(h),
+                Some(_) => return Err(err("bad_request", "'host' must be a string")),
+            }
+            Ok(("fill-create", p))
+        }
+        "ui.press_create" => Ok(("press-create", json!({}))),
+        "ui.close_create" => Ok(("close-create", json!({}))),
         other => Err(err("unknown_op", format!("unknown op: {other}"))),
     }
 }
@@ -1085,6 +1122,16 @@ impl Handler {
                 let _ = self.app.emit(event, payload);
                 Ok(json!({}))
             }
+            "ui.fill_create" | "ui.press_create" | "ui.close_create" => {
+                let (event, payload) = create_door(self.env.test_mode, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
+            // What the New-shed sheet rendered (`{phase, name, host, state, error}`), as it
+            // reported it; `null` while it is closed.
+            "create_sheet.dump" => Ok(json!({
+                "sheet": self.ui_get("create_sheet").unwrap_or(Value::Null),
+            })),
             "create.start" => self.create_start(params).await,
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
@@ -2613,6 +2660,7 @@ mod tests {
             host_errors,
             delivery: Default::default(),
             features: Default::default(),
+            extend_unresolved: Default::default(),
         }
     }
 
@@ -2713,6 +2761,97 @@ mod tests {
         let row = &sheds_payload_at(&r, now)["sheds"][1]["cloud_row"];
         assert_eq!(row["actions"]["extend"], true);
         assert_eq!(row["extend_presets_h"], json!([6, 12]));
+    }
+
+    /// The payload carries the row's extend whose outcome is not known, from the
+    /// listing's snapshot.
+    #[test]
+    fn sheds_payload_carries_an_unresolved_extend() {
+        let now = 1_764_000_000;
+        let mut r = reachability(&[], &[]);
+        let shed: Shed = serde_json::from_value(json!({
+            "name": "w", "host": "cloud-a", "status": "running", "backend": "remote",
+            "created_at": "2025-11-20T00:00:00Z",
+            "cloud": {"size": {"name": "standard"}, "lease": {
+                "expires_at": "2025-11-25T00:00:00Z", "max_expires_at": "2025-12-01T00:00:00Z",
+                "extendable": true, "presets_h": [6]}},
+        }))
+        .unwrap();
+        r.sheds.push(shed);
+        let row = &sheds_payload_at(&r, now)["sheds"][0]["cloud_row"];
+        assert_eq!(row["extend_unresolved_h"], Value::Null);
+        assert_eq!(row["extend_unresolved_words"], Value::Null);
+        // Another incarnation's (a shed since created again under the name): none.
+        r.extend_unresolved.insert(
+            ("cloud-a".into(), "w".into()),
+            ("2025-01-01T00:00:00Z".into(), 6),
+        );
+        let row = &sheds_payload_at(&r, now)["sheds"][0]["cloud_row"];
+        assert_eq!(row["extend_unresolved_h"], Value::Null);
+        r.extend_unresolved.insert(
+            ("cloud-a".into(), "w".into()),
+            ("2025-11-20T00:00:00Z".into(), 6),
+        );
+        let row = &sheds_payload_at(&r, now)["sheds"][0]["cloud_row"];
+        assert_eq!(row["extend_unresolved_h"], 6);
+        assert_eq!(
+            row["extend_unresolved_words"],
+            "An extend by 6 h: not known whether it was applied; it settles within a few minutes"
+        );
+    }
+
+    #[test]
+    fn the_create_sheet_doors_are_test_mode_only_and_check_their_params() {
+        assert_eq!(
+            create_door(false, "ui.press_create", &json!({}))
+                .unwrap_err()
+                .0,
+            "not_enabled"
+        );
+        assert_eq!(
+            create_door(false, "ui.fill_create", &json!({"name": "x"}))
+                .unwrap_err()
+                .0,
+            "not_enabled"
+        );
+        assert_eq!(
+            create_door(true, "ui.press_create", &json!({})).unwrap(),
+            ("press-create", json!({}))
+        );
+        assert_eq!(
+            create_door(true, "ui.close_create", &json!({})).unwrap(),
+            ("close-create", json!({}))
+        );
+        assert_eq!(
+            create_door(false, "ui.close_create", &json!({}))
+                .unwrap_err()
+                .0,
+            "not_enabled"
+        );
+        assert_eq!(
+            create_door(true, "ui.fill_create", &json!({"name": "x"})).unwrap(),
+            ("fill-create", json!({"name": "x"}))
+        );
+        assert_eq!(
+            create_door(
+                true,
+                "ui.fill_create",
+                &json!({"name": "x", "host": "mock"})
+            )
+            .unwrap(),
+            ("fill-create", json!({"name": "x", "host": "mock"}))
+        );
+        for bad in [
+            json!({}),
+            json!({"name": 1}),
+            json!({"name": "x", "host": 2}),
+        ] {
+            assert_eq!(
+                create_door(true, "ui.fill_create", &bad).unwrap_err().0,
+                "bad_request",
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -2894,6 +3033,7 @@ mod tests {
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             delivery_settings_path: PathBuf::from("/run/user/0/shed/delivery.toml"),
             source_recheck: None,
+            extend_settle_s: None,
             log_file: None,
             log_debug: false,
         }

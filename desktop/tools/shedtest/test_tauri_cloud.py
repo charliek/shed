@@ -8,8 +8,10 @@ remote fixture (`MockShedServer.serve_cloud`).
   client's machine that is never extended. A shed of a server without cloud sheds
   has `cloud_row: null`.
 * `shed.extend` moves a lease and answers the shed and its row; a lost decision (a
-  503) is sent again with its request id and moves the lease once; each refusal
-  arrives as its code with its fixed words, never the server's text.
+  503) is sent again within the call with its request id and moves the lease once;
+  every send unanswered is `extend_unknown`, and the shed's next extends are refused
+  here until a listing settles it; each refusal arrives as its code with its fixed
+  words, never the server's text.
 * `cloud.usage` answers a server's usage and its line, and a server without compute
   `FEATURE_UNSUPPORTED`.
 
@@ -110,14 +112,28 @@ def test_extend_moves_the_lease_once(client, mock):
 @pytest.mark.parametrize("code", sorted(EXTEND_REFUSALS))
 def test_an_extend_refusal_has_its_code_and_fixed_words(client, mock, code):
     mock.serve_cloud()
-    # A 5xx is sent again: refuse every send.
-    for _ in range(3 if EXTEND_REFUSALS[code] >= 500 else 1):
+    # A 5xx is sent again: refuse every send. Then no send was answered, so whether the
+    # lease moved is not known: `extend_unknown`, with its words.
+    unknown = EXTEND_REFUSALS[code] >= 500
+    for _ in range(3 if unknown else 1):
         mock.refuse_extend(code, "person" if code == "PERSON_INACTIVE" else "")
     with pytest.raises(ShedError) as e:
         client.call("shed.extend", {"name": "cloud-ok", "hours": 6})
-    assert e.value.code == code
+    assert e.value.code == ("extend_unknown" if unknown else code)
     assert e.value.message and EXTEND_REFUSAL_MESSAGE not in e.value.message, e.value.message
-    assert len(mock.extend_requests()) == (3 if EXTEND_REFUSALS[code] >= 500 else 1)
+    assert len(mock.extend_requests()) == (3 if unknown else 1)
+    if unknown:
+        assert e.value.message == "not known whether it was applied; it settles within a few minutes"
+        # Until a listing settles it, every extend of the shed is refused here, unsent.
+        with pytest.raises(ShedError) as e:
+            client.call("shed.extend", {"name": "cloud-ok", "hours": 6})
+        assert e.value.code == "extend_pending"
+        assert len(mock.extend_requests()) == 3
+        # A listing without the shed settles it (no later cell inherits it).
+        mock.set_sheds([])
+        client.call("sheds.list")
+        mock.serve_cloud()
+        client.call("shed.extend", {"name": "cloud-ok", "hours": 6})
 
 
 def test_extend_refusals_the_mock_decides(client, mock):

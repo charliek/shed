@@ -19,16 +19,32 @@ import (
 )
 
 // createFor creates a shed for a user and waits for it to settle running.
+//
+// A setup step, not a test of the fast-fail window: a create refused because its
+// send never left within the window (provider.ErrNotDelivered, which a loaded
+// machine can cause: the harness window is 1 s) is made again, after the backend
+// is idle. Nothing reached the service, so nothing is made twice.
 func (e *env) createFor(name, user string) {
 	e.t.Helper()
 	req := config.CreateShedRequest{Name: name, NoProvision: true, User: user}
-	if _, err := e.b.CreateShed(ctxT(e.t), req); err != nil {
-		e.t.Fatalf("create %s for %q: %v", name, user, err)
+	for attempt := 1; ; attempt++ {
+		_, err := e.b.CreateShed(ctxT(e.t), req)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, provider.ErrNotDelivered) || attempt >= setupCreateAttempts {
+			e.t.Fatalf("create %s for %q: %v", name, user, err)
+		}
+		e.t.Logf("create %s for %q (attempt %d) was never delivered; making it again: %v", name, user, attempt, err)
+		e.idle()
 	}
 	if got := e.settled(name).Status; got != config.StatusRunning {
 		e.t.Fatalf("shed %s settled %q, want running", name, got)
 	}
 }
+
+// setupCreateAttempts bounds createFor's sends of one create.
+const setupCreateAttempts = 5
 
 // userOf is the user GetShed reports for a shed.
 func (e *env) userOf(name string) string {

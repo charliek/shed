@@ -217,7 +217,10 @@ DEFAULT_SHEDS = [
 #     lease moved, or a refusal `{"error": {"code", "message", "reason"?}}` by the
 #     server's codes (`refuse_extend` scripts the next ones); a repeated `request_id`
 #     answers its first answer again and moves nothing (a 5xx is not kept: it decided
-#     nothing);
+#     nothing); `lose_extend_replies` decides the next ones as usual and loses each
+#     reply (a 502 in its place), as a gateway that drops the answer would, and
+#     `drop_extends` answers the next ones 502 deciding nothing (`move_lease` then
+#     moves a lease as an extend applied late would);
 #   * `GET /api/cloud/usage` -> `{person, org}`; `501 FEATURE_UNSUPPORTED` on a server
 #     without compute (the default).
 _CLOUD_SHAPES = Path(__file__).resolve().parents[3] / "crates" / "fixtures" / "cloud"
@@ -229,6 +232,11 @@ _EXTEND_RE = re.compile(r"^/api/sheds/([^/]+)/extend$")
 # The server's `config.ValidUUID`: 8-4-4-4-12 hex digits, either case (`fullmatch`).
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _CLOUD_USAGE_PATH = "/api/cloud/usage"
+#: The `data:` of the recorded create stream's refusal (`create-refused.sse`): a local
+#: admin's create, COMPUTE_POLICY_REFUSED (person), as shed-server's handlers wrote it.
+CREATE_REFUSED_DATA = next(
+    line[len("data: "):] for line in (_CLOUD_SHAPES / "create-refused.sse").read_text().splitlines()
+    if line.startswith("data: "))
 #: `/api/info` of a remote server with leases.
 CLOUD_INFO = {**DEFAULT_INFO, "backend": "remote",
               "features": ["overview", "async_lifecycle", "delivery", "lease"]}
@@ -414,6 +422,12 @@ class MockShedServer:
         # (caller, shed incarnation, lowercased request id) -> the answer kept for it.
         self._extend_answers: dict[tuple[str, str, str], tuple[int, dict]] = {}
         self._extend_requests: list[dict] = []
+        # The next extends whose reply is lost (`lose_extend_replies`), and those
+        # answered 502 with nothing decided (`drop_extends`).
+        self._extend_lost = 0
+        self._extend_dropped = 0
+        # Set: the next create streams this `error` event data (`refuse_create`).
+        self.create_error_data: str | None = None
         # Holds (`hold_extend` / `hold_usage`): the next request of each waits for its
         # gate before it is answered; the counters say how many arrived and were answered.
         self._extend_hold: threading.Event | None = None
@@ -572,6 +586,9 @@ class MockShedServer:
             self._extend_refusals = []
             self._extend_answers = {}
             self._extend_requests = []
+            self._extend_lost = 0
+            self._extend_dropped = 0
+            self.create_error_data = None
             holds, self._holds = self._holds, []
             self._extend_hold = self._usage_hold = None
             self._extend_arrived = self._usage_arrived = self._usage_answered = 0
@@ -705,6 +722,35 @@ class MockShedServer:
         with self._lock:
             self._extend_refusals.append((code, reason))
 
+    def lose_extend_replies(self, n: int) -> None:
+        """The next `n` extends are decided as usual (applied, refused or answered
+        again for a repeated request id) and each reply is lost: a 502 with no API
+        error goes back instead, as from a gateway that dropped the answer."""
+        with self._lock:
+            self._extend_lost = n
+
+    def drop_extends(self, n: int) -> None:
+        """The next `n` extends are answered 502 with nothing decided (no lease moves,
+        no answer kept)."""
+        with self._lock:
+            self._extend_dropped = n
+
+    def move_lease(self, name: str, hours: int) -> None:
+        """Move `name`'s lease end `hours` later, as an extend the service applied
+        late would."""
+        with self._lock:
+            shed = next(s for s in (self.sheds or []) if s["name"] == name)
+            lease = shed["cloud"]["lease"]
+            end = _parse_utc(lease["expires_at"])
+            assert end is not None, lease
+            lease["expires_at"] = _utc(end + timedelta(hours=hours))
+
+    def refuse_create(self, data: str = CREATE_REFUSED_DATA) -> None:
+        """Every create streams one `error` event with `data` (by default the recorded
+        refusal, `create-refused.sse`) and no shed, until `reset`."""
+        with self._lock:
+            self.create_error_data = data
+
     def hold_extend(self) -> threading.Event:
         """The next extend that arrives waits, before anything is decided, until the
         returned event is set (`reset` sets it too)."""
@@ -778,13 +824,20 @@ class MockShedServer:
                 return 404, _api_error("SHED_NOT_FOUND", f"shed {name!r} not found")
             incarnation = shed.get("id") or f"{name}@{shed.get('created_at', '')}"
             key = (caller, incarnation, rid.lower())
+            if self._extend_dropped > 0:
+                self._extend_dropped -= 1
+                return 502, {}
             if rid and key in self._extend_answers:
-                return self._extend_answers[key]
-            answer = self._extend_locked(name, hours)
-            # An answer is kept, as the account service keeps it; a 5xx (the service
-            # not reached) decided nothing, so a retry is a new try.
-            if rid and answer[0] < 500:
-                self._extend_answers[key] = answer
+                answer = self._extend_answers[key]
+            else:
+                answer = self._extend_locked(name, hours)
+                # An answer is kept, as the account service keeps it; a 5xx (the
+                # service not reached) decided nothing, so a retry is a new try.
+                if rid and answer[0] < 500:
+                    self._extend_answers[key] = answer
+            if self._extend_lost > 0:
+                self._extend_lost -= 1
+                return 502, {}
             return answer
 
     def _extend_locked(self, name: str, hours: int) -> tuple[int, dict]:
@@ -1794,6 +1847,10 @@ class MockShedServer:
                 for msg in state.create_progress:
                     frame("progress", {"message": msg})
                     time.sleep(0.02)
+                if state.create_error_data is not None:
+                    self.wfile.write(f"event: error\ndata: {state.create_error_data}\n\n".encode())
+                    self.wfile.flush()
+                    return
                 if state.create_should_fail:
                     frame("error", {"code": "create_failed", "message": f"could not create {name}"})
                     return

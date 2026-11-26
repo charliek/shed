@@ -15,7 +15,7 @@ use tokio::runtime::Handle;
 
 use shed_core::config::ShedConfig;
 use shed_core::create::{CreateProgress, CreateStore};
-use shed_core::http::{ApiFailure, Client, ShedError, SourceError};
+use shed_core::http::{new_request_id, ApiFailure, Client, ShedError, SourceError};
 use shed_core::models::{
     display_source_text, CloudUsage, CreateShedRequest, EgressProfileInfo, Shed, ShedStatus,
     SourceDocument, SourceUnbound, SystemDiskUsage, MAX_EXTEND_HOURS, SOURCE_TEXT_MAX_BYTES,
@@ -24,6 +24,7 @@ use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
 
 use crate::auth_modes::AuthModeRegistry;
+use crate::extend::{incarnation, lease_end, ExtendBook, UnknownExtend};
 
 /// The code [`Backend::extend`] refuses hours outside 1 to [`MAX_EXTEND_HOURS`] with,
 /// before anything is sent: the IPC vocabulary's `bad_request`.
@@ -45,6 +46,9 @@ pub struct Backend {
     default_server: Option<String>,
     /// Pull-based store of in-flight creates (the pure shed-core orchestration).
     creates: CreateStore,
+    /// Each cloud shed's extend in flight or with an unknown outcome
+    /// ([`crate::extend`]).
+    extends: ExtendBook,
 }
 
 /// A server's SSH endpoint (from config) — where `terminal.preview` points ssh.
@@ -138,6 +142,7 @@ impl Backend {
                 ssh_targets: Vec::new(),
                 default_server: None,
                 creates: CreateStore::new(),
+                extends: ExtendBook::default(),
             };
         }
         let config = ShedConfig::load(&config_path.to_string_lossy());
@@ -292,6 +297,7 @@ impl Backend {
             ssh_targets,
             default_server: config.default_server.clone(),
             creates: CreateStore::new(),
+            extends: ExtendBook::default(),
         }
     }
 
@@ -415,10 +421,74 @@ impl Backend {
                 message: format!("hours is a whole number from 1 to {MAX_EXTEND_HOURS}"),
                 reason: String::new(),
             })?;
-        let client = self
-            .client_for(host)
-            .map_err(|e| ApiFailure::from_shed(&e))?;
-        client.extend(name, hours).await
+        let (server, client) = resolve_entry(&self.clients, self.default_server.as_deref(), host)
+            .ok_or_else(|| ApiFailure::from_shed(&no_configured_host(host)))?;
+        // One extend per shed at a time, and none while an earlier one's outcome is
+        // unknown: that one is settled by what the listings show (`crate::extend`),
+        // never by sending again, so the lease never moves twice.
+        let pending = || ApiFailure {
+            status: None,
+            code: crate::cloud::EXTEND_PENDING.to_string(),
+            message: crate::cloud::EXTEND_PENDING_WORDS.to_string(),
+            reason: String::new(),
+        };
+        if self.extends.in_flight(server, name) {
+            return Err(pending());
+        }
+        // The shed as it is now: its incarnation and its lease's end before the
+        // extend, which is how an unknown outcome is later settled. A failed read
+        // sends nothing, and settles nothing.
+        let read = client.shed_document(name).await.and_then(|doc| {
+            let mut shed: Shed = serde_json::from_value(doc)
+                .map_err(|e| ApiFailure::from_shed(&ShedError::Decode(e.to_string())))?;
+            shed.host = server.clone();
+            Ok(shed)
+        });
+        let before = match read {
+            Ok(shed) => shed,
+            Err(_) if self.extends.has_unknown(server, name) => return Err(pending()),
+            Err(e) => return Err(e),
+        };
+        self.extends.begin(server, &before).map_err(|_| pending())?;
+        let request_id = new_request_id();
+        let out = client
+            .extend_with_request_id(name, hours, &request_id)
+            .await;
+        if !out.unresolved {
+            self.extends.finish(server, name, None);
+            return out.result;
+        }
+        self.extends.finish(
+            server,
+            name,
+            Some(UnknownExtend {
+                incarnation: incarnation(&before),
+                hours,
+                before: lease_end(&before),
+                request_id,
+                at: 0,
+            }),
+        );
+        out.result.map_err(|e| ApiFailure {
+            code: crate::cloud::EXTEND_UNKNOWN.to_string(),
+            message: crate::cloud::EXTEND_UNKNOWN_WORDS.to_string(),
+            reason: String::new(),
+            ..e
+        })
+    }
+
+    /// The hours of `name`'s extend on `host` whose outcome is not known, if any:
+    /// until it settles every extend of the shed is refused unsent.
+    pub fn unresolved_extend(&self, host: &str, name: &str) -> Option<u32> {
+        self.extends.unknown_hours(host, name)
+    }
+
+    /// This backend with another wait before a lease still at its old end settles
+    /// an unknown extend as not applied ([`crate::extend::EXTEND_SETTLE_S`]): a test
+    /// seam.
+    pub fn with_extend_settle_s(mut self, secs: i64) -> Self {
+        self.extends = std::mem::take(&mut self.extends).with_settle_s(secs);
+        self
     }
 
     /// `host`'s cloud usage (`GET /api/cloud/usage`): the caller's machines and the
@@ -481,6 +551,10 @@ impl Backend {
         for (name, result) in self.per_host(list).await {
             match result {
                 Ok((rows, host_features)) => {
+                    // A listing that answered settles what it shows of an extend
+                    // whose outcome was unknown; a failed one settles nothing.
+                    let listed: Vec<Shed> = rows.iter().map(|(s, _)| s.clone()).collect();
+                    self.extends.observe(&name, &listed);
                     if let Some(f) = host_features {
                         features.insert(name, f);
                     }
@@ -499,12 +573,14 @@ impl Backend {
             [only] => Some(only.summary.clone()),
             many => Some(format!("{} hosts unreachable", many.len())),
         };
+        let extend_unresolved = self.extends.snapshot();
         Reachability {
             sheds,
             last_error,
             host_errors,
             delivery,
             features,
+            extend_unresolved,
         }
     }
 
@@ -765,9 +841,26 @@ pub struct Reachability {
     /// may offer ([`crate::cloud::CloudCaps::from_features`]).
     #[serde(skip)]
     pub features: HashMap<String, Vec<String>>,
+    /// Each cloud shed's extend whose outcome is not known, by (server, shed): its
+    /// incarnation ([`crate::extend::incarnation`]) and hours, as of this refresh.
+    #[serde(skip)]
+    pub extend_unresolved: HashMap<(String, String), (String, u32)>,
 }
 
 impl Reachability {
+    /// `shed`'s cloud row at `now` ([`crate::cloud::cloud_row`]), with its server's
+    /// caps and its extend whose outcome is not known, if any; `None` for a shed
+    /// with no `cloud`.
+    pub fn cloud_row(&self, shed: &Shed, now: i64) -> Option<crate::cloud::CloudRow> {
+        let pending = self
+            .extend_unresolved
+            .get(&(shed.host.clone(), shed.name.clone()))
+            .filter(|(inc, _)| *inc == incarnation(shed))
+            .map(|&(_, h)| i64::from(h));
+        crate::cloud::cloud_row(shed, self.cloud_caps(&shed.host), now)
+            .map(|r| r.with_unresolved_extend(pending))
+    }
+
     /// What `host`'s cloud rows may offer, from its features (nothing when they
     /// could not be read: fail closed).
     pub fn cloud_caps(&self, host: &str) -> crate::cloud::CloudCaps {
@@ -1030,6 +1123,7 @@ mod tests {
             ssh_targets: Vec::new(),
             default_server: None,
             creates: CreateStore::new(),
+            extends: ExtendBook::default(),
         }
     }
 
@@ -1556,6 +1650,7 @@ mod tests {
             ssh_targets: Vec::new(),
             default_server: Some("nonexistent".to_string()),
             creates: CreateStore::new(),
+            extends: ExtendBook::default(),
         };
         backend
             .start(None, "thing")
@@ -2202,6 +2297,7 @@ mod tests {
     #[tokio::test]
     async fn extend_refuses_out_of_range_hours_before_sending() {
         let server = MockServer::start_async().await;
+        shed_doc(&server).await;
         let any = server
             .mock_async(|w, t| {
                 w.method(POST).path("/api/sheds/widgets/extend");
@@ -2227,6 +2323,7 @@ mod tests {
     #[tokio::test]
     async fn extend_returns_the_updated_shed() {
         let server = MockServer::start_async().await;
+        shed_doc(&server).await;
         let ok = server
             .mock_async(|w, t| {
                 w.method(POST)
@@ -2262,6 +2359,249 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.status, None);
         assert!(e.message.contains("no configured host"), "{}", e.message);
+    }
+
+    /// `GET /api/sheds/widgets`: the recorded shed (the read before an extend).
+    async fn shed_doc(server: &MockServer) -> httpmock::Mock<'_> {
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/widgets");
+                t.status(200).body(CLOUD_EXTEND);
+            })
+            .await
+    }
+
+    /// The recorded shed's lease end, in unix seconds.
+    fn recorded_end() -> i64 {
+        let shed: Shed = serde_json::from_str(CLOUD_EXTEND).unwrap();
+        crate::extend::lease_end(&shed).unwrap()
+    }
+
+    /// `GET /api/sheds` listing the recorded shed with its lease ending at `end` and
+    /// created at `created` (its incarnation).
+    async fn listing<'a>(
+        server: &'a MockServer,
+        end: i64,
+        created: Option<&str>,
+    ) -> httpmock::Mock<'a> {
+        let mut v: serde_json::Value = serde_json::from_str(CLOUD_EXTEND).unwrap();
+        v["cloud"]["lease"]["expires_at"] =
+            serde_json::json!(chrono::DateTime::from_timestamp(end, 0)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string());
+        if let Some(c) = created {
+            v["created_at"] = serde_json::json!(c);
+        }
+        let body = serde_json::json!({ "sheds": [v] }).to_string();
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200).body(body);
+            })
+            .await
+    }
+
+    /// A backend over `server` whose clock reads `t`.
+    fn clocked(server: &MockServer, t: &Arc<std::sync::atomic::AtomicI64>) -> Backend {
+        let t = t.clone();
+        Backend {
+            extends: ExtendBook::with_clock(Arc::new(move || {
+                t.load(std::sync::atomic::Ordering::SeqCst)
+            })),
+            ..backend_with(vec![client_at("cloud-a", server.base_url())])
+        }
+    }
+
+    /// Every send of an extend unanswered (5xx): its outcome is unknown. Until a
+    /// listing settles it, every extend of the shed is refused here, unsent, the same
+    /// hours too; the row says so. A lease still at its old end 150 s on: not
+    /// applied, settled.
+    #[tokio::test]
+    async fn an_unknown_extend_refuses_every_extend_until_a_listing_settles_it() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let server = MockServer::start_async().await;
+        shed_doc(&server).await;
+        let down = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/widgets/extend");
+                t.status(503)
+                    .body(r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"SERVER TEXT"}}"#);
+            })
+            .await;
+        let t0 = 1_764_000_000;
+        let t = Arc::new(AtomicI64::new(t0));
+        let backend = clocked(&server, &t);
+        let e = backend.extend(None, "widgets", 6).await.unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str(), e.message.as_str()),
+            (
+                Some(503),
+                crate::cloud::EXTEND_UNKNOWN,
+                crate::cloud::EXTEND_UNKNOWN_WORDS
+            )
+        );
+        assert_eq!(
+            crate::CloudFailure::from_api(&e).words,
+            crate::cloud::EXTEND_UNKNOWN_WORDS
+        );
+        assert_eq!(down.hits_async().await, shed_core::http::EXTEND_ATTEMPTS);
+        assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), Some(6));
+
+        // Any extend now, the same hours too: refused here, unsent.
+        for hours in [6, 12] {
+            let e = backend
+                .extend(Some("cloud-a"), "widgets", hours)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (e.status, e.code.as_str()),
+                (None, crate::cloud::EXTEND_PENDING)
+            );
+            assert_eq!(
+                crate::CloudFailure::from_api(&e).words,
+                crate::cloud::EXTEND_PENDING_WORDS
+            );
+        }
+        assert_eq!(down.hits_async().await, shed_core::http::EXTEND_ATTEMPTS);
+
+        // A listing with the lease still at its old end, too soon: kept, and the
+        // row says so.
+        let list = listing(&server, recorded_end(), None).await;
+        t.store(t0 + 10, Ordering::SeqCst);
+        let r = backend.refresh().await;
+        let row = r.cloud_row(&r.sheds[0], t0).unwrap();
+        assert_eq!(row.extend_unresolved_h, Some(6));
+        assert_eq!(
+            row.extend_unresolved_words.as_deref(),
+            Some("An extend by 6 h: not known whether it was applied; it settles within a few minutes")
+        );
+        // 150 s after the unknown outcome, the same end: not applied, settled.
+        t.store(t0 + crate::extend::EXTEND_SETTLE_S, Ordering::SeqCst);
+        let r = backend.refresh().await;
+        assert!(r.extend_unresolved.is_empty());
+        assert_eq!(
+            r.cloud_row(&r.sheds[0], t0).unwrap().extend_unresolved_h,
+            None
+        );
+        assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), None);
+        list.delete_async().await;
+        // Settled: the next extend is sent, under a new request id.
+        backend.extend(None, "widgets", 12).await.unwrap_err();
+        assert_eq!(
+            down.hits_async().await,
+            2 * shed_core::http::EXTEND_ATTEMPTS
+        );
+    }
+
+    /// A listing whose lease moved by the hours settles it as applied; one of another
+    /// incarnation, or with the shed gone, settles it too.
+    #[tokio::test]
+    async fn a_listing_settles_an_applied_extend_and_a_replaced_or_gone_shed() {
+        use std::sync::atomic::AtomicI64;
+        for (end_h, created, gone) in [
+            (6, None, false),
+            (0, Some("2030-01-01T00:00:00Z"), false),
+            (0, None, true),
+        ] {
+            let server = MockServer::start_async().await;
+            shed_doc(&server).await;
+            server
+                .mock_async(|w, t| {
+                    w.method(POST).path("/api/sheds/widgets/extend");
+                    t.status(502);
+                })
+                .await;
+            let t = Arc::new(AtomicI64::new(1_764_000_000));
+            let backend = clocked(&server, &t);
+            backend.extend(None, "widgets", 6).await.unwrap_err();
+            assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), Some(6));
+            if gone {
+                server
+                    .mock_async(|w, t| {
+                        w.method(GET).path("/api/sheds");
+                        t.status(200).body(r#"{"sheds":[]}"#);
+                    })
+                    .await;
+            } else {
+                listing(&server, recorded_end() + end_h * 3600, created).await;
+            }
+            let r = backend.refresh().await;
+            assert!(r.extend_unresolved.is_empty(), "{end_h} {created:?} {gone}");
+            assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), None);
+        }
+    }
+
+    /// A listing or a read that fails (authentication refused here) settles nothing,
+    /// whatever the time short of the age limit.
+    #[tokio::test]
+    async fn an_authentication_failure_never_settles_it() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let server = MockServer::start_async().await;
+        let doc = shed_doc(&server).await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/widgets/extend");
+                t.status(503);
+            })
+            .await;
+        let t0 = 1_764_000_000;
+        let t = Arc::new(AtomicI64::new(t0));
+        let backend = clocked(&server, &t);
+        backend.extend(None, "widgets", 6).await.unwrap_err();
+        doc.delete_async().await;
+        for path in ["/api/sheds", "/api/sheds/widgets"] {
+            server
+                .mock_async(|w, tt| {
+                    w.method(GET).path(path);
+                    tt.status(401)
+                        .body(r#"{"error":{"code":"UNAUTHORIZED","message":"no"}}"#);
+                })
+                .await;
+        }
+        t.store(t0 + 3600, Ordering::SeqCst);
+        let r = backend.refresh().await;
+        assert_eq!(r.host_errors.len(), 1);
+        assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), Some(6));
+        // An extend whose read fails is refused as pending, not as the read's error,
+        // and settles nothing.
+        let e = backend.extend(None, "widgets", 6).await.unwrap_err();
+        assert_eq!(e.code, crate::cloud::EXTEND_PENDING);
+        assert_eq!(backend.unresolved_extend("cloud-a", "widgets"), Some(6));
+    }
+
+    /// An answer (a refusal too) keeps nothing, and a read that fails before the
+    /// extend sends nothing.
+    #[tokio::test]
+    async fn a_refused_extend_keeps_nothing() {
+        let server = MockServer::start_async().await;
+        let doc = shed_doc(&server).await;
+        let post = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds/widgets/extend");
+                t.status(409)
+                    .body(include_str!("../../fixtures/cloud/extend-at-cap.json"));
+            })
+            .await;
+        let backend = backend_with(vec![client_at("cloud-a", server.base_url())]);
+        let e = backend.extend(None, "widgets", 720).await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(409), "LEASE_AT_CAP"));
+        assert!(backend.extends.snapshot().is_empty());
+        assert!(!backend.extends.in_flight("cloud-a", "widgets"));
+        let e = backend.extend(None, "widgets", 6).await.unwrap_err();
+        assert_eq!(e.code, "LEASE_AT_CAP");
+        assert_eq!(post.hits_async().await, 2);
+        doc.delete_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/widgets");
+                t.status(404)
+                    .body(r#"{"error":{"code":"SHED_NOT_FOUND","message":"no"}}"#);
+            })
+            .await;
+        let e = backend.extend(None, "widgets", 6).await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(404), "SHED_NOT_FOUND"));
+        assert_eq!(post.hits_async().await, 2, "nothing was sent");
     }
 
     #[tokio::test]

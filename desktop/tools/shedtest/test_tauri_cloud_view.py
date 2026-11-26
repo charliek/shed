@@ -51,6 +51,10 @@ PLAIN_SHEDS = [
      "memory_mb": 4096, "created_at": "2026-11-20T12:00:00Z"},
 ]
 
+#: How long after an unknown extend a lease still at its old end settles it as not
+#: applied, in this module's app (`SHED_TAURI_EXTEND_SETTLE_S`; 150 s by default).
+SETTLE_S = 10
+
 #: The usage line of the mock's recorded usage (`CLOUD_USAGE`).
 USAGE_WORDS = "2 of 100 machines (1 running, 1 stopped) · organization 2 of 100"
 
@@ -71,6 +75,10 @@ class Rig:
     mock2: MockShedServer
 
     def reset(self) -> None:
+        # A listing with no sheds settles any extend a cell left unknown (the shed
+        # is gone), so no cell inherits one.
+        self.mock.set_sheds([])
+        self.c.call("sheds.list")
         self.mock.reset()
         self.mock.serve_cloud()
         self.mock2.reset()
@@ -99,8 +107,11 @@ class Rig:
 
     def open_detail(self, name: str) -> dict:
         self.c.call("ui.press_shed_details", {"server": "mock", "shed": name})
-        self.c.wait_until(lambda: (self.detail() or {}).get("shed") == name, timeout=10,
-                          what=f"{name}'s cloud detail")
+        # Drivable once its doors' listeners are attached: a press before then would
+        # reach no one.
+        self.c.wait_until(lambda: (self.detail() or {}).get("shed") == name
+                          and self.detail().get("doors") is True, timeout=10,
+                          what=f"{name}'s cloud detail, its doors attached")
         return self.detail()
 
 
@@ -119,7 +130,8 @@ def rig():
     try:
         url = hermetic.mock_url(mock.base_url, {"mock2": mock2.base_url})
         env = ui.subproc_env(cfg, runtime_dir=home, mock_base_url=url,
-                             config_path=_config(home / "cloud-config.yaml"))
+                             config_path=_config(home / "cloud-config.yaml"),
+                             extend_settle_s=SETTLE_S)
         sock = home / cfg.sock_rel
         log = home / "cloud-ui.log"
         log_fh = open(log, "wb")
@@ -376,6 +388,124 @@ def test_a_refusal_shows_its_words(r: Rig, code: str, reason: str, words: str):
     assert _end(r, "cloud-ok") == before, "a refusal moves nothing"
     if code == "LEASE_AT_CAP":
         _shot(r.c, "cloud-refusal.png", anchor="shed:mock/cloud-ok")
+
+
+#: The words of an extend whose outcome is not known, of one refused because of it,
+#: and of the row meanwhile (`shed_app::cloud`).
+UNKNOWN_WORDS = "not known whether it was applied; it settles within a few minutes"
+PENDING_WORDS = "an earlier extend's outcome is not known yet; it settles within a few minutes"
+#: How many times one extend is sent before its outcome is called unknown
+#: (`shed_core::http::EXTEND_ATTEMPTS`).
+EXTEND_ATTEMPTS = 3
+
+
+def _unknown_extend(r: Rig, hours: int) -> None:
+    """Extend cloud-ok by `hours` with every send answered 502, nothing decided: its
+    outcome is unknown, and its row says so with Extend disabled."""
+    r.open_detail("cloud-ok")
+    r.mock.drop_extends(EXTEND_ATTEMPTS)
+    r.c.call("ui.press_extend", {"server": "mock", "shed": "cloud-ok", "hours": hours})
+    r.c.wait_until(lambda: ((r.detail() or {}).get("result") or {}).get("words") == UNKNOWN_WORDS,
+                   timeout=30, what="the unknown outcome")
+    sent = r.mock.extend_requests()
+    assert len(sent) == EXTEND_ATTEMPTS and len({x["request_id"] for x in sent}) == 1, sent
+    r.c.wait_until(lambda: r.detail()["unresolved"] == f"An extend by {hours} h: {UNKNOWN_WORDS}",
+                   timeout=15, what="the row's unresolved line")
+    d = r.detail()
+    assert all(p["disabled"] for p in d["extend"]["presets"]) and d["extend"]["custom"]["disabled"], d
+    assert r.row("cloud-ok")["cloud_row"]["extend_unresolved_h"] == hours
+
+
+def test_an_unknown_extend_is_refused_here_until_the_lease_shows_it_applied(r: Rig):
+    """Every reply lost: the outcome is unknown, and every extend of the shed is refused
+    here, unsent, the same hours too. The lease then moves (the service applied it):
+    the next listing settles it as applied."""
+    _wait_rows(r)
+    before = _end(r, "cloud-ok")
+    _unknown_extend(r, 6)
+    # A press on a disabled preset takes nothing; over IPC the core refuses.
+    r.c.call("ui.press_extend", {"server": "mock", "shed": "cloud-ok", "hours": 6})
+    for hours in (6, 12):
+        with pytest.raises(ShedError) as e:
+            r.c.call("shed.extend", {"host": "mock", "name": "cloud-ok", "hours": hours})
+        assert (e.value.code, e.value.message) == ("extend_pending", PENDING_WORDS)
+    assert len(r.mock.extend_requests()) == EXTEND_ATTEMPTS, "nothing was sent"
+    assert _end(r, "cloud-ok") == before
+    # Applied late: the next listing shows the lease six hours on, and settles it.
+    r.mock.move_lease("cloud-ok", 6)
+    r.c.sheds_refresh()
+    r.c.wait_until(lambda: r.detail()["unresolved"] is None, timeout=15, what="settled as applied")
+    assert r.row("cloud-ok")["cloud_row"]["extend_unresolved_h"] is None
+    r.c.wait_until(lambda: r.row("cloud-ok")["lease"]["text"].startswith("deleted in 11h "),
+                   timeout=10, what="the row shows the lease moved")
+    assert not any(p["disabled"] for p in r.detail()["extend"]["presets"])
+    # The next extend is sent, under a new request id.
+    r.c.call("ui.press_extend", {"server": "mock", "shed": "cloud-ok", "hours": 12})
+    r.c.wait_until(lambda: ((r.detail().get("result") or {}).get("words") or "").startswith("Extended by 12 h; "),
+                   timeout=15, what="a new extend")
+    sent = r.mock.extend_requests()
+    assert len(sent) == EXTEND_ATTEMPTS + 1 and sent[-1]["request_id"] != sent[0]["request_id"], sent
+    assert _end(r, "cloud-ok") == before + timedelta(hours=18)
+
+
+def test_an_unknown_extend_settles_as_not_applied(r: Rig):
+    """Nothing applied: a listing within the settle time keeps it; once the settle
+    time has passed (`SHED_TAURI_EXTEND_SETTLE_S` here, 150 s by default) a lease
+    still at its old end settles it as not applied, and an extend is sent again."""
+    _wait_rows(r)
+    before = _end(r, "cloud-ok")
+    _unknown_extend(r, 12)
+    r.c.sheds_refresh()
+    assert r.detail()["unresolved"] is not None, "too soon to settle"
+
+    def settled() -> bool:
+        r.c.sheds_refresh()
+        return r.detail()["unresolved"] is None
+
+    r.c.wait_until(settled, timeout=SETTLE_S + 20, what="settled as not applied")
+    assert _end(r, "cloud-ok") == before
+    assert r.row("cloud-ok")["cloud_row"]["extend_unresolved_h"] is None
+    r.c.call("ui.press_extend", {"server": "mock", "shed": "cloud-ok", "hours": 6})
+    r.c.wait_until(lambda: ((r.detail().get("result") or {}).get("words") or "").startswith("Extended by 6 h; "),
+                   timeout=15, what="the extend sent again")
+    assert len(r.mock.extend_requests()) == EXTEND_ATTEMPTS + 1
+    assert _end(r, "cloud-ok") == before + timedelta(hours=6)
+
+
+# ---------------------------------------------------------------------------
+# The create sheet
+# ---------------------------------------------------------------------------
+
+#: The fixed words of COMPUTE_POLICY_REFUSED (person) (`shed_core::models::refusal_words`).
+PERSON_REFUSAL_WORDS = ("the account service makes cloud machines only for its own people and for "
+                        "service clients; a local admin can list, stop, delete and extend cloud sheds "
+                        "but not create them")
+
+
+def test_a_refused_create_shows_fixed_words_on_the_create_sheet(r: Rig):
+    """The recorded refusal (`create-refused.sse`): the sheet shows the fixed words an
+    extend's refusal would, never the server's message."""
+    r.mock.refuse_create()
+    r.c.show_create()
+    try:
+        r.c.wait_until(lambda: r.c.modal() == "create", timeout=15, what="the New shed sheet")
+        sheet = lambda: r.c.call("create_sheet.dump")["sheet"] or {}  # noqa: E731
+        r.c.wait_until(lambda: sheet().get("phase") == "form" and sheet().get("doors") is True,
+                       timeout=10, what="the form, its doors attached")
+        r.c.call("ui.fill_create", {"name": "cloud-new", "host": "mock"})
+        r.c.wait_until(lambda: (sheet().get("name"), sheet().get("host")) == ("cloud-new", "mock"),
+                       timeout=10, what="the form filled")
+        r.c.call("ui.press_create")
+        r.c.wait_until(lambda: sheet().get("state") == "error" and sheet().get("error"), timeout=15,
+                       what="the refused create")
+        error = sheet()["error"]
+        assert error == f"create failed: {PERSON_REFUSAL_WORDS}", error
+        assert "compute policy refused" not in error and "COMPUTE_POLICY_REFUSED" not in error
+        assert r.mock.last_create()["name"] == "cloud-new"
+    finally:
+        r.c.call("ui.close_create")
+        r.c.wait_until(lambda: r.c.modal() is None, timeout=10, what="the sheet closed")
+    assert r.c.call("create_sheet.dump")["sheet"] is None
 
 
 # ---------------------------------------------------------------------------

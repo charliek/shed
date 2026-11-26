@@ -27,6 +27,11 @@ export type CloudRow = {
   expires_words: string | null;
   cap_words: string | null;
   created_words: string | null;
+  /** The hours of this shed's extend whose outcome is not known, and the line saying
+   *  so: until a listing settles it every extend of the shed is refused, so Extend is
+   *  disabled. */
+  extend_unresolved_h: number | null;
+  extend_unresolved_words: string | null;
 };
 
 /** A failed extend or usage read (`shed_app::CloudFailure`): `words` is what to show. */
@@ -65,6 +70,11 @@ export function readCloudRow(raw: unknown): CloudRow | null {
     expires_words: optStr(r.expires_words),
     cap_words: optStr(r.cap_words),
     created_words: optStr(r.created_words),
+    extend_unresolved_h:
+      typeof r.extend_unresolved_h === "number" && Number.isInteger(r.extend_unresolved_h) && r.extend_unresolved_h >= 1
+        ? r.extend_unresolved_h
+        : null,
+    extend_unresolved_words: optStr(r.extend_unresolved_words),
   };
 }
 

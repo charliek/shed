@@ -49,8 +49,8 @@ shedctl (no internal deps)
   `feed: "activity", watch: false` for an opencode tab. `RELEASE_PIN` lives in
   `src/bootstrap/source.rs`. Android-clean.
 - **`shed-app`** — toolkit-free shed client core: `Backend`, `AuthModeRegistry`,
-  `timefmt`, `cloud` (plan 041: a cloud shed's `CloudRow` from its `cloud`, the
-  server's features and an injected now, so every shell only draws it). No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
+  `timefmt`, `extend`, `cloud` (plan 041: a cloud shed's `CloudRow` from its `cloud`, the
+  server's features and an injected now, so every shell only draws it; its refusal words are shed-core's `models::refusal_words`, which the create stream's error uses too). `extend` (an extend with an unknown outcome, every send unanswered or `5xx`, kept per shed incarnation and settled by observation of the listings: applied, not applied after 150 s, gone or replaced, 24 h; the shed's extends are refused meanwhile; `Backend::extend` and `refresh` drive it). No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
   `saphyr-parser`.**
 - **`shed-desktop-core`** — toolkit-free **shed-only** runtime the Tauri shell
   (and a future iced UI) hosts: `ShedId` (`roost:<server>/<shed>`),

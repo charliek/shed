@@ -1432,13 +1432,19 @@ impl Client {
                     let chunk =
                         chunk.map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?;
                     for ev in parser.feed(&chunk) {
-                        self.handle_create_event(&ev, sink, &mut saw_complete)?;
+                        if let Some(data) =
+                            self.handle_create_event(&ev, sink, &mut saw_complete)?
+                        {
+                            return Err(self.refused_create(&data).await);
+                        }
                     }
                 }
             }
         }
         for ev in parser.finish() {
-            self.handle_create_event(&ev, sink, &mut saw_complete)?;
+            if let Some(data) = self.handle_create_event(&ev, sink, &mut saw_complete)? {
+                return Err(self.refused_create(&data).await);
+            }
         }
         if !saw_complete {
             return Err(ShedError::Create(
@@ -1448,12 +1454,14 @@ impl Client {
         Ok(())
     }
 
+    /// One create stream event; an `error` event's data comes back (`Some`) for
+    /// [`Self::refused_create`] to word.
     fn handle_create_event(
         &self,
         ev: &crate::sse::SseEvent,
         sink: &dyn CreateSink,
         saw_complete: &mut bool,
-    ) -> Result<(), ShedError> {
+    ) -> Result<Option<String>, ShedError> {
         match ev.event.as_str() {
             "progress" => {
                 if let Some(msg) = decode_progress(&ev.data) {
@@ -1467,10 +1475,27 @@ impl Client {
                 *saw_complete = true;
                 sink.on_complete(shed);
             }
-            "error" => return Err(ShedError::Create(decode_error(&ev.data))),
+            "error" => return Ok(Some(ev.data.clone())),
             _ => {}
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// A create stream's `error` event as the create's error ([`decode_error`]).
+    /// Whether it is a cloud create is asked of the server only when the event does
+    /// not say (an account-service code says): `/api/info`'s `backend` is `remote`.
+    /// A server that cannot say is taken as remote, so a cloud create's server text
+    /// is never shown.
+    async fn refused_create(&self, data: &str) -> ShedError {
+        let parts = api_error_parts(data.as_bytes());
+        let said = crate::models::refusal_words(&parts.code, &parts.reason).is_some()
+            || parts.code.starts_with(crate::models::COMPUTE_CODE_PREFIX);
+        let cloud = said
+            || self
+                .info()
+                .await
+                .map_or(true, |i| i.backend.as_deref() == Some(BACKEND_REMOTE));
+        ShedError::Create(decode_error(data, cloud))
     }
 }
 
@@ -1580,6 +1605,20 @@ const EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_EGRESS_EVENT_BYTES: usize = 64 << 10;
 /// How long a refusal's body on the egress stream may take to arrive.
 const EGRESS_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+/// An extend's answer ([`Client::extend_with_request_id`]), and whether its outcome
+/// is unknown (`unresolved`): every send ended with no answer or a 5xx. A 2xx, a 4xx
+/// and an error before anything was sent are definite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtendOutcome {
+    pub result: Result<Shed, ApiFailure>,
+    pub unresolved: bool,
+}
+
+/// A fresh extend `request_id` (a UUID).
+pub fn new_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// How many times [`Client::extend`] sends one extend at most (the CLI's number).
 pub const EXTEND_ATTEMPTS: usize = 3;
 /// The pause before [`Client::extend`] sends its extend again.
@@ -1671,8 +1710,23 @@ impl Client {
     /// A refusal (4xx: `EXTEND_NOT_ALLOWED`, `LEASE_AT_CAP`, `LEASE_ENDED`,
     /// `PERSON_INACTIVE`, `COMPUTE_DELETING`, …) is final, with its code and reason.
     pub async fn extend(&self, name: &str, hours: u32) -> Result<Shed, ApiFailure> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.extend_with(name, hours, &request_id, EXTEND_RETRY_PAUSE)
+        self.extend_with_request_id(name, hours, &new_request_id())
+            .await
+            .result
+    }
+
+    /// As [`Self::extend`], under the caller's `request_id` (a UUID,
+    /// [`new_request_id`]), and saying whether its outcome is still unknown: every send
+    /// failed with no answer or a 5xx, so the lease may or may not have moved. A
+    /// caller that keeps the id and sends the same extend again under it (the same
+    /// `hours`) gets the first answer, never a second move; a new id is a new extend.
+    pub async fn extend_with_request_id(
+        &self,
+        name: &str,
+        hours: u32,
+        request_id: &str,
+    ) -> ExtendOutcome {
+        self.extend_with(name, hours, request_id, EXTEND_RETRY_PAUSE)
             .await
     }
 
@@ -1682,10 +1736,17 @@ impl Client {
         hours: u32,
         request_id: &str,
         pause: Duration,
-    ) -> Result<Shed, ApiFailure> {
-        let url = self
-            .build_url(&["api", "sheds", name, "extend"], &[])
-            .map_err(|e| ApiFailure::from_shed(&e))?;
+    ) -> ExtendOutcome {
+        let url = match self.build_url(&["api", "sheds", name, "extend"], &[]) {
+            Ok(url) => url,
+            // Nothing was sent: a definite outcome.
+            Err(e) => {
+                return ExtendOutcome {
+                    result: Err(ApiFailure::from_shed(&e)),
+                    unresolved: false,
+                }
+            }
+        };
         let body = serde_json::json!({ "hours": hours, "request_id": request_id });
         let mut attempt = 1;
         loop {
@@ -1715,7 +1776,12 @@ impl Client {
                 ),
             };
             if !again || attempt >= EXTEND_ATTEMPTS {
-                return result;
+                // `again` on the last send: it, and every one before it, ended with
+                // no answer or a 5xx, so whether the lease moved is not known.
+                return ExtendOutcome {
+                    result,
+                    unresolved: again,
+                };
             }
             attempt += 1;
             tokio::time::sleep(pause).await;
@@ -1969,14 +2035,26 @@ fn decode_progress(data: &str) -> Option<String> {
     }
 }
 
-/// A create stream's `error` event as one line: the server's API error
+/// The `backend` a remote server's `/api/info` names (cloud sheds, plan 041).
+const BACKEND_REMOTE: &str = "remote";
+
+/// A create stream's `error` event as one line. A code and reason with fixed words
+/// ([`crate::models::refusal_words`], the words an extend's refusal shows) show them,
+/// never the server's message. On a `cloud` create (or with an account-service code,
+/// `COMPUTE_…`) any other code shows a fixed line naming it
+/// ([`crate::models::unknown_cloud_refusal_words`]): a cloud create never shows the
+/// server's text. Anything else is the server's API error
 /// (`{"error":{"code","message","reason"}}`, or a bare `{"code","message","reason"}`)
-/// as its `message`, else its `code`, else the raw data; a `reason` the message does
-/// not already name in parentheses is added as ` (reason: <reason>)`, so a compute
-/// refusal's reason (`COMPUTE_LIMIT_REACHED`'s `person`, say) reaches whoever shows
-/// the error.
-fn decode_error(data: &str) -> String {
+/// as its `message`, else its `code`, else the raw data, with a `reason` the message
+/// does not already name in parentheses added as ` (reason: <reason>)`.
+fn decode_error(data: &str, cloud: bool) -> String {
     let parts = api_error_parts(data.as_bytes());
+    if let Some(words) = crate::models::refusal_words(&parts.code, &parts.reason) {
+        return words.to_string();
+    }
+    if cloud || parts.code.starts_with(crate::models::COMPUTE_CODE_PREFIX) {
+        return crate::models::unknown_cloud_refusal_words(&parts.code);
+    }
     let mut text = if !parts.message.is_empty() {
         parts.message
     } else if !parts.code.is_empty() {
@@ -3641,6 +3719,14 @@ mod tests {
     #[tokio::test]
     async fn create_error_event_reports_error() {
         let server = MockServer::start_async().await;
+        // A local server (not remote): its message is shown.
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200)
+                    .body(r#"{"name":"m","version":"1","backend":"vz"}"#);
+            })
+            .await;
         server
             .mock_async(|w, t| {
                 w.method(POST).path("/api/sheds");
@@ -3955,39 +4041,105 @@ mod tests {
     /// shed-server's own handlers) carries the server's API error envelope.
     const CREATE_REFUSED_SSE: &str = include_str!("../../fixtures/cloud/create-refused.sse");
 
+    /// The account service's refusals show fixed words, the words an extend's refusal
+    /// shows, never the server's message; anything else keeps the server's API error.
     #[test]
-    fn decode_error_reads_the_envelope_and_carries_the_reason() {
+    fn decode_error_gives_a_compute_refusal_its_fixed_words() {
         let data = CREATE_REFUSED_SSE
             .lines()
             .find_map(|l| l.strip_prefix("data: "))
             .unwrap();
-        // The server's message already names its reason: kept as it is.
-        let text = decode_error(data);
-        assert!(
-            text.starts_with("compute policy refused (person)"),
-            "{text}"
+        // The recorded refusal: COMPUTE_POLICY_REFUSED (person).
+        assert_eq!(
+            decode_error(data, false),
+            crate::models::refusal_words("COMPUTE_POLICY_REFUSED", "person").unwrap()
         );
-        assert!(!text.contains("reason:"), "{text}");
-        assert!(!text.contains("COMPUTE_POLICY_REFUSED"), "{text}");
-        // A reason the message does not name is added.
+        assert!(!decode_error(data, false).contains("compute policy refused"));
+        // By reason, and by code alone when the reason has no words of its own.
+        assert_eq!(
+            decode_error(r#"{"error":{"code":"COMPUTE_LIMIT_REACHED","message":"SERVER TEXT","reason":"organization"}}"#, false),
+            "the organization holds as many cloud machines as the account service allows; try again once one is deleted"
+        );
         assert_eq!(
             decode_error(
-                r#"{"error":{"code":"COMPUTE_LIMIT_REACHED","message":"no room","reason":"organization"}}"#
+                r#"{"error":{"code":"COMPUTE_POLICY_REFUSED","message":"SERVER TEXT","reason":"other"}}"#,
+                false
             ),
-            "no room (reason: organization)"
+            "the account service's policy refused this"
+        );
+        assert_eq!(
+            decode_error(r#"{"error":{"code":"COMPUTE_DENIED"}}"#, false),
+            "the account service does not let this server make cloud machines"
+        );
+        // An account-service code with no words here: a fixed line naming it.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"COMPUTE_NEW_THING","message":"SERVER TEXT"}}"#,
+                false
+            ),
+            "the cloud create was refused (COMPUTE_NEW_THING)"
+        );
+        // shed-server's own errors keep their message; a reason it does not name is
+        // added.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"SERVER_LIMIT_REACHED","message":"no room","reason":"sheds"}}"#,
+                false
+            ),
+            "no room (reason: sheds)"
+        );
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"x","message":"refused (y)","reason":"y"}}"#,
+                false
+            ),
+            "refused (y)"
         );
         // The bare shape is still read; with no message the code stands in.
         assert_eq!(
-            decode_error(r#"{"code":"create_failed","message":"could not create x"}"#),
+            decode_error(
+                r#"{"code":"create_failed","message":"could not create x"}"#,
+                false
+            ),
             "could not create x"
         );
         assert_eq!(
-            decode_error(r#"{"error":{"code":"COMPUTE_DENIED"}}"#),
-            "COMPUTE_DENIED"
+            decode_error(r#"{"error":{"code":"SHED_EXISTS"}}"#, false),
+            "SHED_EXISTS"
         );
+        // The cloud's own refusals have fixed words too.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"ZONE_CAPACITY_UNAVAILABLE","message":"SERVER TEXT"}}"#,
+                true
+            ),
+            "the cloud has no room for this machine now; try again later"
+        );
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"CLOUD_QUOTA_EXCEEDED","message":"SERVER TEXT"}}"#,
+                false
+            ),
+            "the cloud's quota does not allow another machine now; try again later"
+        );
+        // A cloud create never shows the server's text: any other code is a fixed
+        // line naming it, and no code at all a fixed line.
+        for (data, want) in [
+            (
+                r#"{"error":{"code":"SERVER_LIMIT_REACHED","message":"SERVER TEXT"}}"#,
+                "the cloud create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                r#"{"code":"create_failed","message":"SERVER TEXT"}"#,
+                "the cloud create was refused (create_failed)",
+            ),
+            ("SERVER TEXT", "the cloud create was refused"),
+        ] {
+            assert_eq!(decode_error(data, true), want);
+        }
         // Anything else is the raw data.
-        assert_eq!(decode_error("boom"), "boom");
-        assert_eq!(decode_error(r#"{"other":1}"#), r#"{"other":1}"#);
+        assert_eq!(decode_error("boom", false), "boom");
+        assert_eq!(decode_error(r#"{"other":1}"#, false), r#"{"other":1}"#);
     }
 
     #[tokio::test]
@@ -4008,8 +4160,81 @@ mod tests {
         };
         client(&server).create_shed(&req, sink.as_ref()).await;
         let error = sink.snapshot().error.expect("an error");
-        assert!(error.contains("(person)"), "{error}");
-        assert!(!error.contains(r#"{"error""#), "the raw envelope: {error}");
+        let words = crate::models::refusal_words("COMPUTE_POLICY_REFUSED", "person").unwrap();
+        assert_eq!(error, format!("create failed: {words}"));
+        assert!(
+            !error.contains("compute policy refused"),
+            "the server's text: {error}"
+        );
+    }
+
+    /// A refused create's server text: shown by a server that is not remote, never by
+    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read.
+    #[tokio::test]
+    async fn a_cloud_create_never_shows_the_server_text() {
+        for (info, want) in [
+            (
+                Some(r#"{"name":"m","version":"1","backend":"vz"}"#),
+                "create failed: no room on this host",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1","backend":"remote"}"#),
+                "create failed: the cloud create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                None,
+                "create failed: the cloud create was refused (SERVER_LIMIT_REACHED)",
+            ),
+        ] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(POST).path("/api/sheds");
+                    t.status(200)
+                        .header("content-type", "text/event-stream")
+                        .body("event: error\ndata: {\"error\":{\"code\":\"SERVER_LIMIT_REACHED\",\"message\":\"no room on this host\"}}\n\n");
+                })
+                .await;
+            let info_mock = server
+                .mock_async(|w, t| {
+                    w.method(GET).path("/api/info");
+                    match info {
+                        Some(body) => t.status(200).body(body),
+                        None => t.status(503),
+                    };
+                })
+                .await;
+            let sink = Arc::new(RecordingSink::default());
+            let req = CreateShedRequest {
+                name: "x".into(),
+                ..Default::default()
+            };
+            client(&server).create_shed(&req, sink.as_ref()).await;
+            assert_eq!(sink.snapshot().error.as_deref(), Some(want), "{info:?}");
+            assert_eq!(info_mock.hits_async().await, 1);
+        }
+        // A refusal with fixed words does not ask.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(CREATE_REFUSED_SSE);
+            })
+            .await;
+        let info_mock = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200).body(r#"{"name":"m","version":"1"}"#);
+            })
+            .await;
+        let sink = Arc::new(RecordingSink::default());
+        client(&server)
+            .create_shed(&CreateShedRequest::default(), sink.as_ref())
+            .await;
+        assert!(sink.snapshot().error.is_some());
+        assert_eq!(info_mock.hits_async().await, 0);
     }
 
     /// A scripted server that records each request's body: each entry answers one
@@ -4099,6 +4324,7 @@ mod tests {
         let shed = c
             .extend_with("widgets", 6, &rid, Duration::ZERO)
             .await
+            .result
             .unwrap();
         assert_eq!(shed.name, "widgets");
         c.extend("widgets", 6).await.unwrap();
@@ -4121,9 +4347,57 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .result
             .unwrap_err();
         assert_eq!(e.status, None);
         assert_eq!(bodies.lock().unwrap().len(), EXTEND_ATTEMPTS);
+    }
+
+    /// Whether an extend's outcome is unknown: only when every send ended with no
+    /// answer or a 5xx. An answer (2xx or 4xx) settles it, even after lost ones.
+    #[tokio::test]
+    async fn an_extend_is_unresolved_only_when_no_send_was_answered() {
+        let unavailable = || {
+            answer(
+                "503 Service Unavailable",
+                "",
+                r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"down"}}"#,
+            )
+        };
+        let rid = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+        for (script, unresolved, ok) in [
+            (vec![None; EXTEND_ATTEMPTS], true, false),
+            (vec![None, unavailable(), unavailable()], true, false),
+            (
+                vec![None, None, answer("200 OK", "", EXTEND_ANSWER.trim_end())],
+                false,
+                true,
+            ),
+            (
+                vec![None, answer("409 Conflict", "", EXTEND_AT_CAP.trim_end())],
+                false,
+                false,
+            ),
+        ] {
+            let (base, _) = recording_server(script).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert_eq!(
+                (out.unresolved, out.result.is_ok()),
+                (unresolved, ok),
+                "{out:?}"
+            );
+        }
+        // A public entry point that takes the caller's id sends that id.
+        let (base, bodies) =
+            recording_server(vec![answer("200 OK", "", EXTEND_ANSWER.trim_end())]).await;
+        let out = client_at(base)
+            .extend_with_request_id("widgets", 6, rid)
+            .await;
+        assert!(out.result.is_ok() && !out.unresolved);
+        assert_eq!(extend_body(&bodies.lock().unwrap()[0]).1, rid);
+        assert!(uuid::Uuid::parse_str(&new_request_id()).is_ok());
     }
 
     /// A refusal is final, with its status, code, message and reason.
@@ -4148,6 +4422,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .result
             .unwrap_err();
         assert_eq!(e.status, Some(409));
         assert_eq!(e.code, "LEASE_AT_CAP");
@@ -4161,6 +4436,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .result
             .unwrap_err();
         assert_eq!(
             (e.status, e.code.as_str(), e.reason.as_str()),
@@ -4192,6 +4468,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .result
             .unwrap_err();
         assert_eq!(e.status, Some(409), "{e:?}");
         assert_eq!(bodies.lock().unwrap().len(), 1, "a 4xx is never sent again");
@@ -4209,6 +4486,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .result
             .unwrap();
         assert_eq!(shed.name, "widgets");
         let bodies = bodies.lock().unwrap();

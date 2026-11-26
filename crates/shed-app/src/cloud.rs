@@ -11,7 +11,7 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::Serialize;
 
 use shed_core::http::ApiFailure;
-pub use shed_core::models::MAX_EXTEND_HOURS;
+pub use shed_core::models::{refusal_words, MAX_EXTEND_HOURS};
 use shed_core::models::{
     CloudUsage, Shed, ShedCloud, ShedStatus, DEFAULT_LEASE_WARN_S, FEATURE_LEASE,
 };
@@ -91,6 +91,24 @@ pub struct CloudRow {
     pub cap_words: Option<String>,
     /// When the machine was made, in the same words, when known.
     pub created_words: Option<String>,
+    /// The hours of this shed's extend whose outcome is not known
+    /// ([`EXTEND_UNKNOWN`]), `None` when there is none. While it is set every extend
+    /// of the shed is refused unsent ([`EXTEND_PENDING`]), so a shell disables its
+    /// Extend controls and shows [`Self::extend_unresolved_words`]; it settles when a
+    /// listing shows whether the lease moved ([`crate::extend`]).
+    pub extend_unresolved_h: Option<i64>,
+    /// [`unresolved_extend_words`] for [`Self::extend_unresolved_h`].
+    pub extend_unresolved_words: Option<String>,
+}
+
+impl CloudRow {
+    /// This row with the shed's extend whose outcome is not known, if any
+    /// ([`crate::Backend::unresolved_extend`]).
+    pub fn with_unresolved_extend(mut self, hours: Option<i64>) -> Self {
+        self.extend_unresolved_h = hours;
+        self.extend_unresolved_words = hours.map(unresolved_extend_words);
+        self
+    }
 }
 
 /// The row for `shed` at `now` (unix seconds), or `None` for a shed with no
@@ -169,40 +187,38 @@ pub fn cloud_row(shed: &Shed, caps: CloudCaps, now: i64) -> Option<CloudRow> {
         expires_words: expires.map(|t| format_lease_time(t, now)),
         cap_words: cap.map(|t| format_lease_time(t, now)),
         created_words: secs(&cloud.created_at).map(|t| format_lease_time(t, now)),
+        extend_unresolved_h: None,
+        extend_unresolved_words: None,
     })
 }
 
-/// The fixed words for one of the account service's refusals, by its code and
-/// reason (the CLI's `computeWords`, word for word): `None` for any other code,
-/// whose server message is shown instead. The server's message for these codes is
-/// never shown.
-pub fn refusal_words(code: &str, reason: &str) -> Option<&'static str> {
-    Some(match (code, reason) {
-        ("COMPUTE_LIMIT_REACHED", "person") => "you hold as many cloud machines as the account service allows a person; delete one of your cloud sheds and try again",
-        ("COMPUTE_LIMIT_REACHED", "organization") => "the organization holds as many cloud machines as the account service allows; try again once one is deleted",
-        ("COMPUTE_LIMIT_REACHED", _) => "the account service's limit on cloud machines is reached",
-        ("COMPUTE_POLICY_REFUSED", "size") => "the account service does not allow this size",
-        ("COMPUTE_POLICY_REFUSED", "lease") => "the account service does not allow this lease",
-        ("COMPUTE_POLICY_REFUSED", "image") => "the account service does not offer this image",
-        ("COMPUTE_POLICY_REFUSED", "access") => "the account service offers no way to reach a machine that this server supports",
-        ("COMPUTE_POLICY_REFUSED", "person") => "the account service makes cloud machines only for its own people and for service clients; a local admin can list, stop, delete and extend cloud sheds but not create them",
-        ("COMPUTE_POLICY_REFUSED", "client") => "this service client is not registered with the account service for this server",
-        ("COMPUTE_POLICY_REFUSED", _) => "the account service's policy refused this",
-        ("COMPUTE_DENIED", _) => "the account service does not let this server make cloud machines",
-        ("COMPUTE_UNAVAILABLE", _) => "the account service could not be reached, or this server has not finished reading its machines; try again later",
-        ("COMPUTE_DELETING", _) => "the account service is deleting this cloud shed's machine (its lease ended, or it was deleted at the service)",
-        ("EXTEND_NOT_ALLOWED", _) => "this cloud shed's lease cannot be extended (a service client's shed, or the account service's policy)",
-        ("LEASE_AT_CAP", _) => "the extend would take the lease past its cap; extend by fewer hours",
-        ("LEASE_ENDED", _) => "this cloud shed's lease has ended; its machine is being deleted",
-        ("PERSON_INACTIVE", _) => "the shed's person is no longer active at the account service",
-        _ => return None,
-    })
+/// The code of an extend whose outcome is not known ([`crate::Backend::extend`]):
+/// every send ended with no answer or a 5xx, so the lease may have moved. It is
+/// settled by what the listings show ([`crate::extend`]), never by sending it again.
+pub const EXTEND_UNKNOWN: &str = "extend_unknown";
+
+/// [`EXTEND_UNKNOWN`]'s words.
+pub const EXTEND_UNKNOWN_WORDS: &str =
+    "not known whether it was applied; it settles within a few minutes";
+
+/// The code of an extend refused here, unsent, while an earlier extend of that shed
+/// is in flight or has an unknown outcome: sending it could move the lease twice.
+pub const EXTEND_PENDING: &str = "extend_pending";
+
+/// [`EXTEND_PENDING`]'s words.
+pub const EXTEND_PENDING_WORDS: &str =
+    "an earlier extend's outcome is not known yet; it settles within a few minutes";
+
+/// The line a cloud row shows while an extend of `hours` has an unknown outcome.
+pub fn unresolved_extend_words(hours: i64) -> String {
+    format!("An extend by {hours} h: {EXTEND_UNKNOWN_WORDS}")
 }
 
 /// A failed extend or usage read as a shell shows it: the API error's `code`
 /// (`action_failed` when no server answered), its `reason`, the `status`, and
-/// `words`: the fixed words for an account-service refusal ([`refusal_words`]), else
-/// the error's own (cleaned) message.
+/// `words`: the fixed words for an account-service refusal ([`refusal_words`]) and
+/// for [`EXTEND_UNKNOWN`] and [`EXTEND_PENDING`], else the error's own (cleaned)
+/// message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudFailure {
     pub code: String,
@@ -222,8 +238,12 @@ impl CloudFailure {
             code: code.to_string(),
             reason: e.reason.clone(),
             status: e.status,
-            words: refusal_words(&e.code, &e.reason)
-                .map_or_else(|| e.message.clone(), str::to_string),
+            words: match e.code.as_str() {
+                EXTEND_UNKNOWN => EXTEND_UNKNOWN_WORDS,
+                EXTEND_PENDING => EXTEND_PENDING_WORDS,
+                _ => refusal_words(&e.code, &e.reason).unwrap_or(&e.message),
+            }
+            .to_string(),
         }
     }
 }
@@ -243,7 +263,7 @@ pub fn usage_words(u: &CloudUsage) -> String {
 }
 
 /// An instant's unix seconds, fail-closed.
-fn secs(raw: &str) -> Option<i64> {
+pub(crate) fn secs(raw: &str) -> Option<i64> {
     parse_instant(raw).map(|(s, _)| s)
 }
 

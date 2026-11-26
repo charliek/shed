@@ -57,7 +57,8 @@ const runKey = (s: Shed) => extendKey(s.host, s.name, shedIncarnation(s));
  *  lets a second extend start while one is in flight. */
 export type CloudExtends = {
   runOf: (s: Shed) => ExtendRun | undefined;
-  /** Extend `s` by `hours` unless one is in flight for it; `onDone` after success. */
+  /** Extend `s` by `hours` unless one is in flight for it; `onDone` once it has
+   *  settled, either way (a refusal or an unknown outcome changes the row too). */
   extend: (s: Shed, hours: number, onDone: () => void) => void;
   /** Forget the finished runs of shed incarnations no longer in `sheds` (the rows
    *  just listed); a run still in flight is kept. */
@@ -84,7 +85,13 @@ export function useCloudExtends(): CloudExtends {
         settle({ ok: true, words: `Extended by ${hours} h${end}` });
         onDone();
       },
-      (e: unknown) => settle({ ok: false, words: failureWords(e) }),
+      // An extend whose outcome is not known is kept in the core until a listing
+      // settles it; the row says so (`extend_unresolved_words`) once the list is
+      // read again.
+      (e: unknown) => {
+        settle({ ok: false, words: failureWords(e) });
+        onDone();
+      },
     );
   }, []);
   const runOf = useCallback((s: Shed) => runs[runKey(s)], [runs]);
@@ -102,7 +109,9 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
 }) {
   const root = useRef<HTMLDivElement>(null);
   const [custom, setCustom] = useState("");
-  const busy = run?.busy ?? false;
+  // An extend in flight, or an earlier one whose outcome is not known yet (the core
+  // refuses every extend of the shed until a listing settles it): nothing to press.
+  const busy = (run?.busy ?? false) || !!row.extend_unresolved_words;
   const result = run?.result ?? null;
   const customValue = customHours(custom, row.extend_max_h);
   // A new successful extend clears the custom field; one this detail mounted after
@@ -123,6 +132,9 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
 
   // The harness's doors (test mode only): this detail's own controls, pressed or
   // typed into, so a hidden or disabled one takes nothing, as with a pointer.
+  // `doors` is reported once every listener is attached (a press before then would
+  // reach no one).
+  const [doors, setDoors] = useState(false);
   useEffect(() => {
     if (!inTauri()) return;
     let cancelled = false;
@@ -145,6 +157,7 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
         press(mine(e.payload)?.querySelector("button[data-extend-custom-press]"));
       }));
       if (cancelled) uns.forEach((u) => u());
+      else setDoors(true);
     })();
     return () => {
       cancelled = true;
@@ -153,7 +166,7 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
   }, [shed.host, shed.name]);
 
   // Report what this detail rendered, read back off its own nodes after the commit.
-  const key = JSON.stringify([row, custom, busy, result, shed.status]);
+  const key = JSON.stringify([row, custom, busy, run?.busy, result, shed.status, doors]);
   useEffect(() => {
     const el = root.current;
     if (!el) return;
@@ -184,7 +197,9 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
           }
         : null,
       result: res ? { ok: res.dataset.extendResult === "ok", words: res.textContent } : null,
+      unresolved: el.querySelector("[data-extend-unresolved]")?.textContent ?? null,
       rendered: el.textContent ?? "",
+      doors,
     });
   }, [key, shed.host, shed.name]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => reportShedCloud("shed_cloud", null), []);
@@ -251,7 +266,12 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
               Extend
             </button>
           </span>
-          {busy && <span className="text-[12px] text-shed-text-muted" data-extend-busy>Extending…</span>}
+          {run?.busy && <span className="text-[12px] text-shed-text-muted" data-extend-busy>Extending…</span>}
+        </div>
+      )}
+      {row.extend_unresolved_words && (
+        <div className="mt-2.5 text-[12.5px] font-medium" style={{ color: "var(--shed-warn-fg)" }} data-extend-unresolved>
+          {row.extend_unresolved_words}
         </div>
       )}
       {result && (

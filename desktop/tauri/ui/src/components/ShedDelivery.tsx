@@ -153,6 +153,9 @@ export function ShedDeliveryDetail({ shed, rec, prov, onDeliver }: {
 
   // The harness's press (test mode only): this detail's OWN button, clicked, so the
   // press runs its handler and is refused by its disabled state as a pointer's is.
+  // `doors` is reported once the listener is attached: a press sent before then
+  // would reach no one, so the harness waits for it.
+  const [doors, setDoors] = useState(false);
   useEffect(() => {
     if (!inTauri()) return;
     let cancelled = false;
@@ -165,7 +168,10 @@ export function ShedDeliveryDetail({ shed, rec, prov, onDeliver }: {
         });
       });
       if (cancelled) u();
-      else un = u;
+      else {
+        un = u;
+        setDoors(true);
+      }
     })();
     return () => {
       cancelled = true;
@@ -174,7 +180,7 @@ export function ShedDeliveryDetail({ shed, rec, prov, onDeliver }: {
   }, []);
 
   // Report what this detail rendered, read back off its own nodes after the commit.
-  const recKey = JSON.stringify([rec, prov, shed.status]);
+  const recKey = JSON.stringify([rec, prov, shed.status, doors]);
   useEffect(() => {
     const el = root.current;
     if (!el) return;
@@ -205,6 +211,7 @@ export function ShedDeliveryDetail({ shed, rec, prov, onDeliver }: {
       warnings: Array.from(el.querySelectorAll("[data-provision-warning]")).map((w) => w.textContent),
       progress: Array.from(el.querySelectorAll("[data-provision-progress]")).map((w) => w.textContent),
       rendered: el.textContent ?? "",
+      doors,
     });
   }, [recKey, shed.host, shed.name]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => reportShedDelivery(null), []);

@@ -56,9 +56,21 @@ A refusal from the account service shows fixed words, never the server's own tex
 | `LEASE_ENDED` | This cloud shed's lease has ended; its machine is being deleted. |
 | `PERSON_INACTIVE` | The shed's person is no longer active at the account service. |
 | `COMPUTE_DELETING` | The account service is deleting this cloud shed's machine (its lease ended, or it was deleted at the service). |
-| `COMPUTE_UNAVAILABLE` | The account service could not be reached, or this server has not finished reading its machines; try again later. |
 
-When no server answers at all, the message is the app's own error text. A lost reply is safe to retry: the app sends one request id per extend, so the lease moves once.
+### When the outcome is not known
+
+The app sends an extend up to three times, two seconds apart, with one request id, while no server answers or the server answers `5xx` (`COMPUTE_UNAVAILABLE` among them). When every try ends that way, the lease may or may not have moved, and the panel says *not known whether it was applied; it settles within a few minutes*. The app never sends that extend again; it settles it by what the shed's listings show next:
+
+- **Applied:** the lease ends at least that many hours later than it did before the extend.
+- **Not applied:** 150 seconds after the outcome became unknown (two of the server's passes and a margin), the lease still ends where it did before.
+- The shed is gone, or a shed created again under its name is listed: the record belonged to the old shed.
+- After 24 hours, whatever the listing says.
+
+A listing that fails (no answer, a refused sign-in) settles nothing. Until it settles, the row keeps a line saying so (`An extend by 6 h: not known whether it was applied; it settles within a few minutes`), its Extend controls are disabled, and any extend of that shed (from the IPC too) is refused in the app, unsent, with *an earlier extend's outcome is not known yet; it settles within a few minutes*. The app keeps this in memory only; after a restart the shed's next extend is sent.
+
+## When a create is refused
+
+A cloud create that is refused shows fixed words in the New shed sheet, after `create failed:`, never the server's own text: for example *the account service makes cloud machines only for its own people and for service clients; a local admin can list, stop, delete and extend cloud sheds but not create them* for a local admin (`COMPUTE_POLICY_REFUSED`, reason `person`). The words for `COMPUTE_LIMIT_REACHED`, `COMPUTE_POLICY_REFUSED` (by reason), `COMPUTE_DENIED`, `COMPUTE_UNAVAILABLE` and `COMPUTE_DELETING` are the CLI's; `CLOUD_QUOTA_EXCEEDED` shows *the cloud's quota does not allow another machine now; try again later* and `ZONE_CAPACITY_UNAVAILABLE` *the cloud has no room for this machine now; try again later*. Any other code from a remote server (whose `/api/info` says `backend: remote`, or that cannot say) shows *the cloud create was refused (CODE)*. A create refused by a server that is not remote shows the server's message, as before.
 
 ## The usage line
 

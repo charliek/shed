@@ -18,10 +18,14 @@ const ROW = {
   expires_words: "14:10 UTC",
   cap_words: "2026-11-30 13:00 UTC",
   created_words: "06:00 UTC",
+  extend_unresolved_h: null,
+  extend_unresolved_words: null,
 };
 
 test("readCloudRow keeps the core's row as it came", () => {
   assert.deepEqual(readCloudRow(ROW), ROW);
+  const pending = { ...ROW, extend_unresolved_h: 6, extend_unresolved_words: "An extend by 6 h: not known" };
+  assert.deepEqual(readCloudRow(pending), pending);
 });
 
 test("readCloudRow: no row is null, and a malformed one offers nothing", () => {
@@ -34,6 +38,9 @@ test("readCloudRow: no row is null, and a malformed one offers nothing", () => {
   assert.equal(r.extend_max_h, 0);
   assert.equal(r.run_words, null);
   assert.equal(r.expires_words, null);
+  assert.equal(r.extend_unresolved_h, null);
+  assert.equal(r.extend_unresolved_words, null);
+  for (const h of [0, 1.5, "6", -6]) assert.equal(readCloudRow({ extend_unresolved_h: h }).extend_unresolved_h, null);
 });
 
 test("leaseTone: amber within the warning time, danger once ended", () => {
