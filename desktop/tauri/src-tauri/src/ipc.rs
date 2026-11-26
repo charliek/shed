@@ -345,6 +345,65 @@ fn test_mode_door(env: &Env, op: &str) -> Result<(), (String, String)> {
     Ok(())
 }
 
+/// The Sheds pane's cloud doors (plan 041 B2): the event to emit and its payload, or
+/// the refusal. **TEST-MODE ONLY**, the `ui.press_source_use` rule: each is a press
+/// (or a typing) on a control the pane rendered, which it carries out on that control,
+/// so a hidden or disabled one takes nothing, as with a pointer; `dashboard.dump`'s
+/// `cloud` is what proves what happened. The production doors onto the same backend
+/// are `shed.extend` and `shed.delete`.
+///
+/// * `ui.press_shed_details {server, shed}` — the row's details toggle;
+/// * `ui.press_shed_delete {server, shed}` — the row's Delete (a cloud row asks first);
+/// * `ui.press_delete_confirm {button: delete|cancel}` — the confirmation's buttons;
+/// * `ui.press_extend {server, shed, hours}` — a preset in the open cloud detail;
+/// * `ui.fill_extend_hours {server, shed, value}` — the custom hours field;
+/// * `ui.press_extend_custom {server, shed}` — the custom field's Extend.
+fn cloud_door(
+    test_mode: bool,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    let row = |params: &Value| -> Result<Value, (String, String)> {
+        let server = req_str(params, "server")?;
+        let shed = req_str(params, "shed")?;
+        if server.is_empty() || shed.is_empty() {
+            return Err(err("bad_request", "'server' and 'shed' name a shed's row"));
+        }
+        Ok(json!({ "server": server, "shed": shed }))
+    };
+    match op {
+        "ui.press_shed_details" => Ok(("press-shed-details", row(params)?)),
+        "ui.press_shed_delete" => Ok(("press-shed-delete", row(params)?)),
+        "ui.press_delete_confirm" => match params.get("button").and_then(Value::as_str) {
+            Some(b @ ("delete" | "cancel")) => Ok(("press-delete-confirm", json!({ "button": b }))),
+            _ => Err(err("bad_request", "'button' is delete or cancel")),
+        },
+        "ui.press_extend" => {
+            let mut p = row(params)?;
+            let hours = params
+                .get("hours")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| err("bad_request", "'hours' names a preset, in whole hours"))?;
+            p["hours"] = json!(hours);
+            Ok(("press-extend", p))
+        }
+        "ui.fill_extend_hours" => {
+            let mut p = row(params)?;
+            let value = params
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| err("bad_request", "'value' must be a string"))?;
+            p["value"] = json!(value);
+            Ok(("fill-extend-hours", p))
+        }
+        "ui.press_extend_custom" => Ok(("press-extend-custom", row(params)?)),
+        other => Err(err("unknown_op", format!("unknown op: {other}"))),
+    }
+}
+
 fn press_source_door(env: &Env, op: &str, params: &Value) -> Result<Value, (String, String)> {
     if !env.test_mode {
         return Err(err("not_enabled", format!("{op} requires test mode")));
@@ -990,10 +1049,24 @@ impl Handler {
             "sheds.refresh" => self.sheds_refresh().await,
             "dashboard.dump" => {
                 let reported = self.reported_sheds_payload();
+                // The Sheds pane's cloud parts (plan 041 B2), each as it reported what it
+                // rendered: the open cloud detail, the usage lines under the servers'
+                // headings, and the delete confirmation; `null` off the pane.
+                let on_pane = self.ui_get("pane").as_ref().and_then(Value::as_str) == Some("sheds");
+                let cloud = if on_pane {
+                    json!({
+                        "detail": self.ui_get("shed_cloud").unwrap_or(Value::Null),
+                        "usage": self.ui_get("cloud_usage").unwrap_or_else(|| json!([])),
+                        "delete_confirm": self.ui_get("cloud_delete").unwrap_or(Value::Null),
+                    })
+                } else {
+                    Value::Null
+                };
                 Ok(json!({
                     "rows": reported["sheds"],
                     "host_errors": reported["host_errors"],
                     "empty": self.ui_get("empty").unwrap_or(Value::Null),
+                    "cloud": cloud,
                 }))
             }
             "shed.start" => self.shed_action(params, "start").await,
@@ -1002,6 +1075,16 @@ impl Handler {
             "shed.delete" => self.shed_action(params, "delete").await,
             "shed.extend" => self.shed_extend(params).await,
             "cloud.usage" => self.cloud_usage(params).await,
+            "ui.press_shed_details"
+            | "ui.press_shed_delete"
+            | "ui.press_delete_confirm"
+            | "ui.press_extend"
+            | "ui.fill_extend_hours"
+            | "ui.press_extend_custom" => {
+                let (event, payload) = cloud_door(self.env.test_mode, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
             "create.start" => self.create_start(params).await,
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
@@ -2630,6 +2713,102 @@ mod tests {
         let row = &sheds_payload_at(&r, now)["sheds"][1]["cloud_row"];
         assert_eq!(row["actions"]["extend"], true);
         assert_eq!(row["extend_presets_h"], json!([6, 12]));
+    }
+
+    #[test]
+    fn the_cloud_doors_are_test_mode_only_and_check_their_params() {
+        let row = json!({ "server": "mock", "shed": "cloud-ok" });
+        for op in [
+            "ui.press_shed_details",
+            "ui.press_shed_delete",
+            "ui.press_extend_custom",
+        ] {
+            assert_eq!(
+                cloud_door(false, op, &row).unwrap_err().0,
+                "not_enabled",
+                "{op}"
+            );
+            let (_, p) = cloud_door(true, op, &row).unwrap();
+            assert_eq!(p, row, "{op}");
+            for bad in [
+                json!({}),
+                json!({ "server": "mock" }),
+                json!({ "server": "", "shed": "x" }),
+            ] {
+                assert_eq!(
+                    cloud_door(true, op, &bad).unwrap_err().0,
+                    "bad_request",
+                    "{op} {bad}"
+                );
+            }
+        }
+        assert_eq!(
+            cloud_door(true, "ui.press_shed_details", &row).unwrap().0,
+            "press-shed-details"
+        );
+        let (event, p) = cloud_door(
+            true,
+            "ui.press_extend",
+            &json!({ "server": "mock", "shed": "cloud-ok", "hours": 6 }),
+        )
+        .unwrap();
+        assert_eq!((event, p["hours"].as_i64()), ("press-extend", Some(6)));
+        assert_eq!(
+            cloud_door(true, "ui.press_extend", &row).unwrap_err().0,
+            "bad_request"
+        );
+        assert_eq!(
+            cloud_door(
+                true,
+                "ui.press_extend",
+                &json!({ "server": "mock", "shed": "c", "hours": "6" })
+            )
+            .unwrap_err()
+            .0,
+            "bad_request"
+        );
+        let (event, p) = cloud_door(
+            true,
+            "ui.fill_extend_hours",
+            &json!({ "server": "mock", "shed": "cloud-ok", "value": " 30" }),
+        )
+        .unwrap();
+        assert_eq!(
+            (event, p["value"].as_str()),
+            ("fill-extend-hours", Some(" 30"))
+        );
+        assert_eq!(
+            cloud_door(true, "ui.fill_extend_hours", &row)
+                .unwrap_err()
+                .0,
+            "bad_request"
+        );
+        for b in ["delete", "cancel"] {
+            let (event, p) =
+                cloud_door(true, "ui.press_delete_confirm", &json!({ "button": b })).unwrap();
+            assert_eq!(
+                (event, p["button"].as_str()),
+                ("press-delete-confirm", Some(b))
+            );
+        }
+        for bad in [json!({}), json!({ "button": "yes" })] {
+            assert_eq!(
+                cloud_door(true, "ui.press_delete_confirm", &bad)
+                    .unwrap_err()
+                    .0,
+                "bad_request"
+            );
+        }
+        assert_eq!(
+            cloud_door(
+                false,
+                "ui.press_delete_confirm",
+                &json!({ "button": "delete" })
+            )
+            .unwrap_err()
+            .0,
+            "not_enabled"
+        );
     }
 
     #[test]

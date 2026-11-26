@@ -414,6 +414,14 @@ class MockShedServer:
         # (caller, shed incarnation, lowercased request id) -> the answer kept for it.
         self._extend_answers: dict[tuple[str, str, str], tuple[int, dict]] = {}
         self._extend_requests: list[dict] = []
+        # Holds (`hold_extend` / `hold_usage`): the next request of each waits for its
+        # gate before it is answered; the counters say how many arrived and were answered.
+        self._extend_hold: threading.Event | None = None
+        self._usage_hold: threading.Event | None = None
+        self._extend_arrived = 0
+        self._usage_arrived = 0
+        self._usage_answered = 0
+        self._holds: list[threading.Event] = []  # every hold made, set again by `reset`
         # Create-stream controls.
         self.create_should_fail = False
         self.create_progress = ["resolving image", "starting VM", "provisioning workspace"]
@@ -564,7 +572,12 @@ class MockShedServer:
             self._extend_refusals = []
             self._extend_answers = {}
             self._extend_requests = []
+            holds, self._holds = self._holds, []
+            self._extend_hold = self._usage_hold = None
+            self._extend_arrived = self._usage_arrived = self._usage_answered = 0
             gate, self._provision_gate = self._provision_gate, None
+        for h in holds:
+            h.set()
         if gate is not None:
             gate.set()
         with self._lock:
@@ -692,6 +705,42 @@ class MockShedServer:
         with self._lock:
             self._extend_refusals.append((code, reason))
 
+    def hold_extend(self) -> threading.Event:
+        """The next extend that arrives waits, before anything is decided, until the
+        returned event is set (`reset` sets it too)."""
+        gate = threading.Event()
+        with self._lock:
+            self._extend_hold = gate
+            self._holds.append(gate)
+        return gate
+
+    def hold_usage(self) -> threading.Event:
+        """The next usage read takes its answer when it arrives, then waits to send it
+        until the returned event is set (`reset` sets it too)."""
+        gate = threading.Event()
+        with self._lock:
+            self._usage_hold = gate
+            self._holds.append(gate)
+        return gate
+
+    def cloud_counts(self) -> dict:
+        """`{extend_arrived, usage_arrived, usage_answered}`: the extends that reached
+        the mock (held ones included) and the usage reads that arrived and were sent."""
+        with self._lock:
+            return {"extend_arrived": self._extend_arrived, "usage_arrived": self._usage_arrived,
+                    "usage_answered": self._usage_answered}
+
+    def _arrive_extend(self) -> None:
+        with self._lock:
+            self._extend_arrived += 1
+            gate, self._extend_hold = self._extend_hold, None
+        if gate is not None:
+            gate.wait(30)
+
+    def _note_usage_answered(self) -> None:
+        with self._lock:
+            self._usage_answered += 1
+
     def extend_requests(self) -> list[dict]:
         """Every extend body received, with the shed's name under `name`."""
         with self._lock:
@@ -768,9 +817,15 @@ class MockShedServer:
 
     def _usage(self) -> tuple[int, dict]:
         with self._lock:
+            self._usage_arrived += 1
+            gate, self._usage_hold = self._usage_hold, None
             if self.cloud_usage is None:
-                return 501, _api_error("FEATURE_UNSUPPORTED", "cloud usage is not supported")
-            return 200, json.loads(json.dumps(self.cloud_usage))
+                answer = 501, _api_error("FEATURE_UNSUPPORTED", "cloud usage is not supported")
+            else:
+                answer = 200, json.loads(json.dumps(self.cloud_usage))
+        if gate is not None:
+            gate.wait(30)
+        return answer
 
     # -- mutations the request handlers call (under lock) -----------------
     def _set_status(self, name: str, status: str) -> bool:
@@ -1444,6 +1499,7 @@ class MockShedServer:
                     return
                 if path == _CLOUD_USAGE_PATH:
                     self._send(*state._usage())
+                    state._note_usage_answered()
                     return
                 m = _EGRESS_SHOW_RE.match(path)
                 if m and m.group(1) not in ("stream", "profiles"):
@@ -1674,6 +1730,7 @@ class MockShedServer:
                         body = None
                     # The mock's only notion of who asks: the credential presented.
                     caller = self.headers.get("Authorization") or ""
+                    state._arrive_extend()
                     self._send(*state._extend(unquote(m.group(1)), body, caller))
                     return
                 if path == _SOURCES_USE_PATH:

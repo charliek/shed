@@ -102,6 +102,7 @@ nav = [
     { "Credentials" = "desktop/credentials.md" },
     { "Agents pane" = "desktop/rc-sessions.md" },
     { "Agent lanes" = "desktop/agent-lanes.md" },
+    { "Cloud sheds" = "desktop/cloud-sheds.md" },
     { "IPC" = "desktop/ipc.md" },
     { "shedctl CLI" = "desktop/cli.md" },
     { "Development setup" = "desktop/development-setup.md" },

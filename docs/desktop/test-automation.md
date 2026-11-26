@@ -69,7 +69,7 @@ per-server credential mode and launch at login. `test_tauri_server_views.py` dri
 that read the servers themselves, over two private mocks and one that is down: the four
 sidebar entries, Activity merged across servers and paged with its cursor, a shed's detail
 (its delivery and its egress, keyed by the shed's creation time so a reused name starts
-empty) and the System pane's egress profiles. `hermetic.py` is the launch environment every
+empty) and the System pane's egress profiles. `test_tauri_cloud.py` drives cloud sheds over IPC (the `cloud_row` on `sheds.list`, `shed.extend` with its refusals, `cloud.usage`) against the mock's remote fixture, and `test_tauri_cloud_view.py` drives what the Sheds pane renders for them (the tag, meta line, detail, Extend, usage line and delete confirmation) through the test-mode `ui.press_*` doors; see [Cloud sheds](cloud-sheds.md). `hermetic.py` is the launch environment every
 cell runs under and its check.
 
 ### Simulating a down (unreachable) host

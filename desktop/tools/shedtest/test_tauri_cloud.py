@@ -13,7 +13,8 @@ remote fixture (`MockShedServer.serve_cloud`).
 * `cloud.usage` answers a server's usage and its line, and a server without compute
   `FEATURE_UNSUPPORTED`.
 
-The rendered rows (the tag, the meta line, Extend) are B2's cells.
+The rendered rows (the tag, the meta line, the detail with Extend, the usage line,
+Delete's confirmation) are `test_tauri_cloud_view.py`'s cells.
 """
 
 from __future__ import annotations
