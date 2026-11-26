@@ -466,6 +466,8 @@ def test_an_unknown_extend_is_refused_here_until_the_lease_shows_it_applied(r: R
     r.c.sheds_refresh()
     r.c.wait_until(lambda: r.detail()["unresolved"] is None, timeout=15, what="settled as applied")
     assert r.row("cloud-ok")["cloud_row"]["extend_unresolved_h"] is None
+    # Its unknown-outcome words go with it: they would contradict the enabled controls.
+    r.c.wait_until(lambda: r.detail()["result"] is None, timeout=5, what="the unknown words cleared")
     r.c.wait_until(lambda: r.row("cloud-ok")["lease"]["text"].startswith("deleted in 11h "),
                    timeout=10, what="the row shows the lease moved")
     assert not any(p["disabled"] for p in r.detail()["extend"]["presets"])

@@ -7,6 +7,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -199,6 +200,10 @@ func fixtureShape(data []byte) (any, error) {
 	var doc any
 	if err := dec.Decode(&doc); err != nil {
 		return nil, err
+	}
+	// One document, nothing after it: the Rust clients refuse trailing data.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("data after the JSON document (%v)", err)
 	}
 	return shapeOf(doc), nil
 }

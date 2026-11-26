@@ -49,11 +49,20 @@ function Fact({ label, fact, children }: { label: string; fact: string; children
   );
 }
 
-type ExtendResult = { ok: boolean; words: string };
+/** How an extend ended; `unknown` when no answer said whether it was applied (the
+ *  core then holds the shed until a listing settles it). */
+type ExtendResult = { ok: boolean; words: string; unknown?: boolean };
 
 /** One shed's extend: whether one is in flight, and how the last one ended (`seq`
  *  counts the results, so a detail can tell a new one from the one it has seen). */
-export type ExtendRun = { busy: boolean; result: ExtendResult | null; seq: number };
+export type ExtendRun = {
+  busy: boolean;
+  result: ExtendResult | null;
+  seq: number;
+  /** Listings read since an unknown result: one that no longer shows the extend
+   *  held means it was settled. Held here, so a detail opened later knows too. */
+  listedAfter?: number;
+};
 
 /** This incarnation of a shed (its creation time): a shed created again under its
  *  name is another shed, and shares none of the old one's runs. */
@@ -100,7 +109,8 @@ export function useCloudExtends(): CloudExtends {
       // settles it; the row says so (`extend_unresolved_words`) once the list is
       // read again.
       (e: unknown) => {
-        settle({ ok: false, words: failureWords(e) });
+        const unknown = !!e && typeof e === "object" && (e as { code?: unknown }).code === "extend_unknown";
+        settle({ ok: false, words: failureWords(e), unknown });
         onDone();
       },
     );
@@ -108,7 +118,19 @@ export function useCloudExtends(): CloudExtends {
   const runOf = useCallback((s: Shed) => runs[runKey(s)], [runs]);
   const prune = useCallback((sheds: Shed[]) => {
     const live = new Set(sheds.map(runKey));
-    setRuns((r) => pruneRuns(r, live, inFlight.current));
+    setRuns((r) => {
+      const kept = pruneRuns(r, live, inFlight.current);
+      // A listing read after an unknown outcome: counted, so its words go once the
+      // rows no longer show the extend held (not against the rows it ended on).
+      let counted = kept;
+      for (const [k, run] of Object.entries(kept)) {
+        if (!run.busy && run.result?.unknown) {
+          if (counted === kept) counted = { ...kept };
+          counted[k] = { ...run, listedAfter: (run.listedAfter ?? 0) + 1 };
+        }
+      }
+      return counted;
+    });
   }, []);
   return { runOf, extend, prune };
 }
@@ -123,7 +145,12 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
   // An extend in flight, or an earlier one whose outcome is not known yet (the core
   // refuses every extend of the shed until a listing settles it): nothing to press.
   const busy = (run?.busy ?? false) || !!row.extend_unresolved_words;
-  const result = run?.result ?? null;
+  // An unknown outcome's words stand until a listing read after it no longer shows the
+  // extend held: then it was settled, and the words would contradict the enabled
+  // controls. Not against the rows the extend ended on (read before it was recorded).
+  const unknownSettled =
+    !!run?.result?.unknown && (run.listedAfter ?? 0) > 0 && !row.extend_unresolved_words;
+  const result = unknownSettled ? null : (run?.result ?? null);
   const customValue = customHours(custom, row.extend_max_h);
   // A new successful extend clears the custom field; one this detail mounted after
   // does not.

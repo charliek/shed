@@ -321,13 +321,40 @@ pub struct CloudCounts {
 /// `org` that is missing or not one (a member of the wrong type, a fractional
 /// number), fail the whole answer, so an invalid scope is shown as no usage at
 /// all, never as a count or as a caller who is not a person. A count object's
-/// missing members are 0.
+/// missing members are 0. The answer itself must be an object (an array, which serde
+/// would read positionally, is refused).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "UsageObject")]
 pub struct CloudUsage {
-    #[serde(default, deserialize_with = "usage_person")]
     pub person: Option<CloudCounts>,
-    #[serde(deserialize_with = "usage_org")]
     pub org: CloudCounts,
+}
+
+/// [`CloudUsage`] as received: any JSON value, refused unless it is an object.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct UsageObject(Value);
+
+#[derive(Deserialize)]
+struct UsageMembers {
+    #[serde(default, deserialize_with = "usage_person")]
+    person: Option<CloudCounts>,
+    #[serde(deserialize_with = "usage_org")]
+    org: CloudCounts,
+}
+
+impl TryFrom<UsageObject> for CloudUsage {
+    type Error = String;
+    fn try_from(UsageObject(v): UsageObject) -> Result<Self, String> {
+        if !v.is_object() {
+            return Err(format!("a usage answer is an object, not {v}"));
+        }
+        let m: UsageMembers = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        Ok(CloudUsage {
+            person: m.person,
+            org: m.org,
+        })
+    }
 }
 
 /// One scope of [`CloudUsage`]: a JSON object whose members are integers (an array,
@@ -1481,6 +1508,9 @@ mod tests {
             r#"{"org":[]}"#,
             r#"{"org":[3,1,2,10]}"#,
             r#"{"person":[1,1,0,2],"org":{"machines":3,"max":10}}"#,
+            // The answer itself must be an object, not read positionally.
+            r#"[null,{"machines":3,"max":10}]"#,
+            r#"null"#,
         ] {
             assert!(serde_json::from_str::<CloudUsage>(raw).is_err(), "{raw}");
         }
