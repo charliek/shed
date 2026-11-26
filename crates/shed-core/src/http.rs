@@ -1484,7 +1484,7 @@ impl Client {
     /// A create stream's `error` event as the create's error ([`decode_error`]).
     /// Whether it is a cloud create is asked of the server only when the event does
     /// not say (an account-service code says): `/api/info`'s `backend` is `remote`.
-    /// A server that cannot say gets a fixed line that names no backend
+    /// A server that cannot say (no answer, or no `backend` in it) gets a fixed line that names no backend
     /// ([`crate::models::unknown_refusal_words`]), so neither a cloud create's server
     /// text nor a false "cloud" is ever shown.
     async fn refused_create(&self, data: &str) -> ShedError {
@@ -1494,12 +1494,10 @@ impl Client {
         if said {
             return ShedError::Create(decode_error(data, true));
         }
-        match self.info().await {
-            Ok(i) => ShedError::Create(decode_error(
-                data,
-                i.backend.as_deref() == Some(BACKEND_REMOTE),
-            )),
-            Err(_) => ShedError::Create(crate::models::unknown_refusal_words(&parts.code)),
+        // A server that answers with no `backend` cannot say either.
+        match self.info().await.ok().and_then(|i| i.backend) {
+            Some(b) => ShedError::Create(decode_error(data, b == BACKEND_REMOTE)),
+            None => ShedError::Create(crate::models::unknown_refusal_words(&parts.code)),
         }
     }
 }
@@ -4212,8 +4210,8 @@ mod tests {
     }
 
     /// A refused create's server text: shown by a server that is not remote, never by
-    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read, which
-    /// gets a line that calls it no cloud refusal either.
+    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read or
+    /// names no backend, which gets a line that calls it no cloud refusal either.
     #[tokio::test]
     async fn a_cloud_create_never_shows_the_server_text() {
         for (info, want) in [
@@ -4228,6 +4226,14 @@ mod tests {
             // The backend cannot be told: a fixed line that names none.
             (
                 None,
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1"}"#),
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1","backend":null}"#),
                 "create failed: the create was refused (SERVER_LIMIT_REACHED)",
             ),
         ] {
