@@ -37,6 +37,28 @@ type asyncFakeBackend struct {
 	jobCtx context.Context
 	// settled is closed when a job ends.
 	settled chan struct{}
+	// catalog is the compute service's catalog it reports (remote); nil
+	// reports none read yet.
+	catalog *backend.ComputeCatalog
+}
+
+// ComputeCatalog reports the fake's catalog (backend.Cataloger).
+func (b *asyncFakeBackend) ComputeCatalog() (backend.ComputeCatalog, bool) {
+	if b.catalog == nil {
+		return backend.ComputeCatalog{}, false
+	}
+	return *b.catalog, true
+}
+
+// testCatalog is a compute catalog of two sizes and the alias cloud.
+func testCatalog(arch string) *backend.ComputeCatalog {
+	return &backend.ComputeCatalog{
+		Sizes: []backend.CatalogSize{
+			{Name: "standard", CPUs: 2, MemoryMB: 8192, Arch: arch},
+			{Name: "large", CPUs: 8, MemoryMB: 32768, Arch: arch},
+		},
+		DefaultSize: "standard", DefaultImage: "shed-remote-full-test", Images: []string{"cloud"}, GuestArch: arch,
+	}
 }
 
 func newAsyncFakeBackend(sheds ...config.Shed) *asyncFakeBackend {
@@ -180,19 +202,13 @@ func (b *asyncFakeBackend) WaitSettled(ctx context.Context, name string) (*confi
 // and a service client with the given policy.
 func remoteTestServer(t *testing.T, b backend.Backend, policy config.ServiceClientPolicy) http.Handler {
 	t.Helper()
+	if ab, ok := b.(*asyncFakeBackend); ok && ab.catalog == nil {
+		ab.catalog = testCatalog("")
+	}
 	cfg := &config.ServerConfig{
 		Name:           "test-server",
 		DefaultBackend: config.BackendRemote,
-		Remote: &config.RemoteConfig{
-			Environment:  "test",
-			DefaultImage: "family/shed-test",
-			ImageAliases: map[string]string{"cloud": "family/shed-test"},
-			DefaultSize:  "standard",
-			Sizes: map[string]config.RemoteSizeConfig{
-				"standard": {MachineType: "m-2", CPUs: 2, MemoryMB: 8192},
-				"large":    {MachineType: "m-8", CPUs: 8, MemoryMB: 32768},
-			},
-		},
+		Remote:         &config.RemoteConfig{},
 		Auth: &config.AuthConfig{
 			Mode:    config.AuthModeMTLS,
 			Clients: map[string]config.ServiceClientConfig{testClientName: {Policy: policy}},
@@ -433,6 +449,47 @@ func TestAsyncErrorMapping(t *testing.T) {
 	}
 }
 
+// A compute service's refusal reaches the caller by its code, with its
+// reason inside error (S0 ruling 1): a local admin's create is 422
+// COMPUTE_POLICY_REFUSED with reason person, on the JSON answer and on the
+// create stream's error event.
+func TestAsyncComputeRefusalCarriesItsReason(t *testing.T) {
+	refusal := &config.ComputeRefusal{Status: http.StatusUnprocessableEntity, Code: config.ErrComputePolicyRefused, Reason: "person",
+		Err: errors.New("a local admin creates no cloud shed")}
+	b := newAsyncFakeBackend()
+	b.createErr = fmt.Errorf("create: %w", refusal)
+	h := remoteTestServer(t, b, remotePolicy())
+	resp := doCtx(context.Background(), h, http.MethodPost, "/api/sheds", `{"name":"a1"}`)
+	var body config.APIError
+	if err := json.Unmarshal(resp.body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.code != http.StatusUnprocessableEntity || body.Error.Code != config.ErrComputePolicyRefused || body.Error.Reason != "person" {
+		t.Fatalf("got %d %s, want 422 COMPUTE_POLICY_REFUSED with reason person", resp.code, resp.body)
+	}
+	var raw map[string]map[string]any
+	if err := json.Unmarshal(resp.body, &raw); err != nil || raw["error"]["reason"] != "person" {
+		t.Fatalf("error.reason is not in the body: %s", resp.body)
+	}
+
+	b2 := newAsyncFakeBackend()
+	b2.createErr = refusal
+	h2 := remoteTestServer(t, b2, remotePolicy())
+	resp = doCtx(context.Background(), h2, http.MethodPost, "/api/sheds", `{"name":"a1"}`, "Accept", "text/event-stream")
+	names, last := sseEvents(t, resp.body)
+	if len(names) == 0 || names[len(names)-1] != "error" || !strings.Contains(last, `"reason":"person"`) {
+		t.Fatalf("stream events %v, last %s; want an error event with reason person", names, last)
+	}
+
+	// Errors with no reason carry none.
+	b3 := newAsyncFakeBackend()
+	b3.createErr = config.ErrCloudQuotaExceededSentinel
+	resp = doCtx(context.Background(), remoteTestServer(t, b3, remotePolicy()), http.MethodPost, "/api/sheds", `{"name":"a1"}`)
+	if strings.Contains(string(resp.body), "reason") {
+		t.Errorf("a refusal with no reason has one: %s", resp.body)
+	}
+}
+
 func TestAsyncCreateFieldRefusals(t *testing.T) {
 	tests := []struct{ name, body string }{
 		{"local_dir", `{"name":"a1","local_dir":"/tmp"}`},
@@ -511,7 +568,7 @@ func TestAsyncInfo(t *testing.T) {
 	if err := json.Unmarshal(resp.body, &info); err != nil {
 		t.Fatal(err)
 	}
-	if info.Backend != config.BackendRemote || info.DefaultImage != "family/shed-test" || info.Isolation != backend.IsolationTopology {
+	if info.Backend != config.BackendRemote || info.DefaultImage != "shed-remote-full-test" || info.Isolation != backend.IsolationTopology {
 		t.Errorf("info = backend %q image %q isolation %q", info.Backend, info.DefaultImage, info.Isolation)
 	}
 	for _, f := range []string{FeatureAsyncLifecycle, FeatureNetworkProfiles, FeatureServiceClients, FeatureHTTPExec} {
@@ -550,8 +607,8 @@ func TestAsyncClientPolicy(t *testing.T) {
 		b := newAsyncFakeBackend()
 		h := remoteTestServer(t, b, remotePolicy())
 		resp := doCtx(context.Background(), h, http.MethodPost, "/api/sheds", `{"name":"a1","cpus":64}`)
-		if resp.code != http.StatusBadRequest || resp.errCode(t) != config.ErrInvalidRequest {
-			t.Fatalf("got %d %s, want 400 INVALID_REQUEST", resp.code, resp.body)
+		if resp.code != http.StatusUnprocessableEntity || resp.errCode(t) != config.ErrSizeUnavailable {
+			t.Fatalf("got %d %s, want 422 SIZE_UNAVAILABLE", resp.code, resp.body)
 		}
 	})
 	t.Run("client create is isolated, owned and minted", func(t *testing.T) {

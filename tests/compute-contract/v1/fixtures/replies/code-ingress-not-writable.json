@@ -1,0 +1,25 @@
+{
+  "name": "code-ingress-not-writable",
+  "description": "INGRESS_NOT_WRITABLE at 403: a refusal of kind ErrIngress.",
+  "call": "ingress_put",
+  "replies": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INGRESS_NOT_WRITABLE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INGRESS_NOT_WRITABLE",
+    "kind": "ErrIngress"
+  }
+}

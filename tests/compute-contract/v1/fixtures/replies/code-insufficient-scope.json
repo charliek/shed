@@ -1,0 +1,25 @@
+{
+  "name": "code-insufficient-scope",
+  "description": "INSUFFICIENT_SCOPE at 403: a refusal of kind ErrDenied.",
+  "call": "list",
+  "replies": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INSUFFICIENT_SCOPE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INSUFFICIENT_SCOPE",
+    "kind": "ErrDenied"
+  }
+}

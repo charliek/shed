@@ -1,0 +1,14 @@
+{
+  "name": "stop-silent",
+  "description": "Nothing within 12 s to a stop: the outcome is unknown.",
+  "call": "stop",
+  "replies": [
+    {
+      "silent": true
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

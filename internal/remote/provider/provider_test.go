@@ -4,171 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
 
-func testIdentity() Identity {
-	return Identity{Env: "dev-home", ID: "abcdefghijklmnopqrstuvwx23", Name: "my-shed", Owner: "nocturn"}
-}
+const (
+	testShedID = "abcdefghijklmnopqrstuvwx23"
+	testKey    = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
+)
 
-func TestIdentityLabelsRoundTrip(t *testing.T) {
-	tests := []struct {
-		name string
-		id   Identity
-	}{
-		{"owned", testIdentity()},
-		{"admin shed has an empty owner", Identity{Env: "prod", ID: "a1b2c3d4", Name: "x"}},
-		{"a user's shed", Identity{Env: "prod", ID: "a1b2c3d4", Name: "x", User: "alice"}},
-		{"longest names", Identity{
-			Env:   "e" + strings.Repeat("n", 19),
-			ID:    strings.Repeat("7", 32),
-			Name:  "s" + strings.Repeat("h", 62),
-			Owner: strings.Repeat("o", 63),
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.id.Validate(); err != nil {
-				t.Fatalf("Validate: %v", err)
-			}
-			labels := tt.id.Labels(ShedStateCreating)
-			if err := checkLabels(labels); err != nil {
-				t.Fatalf("labels are not legal: %v", err)
-			}
-			if _, ok := labels[LabelOwner]; !ok {
-				t.Errorf("label %s must be present even when empty", LabelOwner)
-			}
-			if got, ok := labels[LabelUser]; !ok || got != tt.id.User {
-				t.Errorf("label %s = %q (present %v), want %q and present even when empty", LabelUser, got, ok, tt.id.User)
-			}
-			if _, ok := labels[LabelLayout]; ok {
-				t.Errorf("label %s must not be set at create", LabelLayout)
-			}
-			got, err := IdentityFromLabels(labels)
-			if err != nil {
-				t.Fatalf("IdentityFromLabels: %v", err)
-			}
-			if got != tt.id {
-				t.Errorf("round trip = %+v, want %+v", got, tt.id)
-			}
-			if n := len(tt.id.InstanceName()); n > 63 {
-				t.Errorf("instance name is %d characters, over 63", n)
-			}
-		})
-	}
-}
-
-func TestIdentityRejects(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*Identity)
-	}{
-		{"empty env", func(i *Identity) { i.Env = "" }},
-		{"env starts with a digit", func(i *Identity) { i.Env = "1dev" }},
-		{"env ends with a hyphen", func(i *Identity) { i.Env = "dev-" }},
-		{"env too long", func(i *Identity) { i.Env = strings.Repeat("e", 21) }},
-		{"env upper case", func(i *Identity) { i.Env = "Dev" }},
-		{"id too short", func(i *Identity) { i.ID = "abc" }},
-		{"id with a hyphen", func(i *Identity) { i.ID = "abcd-efgh" }},
-		{"empty name", func(i *Identity) { i.Name = "" }},
-		{"name with a dot", func(i *Identity) { i.Name = "a.b" }},
-		{"owner with a space", func(i *Identity) { i.Owner = "a b" }},
-		{"user with a space", func(i *Identity) { i.User = "a b" }},
-		{"user in upper case", func(i *Identity) { i.User = "Alice" }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			id := testIdentity()
-			tt.mutate(&id)
-			if err := id.Validate(); !errors.Is(err, ErrInvalid) {
-				t.Errorf("Validate = %v, want ErrInvalid", err)
-			}
-		})
-	}
-}
-
-func TestIdentityFromLabelsSchema(t *testing.T) {
-	tests := []struct {
-		name   string
-		schema string
-		set    bool
-	}{
-		{"missing", "", false},
-		{"unknown", "2", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			labels := testIdentity().Labels(ShedStateReady)
-			delete(labels, LabelSchema)
-			if tt.set {
-				labels[LabelSchema] = tt.schema
-			}
-			if _, err := IdentityFromLabels(labels); !errors.Is(err, ErrInvalid) {
-				t.Errorf("IdentityFromLabels = %v, want ErrInvalid", err)
-			}
-		})
-	}
-}
-
-// shed_user was added to label schema 1 without a bump: an instance labelled
-// before it existed carries no such key and still reads, as a shed with no
-// user. Present and empty reads the same way.
-func TestIdentityFromLabelsWithoutUser(t *testing.T) {
-	id := Identity{Env: "prod", ID: "a1b2c3d4", Name: "x"}
-	labels := id.Labels(ShedStateReady)
-	delete(labels, LabelUser)
-	got, err := IdentityFromLabels(labels)
-	if err != nil {
-		t.Fatalf("a schema-1 label set without %s: IdentityFromLabels = %v", LabelUser, err)
-	}
-	if got.User != "" {
-		t.Errorf("user = %q, want none", got.User)
-	}
-	labels[LabelUser] = ""
-	if got, err := IdentityFromLabels(labels); err != nil || got.User != "" {
-		t.Errorf("an empty %s: %+v, %v; want no user", LabelUser, got, err)
-	}
-	labels[LabelUser] = "a b"
-	if _, err := IdentityFromLabels(labels); !errors.Is(err, ErrInvalid) {
-		t.Errorf("an invalid %s: IdentityFromLabels = %v, want ErrInvalid", LabelUser, err)
-	}
-	if SchemaVersion != "1" {
-		t.Errorf("SchemaVersion = %q: adding %s must not bump it", SchemaVersion, LabelUser)
-	}
-}
-
-// A shed belongs to a service client or to a user: a create spec that labels
-// both is refused before anything reaches a cloud.
-func TestNewSpecRefusesOwnerAndUser(t *testing.T) {
-	id := testIdentity() // owned by nocturn
-	id.User = "alice"
-	shed := ShedSpec{CreatedAt: time.Unix(1700000000, 0), Network: "open"}
-	const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
-	if _, err := NewSpec(id, shed, []string{key}, DefaultSizes()[0], DefaultDiskGB, "img", 0); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("NewSpec with an owner and a user = %v, want ErrInvalid", err)
-	}
-	id.Owner = ""
-	spec, err := NewSpec(id, shed, []string{key}, DefaultSizes()[0], DefaultDiskGB, "img", 0)
-	if err != nil {
-		t.Fatalf("NewSpec for a user's shed: %v", err)
-	}
-	if spec.Labels[LabelUser] != "alice" {
-		t.Errorf("spec labels %v carry no %s", spec.Labels, LabelUser)
-	}
-}
-
-func TestNames(t *testing.T) {
-	if got := InstanceName("dev-home", "abcd1234"); got != "shed-dev-home-abcd1234" {
-		t.Errorf("InstanceName = %q", got)
-	}
-	if got := NetworkTag("dev-home"); got != "shed-dev-home" {
-		t.Errorf("NetworkTag = %q", got)
-	}
-	if got := FirewallRuleName("dev-home"); got != "shed-dev-home-ssh" {
-		t.Errorf("FirewallRuleName = %q", got)
-	}
+func testShedSpec() ShedSpec {
+	return ShedSpec{CreatedAt: time.Unix(1700000000, 0), Network: "open", Repo: "https://u:p@host/o/r.git", UserOrigin: "directory"}
 }
 
 func TestStripRepoUserinfo(t *testing.T) {
@@ -200,10 +48,9 @@ func TestShedSpecRoundTrip(t *testing.T) {
 	in := ShedSpec{
 		CreatedAt:  created,
 		Repo:       "https://secret@github.com/o/r.git",
-		Image:      "shed-full-v1",
-		Size:       SizeStandard,
 		Network:    "isolated",
 		LandingDir: "/home/shed/r",
+		UserOrigin: "directory",
 	}
 	encoded, err := in.Encode()
 	if err != nil {
@@ -222,124 +69,141 @@ func TestShedSpecRoundTrip(t *testing.T) {
 	if !got.CreatedAt.Equal(created) || got.CreatedAt.Location() != time.UTC {
 		t.Errorf("CreatedAt = %v, want %v in UTC", got.CreatedAt, created)
 	}
-	if got.Repo != "https://github.com/o/r.git" || got.Network != "isolated" || got.LandingDir != "/home/shed/r" {
+	if got.Repo != "https://github.com/o/r.git" || got.Network != "isolated" || got.LandingDir != "/home/shed/r" || got.UserOrigin != "directory" {
 		t.Errorf("decoded spec = %+v", got)
 	}
 
-	for _, bad := range []string{"", "   ", "{", `{"schema":0}`, `{"schema":99}`} {
+	for _, bad := range []string{"", "   ", "{", `{"schema":0}`, `{"schema":1}`, `{"schema":99}`} {
 		t.Run("rejects "+bad, func(t *testing.T) {
 			if _, err := DecodeShedSpec(bad); !errors.Is(err, ErrInvalid) {
 				t.Errorf("DecodeShedSpec(%q) = %v, want ErrInvalid", bad, err)
 			}
 		})
 	}
+	t.Run("too long to store", func(t *testing.T) {
+		long := in
+		long.Repo = "https://github.com/o/" + strings.Repeat("r", MaxSpec)
+		if _, err := long.Encode(); !errors.Is(err, ErrInvalid) {
+			t.Errorf("Encode of an over-long spec = %v, want ErrInvalid", err)
+		}
+	})
 }
 
 func TestNewSpec(t *testing.T) {
-	id := testIdentity()
-	size := DefaultSizes()[0]
-	shed := ShedSpec{CreatedAt: time.Unix(1700000000, 0), Network: "open", Repo: "https://u:p@host/o/r.git"}
-	const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
-
-	spec, err := NewSpec(id, shed, []string{key, "  "}, size, DefaultDiskGB, "shed-full-v1", 24*time.Hour)
+	spec, err := NewSpec(testShedID, "my-shed", Owner{User: "ada"}, testShedSpec(), []string{testKey, "  "}, "standard", 0, "")
 	if err != nil {
 		t.Fatalf("NewSpec: %v", err)
 	}
-	if spec.Name != "shed-dev-home-"+id.ID {
-		t.Errorf("Name = %q", spec.Name)
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(spec.RequestID) {
+		t.Errorf("RequestID = %q, want a lower-case random UUID", spec.RequestID)
 	}
-	if spec.Labels[LabelState] != string(ShedStateCreating) {
-		t.Errorf("shed_state = %q, want creating", spec.Labels[LabelState])
+	if spec.ShedID != testShedID || spec.Name != "my-shed" || spec.User != "ada" || spec.Client != "" {
+		t.Errorf("identity = %+v", spec)
 	}
-	if spec.Metadata[MetadataShedName] != id.Name || spec.Metadata[MetadataShedID] != id.ID {
-		t.Errorf("metadata identity = %v", spec.Metadata)
+	if spec.Image != ImageDefault {
+		t.Errorf("Image = %q, want %q for none", spec.Image, ImageDefault)
 	}
-	if spec.Metadata[MetadataAuthorizedKeys] != key {
-		t.Errorf("authorized keys = %q, want the one non-blank key", spec.Metadata[MetadataAuthorizedKeys])
+	if spec.Labels[LabelState] != string(ShedStateCreating) || len(spec.Labels) != 1 {
+		t.Errorf("labels = %v, want shed_state=creating alone", spec.Labels)
 	}
-	if _, ok := spec.Metadata[MetadataHostKeyPin]; ok {
-		t.Errorf("the host key pin must not be set at create")
+	if len(spec.AuthorizedKeys) != 1 || spec.AuthorizedKeys[0] != testKey {
+		t.Errorf("authorized keys = %q, want the one non-blank key", spec.AuthorizedKeys)
 	}
-	decoded, err := DecodeShedSpec(spec.Metadata[MetadataShedSpec])
+	if spec.LeaseS != 0 {
+		t.Errorf("a person's create carries a lease: %d", spec.LeaseS)
+	}
+	decoded, err := DecodeShedSpec(spec.Spec)
 	if err != nil {
 		t.Fatalf("DecodeShedSpec: %v", err)
 	}
-	if decoded.Image != "shed-full-v1" || decoded.Size != SizeStandard || decoded.Repo != "https://host/o/r.git" {
-		t.Errorf("shed-spec = %+v", decoded)
+	if decoded.Repo != "https://host/o/r.git" || decoded.UserOrigin != "directory" {
+		t.Errorf("spec = %+v", decoded)
+	}
+
+	client, err := NewSpec(testShedID, "nocturn-1", Owner{Client: "nocturn", Lease: 30 * time.Hour}, testShedSpec(), []string{testKey}, "standard", 50, "cloud")
+	if err != nil {
+		t.Fatalf("NewSpec for a client: %v", err)
+	}
+	if client.LeaseS != 30*3600 || client.Client != "nocturn" || client.DiskGB != 50 {
+		t.Errorf("client spec = %+v", client)
 	}
 
 	tests := []struct {
 		name   string
 		mutate func(*Spec)
 	}{
-		{"name does not match labels", func(s *Spec) { s.Name = "other" }},
-		{"state is not creating", func(s *Spec) { s.Labels[LabelState] = string(ShedStateReady) }},
-		{"no authorized key", func(s *Spec) { s.Metadata[MetadataAuthorizedKeys] = "" }},
-		{"no machine type", func(s *Spec) { s.Size.MachineType = "" }},
-		{"no disk", func(s *Spec) { s.DiskGB = 0 }},
+		{"no request id", func(s *Spec) { s.RequestID = "" }},
+		{"bad shed id", func(s *Spec) { s.ShedID = "abc" }},
+		{"bad name", func(s *Spec) { s.Name = "My_Shed" }},
+		{"user and client", func(s *Spec) { s.Client = "nocturn" }},
+		{"bad user", func(s *Spec) { s.User = "Ada" }},
+		{"a person with a lease", func(s *Spec) { s.LeaseS = 3600 }},
+		{"no size", func(s *Spec) { s.Size = "" }},
 		{"no image", func(s *Spec) { s.Image = "" }},
-		{"negative run limit", func(s *Spec) { s.MaxRun = -1 }},
-		{"foreign metadata key", func(s *Spec) { s.Metadata["ssh-keys"] = "x" }},
-		{"metadata too large", func(s *Spec) { s.Metadata[MetadataAuthorizedKeys] = strings.Repeat("k", MaxMetadataBytes) }},
-		{"bad shed-spec", func(s *Spec) { s.Metadata[MetadataShedSpec] = "{" }},
-		{"illegal label value", func(s *Spec) { s.Labels["extra"] = "Upper" }},
+		{"disk too large", func(s *Spec) { s.DiskGB = MaxDiskGB + 1 }},
+		{"state is not creating", func(s *Spec) { s.Labels[LabelState] = string(ShedStateReady) }},
+		{"a reserved label", func(s *Spec) { s.Labels["shed_user"] = "ada" }},
+		{"an illegal label value", func(s *Spec) { s.Labels["extra"] = "Upper" }},
+		{"no authorized key", func(s *Spec) { s.AuthorizedKeys = nil }},
+		{"five authorized keys", func(s *Spec) { s.AuthorizedKeys = []string{testKey, testKey, testKey, testKey, testKey} }},
+		{"a key over two lines", func(s *Spec) { s.AuthorizedKeys = []string{testKey + "\n" + testKey} }},
+		{"no access kind", func(s *Spec) { s.AccessKinds = nil }},
+		{"a spec that is not a shed spec", func(s *Spec) { s.Spec = "{" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			bad, err := NewSpec(id, shed, []string{key}, size, DefaultDiskGB, "shed-full-v1", 0)
-			if err != nil {
-				t.Fatalf("NewSpec: %v", err)
-			}
+			bad := *spec.Clone()
 			tt.mutate(&bad)
 			if err := bad.Validate(); !errors.Is(err, ErrInvalid) {
 				t.Errorf("Validate = %v, want ErrInvalid", err)
 			}
 		})
 	}
-}
-
-func TestResolveSize(t *testing.T) {
-	sizes := DefaultSizes()
-	tests := []struct {
-		name     string
-		cpus, mb int
-		want     string
-		wantErr  bool
-	}{
-		{"nothing asked gives the default", 0, 0, SizeStandard, false},
-		{"exact standard", 2, 8192, SizeStandard, false},
-		{"smaller rounds up to standard", 1, 1024, SizeStandard, false},
-		{"cpus only", 4, 0, SizeLarge, false},
-		{"memory only", 0, 16384, SizeLarge, false},
-		{"exact large", 8, 32768, SizeLarge, false},
-		{"too many cpus", 16, 0, "", true},
-		{"too much memory", 2, 65536, "", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResolveSize(sizes, SizeStandard, tt.cpus, tt.mb)
-			if tt.wantErr {
-				if !errors.Is(err, ErrInvalid) {
-					t.Fatalf("err = %v, want ErrInvalid", err)
-				}
-				if !strings.Contains(err.Error(), SizeLarge) {
-					t.Errorf("error should name the sizes: %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ResolveSize: %v", err)
-			}
-			if got.Name != tt.want {
-				t.Errorf("size = %q, want %q", got.Name, tt.want)
-			}
-		})
-	}
-	t.Run("unknown default", func(t *testing.T) {
-		if _, err := ResolveSize(sizes, "huge", 0, 0); !errors.Is(err, ErrInvalid) {
-			t.Errorf("err = %v, want ErrInvalid", err)
+	t.Run("a client without a lease", func(t *testing.T) {
+		bad := *client.Clone()
+		bad.LeaseS = 0
+		if err := bad.Validate(); !errors.Is(err, ErrInvalid) {
+			t.Errorf("Validate = %v, want ErrInvalid", err)
 		}
 	})
+}
+
+func TestSameCreate(t *testing.T) {
+	a, err := NewSpec(testShedID, "my-shed", Owner{User: "ada"}, testShedSpec(), []string{testKey}, "standard", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := *a.Clone()
+	b.RequestID = NewRequestID()
+	if !SameCreate(a, b) {
+		t.Errorf("two creates that differ only in request id are not the same")
+	}
+	b.AuthorizedKeys = append(b.AuthorizedKeys, testKey)
+	if SameCreate(a, b) {
+		t.Errorf("two creates with different keys are the same")
+	}
+}
+
+func TestCatalog(t *testing.T) {
+	c := Catalog{
+		Sizes:   []Size{{Name: "standard", CPUs: 2, MemoryMB: 8192, Arch: ArchAMD64}, {Name: "large", CPUs: 8, MemoryMB: 32768, Arch: ArchAMD64}},
+		Aliases: []string{"base", "cloud"},
+	}
+	if c.GuestArch() != ArchAMD64 {
+		t.Errorf("GuestArch = %q", c.GuestArch())
+	}
+	c.Sizes = append(c.Sizes, Size{Name: "arm", CPUs: 2, MemoryMB: 8192, Arch: ArchARM64})
+	if c.GuestArch() != "" {
+		t.Errorf("GuestArch of mixed sizes = %q, want none", c.GuestArch())
+	}
+	for image, want := range map[string]bool{"": true, ImageDefault: true, "cloud": true, "other": false} {
+		if got := c.HasImage(image); got != want {
+			t.Errorf("HasImage(%q) = %v, want %v", image, got, want)
+		}
+	}
+	if s, ok := c.SizeNamed("large"); !ok || s.CPUs != 8 {
+		t.Errorf("SizeNamed(large) = %+v, %v", s, ok)
+	}
 }
 
 func TestErrorKindsAndReasons(t *testing.T) {
@@ -351,13 +215,14 @@ func TestErrorKindsAndReasons(t *testing.T) {
 		{ErrQuota, ReasonQuota, true},
 		{ErrCapacity, ReasonCapacity, true},
 		{ErrLimit, ReasonLimit, true},
+		{ErrComputeLimit, ReasonLimit, true},
 		{ErrNotFound, "", false},
 		{ErrBusy, "", false},
-		{ErrForeign, "", false},
+		{ErrPolicy, "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.kind.Error(), func(t *testing.T) {
-			err := fmt.Errorf("job: %w", Errorf(tt.kind, "wait", "zone %s", "z"))
+			err := fmt.Errorf("job: %w", Errorf(tt.kind, "wait", "machine %s", "x"))
 			if !errors.Is(err, tt.kind) {
 				t.Errorf("errors.Is lost the kind: %v", err)
 			}
@@ -373,6 +238,15 @@ func TestErrorKindsAndReasons(t *testing.T) {
 			}
 		})
 	}
+	t.Run("the code travels", func(t *testing.T) {
+		err := fmt.Errorf("job: %w", &Error{Kind: ErrComputeLimit, Op: "create", Code: "QUOTA_PERSON"})
+		if CodeOf(err) != "QUOTA_PERSON" || !strings.Contains(err.Error(), "QUOTA_PERSON") {
+			t.Errorf("CodeOf = %q, text %q", CodeOf(err), err)
+		}
+		if CodeOf(errors.New("x")) != "" {
+			t.Errorf("CodeOf of a plain error is not empty")
+		}
+	})
 	t.Run("context error stays visible", func(t *testing.T) {
 		err := &Error{Op: "wait", Err: context.DeadlineExceeded}
 		if !errors.Is(err, context.DeadlineExceeded) {
@@ -387,7 +261,7 @@ func TestErrorKindsAndReasons(t *testing.T) {
 func TestStateSettled(t *testing.T) {
 	settled := map[State]bool{
 		StateRunning: true, StateStopped: true, StateAbsent: true,
-		StateStarting: false, StateStopping: false, StateUnknown: false,
+		StateStarting: false, StateStopping: false, StateDeleting: false, StateUnknown: false,
 	}
 	for state, want := range settled {
 		t.Run(string(state), func(t *testing.T) {
@@ -399,19 +273,14 @@ func TestStateSettled(t *testing.T) {
 }
 
 func TestInstanceAccessors(t *testing.T) {
-	id := testIdentity()
-	labels := id.Labels(ShedStateReady)
-	labels[LabelLayout] = LayoutLabel(1)
-	spec, err := ShedSpec{CreatedAt: time.Unix(1700000000, 0), Image: "img", Size: SizeLarge, Network: "open"}.Encode()
+	spec, err := testShedSpec().Encode()
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := Instance{Labels: labels, Metadata: map[string]string{
-		MetadataShedSpec:   spec,
-		MetadataHostKeyPin: "ssh-ed25519 AAAA",
-	}}
-	if got, err := inst.Identity(); err != nil || got != id {
-		t.Errorf("Identity = %+v, %v", got, err)
+	inst := Instance{
+		Labels: map[string]string{LabelState: string(ShedStateReady), LabelLayout: LayoutLabel(1)},
+		Spec:   spec,
+		Access: []Access{{Kind: AccessSSH, Host: "203.0.113.7", Port: 22}},
 	}
 	if inst.ShedState() != ShedStateReady {
 		t.Errorf("ShedState = %q", inst.ShedState())
@@ -422,10 +291,27 @@ func TestInstanceAccessors(t *testing.T) {
 	if (Instance{}).Layout() != 0 {
 		t.Errorf("Layout with no label should be 0")
 	}
-	if inst.HostKeyPin() != "ssh-ed25519 AAAA" {
-		t.Errorf("HostKeyPin = %q", inst.HostKeyPin())
-	}
-	if got, err := inst.ShedSpec(); err != nil || got.Size != SizeLarge {
+	if got, err := inst.ShedSpec(); err != nil || got.UserOrigin != "directory" {
 		t.Errorf("ShedSpec = %+v, %v", got, err)
+	}
+	cp := inst.Clone()
+	cp.Labels[LabelState] = "x"
+	cp.Access[0].Host = "x"
+	if inst.Labels[LabelState] != string(ShedStateReady) || inst.Access[0].Host != "203.0.113.7" {
+		t.Errorf("Clone shares state with its source")
+	}
+}
+
+func TestCheckLabels(t *testing.T) {
+	if err := CheckLabels(map[string]*string{LabelState: Str("ready"), "old": nil}); err != nil {
+		t.Errorf("CheckLabels of a legal write: %v", err)
+	}
+	for _, k := range ReservedLabels {
+		if err := CheckLabels(map[string]*string{k: Str("x")}); err == nil {
+			t.Errorf("CheckLabels allows the reserved label %s", k)
+		}
+	}
+	if err := CheckLabels(map[string]*string{"Bad": nil}); err == nil {
+		t.Errorf("CheckLabels allows a bad key")
 	}
 }

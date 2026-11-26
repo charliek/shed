@@ -159,8 +159,8 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from. `test-integration-dev-fc` sets this to the dev server's log file so the existing tests find PhaseTimer lines (the dev server runs via `sudo nohup`, not systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_DEV_STATE_DIR` | _unset_ | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state (`images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`) under this directory — for a boot volume that cannot host a multi-GB dev image store. Unset means the committed default (`~/Library/Application Support/shed-dev/vz`), so no other developer is affected; set it in your shell profile (e.g. `export SHED_DEV_STATE_DIR=/Volumes/ext/shed-dev/vz`). `socket_dir` is deliberately NOT relocated (unix socket path length limits), and neither is the identity directory (`state_dir: ~/.shed/dev/state`). `dev-server-up` refuses to start if the path is unmounted or unwritable, rather than silently building a second empty store on the mount point. |
-| `SHED_DEV_USERS` | _unset_ | Makefile only. `itest` starts the dev servers (`dev-server-up`, `dev-server-up-fc`, `dev-server-up-remote` and their restarts) with the integration suite's itest user list (`auth.users`; see [Named users](#named-users-authusers)) and has `test-integration-dev-fc` and `-remote` tell the suite so. Empty: no user list. Needs `uv`. |
-| `SHED_ITEST_USERS` | _unset_ | Suite only. A comma list of the backends (`fc`, `remote`) whose dev server was started with the itest user list. Without it the users cases skip on `[fc]` and `[remote]`, saying what to set; `[vz]` always restarts the Mac dev server with the list itself. |
+| `SHED_DEV_USERS` | _unset_ | Makefile only. `itest` starts the Mac and FC dev servers (`dev-server-up`, `dev-server-up-fc` and their restarts) with the integration suite's itest user list (`auth.users`; see [Named users](#named-users-authusers)) and has `test-integration-dev-fc` tell the suite so. Empty: no user list. Needs `uv`. The remote dev server takes no user list (it refuses `itest`): its people come from the account service, so list the itest people there. |
+| `SHED_ITEST_USERS` | _unset_ | Suite only. A comma list of the backends (`fc`) whose dev server was started with the itest user list. Without it the users cases skip on `[fc]`, saying what to set; `[remote]` takes its people from the account service and needs none; `[vz]` always restarts the Mac dev server with the list itself. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users` | The itest users' keys (generated once by `make dev-itest-users`, or on first use) and each test identity's throwaway `$HOME`. The server's user list must have been rendered from the same directory. |
 
 #### Validating server-side changes — parallel dev server
@@ -242,10 +242,11 @@ shed server add mini3 --ssh-port 12222 --name mini3-dev           # FC
 
 #### Remote backend (cloud sheds)
 
-A dev server with `default_backend: remote` runs on your machine and creates one cloud VM per shed. Its setup (the private env file, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). The suite's `[remote]` cases are opt-in and billed:
+A dev server with `default_backend: remote` runs on your machine and gets one machine per shed from an account service. Its setup (the private env file, the in-tree reference service, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). Two targets run the suite's cloud cases:
 
 ```bash
-make test-integration-remote
+make test-integration-compute   # no cloud: each case starts a reference service and a private server (Linux only, not in CI)
+make test-integration-remote    # the [remote] cases against the running remote dev server; billed against a real service
 ```
 
 #### Service clients, HTTPS exec and network profiles (FC, mtls)
@@ -435,7 +436,7 @@ keeps working.
 ```sh
 make dev-itest-users                                   # the keys, once (outside the repo)
 scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-users
-SHED_DEV_USERS=itest make dev-server-restart-fc        # or -restart-remote: start with the list
+SHED_DEV_USERS=itest make dev-server-restart-fc        # start with the list (not -restart-remote: its people come from the account service)
 SHED_DEV_USERS=itest make test-integration-dev-fc      # sets SHED_ITEST_USERS=fc for the suite
 ```
 

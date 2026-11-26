@@ -14,6 +14,13 @@ run on THIS host as THIS user: the cases assert that a session opens, runs,
 closes or is refused, never the guest user, its home or its landing
 directory, and they run nothing in one but `echo` and `cat`.
 
+`compute_world()` is the same world with the machines from the reference
+service too (`remote.provider: service`, the compute contract, still the
+local link), reached through a relay a case can take down
+(`fixtures/compute.py`: `ServiceGate`), and a registered service client:
+the world of `test_remote_compute.py`'s `[hermetic]` cases (`make
+test-integration-compute`).
+
 One `World` per case (`directory_world()`), all inside one fresh temporary
 folder:
 
@@ -94,6 +101,7 @@ from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 import yaml
 
+from .compute import RefControl, ServiceGate
 from .identity import LOCAL_ADMIN, Identity, shim_text
 from .tlsclient import PinMismatch, error_code, fingerprint, server_cert_pem
 
@@ -116,6 +124,16 @@ TRUST = "2m"
 UNKNOWN_KEY_EVERY = 60
 UNKNOWN_KEY_WAIT = 8
 TRUST_TICK = 30
+# The compute world's service client (`compute_world`): in the server's
+# auth.clients, registered for the server at the reference service.
+COMPUTE_CLIENT = "itest-client"
+COMPUTE_CLIENT_PREFIX = "itest-client-"
+# The compute world's trust time: its service-down cases (a restart waits
+# two minutes for the service first) must not outlast the list.
+COMPUTE_TRUST = "30m"
+# How soon the compute world's reference service settles every cloud
+# operation (compute.json auto_settle_s).
+COMPUTE_AUTO_SETTLE_S = 1
 # Ports other work on this machine holds: never picked, even if free now.
 FORBIDDEN_PORTS = frozenset({8000, 8100, 8114, 5179, 5533, 1126, 8126, 12222, 18443, 12290, 18490, 12936, 18936})
 # A base for the world's folder longer than this would push the agent's and
@@ -230,6 +248,22 @@ _JWT = re.compile(rb"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.")
 # ----------------------------------------------------------------------------
 
 
+def compute_skip_reason(environ: Mapping[str, str] = os.environ, system: str = sys.platform) -> Optional[str]:
+    """Why the hermetic compute cases (`compute_world`) cannot run here, or
+    None. They run only under `make test-integration-compute`, which builds
+    `bin/` and the reference service and sets SHED_COMPUTE_ITEST=1, and only
+    on Linux (the local link runs a shed-agent on this host)."""
+    if environ.get("SHED_COMPUTE_ITEST", "") != "1":
+        return ("the hermetic compute cases start their own reference service and shed-server from bin/: "
+                "run make test-integration-compute")
+    if not system.startswith("linux"):
+        return (f"the hermetic compute cases run the remote backend's local link, which is Linux only "
+                f"(this host is {system})")
+    if not environ.get("SHED_BIN_DIR", "").strip():
+        return "SHED_BIN_DIR is not set: run make test-integration-compute"
+    return None
+
+
 def skip_reason(environ: Mapping[str, str] = os.environ, system: str = sys.platform) -> Optional[str]:
     """Why the directory cases cannot run here, or None. They run only under
     `make test-integration-directory`, which builds `bin/` and the reference
@@ -300,10 +334,29 @@ def ssh_fingerprint(pub_line: str) -> str:
 
 
 def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: Path, issuer: str,
-                  admin_key: str, agent_dir: Path, refresh: str = REFRESH, trust: str = TRUST) -> dict:
+                  admin_key: str, agent_dir: Path, refresh: str = REFRESH, trust: str = TRUST,
+                  compute: bool = False) -> dict:
     """The shed server's config: the remote backend on its test drivers (no
     cloud VM, no root), mtls, one local admin, and the directory at `issuer`
-    over plain HTTP on loopback."""
+    over plain HTTP on loopback.
+
+    `compute`: the machines come from the account service too
+    (`provider: service`, the reference service's compute contract), still
+    with the local link (a real agent on this host, whatever `access` the
+    service names), no server limits (the service holds the quotas), and the
+    service client COMPUTE_CLIENT (`compute_world`)."""
+    cfg = _server_config(http_port=http_port, https_port=https_port, ssh_port=ssh_port, state_dir=state_dir,
+                         issuer=issuer, admin_key=admin_key, agent_dir=agent_dir, refresh=refresh, trust=trust)
+    if compute:
+        remote = cfg["remote"]
+        remote["provider"] = "service"
+        del remote["limits"]
+        cfg = with_service_client(cfg, COMPUTE_CLIENT, COMPUTE_CLIENT_PREFIX)
+    return cfg
+
+
+def _server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: Path, issuer: str,
+                   admin_key: str, agent_dir: Path, refresh: str, trust: str) -> dict:
     return {
         "name": SERVER_NAME,
         "http_port": http_port,
@@ -323,9 +376,7 @@ def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: 
             "provider": "fake",
             "transport": "local",
             "allow_test_drivers": True,
-            "environment": "itest-dir",
             "state_dir": str(state_dir / "remote"),
-            "default_image": "family/fake-image",
             # serve runs <agent_dir>/shed-agent-linux-<arch>.
             "agent_dir": str(agent_dir),
             "agent_install": "never",
@@ -333,7 +384,7 @@ def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: 
             # (the default lets two run).
             "limits": {"max_running": 8, "max_sheds": 12},
             # Static mode needs a source; a documentation address, which the
-            # fake provider's rule is made to match.
+            # fake provider's ingress is made to match.
             "firewall": {"mode": "static", "source_ranges": ["192.0.2.10/32"]},
         },
     }
@@ -1351,10 +1402,19 @@ class RefServer:
         # The world is the local harness: nothing it serves may be accepted.
         self.deliveries = DeliveriesControl(control, self.log, local=True)
 
-    def start(self, timeout: float = 20) -> None:
+    def start(self, timeout: float = 20, listen: str = f"{HOST}:0", issuer: str = "",
+              inventory: Optional[Path] = None) -> None:
+        """`issuer`, when given, is the origin to serve as (a relay's in
+        front of it) instead of the listening address; `inventory`, a file
+        the server rewrites with its compute machines every second."""
+        argv = [str(self.binary), "--control", str(self.control), "--listen", listen]
+        if issuer:
+            argv += ["--issuer", issuer]
+        if inventory is not None:
+            argv += ["--inventory", str(inventory)]
         with self.out.open("wb") as out, self.err.open("wb") as err:
             self.proc = subprocess.Popen(
-                [str(self.binary), "--control", str(self.control), "--listen", f"{HOST}:0"],
+                argv,
                 stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=_base_env(self.home),
             )
         if not _wait_for(lambda: parse_issuer(self.out.read_text()) is not None or self.proc.poll() is not None,
@@ -1773,9 +1833,13 @@ class World:
     """The reference server, the directory server, the local admin, and the
     people of one case."""
 
-    def __init__(self, root: Path, bin_dir: Path, ssh: str, false: str) -> None:
+    def __init__(self, root: Path, bin_dir: Path, ssh: str, false: str, compute: bool = False) -> None:
         self.root, self.bin_dir = root, bin_dir
         self.ssh, self.false = ssh, false
+        # The machines come from the reference service too (compute_world),
+        # which the server then reaches through `gate`.
+        self.compute = compute
+        self.gate: Optional[ServiceGate] = None
         self.keys_dir = root / "keys"
         self.homes = root / "homes"
         self.logs = root / "logs"
@@ -1809,7 +1873,17 @@ class World:
         admin_key = self.admin_key = self.key(LOCAL_ADMIN)
         self.publish()  # an empty list: the reference server answers no list at all without a file
         self.ref.set_codes({SERVER_NAME: self.code})
-        self.ref.start()
+        if self.compute:
+            # The service behind a gate the case can take down and bring
+            # back (ref_control().stop/start), its state kept: the server
+            # knows the service by the gate's address.
+            ref_port, gate_port = free_ports(2)
+            self.gate = ServiceGate(gate_port, ref_port)
+            self.gate.up()
+            self.ref.start(listen=f"{HOST}:{ref_port}", issuer=f"http://{HOST}:{gate_port}",
+                           inventory=self.root / "inventory.json")
+        else:
+            self.ref.start()
 
         http_port, self.https_port, self.ssh_port = free_ports(3)
         self.server.ssh_port = self.ssh_port
@@ -1818,7 +1892,9 @@ class World:
         agent.chmod(0o755)
         cfg = server_config(http_port=http_port, https_port=self.https_port, ssh_port=self.ssh_port,
                             state_dir=self.state, issuer=self.ref.issuer, admin_key=admin_key.pub,
-                            agent_dir=self.agent_dir)
+                            agent_dir=self.agent_dir, compute=self.compute,
+                            # The service-down cases outlast the usual trust.
+                            trust=COMPUTE_TRUST if self.compute else TRUST)
         write_private(self.config_path, yaml.safe_dump(cfg, sort_keys=False).encode())
         r = self.server.run("config-validate")
         assert r.returncode == 0, f"config-validate: {r.stdout}{r.stderr}"
@@ -1831,11 +1907,38 @@ class World:
         assert m, f"directory enroll named no client id: {r.stdout!r}"
         self.client_id = m.group(1)
 
+        if self.compute:
+            # The enrolled server may manage compute, and its service client
+            # make machines; every operation settles a second after it
+            # starts. Applied before the server asks for its first token.
+            ctl = self.ref_control()
+            ctl.settings(auto_settle_s=COMPUTE_AUTO_SETTLE_S)
+            ctl.steps(("compute.allow", SERVER_NAME), ("client.register", [SERVER_NAME, COMPUTE_CLIENT]))
         self.server.start()
         self.admin = self.identity(LOCAL_ADMIN, admin_key)
         self.admin.add_server()
         shutil.copyfile(self.admin.known_hosts, self.known_hosts)
         self.wait_state("trusted", 60)
+
+    def ref_control(self) -> RefControl:
+        """The reference service's compute controls (compute.json, the
+        outage file)."""
+        return RefControl(self.control, SERVER_NAME, self.ref.log, gate=self.gate,
+                          inventory=self.root / "inventory.json")
+
+    def client_bundle(self, client: str = COMPUTE_CLIENT) -> dict:
+        """A bundle for the service client `client`, issued by
+        `shed-server client issue` as an operator would, with its certificate
+        and key written beside it (`cert_file`, `key_file`)."""
+        r = self.server.run("client", "issue", client)
+        assert r.returncode == 0, f"client issue {client}: exit {r.returncode}: {r.stdout}{r.stderr}"
+        b = json.loads(r.stdout)
+        d = self.root / "clients" / client
+        d.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for name, key in (("client.pem", "client_cert"), ("client.key", "client_key")):
+            write_private(d / name, b[key].encode())
+        b["cert_file"], b["key_file"] = str(d / "client.pem"), str(d / "client.key")
+        return b
 
     def config(self) -> dict:
         """The server's config as written now."""
@@ -2104,6 +2207,13 @@ class World:
                 h.close()
             except Exception as e:  # noqa: BLE001 - reported with the rest
                 problems.append(f"closing {type(h).__name__}: {e}")
+        if self.gate is not None:
+            # A case may end with the service down: its machines are deleted
+            # through it.
+            try:
+                self.gate.up()
+            except OSError as e:
+                problems.append(f"bringing the service's gate back up: {e}")
         if self.admin is not None and self.server.proc is not None and self.server.proc.poll() is None:
             try:
                 problems += self._delete_sheds()
@@ -2118,6 +2228,8 @@ class World:
                 problems.append("the reference server did not stop on SIGTERM and was killed")
         except Exception as e:  # noqa: BLE001
             problems.append(f"stopping the reference server: {e}")
+        if self.gate is not None:
+            self.gate.close()
         # Whatever still runs from the world's folder, whoever started it.
         try:
             problems += stop_survivors(owned_processes(f"{self.root}/"), "started in the world")
@@ -2154,13 +2266,30 @@ def real_ssh() -> Optional[str]:
 
 
 @contextmanager
-def directory_world() -> Iterator[World]:
+def compute_world() -> Iterator[World]:
+    """`directory_world` whose server also takes its machines from the
+    reference service (`remote.provider: service`, still with the local
+    link, so a machine is a shed-agent on this host whatever `access` the
+    service names): the server is allowed compute at the service before it
+    starts, and its service client COMPUTE_CLIENT (prefix
+    COMPUTE_CLIENT_PREFIX) is in its config and registered at the service.
+    No server limits: the service's quotas are the only ones. The server
+    reaches the service through a `ServiceGate` (`World.gate`), so a case can
+    take the service down and bring it back with its state kept
+    (`ref_control().stop()` and `start()`); the trust time is
+    COMPUTE_TRUST, so the list outlasts that."""
+    with directory_world(compute=True) as w:
+        yield w
+
+
+@contextmanager
+def directory_world(compute: bool = False) -> Iterator[World]:
     """A fresh world, removed when the block ends, whatever happened in it.
     A clean-up that failed fails the case (or is noted on its own failure)."""
     bin_dir = Path(os.environ["SHED_BIN_DIR"]).resolve()
     missing = missing_binaries(bin_dir)
     if missing:
-        raise AssertionError(f"missing {', '.join(map(str, missing))}: make test-integration-directory builds them")
+        raise AssertionError(f"missing {', '.join(map(str, missing))}: make test-integration-directory (or -compute) builds them")
     ssh, false = real_ssh(), shutil.which("false")
     if not ssh or not false:
         raise AssertionError("ssh and false must be on PATH")
@@ -2170,7 +2299,7 @@ def directory_world() -> Iterator[World]:
     problems: list[str] = []
     try:
         root.chmod(0o700)
-        world = World(root, bin_dir, ssh, false)
+        world = World(root, bin_dir, ssh, false, compute=compute)
         world.start()
         yield world
     except BaseException as e:

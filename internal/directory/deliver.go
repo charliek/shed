@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -143,17 +142,10 @@ func (c *Client) requestDeliveryToken(ctx context.Context, f *deliveryFlight) {
 		f.status = delivery.HostedOffline
 		return
 	}
-	form := url.Values{
-		"grant_type":            {"client_credentials"},
-		"client_assertion_type": {assertionType},
-		"client_assertion":      {assertion},
-		"scope":                 {deliveriesScope},
-	}
-	req, err := newRequest(ctx, http.MethodPost, c.tokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := c.tokenRequest(ctx, deliveriesScope, assertion)
 	if err != nil {
 		return
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.dhc.Do(req)
 	if err != nil {
 		f.status = delivery.HostedOffline

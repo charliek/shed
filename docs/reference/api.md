@@ -29,6 +29,11 @@ Errors share one JSON shape, whatever the endpoint:
 {"error": {"code": "SHED_NOT_FOUND", "message": "shed not found: codelens"}}
 ```
 
+A refusal of the [remote backend](remote-backend.md)'s account service adds a
+`reason` member that says which rule refused (`COMPUTE_LIMIT_REACHED` and
+`COMPUTE_POLICY_REFUSED` carry one; see [Cloud error codes](#cloud-error-codes)).
+No other error has it.
+
 ## Authentication
 
 In `mtls` mode the HTTP API is certificate-gated, and certificates are **not**
@@ -124,6 +129,8 @@ the route's own `403`, `400` or `501` never appears.
 | POST | `/api/sheds/{name}/start` | Start a shed |
 | POST | `/api/sheds/{name}/stop` | Stop a shed |
 | POST | `/api/sheds/{name}/assign` | Give a shed with no user to a user (admin) |
+| POST | `/api/sheds/{name}/extend` | Move a cloud shed's lease later |
+| GET | `/api/cloud/usage` | The cloud machines held against the account service's limits |
 | POST | `/api/sheds/{name}/reset` | Wipe and recreate the shed's writable upper layer |
 | POST | `/api/sheds/{name}/exec` | Run one command in a running shed, streamed as NDJSON |
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
@@ -234,6 +241,7 @@ never renamed; treat an unknown token as absent.
 | `uniform_shed_record` | always | Every [shed record](#get-apisheds), on every backend and every route that returns one, carries `mounts`, `network_profile` and `isolation`, and `arch` where the server knows it; this response carries `guest_arch` when every shed this server can create has one architecture (below) |
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
 | `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
+| `lease` | remote backend | Every shed record carries [`cloud`](#get-apisheds), [`POST /api/sheds/{name}/extend`](#post-apishedsnameextend) and [`GET /api/cloud/usage`](#get-apicloudusage) exist, and a [service client](#service-clients)'s create may carry `lease` |
 | `async_lifecycle` | remote backend | Create, start, stop and delete return before the cloud work is done; see [Remote backend](remote-backend.md) |
 | `delivery` | always | The shed record carries `delivery` (see [Delivery in the shed document](#delivery-in-the-shed-document)); [`POST /api/sheds/{name}/provision`](#post-apishedsnameprovision) and the [delivery routes](#delivery-routes) exist |
 | `activity` | while the audit log is open | [`GET /api/activity`](#get-apiactivity) |
@@ -345,7 +353,8 @@ Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mo
 | `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. A remote shed, which mounts nothing, always reports `{"mode": "selected"}`. |
 | `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
 | `isolation` | string | The isolation in force for this shed: `none` (its profile is `open`), `firewall` (`isolated`, held by firewall rules the server installs on its own host: Firecracker) or `topology` (`isolated`, held by the network giving the shed no route to another shed or to the server's private network: [remote](remote-backend.md)). It fails closed: an `isolated` shed on a backend that cannot hold isolation now reports `none` (a remote server whose `firewall` config admits more than the server), never the profile's name. It names the kind of isolation the server's configuration provides; it is not a live check that the network isolates the shed at this moment. A client that requires isolation reads this member, not `network_profile`, and treats a record without it (an older server) as not isolated. |
-| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the shed's size's, stored at create; when a lost record is rebuilt from the cloud, the architecture the cloud reports for the VM's boot disk (when the cloud reports none, the configured sizes' for its machine type if they all agree; none when they disagree or no configured size has that machine type); a remote shed created by a server older than this member reports none. |
+| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the architecture of the shed's size in the account service's catalog, stored at create. |
+| `cloud` | object | Remote only (advertised by `lease`): the shed's machine as the account service reported it. See [The `cloud` object](#the-cloud-object). Present on every remote record from its first, and never on another backend's. |
 
 Every route that returns a shed record (this list, `GET /api/sheds/{name}`,
 create (JSON and the stream's `complete` event), start, stop, assign, reset,
@@ -355,6 +364,49 @@ reported, never stored. Advertised by `uniform_shed_record`.
 
 The list holds only the sheds the caller may view: a service client's, its
 own; a user's, their own; an admin's, every shed (see [Ownership](#ownership)).
+
+#### The `cloud` object
+
+A remote shed's record carries what the account service says about its
+machine. Nothing in it names a cloud project, a zone, a network or an address,
+so every caller who may see the shed (a service client included) gets it.
+Members whose value is not known yet are omitted, never zero.
+
+```json
+"cloud": {
+  "provider": "cloud-a",
+  "size": {"name": "standard", "cpus": 2, "memory_mb": 8192},
+  "disk_gb": 50,
+  "image": "shed-full-v1-0-0-20261120-120000",
+  "created_at": "2026-11-26T09:00:00Z",
+  "started_at": "2026-11-26T09:01:10Z",
+  "lease": {
+    "expires_at": "2026-11-26T21:00:00Z",
+    "max_expires_at": "2026-11-29T09:00:00Z",
+    "extendable": true,
+    "presets_h": [6, 12, 24],
+    "warn_s": 7200
+  }
+}
+```
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `provider` | string | A word for display (which cloud). Omitted until the service has answered for the machine. |
+| `size` | object | `name`, `cpus` and `memory_mb` of the machine's size. |
+| `disk_gb` | integer | The boot disk, in GB. Omitted when not known. |
+| `image` | string | The image the machine was made from: what the requested image name resolved to, or the name itself when the service gave no resolution (or has not answered yet). |
+| `created_at` | string | When the service made the machine. |
+| `started_at`, `stopped_at` | string | The machine's last start, and its last stop (omitted once it has started again). Omitted when not known. |
+| `lease` | object | Omitted while the lease is unknown, which is before the service has answered for the machine; a client treats a shed with no `lease` as one whose end it does not know, not as one with none. |
+
+| `lease` member | Type | Description |
+|----------------|------|-------------|
+| `expires_at` | string | When the service deletes the machine, running or stopped. |
+| `max_expires_at` | string | The cap: no extend goes past it. |
+| `extendable` | boolean | An extend by one hour would be accepted now. `false` for a service client's shed, at the cap, and where the service's policy lets nobody extend. |
+| `presets_h` | array | The hours a person is offered to extend by. |
+| `warn_s` | integer | How long before `expires_at`, in seconds, a person is warned (the [banner](cli.md#the-lease-banner) and the `!` mark). Absent: 2 hours. `0`: never warn. |
 
 **Status values:** `running`, `stopped`, `starting`, `stopping`, `error`
 
@@ -386,6 +438,7 @@ Creates a new shed.
 | `upper_size_bytes` | No | Server default | Per-shed overlay upper size in bytes. Range-validated 1 GiB – 100 GiB. When omitted, the per-backend `upper_size_default` config value applies. |
 | `no_provision` | No | `false` | Skip provisioning hooks (repo clone, install hook, first-time auto-sync). |
 | `mounts` | No | every server mount | Which server mounts (top-level `mounts:`) the shed gets. Omitted: every one, as before. `[]`: none. `["claude", "gh"]`: exactly those; each must be a configured mount name (else `400 INVALID_REQUEST`). Stored with the shed and honoured on every later start, including an SSH auto-start. Needs the `mount_selection` feature. |
+| `lease` | No | None | A duration of whole seconds, at least `1m` (`30h`). Remote, [service clients](#service-clients) only: how long the account service keeps the machine. Without it the client's `policy.max_age` applies. Above `max_age` is `403 POLICY_VIOLATION`; anyone else, or a server without the `lease` feature, gets `422 FEATURE_UNSUPPORTED`. A person's lease is the service's own, from its policy. |
 | `network` | No | `network.default_profile` (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only; Firecracker). Fixed for the shed's life. Needs the `network_profiles` feature. See [Security › Network profiles](security.md#network-profiles). |
 
 A [service client](#service-clients)'s create is checked against its policy
@@ -455,6 +508,9 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 | 404 | `SNAPSHOT_NOT_FOUND` | `from_snapshot` names a snapshot that does not exist or that the caller may not see |
 | 409 | `SHED_ALREADY_EXISTS` | A shed with that name exists, whoever it belongs to |
 | 422 | `NETWORK_PROFILE_UNSUPPORTED` | A non-`open` profile on a backend that cannot enforce it (VZ) |
+| 422 | `FEATURE_UNSUPPORTED` | The remote backend has no such feature (host directories, mounts, snapshots, egress profiles), or `lease` from a caller that is not a service client |
+| 422 | `SIZE_UNAVAILABLE` | Remote: no size of the account service's catalog has the requested `cpus` and `memory_mb` |
+| 422, 503, 403, 409 | the [cloud codes](#cloud-error-codes) | Remote: the account service refused the create, or could not be asked |
 | 500 | `CLONE_FAILED` / `BACKEND_ERROR` | Backend or clone failure |
 | 503 | `NETWORK_ENFORCEMENT_UNAVAILABLE` | The server could not install the firewall rules an `isolated` shed needs, so it refused to create it |
 
@@ -654,8 +710,110 @@ moved between users, and snapshots cannot be assigned.
 
 On Firecracker and VZ the new user is written to disk before the answer, and a
 running shed's credential requests go to the new user's machine from then on.
-On the remote backend the user is also written to the instance's `shed_user`
-label; see [Remote backend › Users](remote-backend.md#users).
+A remote (cloud) shed's user is its machine's, fixed by the account service at
+create, so assigning one is `501 FEATURE_UNSUPPORTED`; see [Remote backend ›
+Users](remote-backend.md#users).
+
+### POST /api/sheds/{name}/extend
+
+Moves a cloud shed's lease later, so the account service deletes its
+machine later, never past the lease's cap. The shed's own user or an admin
+(a local admin included); never a service client or a script key. A server
+whose sheds have leases advertises the `lease` feature; any other answers
+501 `FEATURE_UNSUPPORTED`.
+
+**Request:**
+
+```json
+{"hours": 6, "request_id": "6f9619ff-8b86-4d01-b42d-00cf4fc964ff"}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hours` | integer | How much later the lease ends: 1 to 720 |
+| `request_id` | string | Optional. A UUID the caller makes for this extend and sends again when it retries the request (a reply it did not get): every request with the same `request_id` for the same shed, from the same caller, moves the lease once, for as long as the account service keeps its answer (24 hours). Without it every request is a new extend. `shed extend` makes one per invocation. |
+
+**Response (200 OK):** the shed, with its new `cloud.lease`.
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | `hours` outside 1 to 720, or a `request_id` that is not a UUID |
+| 403 | `FORBIDDEN` | A service client, a script key, or a user who is neither the shed's nor an admin |
+| 403 | `EXTEND_NOT_ALLOWED` | The lease cannot be extended (a service client's shed, or the account service's policy) |
+| 403 | `PERSON_INACTIVE` | The shed's person is no longer active at the account service |
+| 404 | `SHED_NOT_FOUND` | No such shed, or one the caller may not see |
+| 409 | `PROVISION_IN_PROGRESS` | The shed's create has not been accepted by the account service yet; try again |
+| 409 | `LEASE_AT_CAP` | The extend would take the lease past its cap; nothing changed |
+| 409 | `LEASE_ENDED` | The lease has ended |
+| 409 | `COMPUTE_DELETING` | The account service is deleting the machine |
+| 501 | `FEATURE_UNSUPPORTED` | The server's sheds have no lease |
+| 503 | `COMPUTE_UNAVAILABLE` | The account service could not be reached, or the answer is not known: send the request again with the same `request_id` |
+
+### GET /api/cloud/usage
+
+The machines held against the account service's limits: the caller's own
+count and the organization's, so a client can say "3 of 4" before a create is
+refused. A server whose sheds have a lease (the `lease` feature) answers; any
+other answers `501 FEATURE_UNSUPPORTED`. The answer is cached for 30 seconds
+per user, and only successful answers are cached.
+
+**Query:** `user` (optional, once): a user name. Without it the count is the
+caller's. A person of the account service may name themselves. Only an admin
+who is a person of the service may name another person; a local admin (an
+admin of the server's own `auth.users`, who is no person of the service) is
+refused (`403 FORBIDDEN`), as is a user who is not an admin, so `?user=` never
+lets one person read another's count. A service client may not name anyone.
+
+**Response (200 OK):**
+
+```json
+{
+  "person": {"machines": 3, "running": 2, "stopped": 1, "max": 4},
+  "org": {"machines": 7, "running": 5, "stopped": 2, "max": 10}
+}
+```
+
+| Member | Description |
+|--------|-------------|
+| `person` | The caller's machines (`machines`, of which `running` and `stopped`) and the limit `max`. `null` for a caller who is no person of the service (a local admin, a service client) and for a person the service would refuse a machine. |
+| `org` | The same for the whole organization, which every caller sees. |
+
+`creating`, `starting` and `running` machines count as running. A service
+client reaches this route and reads `org` only.
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | `user` given more than once, or not a user name |
+| 403 | `FORBIDDEN` | `user` names someone the caller may not read (above) |
+| 501 | `FEATURE_UNSUPPORTED` | The server has no cloud sheds with a lease |
+| 503 | `COMPUTE_UNAVAILABLE` | The account service could not be reached |
+
+### Cloud error codes
+
+Refusals of the remote backend's account service, as a client sees them. Each
+is a `config.APIError`; `reason`, where the table gives one, is the error's
+`reason` member. A refusal answered on the request leaves no shed behind. See
+[Remote backend › Codes and reasons](remote-backend.md#codes-and-reasons) for
+what each means to an operator.
+
+| Status | Code | Reason | When |
+|--------|------|--------|------|
+| 503 | `COMPUTE_LIMIT_REACHED` | `person`, `organization` | The service's limit on machines per person, or per organization, is reached (every state counted). Wait for a machine to go. |
+| 422 | `COMPUTE_POLICY_REFUSED` | `size`, `lease`, `image`, `access`, `person`, `client` | The service's policy refused the create. `person`: the caller is a local admin, or a person the service does not list for this server (or who opted this server out). `client`: a service client the service has not registered for this server. |
+| 403 | `COMPUTE_DENIED` | | The service does not let this server manage compute (the grant is off, the server is disabled). |
+| 503 | `COMPUTE_UNAVAILABLE` | | The service could not be reached or answered too late, or the server has not yet read its machines after a start (a degraded start). Safe to send again. |
+| 409 | `COMPUTE_DELETING` | | The service is deleting the machine (its lease ended, or it was deleted at the service). A create whose name is held by a machine still being deleted answers this once the wait for it passes: try again later. It is never `SHED_ALREADY_EXISTS`. |
+| 403 | `EXTEND_NOT_ALLOWED` | | An [extend](#post-apishedsnameextend) the lease does not allow. |
+| 409 | `LEASE_AT_CAP` | | An extend past the cap; nothing changed. |
+| 409 | `LEASE_ENDED` | | The lease has ended. |
+| 403 | `PERSON_INACTIVE` | | The shed's person is no longer active at the service. |
+| 503 | `CLOUD_QUOTA_EXCEEDED` | | The cloud's own quota refused the machine. |
+| 503 | `ZONE_CAPACITY_UNAVAILABLE` | | The cloud has no room for the machine. |
+| 503 | `FIREWALL_CHECK_FAILED` | | The server's [ingress check](remote-backend.md#ingress-and-the-firewall-modes) found the ingress wrong (one that could not read it is `COMPUTE_UNAVAILABLE`). |
 
 ### POST /api/sheds/{name}/reset
 
@@ -794,6 +952,7 @@ Client requests are deny by default. The whole surface a client can reach:
 | POST | `/api/sheds/{name}/start` | Owned sheds only |
 | POST | `/api/sheds/{name}/stop` | Owned sheds only |
 | POST | `/api/sheds/{name}/exec` | Owned sheds only |
+| GET | `/api/cloud/usage` | The organization's count only; it may not name a user |
 
 | Status | Code | When |
 |--------|------|------|

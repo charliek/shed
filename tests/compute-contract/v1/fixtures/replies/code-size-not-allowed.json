@@ -1,0 +1,25 @@
+{
+  "name": "code-size-not-allowed",
+  "description": "SIZE_NOT_ALLOWED at 403: a refusal of kind ErrPolicy.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SIZE_NOT_ALLOWED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "SIZE_NOT_ALLOWED",
+    "kind": "ErrPolicy"
+  }
+}

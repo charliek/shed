@@ -1,0 +1,25 @@
+{
+  "name": "code-spec-mismatch",
+  "description": "SPEC_MISMATCH at 409: a refusal of kind ErrSpecMismatch.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SPEC_MISMATCH",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "SPEC_MISMATCH",
+    "kind": "ErrSpecMismatch"
+  }
+}

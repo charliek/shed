@@ -1,0 +1,21 @@
+{
+  "name": "operation-pending",
+  "description": "The operation is not done.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "done": false
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "operation": "pending"
+  }
+}

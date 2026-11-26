@@ -1,0 +1,339 @@
+{
+  "codes": {
+    "NOT_FOUND": {
+      "status": 404,
+      "provider": "ErrNotFound",
+      "refusal": false,
+      "shed_api": {
+        "status": 404,
+        "code": "SHED_NOT_FOUND",
+        "reason": null
+      }
+    },
+    "EXISTS": {
+      "status": 409,
+      "provider": "ErrExists",
+      "refusal": false,
+      "shed_api": {
+        "status": 409,
+        "code": "SHED_ALREADY_EXISTS",
+        "reason": null
+      }
+    },
+    "SPEC_MISMATCH": {
+      "status": 409,
+      "provider": "ErrSpecMismatch",
+      "refusal": false,
+      "shed_api": {
+        "status": 500,
+        "code": "BACKEND_ERROR",
+        "reason": null
+      }
+    },
+    "BUSY": {
+      "status": 409,
+      "provider": "ErrBusy",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_UNAVAILABLE",
+        "reason": null
+      }
+    },
+    "INVALID": {
+      "status": 422,
+      "provider": "ErrInvalid",
+      "refusal": false,
+      "shed_api": {
+        "status": 500,
+        "code": "BACKEND_ERROR",
+        "reason": null
+      }
+    },
+    "LABEL_TAKEN": {
+      "status": 409,
+      "provider": "ErrLabelTaken",
+      "refusal": false,
+      "shed_api": {
+        "status": 500,
+        "code": "BACKEND_ERROR",
+        "reason": null
+      }
+    },
+    "RESERVED_LABEL": {
+      "status": 422,
+      "provider": "ErrInvalid",
+      "refusal": false,
+      "shed_api": {
+        "status": 500,
+        "code": "BACKEND_ERROR",
+        "reason": null
+      }
+    },
+    "QUOTA_PERSON": {
+      "status": 409,
+      "provider": "ErrComputeLimit",
+      "refusal": true,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_LIMIT_REACHED",
+        "reason": "person"
+      }
+    },
+    "QUOTA_ORG": {
+      "status": 409,
+      "provider": "ErrComputeLimit",
+      "refusal": true,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_LIMIT_REACHED",
+        "reason": "organization"
+      }
+    },
+    "SIZE_NOT_ALLOWED": {
+      "status": 403,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "size"
+      }
+    },
+    "SIZE_UNKNOWN": {
+      "status": 422,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "size"
+      }
+    },
+    "IMAGE_UNKNOWN": {
+      "status": 422,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "image"
+      }
+    },
+    "LEASE_TOO_LONG": {
+      "status": 422,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "lease"
+      }
+    },
+    "EXTEND_NOT_ALLOWED": {
+      "status": 403,
+      "provider": "ErrLease",
+      "refusal": false,
+      "shed_api": {
+        "status": 403,
+        "code": "EXTEND_NOT_ALLOWED",
+        "reason": null
+      }
+    },
+    "LEASE_AT_CAP": {
+      "status": 409,
+      "provider": "ErrLease",
+      "refusal": false,
+      "shed_api": {
+        "status": 409,
+        "code": "LEASE_AT_CAP",
+        "reason": null
+      }
+    },
+    "LEASE_ENDED": {
+      "status": 409,
+      "provider": "ErrLease",
+      "refusal": false,
+      "shed_api": {
+        "status": 409,
+        "code": "LEASE_ENDED",
+        "reason": null
+      }
+    },
+    "DELETING": {
+      "status": 409,
+      "provider": "ErrDeleting",
+      "refusal": false,
+      "shed_api": {
+        "status": 409,
+        "code": "COMPUTE_DELETING",
+        "reason": null
+      }
+    },
+    "PERSON_INACTIVE": {
+      "status": 403,
+      "provider": "ErrLease",
+      "refusal": false,
+      "shed_api": {
+        "status": 403,
+        "code": "PERSON_INACTIVE",
+        "reason": null
+      }
+    },
+    "PERSON_UNKNOWN": {
+      "status": 403,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "person"
+      }
+    },
+    "CLIENT_UNKNOWN": {
+      "status": 403,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "client"
+      }
+    },
+    "CLOUD_QUOTA": {
+      "status": 409,
+      "provider": "ErrQuota",
+      "refusal": true,
+      "shed_api": {
+        "status": 503,
+        "code": "CLOUD_QUOTA_EXCEEDED",
+        "reason": null
+      }
+    },
+    "CLOUD_CAPACITY": {
+      "status": 409,
+      "provider": "ErrCapacity",
+      "refusal": true,
+      "shed_api": {
+        "status": 503,
+        "code": "ZONE_CAPACITY_UNAVAILABLE",
+        "reason": null
+      }
+    },
+    "ACCESS_UNSUPPORTED": {
+      "status": 422,
+      "provider": "ErrPolicy",
+      "refusal": false,
+      "shed_api": {
+        "status": 422,
+        "code": "COMPUTE_POLICY_REFUSED",
+        "reason": "access"
+      }
+    },
+    "INGRESS_NOT_WRITABLE": {
+      "status": 403,
+      "provider": "ErrIngress",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "FIREWALL_CHECK_FAILED",
+        "reason": null
+      }
+    },
+    "INGRESS_TOO_WIDE": {
+      "status": 422,
+      "provider": "ErrIngress",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "FIREWALL_CHECK_FAILED",
+        "reason": null
+      }
+    },
+    "COMPUTE_DENIED": {
+      "status": 403,
+      "provider": "ErrDenied",
+      "refusal": false,
+      "shed_api": {
+        "status": 403,
+        "code": "COMPUTE_DENIED",
+        "reason": null
+      }
+    },
+    "INSUFFICIENT_SCOPE": {
+      "status": 403,
+      "provider": "ErrDenied",
+      "refusal": false,
+      "shed_api": {
+        "status": 403,
+        "code": "COMPUTE_DENIED",
+        "reason": null
+      }
+    },
+    "SERVER_DISABLED": {
+      "status": 403,
+      "provider": "ErrDenied",
+      "refusal": false,
+      "shed_api": {
+        "status": 403,
+        "code": "COMPUTE_DENIED",
+        "reason": null
+      }
+    },
+    "RATE_LIMITED": {
+      "status": 429,
+      "provider": "ErrUnavailable",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_UNAVAILABLE",
+        "reason": null
+      }
+    },
+    "UNAVAILABLE": {
+      "status": 503,
+      "provider": "ErrUnavailable",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_UNAVAILABLE",
+        "reason": null
+      }
+    }
+  },
+  "status_defaults": {
+    "403": "COMPUTE_DENIED",
+    "404": "NOT_FOUND",
+    "409": "INVALID",
+    "422": "INVALID"
+  },
+  "failures": {
+    "unavailable": {
+      "provider": "ErrUnavailable",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_UNAVAILABLE",
+        "reason": null
+      }
+    },
+    "invalid_reply": {
+      "provider": "ErrInvalidReply",
+      "refusal": false,
+      "shed_api": {
+        "status": 503,
+        "code": "COMPUTE_UNAVAILABLE",
+        "reason": null
+      }
+    },
+    "payload_too_large": {
+      "provider": "ErrInvalid",
+      "refusal": false,
+      "shed_api": {
+        "status": 500,
+        "code": "BACKEND_ERROR",
+        "reason": null
+      }
+    }
+  }
+}

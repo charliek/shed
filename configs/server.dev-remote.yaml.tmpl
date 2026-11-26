@@ -2,17 +2,25 @@
 #
 # A TEMPLATE, not a config: `make dev-server-up-remote` renders it to
 # ~/.shed/dev-remote/server.yaml, replacing the @...@ placeholders, and
-# runs the dev build with it. Nothing private lives here. The cloud project,
-# zone, network, subnet, credentials, SSH client key and the firewall rule's
-# source ranges are read from the process environment at start-up through the
-# `*_env` names in the `remote:` block; the Make target sources them from a
-# private env file
-# (default ~/.config/shed/remote-dev/env, override with SHED_REMOTE_ENV_FILE).
+# runs the dev build with it. Nothing private lives here. The account
+# service's URL, the local admin's key, the SSH client key and the
+# firewall's source ranges come from a private env file (default
+# ~/.config/shed/remote-dev/env, override with SHED_REMOTE_ENV_FILE): the
+# first two are rendered in, the others read from the process environment
+# at start-up through the `*_env` names in the `remote:` block.
+#
+# The server gets every machine from the account service it is enrolled
+# with (auth.directory): a local account service, or the in-tree reference
+# service (`make dev-compute-ref-up`, then SHED_REMOTE_TRANSPORT=local, which
+# runs a real agent on this host in place of a cloud machine). Enrol it once,
+# after the first start, with the one-time code on standard input (there is
+# no --code flag; without the pipe it prompts for the code):
+#   awk '{print $2}' ~/.shed/dev-remote/ref/control/codes | bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --name remote-dev
 #
 # The server runs ALONGSIDE an installed shed-server on the same machine:
-# its own ports, its own identity directory, its own record cache. Each shed
-# is a cloud VM, so a shed left running costs money: `shed -s remote-dev list`
-# before `make dev-server-down-remote`.
+# its own ports, its own identity directory, its own record cache. Against a
+# real service each shed is a cloud machine that costs money until its lease
+# ends: `shed -s remote-dev list` before `make dev-server-down-remote`.
 #
 # Register it with the CLI once, after the first start:
 #   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev
@@ -37,8 +45,17 @@ state_dir: @DEV_REMOTE_DIR@/state
 
 auth:
   mode: mtls
-  ssh:
-    github_users: [@GITHUB_USER@]
+  # The local admin: lists, stops, deletes and extends any cloud shed, and
+  # creates none (only the account service's people and clients do).
+  users:
+    dev:
+      admin: true
+      keys:
+        - {key: "@ADMIN_KEY@", label: dev}
+  # The account service the server's people and machines come from.
+  directory:
+    url: @DIRECTORY_URL@
+    @DIRECTORY_SETTING@
   clients:
     # A development Nocturn (the shed-craze Agent Provider). Issue its bundle
     # with the dev build and the rendered config:
@@ -48,8 +65,9 @@ auth:
       policy:
         name_prefix: "nocturn-"
         max_sheds: 4
-        # Above Nocturn's delegate.max_age (24h). Also this client's cloud run
-        # limit: a shed gets the larger of this and remote.max_run_duration.
+        # Above Nocturn's delegate.max_age (24h). Also the lease of this
+        # client's cloud machines: the account service deletes one this long
+        # after its create.
         max_age: 30h
         # On remote, isolated means isolation by network topology.
         network: isolated
@@ -57,21 +75,15 @@ auth:
         images: [cloud]
 
 remote:
-  provider: gce
-  transport: ssh
-  environment: @SHED_REMOTE_ENV@
+  provider: service
+  # ssh (a cloud machine), or, against the reference service, local with
+  # allow_test_drivers (SHED_REMOTE_TRANSPORT=local).
+  transport: @TRANSPORT@
+  @TRANSPORT_SETTING@
   state_dir: @DEV_REMOTE_DIR@/remote
-  # The newest image of the family `make gce-image` bakes.
-  default_image: family/shed-full-amd64
-  image_aliases:
-    cloud: family/shed-full-amd64
-    base: family/shed-base-amd64
-  default_size: standard
-  disk_gb: 50
-  limits:
-    max_running: 2
-    max_sheds: 8
-  max_run_duration: 24h
+  # Sizes, images and leases are the account service's; the disk is the
+  # size's own unless set here. The service holds the quotas: the server's
+  # own limits are off unless set.
   # `make dev-server-up-remote` builds shed-agent-linux-amd64 into it.
   agent_dir: @DEV_REMOTE_DIR@/agent
   # The backend does not push agents yet: an image whose agent is
@@ -80,35 +92,33 @@ remote:
   ssh:
     client_key_env: SHED_REMOTE_SSH_KEY
     client_key_file_env: SHED_REMOTE_SSH_KEY_FILE
-  # The server reads the environment's cloud firewall rule (shed-<env>-ssh)
-  # and refuses creates and starts (503 FIREWALL_CHECK_FAILED) while the rule
-  # or its network is not as scripts/remote/gce-setup.sh made it.
+  # The server reads the machines' ingress from the account service and
+  # refuses creates and starts (503 FIREWALL_CHECK_FAILED) while its sources
+  # are not these and it cannot make them so (and isolated sheds while the
+  # service cannot say the ingress is exclusive).
   firewall:
     # `make dev-server-up-remote` renders the two lines after this comment
     # from the private env file, so neither an address nor a service you
     # trust is named here.
     #
-    # static (the default): the rule's source ranges must equal the
+    # static (the default): the ingress's sources must equal the
     # comma-separated list in SHED_REMOTE_SOURCE_RANGES (your public address
-    # as a /32). The server only reads the rule. Rendered as
+    # as a /32). When they differ and the service's ingress is writable, the
+    # server writes this list as the sources (at most once every 5 minutes),
+    # replacing whatever the service had; only when the ingress is managed
+    # elsewhere (not writable) does it just compare, refusing creates and
+    # starts on a mismatch. Rendered as
     #   mode: static
     #   source_ranges_env: SHED_REMOTE_SOURCE_RANGES
     #
     # auto (SHED_REMOTE_FIREWALL_MODE=auto), for a machine whose public
     # address changes: the server asks the echo services for its address
-    # and, when two agree, patches the rule's sources to that one /32. It
-    # needs the extra roles that `gce-setup.sh --print --firewall-auto`
-    # prints, and SHED_REMOTE_ECHO_URLS: two or more https services you
-    # trust, on different hosts, comma-separated, that answer with the
-    # caller's IPv4 address as plain text. Rendered as
+    # and, when two agree, writes the ingress's sources (that one /32). It
+    # needs a service whose ingress is writable, and SHED_REMOTE_ECHO_URLS:
+    # two or more https services you trust, on different hosts,
+    # comma-separated, that answer with the caller's IPv4 address as plain
+    # text. Rendered as
     #   mode: auto
     #   echo_urls: [https://<first-echo-service>/, https://<second-echo-service>/]
     mode: @FIREWALL_MODE@
     @FIREWALL_SETTING@
-  gce:
-    project_env: SHED_GCE_PROJECT
-    zone_env: SHED_GCE_ZONE
-    network_env: SHED_GCE_NETWORK
-    subnet_env: SHED_GCE_SUBNET
-    credentials_env: GOOGLE_CREDENTIALS_BASE64
-    credentials_file_env: SHED_GCE_CREDENTIALS_FILE

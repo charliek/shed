@@ -1,0 +1,25 @@
+{
+  "name": "code-ingress-too-wide",
+  "description": "INGRESS_TOO_WIDE at 422: a refusal of kind ErrIngress.",
+  "call": "ingress_put",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INGRESS_TOO_WIDE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INGRESS_TOO_WIDE",
+    "kind": "ErrIngress"
+  }
+}

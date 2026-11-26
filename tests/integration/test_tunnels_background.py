@@ -58,6 +58,7 @@ def test_tunnels_background_detaches(shed_server, test_shed_name):
             ["shed", "-s", server.name, "tunnels", "start", name,
              "-t", f"{local_port}:22", "-d"],
             capture_output=True,
+            env=server.env,
             text=True,
             timeout=30,
         )
@@ -87,6 +88,7 @@ def test_tunnels_background_detaches(shed_server, test_shed_name):
         stop = subprocess.run(
             ["shed", "-s", server.name, "tunnels", "stop", name],
             capture_output=True,
+            env=server.env,
             text=True,
             timeout=15,
         )
@@ -103,6 +105,7 @@ def test_tunnels_background_detaches(shed_server, test_shed_name):
         subprocess.run(
             ["shed", "-s", server.name, "tunnels", "stop", name],
             capture_output=True,
+            env=server.env,
             text=True,
             timeout=15,
         )

@@ -5,12 +5,17 @@
 // the provision contract (tests/provision-contract/v2/CONTRACT.md, section
 // 3b): the delivery scope and POST /v1/deliveries, held to every hosted
 // exchange of that contract, answering from canned items or sending any
-// reply a server must classify (deliveries.go).
+// reply a server must classify (deliveries.go). And it is a compute
+// service of the compute contract (tests/compute-contract/v1/CONTRACT.md):
+// the compute scope and /v1/compute/*, with an in-memory cloud
+// (compute.go), held to every exchange of that contract.
 //
 // It is for tests, never for production. All of its state (enrolled
-// servers, spent codes, the replay ledger) is in memory, so a restart is a
-// clean start; its users, codes and disabled servers come from Inputs,
-// which it only reads; nothing about it can be changed over HTTP. Its
+// servers, spent codes, the replay ledger, the compute service's machines)
+// is in memory, so a restart is a clean start; its users, codes and
+// disabled servers come from Inputs, which it only reads; nothing about
+// them can be changed over HTTP (the compute calls change only the
+// compute service's own machines). Its
 // command, cmd/shed-directory-ref, serves plain HTTP on a loopback address
 // only.
 //
@@ -43,6 +48,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -68,18 +74,20 @@ const (
 	// pathDeliveries is the provision contract's hosted source (its
 	// version 2, section 3b).
 	pathDeliveries = "/v1/deliveries"
-	pathToken      = "/oauth2/token"
-	pathJWKS       = "/.well-known/jwks.json"
-	pathMetadata   = "/.well-known/oauth-authorization-server"
+	// The compute contract's routes are every path under
+	// pathComputePrefix (compute.go).
+	pathToken    = "/oauth2/token"
+	pathJWKS     = "/.well-known/jwks.json"
+	pathMetadata = "/.well-known/oauth-authorization-server"
 )
 
 var organizationRx = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
 // Limits are the requests allowed per minute: enrolments and token
-// requests per calling address, directory and delivery requests per server.
-// Zero takes the default.
+// requests per calling address, directory, delivery and compute requests
+// per server. Zero takes the default.
 type Limits struct {
-	Enroll, Token, Directory, Deliveries int
+	Enroll, Token, Directory, Deliveries, Compute int
 }
 
 // Config is a reference server's configuration.
@@ -127,6 +135,9 @@ type Server struct {
 
 	ledger ledger
 	limits map[limitKind]*limiter
+
+	// compute is the compute service (compute.go), with its own lock.
+	compute *computeState
 }
 
 // server is an enrolled server.
@@ -159,6 +170,7 @@ func New(cfg Config) (*Server, error) {
 		servers:    map[string]*server{},
 		spentCodes: map[string]string{},
 		ledger:     ledger{spent: map[ledgerKey]int64{}},
+		compute:    newComputeState(),
 	}
 	if s.signer == nil {
 		if cfg.KeyID != "" {
@@ -179,6 +191,7 @@ func New(cfg Config) (*Server, error) {
 	if s.logf == nil {
 		s.logf = func(string, ...any) {}
 	}
+	s.compute.logf = s.logf
 	if s.onEnrol == nil {
 		s.onEnrol = func(string, string) {}
 	}
@@ -188,6 +201,7 @@ func New(cfg Config) (*Server, error) {
 		limitToken:      newLimiter(orDefault(l.Token, 120)),
 		limitDirectory:  newLimiter(orDefault(l.Directory, 120)),
 		limitDeliveries: newLimiter(orDefault(l.Deliveries, 120)),
+		limitCompute:    newLimiter(orDefault(l.Compute, 600)),
 	}
 	return s, nil
 }
@@ -234,6 +248,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pathMetadata:   {http.MethodGet, s.handleMetadata},
 	}[r.URL.Path]
 	switch {
+	case route.handler == nil && strings.HasPrefix(r.URL.Path, pathComputePrefix):
+		s.handleCompute(w, r)
 	case route.handler == nil:
 		writeV1Error(w, http.StatusNotFound, "NOT_FOUND", "no such endpoint", 0)
 	case r.Method != route.method:
@@ -316,6 +332,7 @@ const (
 	limitToken      limitKind = "token"
 	limitDirectory  limitKind = "directory"
 	limitDeliveries limitKind = "deliveries"
+	limitCompute    limitKind = "compute"
 )
 
 type limiter struct {

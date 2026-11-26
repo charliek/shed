@@ -1,0 +1,29 @@
+{
+  "name": "list-unknown-cause",
+  "description": "A deletion whose cause is not one of the four: invalid.",
+  "call": "list",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "machines": [],
+        "deleted": [
+          {
+            "shed_id": "b7d4h5zn2c6n3elxf2lza6iiza",
+            "at": "2026-11-16T06:00:00Z",
+            "cause": "gremlins"
+          }
+        ],
+        "complete": true
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

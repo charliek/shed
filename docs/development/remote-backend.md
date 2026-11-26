@@ -1,9 +1,11 @@
 # Remote Backend Development
 
-This page sets up a development shed-server that runs `default_backend: remote` on your machine, beside any installed shed-server. Each shed it creates is a virtual machine in your own Google Cloud project. For what the backend does and how clients see it, see [Remote Backend (Cloud)](../reference/remote-backend.md).
+This page sets up a development shed-server that runs `default_backend: remote` on your machine, beside any installed shed-server. Its machines come from an **account service**, never from a cloud directly (see [Remote Backend (Cloud)](../reference/remote-backend.md)). You can run it against:
 
-!!! warning "Every shed is a billed VM"
-    A shed on this server is a Compute Engine VM with its own boot disk. It keeps running, and costing money, after you stop the dev server or close your terminal. Delete what you create and [check that nothing is left](#checking-nothing-is-left).
+- **The in-tree reference service**, an in-memory account service that ships with the repository. With `transport: local` each shed's agent runs on your own host, so there is no cloud, no private value and no billing. Start here.
+- **A local account service** of your own (or a development instance of one), which makes real cloud machines. Each shed is then a billed machine until its lease ends.
+
+For what the backend does and how clients see it, see [Remote Backend (Cloud)](../reference/remote-backend.md); for the protocol, the [compute contract](../reference/compute-contract.md).
 
 ## Ports and paths
 
@@ -19,106 +21,121 @@ The remote dev server never touches an installed server's ports (8080 and 2222) 
 | PID file | `~/.shed/dev-remote/server.pid` |
 | Record cache | `~/.shed/dev-remote/remote/` |
 | Agent build | `~/.shed/dev-remote/agent/shed-agent-linux-amd64` |
-| Server identity (host key, TLS pair, client CA) | `~/.shed/dev-remote/state/` |
+| Server identity (host key, TLS pair, client CA, enrolment) | `~/.shed/dev-remote/state/` |
+| Reference service (control files, log, PID) | `~/.shed/dev-remote/ref/` (override with `SHED_COMPUTE_REF_DIR`), on `127.0.0.1:18700` (`SHED_COMPUTE_REF_PORT`) |
 | CLI entry | `remote-dev` |
 
-## One-time cloud setup
+## Against the reference service
 
-Use a Google Cloud project that runs nothing but sheds. `scripts/remote/gce-setup.sh` prints the `gcloud` commands for one environment and runs none of them:
+The reference service (`internal/directory/refserver`, built by `make directory-ref` into `bin/test/`) holds machines as records in memory, answers every call of the compute contract, and is steered through files in its control directory. It is built and used only by tests and by this loop; no release carries it.
 
-```bash
-scripts/remote/gce-setup.sh --print \
-  --project <project-id> \
-  --env <env-name> \
-  --region <region> \
-  --source-range <your-public-address>/32 \
-  --key-out ~/.config/shed/remote-dev/gce-key.b64
-```
+1. Make the private env file the Make targets read, `~/.config/shed/remote-dev/env` (override with `SHED_REMOTE_ENV_FILE`), mode `0600`:
 
-Use a documentation address such as `203.0.113.7/32` when you only want to read the output.
+   ```bash
+   SHED_REMOTE_DIRECTORY_URL=http://127.0.0.1:18700
+   SHED_REMOTE_TRANSPORT=local
+   SHED_REMOTE_ADMIN_KEY="ssh-ed25519 AAAA... you@host"
+   SHED_REMOTE_SOURCE_RANGES=203.0.113.7/32
+   ```
 
-| Flag | Meaning |
-|---|---|
-| `--project` | The Google Cloud project ID. |
-| `--env` | The environment name (`remote.environment`): 1 to 20 of `a-z`, `0-9` and `-`, starting with a letter. VMs, the network, subnet, network tag, firewall rule and service account are named `shed-<env>...`. |
-| `--region` | The region of the zone the server uses. |
-| `--source-range` | Your machine's public address as a `/32`: the only source the firewall rule admits on port 22. |
-| `--subnet-range` | The subnet range (default `10.10.0.0/24`). |
-| `--role-id` | The custom role ID (default `shedServer`), shared by every environment in the project. |
-| `--key-out` | Where the base64 service account key is written, mode `0600`. The file must not exist yet: the printed block stops before making a key when it does. |
-| `--firewall-auto` | Also print the two extra roles `remote.firewall.mode: auto` needs. Leave it out for `static`, the dev default. |
+   `SHED_REMOTE_SSH_KEY_FILE` is not needed with the local transport. `SHED_REMOTE_ADMIN_KEY` is the public key line of the local admin `dev` (default `~/.ssh/id_ed25519.pub`). A plain `http://` URL is accepted only for a loopback address, as the reference service's.
 
-Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set.
+2. Start the service, then the server:
 
-The server never creates or deletes the firewall rule, but it reads it. Unless the env file says otherwise, the dev config is rendered with `firewall.mode: static` and `source_ranges_env: SHED_REMOTE_SOURCE_RANGES`: the rule's source ranges must equal that variable, and while they do not, `shed create` and `shed start` answer `503 FIREWALL_CHECK_FAILED`. When your public address changes, update both:
+   ```bash
+   make dev-compute-ref-up        # builds the service, starts it, prints the enrolment code
+   make dev-server-up-remote      # renders the config, builds, starts the server
+   # the one-time code, on standard input (there is no --code flag)
+   awk '{print $2}' ~/.shed/dev-remote/ref/control/codes \
+     | bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --name remote-dev
+   make dev-compute-ref-grant     # lets remote-dev manage compute; registers the client nocturn
+   ```
 
-```bash
-gcloud compute firewall-rules update shed-<env-name>-ssh --project <project-id> \
-  --source-ranges=<new-address>/32
-# then set SHED_REMOTE_SOURCE_RANGES=<new-address>/32 in the env file and
-make dev-server-restart-remote
-```
+   The enrolment happens once. `shed-server directory enroll` reads the code from standard input, never from the command line: `dev-compute-ref-up` prints the one-time code and writes it to `~/.shed/dev-remote/ref/control/codes` (`remote-dev <code>`), so pipe it in as above, or run the command without the pipe and paste the code at its prompt (which does not echo). If the server started before the enrolment or the grant, restart it (`make dev-server-restart-remote`) so it reads the service's machines.
 
-If the address changes often, let the server follow it: run the block `gce-setup.sh --print --firewall-auto` adds (pass the `--role-id` your project's base role was made with, and check the printed service account is the one your key belongs to), then set two variables in the env file and restart:
+3. Register the CLI entry once:
 
-```bash
-SHED_REMOTE_FIREWALL_MODE=auto
-SHED_REMOTE_ECHO_URLS=https://<first-echo-service>/,https://<second-echo-service>/
-```
+   ```bash
+   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev
+   ```
 
-The config is then rendered with `mode: auto` and those `echo_urls`, and `SHED_REMOTE_SOURCE_RANGES` is no longer read. The start-up log line `firewall check passed (mode auto, ...)` shows the address the services agreed on. See [The firewall check](../reference/remote-backend.md#the-firewall-check) for every clause, the two extra roles and what each failure means.
+   First contact is over SSH, so name the SSH port. The CLI enrols with the server's client CA and records an entry with the HTTPS API URL (port 18490), the pinned certificate fingerprint and a client certificate under `~/.shed/creds/remote-dev/`, which it renews when it nears expiry.
 
-Create the SSH key the server uses to log in to every VM:
+4. Make a person. The server's local admin `dev` (the `remote-dev` entry, enrolled with `SHED_REMOTE_ADMIN_KEY`) **creates no cloud sheds** (`COMPUTE_POLICY_REFUSED`, reason `person`); the service's people do, and service clients. A person needs a key of their own and a CLI entry enrolled with it:
 
-```bash
-mkdir -p ~/.config/shed/remote-dev && chmod 700 ~/.config/shed/remote-dev
-ssh-keygen -t ed25519 -N '' -C shed-remote-link -f ~/.config/shed/remote-dev/link_ed25519
-```
+   ```bash
+   ssh-keygen -t ed25519 -N '' -C ada -f ~/.config/shed/remote-dev/ada_ed25519
+   ```
 
-## The private env file
+   List the person, with the public key of that key pair **without its comment** (the key type and the key only), in `~/.shed/dev-remote/ref/control/users.json`, as the reference service reads it. `cut -d' ' -f1,2 ~/.config/shed/remote-dev/ada_ed25519.pub` prints it:
 
-The cloud settings live in a private env file, never in the repository or the config file. The Make targets source `~/.config/shed/remote-dev/env` (override with `SHED_REMOTE_ENV_FILE`). It holds `VAR=value` lines:
+   ```json
+   [{"name": "ada", "admin": false, "keys": [{"key": "ssh-ed25519 AAAA...", "label": "laptop"}]}]
+   ```
 
-```bash
-SHED_REMOTE_ENV=<env-name>
-SHED_GCE_PROJECT=<project-id>
-SHED_GCE_ZONE=<zone>
-SHED_GCE_NETWORK=shed-<env-name>
-SHED_GCE_SUBNET=shed-<env-name>
-SHED_GCE_TAG=shed-<env-name>
-SHED_GCE_CREDENTIALS_FILE=<path to the key file>
-SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>
-SHED_REMOTE_SOURCE_RANGES=<your-public-address>/32
-```
+   Have the server read the list now (as the local admin), then enrol a second entry as `ada`, with her key:
+
+   ```bash
+   shed -s remote-dev users refresh
+   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev-ada \
+     --identity-file ~/.config/shed/remote-dev/ada_ed25519
+   shed server list        # remote-dev-ada: user ada; remote-dev: user dev
+   ```
+
+   The integration suite does all of this for its people (`itest-alice` and friends, each with a HOME of its own): see `tests/integration/README.md`. A service client's create works too: issue the `nocturn` bundle with
+
+   ```bash
+   bin/shed-server client issue nocturn --config ~/.shed/dev-remote/server.yaml --ttl 72h --out <file>
+   ```
+
+5. Create, extend and delete, as `ada`:
+
+   ```bash
+   shed -s remote-dev-ada create t1
+   shed -s remote-dev-ada list              # SIZE and LEASE columns, the Cloud: footer
+   shed -s remote-dev-ada extend t1 --hours 6
+   shed -s remote-dev-ada exec t1 -- uname -a
+   shed -s remote-dev-ada delete t1 --force
+   ```
+
+   The local admin's entry sees and manages the shed too (`shed -s remote-dev list`, `stop`, `delete`, `extend`), but cannot enter or start it.
+
+6. Stop the service when you are done (`make dev-compute-ref-down` forgets every machine it held, and the shed records then go at the server's next pass):
+
+   ```bash
+   make dev-server-down-remote
+   make dev-compute-ref-down
+   ```
+
+`make dev-compute-ref-grant` writes `control/compute.json`, which the service reads each tick. Its `steps` are the named set-up steps and failures of the contract's fixtures (`compute.allow`, `client.register`, `quota.fill`, `cloud.fail`, `clock.advance`, ...); the test cases use the same file to make quotas full, a cloud fail or a lease end.
+
+## Against a local account service
+
+An account service of your own that implements the [compute contract](../reference/compute-contract.md) works the same way, with these differences:
+
+- `SHED_REMOTE_DIRECTORY_URL` is its `https://` URL (or a loopback `http://` URL for one on your machine), and `SHED_REMOTE_TRANSPORT` is `ssh` (the default).
+- The server logs in to each machine with an SSH key you make. The public half is sent in every create and fixed into the machine:
+
+  ```bash
+  mkdir -p ~/.config/shed/remote-dev && chmod 700 ~/.config/shed/remote-dev
+  ssh-keygen -t ed25519 -N '' -C shed-remote-link -f ~/.config/shed/remote-dev/link_ed25519
+  ```
+
+  and in the env file `SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>`.
+- The service must let this server manage compute (the grant, in its own operator setup) and know your people and clients. Enrol the server under the name `remote-dev`.
+- The ingress is the service's. In the default `static` mode the server writes `SHED_REMOTE_SOURCE_RANGES` (your public address as a `/32`) to it, or only compares when the service says its ingress is managed elsewhere. If your address changes often, set `SHED_REMOTE_FIREWALL_MODE=auto` and `SHED_REMOTE_ECHO_URLS` (two or more https echo services on different hosts, comma-separated, no spaces) so the server follows it. See [Ingress and the firewall modes](../reference/remote-backend.md#ingress-and-the-firewall-modes).
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `SHED_REMOTE_ENV` | `dev-server-up-remote` | The environment name, rendered into `remote.environment`. |
-| `SHED_GCE_PROJECT` | server, `gce-image` | The project ID. |
-| `SHED_GCE_ZONE` | server, `gce-image` | The zone every VM is created in. |
-| `SHED_GCE_NETWORK` | server, `gce-image` | The environment's network. |
-| `SHED_GCE_SUBNET` | server, `gce-image` | The environment's subnet. |
-| `SHED_GCE_TAG` | `gce-image` | The network tag the firewall rule admits; the image bake gives it to its builder VM (`SHED_GCE_BAKE_TAG` overrides). |
-| `SHED_GCE_CREDENTIALS_FILE` | server | Path to the service account key file: the JSON key or its base64, as `--key-out` writes it. `GOOGLE_CREDENTIALS_BASE64` (the key itself) is the alternative; set exactly one. |
-| `SHED_REMOTE_SSH_KEY_FILE` | server | Path to the SSH private key. `SHED_REMOTE_SSH_KEY` (base64 of the key) is the alternative; set exactly one. |
-| `SHED_REMOTE_SOURCE_RANGES` | server | The firewall rule's source ranges, comma-separated IPv4 CIDRs: what you passed as `--source-range`. The server compares the rule with it (`remote.firewall.source_ranges_env`). Not read in `auto` mode. |
+| `SHED_REMOTE_DIRECTORY_URL` | `dev-server-up-remote` | The account service's URL, rendered into `auth.directory.url`. |
+| `SHED_REMOTE_ADMIN_KEY` | `dev-server-up-remote` | The local admin's public key line. |
+| `SHED_REMOTE_TRANSPORT` | `dev-server-up-remote` | `ssh` (default) or `local` (a real agent on this host; reference service only). |
+| `SHED_REMOTE_SSH_KEY_FILE` | server | Path to the SSH private key the server logs in with. `SHED_REMOTE_SSH_KEY` (base64 of the key) is the alternative; set exactly one. Not read with `local`. |
+| `SHED_REMOTE_SOURCE_RANGES` | server | The ingress's source ranges, comma-separated IPv4 CIDRs (`remote.firewall.source_ranges_env`). Not read in `auto` mode. |
 | `SHED_REMOTE_FIREWALL_MODE` | `dev-server-up-remote` | Optional: `static` (the default) or `auto`, rendered into `remote.firewall.mode`. |
-| `SHED_REMOTE_ECHO_URLS` | `dev-server-up-remote` | For `auto` only: two or more https echo services on different hosts, comma-separated with no spaces, rendered into `remote.firewall.echo_urls`. |
+| `SHED_REMOTE_ECHO_URLS` | `dev-server-up-remote` | For `auto` only: the echo services, rendered into `remote.firewall.echo_urls`. |
 
-Keep the file mode `0600`. The server refuses to start, naming the variable, when one it needs is unset.
-
-## Baking an image
-
-A remote shed boots from an image baked by `scripts/build-gce-image.sh`. The bake boots a builder VM from stock Ubuntu 24.04, provisions and verifies it, saves its disk as an image in the family `shed-full-amd64` (or `shed-base-amd64` with `--variant base`), and deletes the builder.
-
-```bash
-set -a; . ~/.config/shed/remote-dev/env; set +a
-make gce-image GCE_IMAGE_ARGS=--print   # show every step, run nothing
-make gce-image                          # bake (the builder VM is billed while it runs)
-make test-gce-image                     # offline checks of the image tooling
-```
-
-The dev config boots the newest image of the family (`default_image: family/shed-full-amd64`, alias `cloud`). Rebake after any change to `cmd/shed-agent` or `gce/`: the server does not copy an agent into a VM (`agent_install` is not built), so a VM whose agent is incompatible fails its create with reason `layout`.
+Keep the env file mode `0600`. The server refuses to start, naming the variable, when one it needs is unset.
 
 ## Running the dev server
 
@@ -127,83 +144,82 @@ make dev-server-up-remote        # build, render the config, start
 make dev-server-status-remote    # running? reachable through the CLI?
 make dev-server-logs-remote      # follow the log
 make build && make dev-server-restart-remote   # pick up a rebuild
-make dev-server-down-remote      # stop the server; its sheds keep running
+make dev-server-down-remote      # stop the server; its sheds' machines keep running
 ```
 
-`dev-server-up-remote` refuses to start when the env file is missing or a dev server is already running. Like the other dev servers it runs under `nohup` with a PID file: no unit, no restart on crash, nothing that survives a reboot. Stopping the server does not stop or delete any VM; at its next start it lists the cloud and adopts what it finds (see [Server restarts](../reference/remote-backend.md#server-restarts)).
+`dev-server-up-remote` refuses to start when the env file is missing or a dev server is already running. Like the other dev servers it runs under `nohup` with a PID file: no unit, no restart on crash, nothing that survives a reboot. Stopping the server does not stop or delete any machine; at its next start it lists the service and adopts what it finds (see [Server restarts](../reference/remote-backend.md#server-restarts)). A server whose state directory holds records from before the account service supplied machines refuses to start; see the [upgrade guide](../upgrades/remote-compute.md#old-cloud-sheds).
 
-`SHED_REMOTE_GITHUB_USER` (a Make variable) names the GitHub account whose SSH keys may enrol a CLI. The rendered config also defines a `nocturn` service client; issue its bundle with:
+## Baking an image
+
+Against a real cloud, a machine boots from an image the service's cloud adapter can use. shed bakes the reference image for Compute Engine, the one example adapter: `scripts/build-gce-image.sh` boots a builder VM from stock Ubuntu 24.04, provisions and verifies it, saves its disk as an image in the family `shed-full-amd64` (or `shed-base-amd64` with `--variant base`), and deletes the builder. The server itself calls no cloud, so the image is the only thing this repository needs from a project.
+
+`scripts/remote/gce-setup.sh` prints the one-time `gcloud` commands the bake needs (a network, a subnet and one ingress rule for the baking machine), and runs none of them:
 
 ```bash
-bin/shed-server client issue nocturn --config ~/.shed/dev-remote/server.yaml --ttl 72h --out <file>
+scripts/remote/gce-setup.sh --print \
+  --project <project-id> \
+  --region <region> \
+  --source-range <your-public-address>/32
 ```
 
-## Registering the CLI entry
+Use a documentation address such as `203.0.113.7/32` when you only want to read the output.
 
-Once, after the first start:
+| Flag | Meaning |
+|---|---|
+| `--project` | The Google Cloud project ID. |
+| `--region` | The region of the zone the builder runs in. |
+| `--source-range` | Your machine's public address as a `/32`: the only source the firewall rule admits on port 22 of the builder. |
+| `--name` | The name of the network, subnet, firewall rule and network tag (default `shed-bake`). |
+| `--subnet-range` | The subnet range (default `10.10.0.0/24`). |
+
+Read each printed block, then run it yourself with your own gcloud sign-in. It creates no service account, role or key. Then bake:
 
 ```bash
-shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev
+export SHED_GCE_PROJECT=<project-id> SHED_GCE_ZONE=<zone> \
+       SHED_GCE_NETWORK=shed-bake SHED_GCE_SUBNET=shed-bake SHED_GCE_BAKE_TAG=shed-bake
+make gce-image GCE_IMAGE_ARGS=--print   # show every step, run nothing
+make gce-image                          # bake (the builder VM is billed while it runs)
+make test-gce-image                     # offline checks of the image tooling
 ```
 
-First contact is over SSH, so name the SSH port. The CLI enrols with the server's client CA and records an entry with the HTTPS API URL (port 18490), the pinned certificate fingerprint and a client certificate under `~/.shed/creds/remote-dev/`, which it renews when it nears expiry. Then:
-
-```bash
-shed -s remote-dev create t1
-shed -s remote-dev exec t1 -- uname -a
-ssh t1@localhost -p 12290
-shed -s remote-dev stop t1
-shed -s remote-dev start t1
-shed -s remote-dev delete t1 --force
-```
+Rebake after any change to `cmd/shed-agent` or `gce/`: the server does not copy an agent into a machine (`agent_install` is not built), so a machine whose agent is incompatible fails its create with reason `layout`.
 
 ## Checking nothing is left
 
-Before you stop for the day:
+Every shed on a real service is a billed machine. **No timer in the server deletes anything**: the account service deletes a machine at its lease's end, and a delete does it earlier. Before you stop for the day:
 
 ```bash
 shed -s remote-dev list
-gcloud compute instances list --project <project-id> --filter='labels.shed_env=<env-name>'
-gcloud compute disks list --project <project-id> --filter='labels.shed_env=<env-name>'
 ```
 
-Both `gcloud` lists must be empty once every shed is deleted. `shed delete` returns only when the VM is gone (about 30 s); a JSON `DELETE` through the API answers in about 3 s and the VM goes in the background, so it can show for a short while. A destroy that fails is retried by the server's periodic pass, which runs once a minute. A VM that should not exist can be deleted with `gcloud compute instances delete`; the server forgets its record at the next pass.
-
-Every VM also carries a maximum run duration (the larger of `remote.max_run_duration`, 24 h in the dev config, and the owning client's `max_age`), after which the cloud stops it and the shed is listed `stopped (run_limit)`. A stopped VM still bills for its disk. To see it happen, render the config with `max_run_duration: 10m`, the shortest the server accepts.
+Every row is a machine, with its lease in the `LEASE` column. Delete what you do not need (`shed -s remote-dev delete <name> --force`); `shed delete` returns only when the machine is gone. Check the service's own view of the machines too (its page, or your cloud's list filtered by the labels your adapter sets), since a machine whose record was lost is still the service's until its lease ends. Stopping the dev server stops nothing.
 
 ## Integration tests
 
-The integration suite's `[remote]` cases run only when `SHED_REMOTE_SERVER` names this entry:
+Two targets run the suite's cloud cases. Neither starts a dev server for you except where stated.
 
 ```bash
-make test-integration-remote                                          # every [remote] case
-make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"    # no VMs
+make test-integration-compute                    # no cloud: hermetic worlds, Linux only, about ten minutes
+make test-integration-compute PYTEST_ARGS="-k quotas"
+make test-integration-remote                     # the [remote] cases against the running remote dev server
+SHED_REMOTE_SERVICE=ref make test-integration-remote PYTEST_ARGS="test_remote_compute.py"
 ```
 
-The target is manual only and never starts the server for you. It sets every vz and fc server variable empty, so no other backend is touched. A full run creates about 25 VMs one after another, never more than `remote.limits.max_running` (2) at once, and takes about 42 minutes. Tests the backend cannot run (mounts, image store, guest MTU, vz/fc timing and image bakes) skip with a reason. See `tests/integration/README.md` for the list.
+`make test-integration-compute` needs no cloud and no dev server: each case starts its own reference service and a private `shed-server` from `bin/` with the local transport, and the shared `[remote]` cases run against one such world. `make test-integration-remote` is manual only and runs against `remote-dev`; against a real service every case that creates a shed creates a billed machine (see the suite's README for the counts). `SHED_REMOTE_SERVICE` (`ref` or `service`), `SHED_COMPUTE_CONTROL` and `SHED_REMOTE_RESTART` steer the cloud cases; every variable is in `tests/integration/README.md`. Cases the backend cannot run (mounts, image store, guest MTU, vz/fc timing) skip with a reason.
 
 ## Measured timings
 
-From three live runs on the dev project (`e2-standard-2`, 20 GB image, one zone). The cloud's own share varies from run to run: the provider phase of a create took between 12 and 35 s.
+Measured on a development project before the server's machines came from the account service (a direct Compute Engine provider, `e2-standard-2`, 20 GB image, one zone). They are indicative: the service adds its own few seconds, and the cloud's share varies from run to run.
 
 | Step | Seconds |
 |---|---|
-| `shed create` (streamed) | 52 to 58 usually, 81 once: provider 12 to 35, boot 33 to 43, provision 0.1 to 0.5, ready 3 |
+| `shed create` (streamed) | 52 to 58 usually, 81 once: cloud 12 to 35, boot 33 to 43, provision 0.1 to 0.5, ready 3 |
 | `shed create --repo` (a public repo) | 59.7: clone 1.4, provision 4.2 |
-| `shed create --repo` (a repository that does not exist) | 68: three clone attempts 11, then a warning and a running shed |
 | `shed exec` on a running shed | 0.22 |
-| `shed stop` (VM powered off) | 28 to 34 |
+| `shed stop` (machine powered off) | 28 to 34 |
 | `shed start` (disk and host key kept) | 42 to 54 |
-| Create refused at `max_running` | 0.3, no VM created |
+| Create refused at `max_running` | 0.3, no machine created |
 | JSON create (`POST /api/sheds`), until 201 `starting` | 11 to 15 |
-| Adopting a running VM after the record cache was removed | probe 0.6 |
-| `shed delete` (streamed) | 29 to 34, returns when the VM is gone |
-| JSON `DELETE` | 204 after about 3; VM gone after about 30 |
-| A VM stopped outside shed, until listed `stopped (external)` | 10 after the VM stopped (the pass runs once a minute) |
-| A VM deleted outside shed, until its record is gone | 2 to 12 after the VM was gone |
+| `shed delete` (streamed) | 29 to 34, returns when the machine is gone |
+| JSON `DELETE` | 204 after about 3; machine gone after about 30 |
 | `make gce-image` | 272 |
-| A create from an image with no shed agent, until `error (create_failed)` | 324 (the 5 minute wait for the agent); VM and disk gone 58 later |
-| A VM at its run limit (10 minutes), until listed `stopped (run_limit)` | 63 after the limit; `shed start` 44, with a new limit |
-| `shed delete` of a VM under deletion protection | 4, with an error; a create refused at `max_running` from 2 minutes on; VM gone 80 after the protection was cleared |
-| Firewall rule changed by hand, until creates are refused | 29 to 53 (the next pass) |
-| Auto mode: rule sources changed by hand, until patched back | 45 to 47 |

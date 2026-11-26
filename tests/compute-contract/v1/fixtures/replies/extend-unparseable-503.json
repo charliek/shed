@@ -1,0 +1,18 @@
+{
+  "name": "extend-unparseable-503",
+  "description": "503 whose body is not JSON, to an extend: the outcome is unknown.",
+  "call": "extend",
+  "replies": [
+    {
+      "status": 503,
+      "headers": {
+        "Content-Type": "text/plain"
+      },
+      "text": "upstream down"
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

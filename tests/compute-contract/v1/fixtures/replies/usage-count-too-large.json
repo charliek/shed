@@ -1,0 +1,27 @@
+{
+  "name": "usage-count-too-large",
+  "description": "Usage whose org max is above 1 000 000: invalid.",
+  "call": "usage",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "person": null,
+        "org": {
+          "machines": 0,
+          "running": 0,
+          "stopped": 0,
+          "max": 1000001
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

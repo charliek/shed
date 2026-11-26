@@ -85,7 +85,7 @@ tests they would have run, not the whole session.
 | `SHED_REMOTE_SERVER`   | _unset_                                            | Entry name for a shed-server running `default_backend: remote`. When unset every `[remote]` case skips. Set by `make test-integration-remote` (default `remote-dev`). |
 | `SHED_REMOTE_LOG_PATH` | `~/.shed/dev-remote/server.log`                    | Local file the remote dev server logs to (its PhaseTimer lines). Set by `make test-integration-remote`. |
 | `SHED_REMOTE_IMAGE`    | _unset_                                            | Image alias every `[remote]` create asks for. Unset, creates boot the server's `remote.default_image` (the vz/fc names `base` and `full` do not exist on a remote server). |
-| `SHED_REMOTE_MAX_RUNNING` | `2`                                             | The server's `remote.limits.max_running`, for `test_remote_lifecycle.py::test_create_past_running_limit_is_refused`. |
+| `SHED_REMOTE_MAX_RUNNING` | _unset_                                         | The server's `remote.limits.max_running`, for `test_remote_lifecycle.py::test_create_past_running_limit_is_refused`; unset, it is read from the rendered dev config, and the case skips when no limit is set. |
 | `SHED_IMAGE_HAS_HOME_DIRS` | _unset_                                            | Gates `test_smoke.py::test_home_dirs_owned_by_shed` — a comma list of the backends (`vz`, `fc`) whose `base` image was rebuilt with the shed-owned `~/.local`, `~/.config` and `~/.cache` dirs (#410). `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images carry these dirs only from the 0.9.1 tag). |
 | `SHED_IMAGE_HAS_DELIVERY` | _unset_                                         | Gates the cases of `test_delivery.py` that need this branch's agent, `test_delivery.py::test_delivery_image_baked`, and `test_smoke.py::test_base_image_smoke` / `test_full_image_smoke` (the two variants: roost-session and craze in `base`, strix/prox/parcel/envsecrets in `full` only, and none of the retired credential helpers) — a comma list of the backends (`vz`, `fc`, `remote`) whose image was rebuilt with this branch's agent protocol 2, the two variants and parcel/envsecrets. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc`, `test-integration-remote` sets `remote`; unset for plain `test-integration` (published images have none of it). A listed backend whose dev store has no `base` or `full` image FAILS the image tests rather than skipping them. |
 | `SHED_PROVISION_REF`   | `bin/test/shed-provision-ref`                      | The provision contract's reference source, which `test_delivery.py` runs as the itest users' machine (`make provision-ref` builds it). |
@@ -95,11 +95,18 @@ tests they would have run, not the whole session.
 | `SHED_ITEST_DIRECTORY_LOG` | _unset_                                        | The file that reference server's standard error goes to: `test_delivery_hosted.py` counts its `delivery call` and token-request lines. Unset, the writing hosted-delivery cases skip. |
 | `SHED_HOSTED_V011_SHED` | _unset_                                           | A shed `itest-alice` made on a v0.11 server binary before the server was upgraded to this build (same state): `test_delivery_hosted.py`'s case 8 lists it and delivers to it. Unset, that case skips. |
 | `SHED_VZ_DEV_AUDIT_LOG`, `SHED_VZ_DEV_STATE_DIRS`, `SHED_FC_DEV_AUDIT_LOG`, `SHED_FC_DEV_STATE_DIRS`, `SHED_REMOTE_AUDIT_LOG`, `SHED_REMOTE_STATE_DIRS`, `SHED_REMOTE_DEV_DIR` | the dev servers' own | Where `test_delivery.py`'s sentinel sweep reads each dev server's audit log and state directories (comma lists). Defaults: the Mac dev server's directory above `vz.instance_dir` and its `state_dir`; `/var/lib/shed-dev/firecracker/audit.jsonl`, its directory and the `state` directory beside it (on `SHED_FC_HOST`); `~/.shed/dev-remote/remote` and `state`. |
-| `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
+| `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself, and `[remote]` takes its people from the account service. `test-integration-dev-fc` sets it from `SHED_DEV_USERS`. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
 | `SHED_ITEST_SOURCE`    | `config`                                           | Where the users cases' server takes its users from: `config` (`auth.users`) or `directory` (an account service; the run started the server with `render-directory`'s auth block). See [Named users](#named-users-authusers). |
 | `SHED_DIRECTORY_ITEST` | _unset_                                            | `1` runs `test_directory.py` and the local cases of `test_delivery_hosted.py`; set, with `SHED_BIN_DIR` (the built `bin/`), by `make test-integration-directory` only. Unset, they skip. |
-| `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the itest user list and tells `test-integration-dev-fc`/`-remote` so; empty means no user list (one implicit user). |
+| `SHED_COMPUTE_ITEST`   | _unset_                                            | `1` runs the `[hermetic]` cases of `test_remote_compute.py`; set, with `SHED_BIN_DIR`, by `make test-integration-compute` only. Unset, they skip. |
+| `SHED_REMOTE_HERMETIC` | _unset_                                            | `1` makes the `[remote]` server one compute world for the session (no cloud), for the shared `[remote]` cases; set by `make test-integration-compute` only. |
+| `SHED_REMOTE_SERVICE`  | _unset_                                            | The account service the remote dev server is enrolled with, for the `[remote]` cases of `test_remote_compute.py`: `ref` (the reference service) or `service` (a local account service). Unset, they skip. See [Cloud sheds from the account service](#cloud-sheds-from-the-account-service-test_remote_computepy). |
+| `SHED_COMPUTE_CONTROL` | _unset_                                            | A hook (an executable and its first arguments) that steers a local account service for `test_remote_compute.py`: `policy KEY=VALUE...`, `policy-reset`, `stop`, `start`, and `machines` (print the shed id of every machine the service holds for this server, one a line). Unset, the cases that need it skip, and the clean-up says it could not confirm the machines are gone. |
+| `SHED_COMPUTE_REF_DIR`, `SHED_COMPUTE_REF_SERVER` | `~/.shed/dev-remote/ref`, the config's `name` | The reference service's directory (its `control/` and `ref.log`, as `make dev-compute-ref-up` makes them) and the name the dev server is enrolled under. |
+| `SHED_COMPUTE_CLIENT`, `SHED_REMOTE_CONFIG`, `SHED_SERVER_BIN` | `nocturn`, `~/.shed/dev-remote/server.yaml`, `bin/shed-server` | The service client the compute cases act as, the rendered config its bundle is issued from, and the binary that issues it. |
+| `SHED_REMOTE_RESTART`  | _unset_                                            | A shell command that restarts the remote dev server (e.g. `make -C <repo> dev-server-restart-remote`), for the degraded-start case of `test_remote_compute.py`. Unset, that case skips. |
+| `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the Mac and FC dev servers (`dev-server-up`, `-up-fc` and their restarts) with the itest user list and tells `test-integration-dev-fc` so; empty means no user list (one implicit user). The remote dev server refuses it: its people come from the account service. |
 
 ## Fixtures
 
@@ -157,6 +164,7 @@ tests/integration/
   test_users_upgrade.py   # sheds with no user: the upgrade step, shed assign (Mac dev server)
   test_source_pin.py      # the pin: one machine per user answers credential requests (users_env)
   test_directory.py       # users from an account service, self-managed (make test-integration-directory)
+  test_remote_compute.py  # cloud sheds from the account service: [remote] and [hermetic] (make test-integration-compute)
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
@@ -562,8 +570,11 @@ scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-us
 
 # The dev targets do it with SHED_DEV_USERS=itest, and tell the suite:
 SHED_DEV_USERS=itest make dev-server-restart-fc && SHED_DEV_USERS=itest make test-integration-dev-fc
-SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make test-integration-remote PYTEST_ARGS=test_users.py
 ```
+
+The remote dev server takes no user list (it refuses `SHED_DEV_USERS=itest`):
+its people come from the account service it is enrolled with, so the itest
+people are listed there (see [Cloud sheds from the account service](#cloud-sheds-from-the-account-service-test_remote_computepy)).
 
 **Which server each backend uses** (`users_env` in `conftest.py`):
 
@@ -571,7 +582,7 @@ SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make
 |---|---|---|
 | `[vz]` | the Mac dev server | nothing: the module restarts it with the user list through `dev_config()` and restores the committed base afterwards (always: other modules' `dev_config()` calls restore the base too, so a list the server was started with would be gone by then). The developer's credential source bindings are kept aside for the detour and put back (see "Reconfiguring the Mac dev server" above) |
 | `[fc]` | `$SHED_FC_DEV_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=fc`; skips saying so otherwise |
-| `[remote]` | `$SHED_REMOTE_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=remote`; skips saying so otherwise |
+| `[remote]` | `$SHED_REMOTE_SERVER` | the itest people on its account service's list (its users come from `auth.directory`; no `SHED_ITEST_USERS`) |
 
 To run only the users cases against an FC dev server started by hand (for
 example from a config rendered with `--users`):
@@ -965,6 +976,94 @@ Two remote-only modules:
 Snapshot, reset and egress-profile behaviour has no `shed_server` case to
 skip: those modules use the vz/fc dev fixtures and never reach a remote
 server.
+
+Since plan 041 a remote server's machines come from the account service,
+and its local admins (the developer's own entry, `dev`) create none: a
+create as `dev` is 422 `COMPUTE_POLICY_REFUSED` with reason `person`. On
+such a server (`/api/info` lists `lease`) the shared `[remote]` cases above
+and `test_remote_lifecycle.py` act as the service's person `itest-alice`
+(conftest's `remote_person`: an identity of her own, with the itest key,
+through `CloudServer.as_person`); she must be on the service's list (against
+the reference service, `SHED_REMOTE_SERVICE=ref`, the run lists her). The
+users cases take the directory source there. `test_delivery.py`'s `[remote]`
+cases skip on such a server, since its people's credentials come from the
+account service (plan 040: `test_delivery_hosted.py`), and
+`test_remote_lifecycle.py`'s limit case runs only where
+`remote.limits.max_running` is set (the rendered dev config, or
+`SHED_REMOTE_MAX_RUNNING`). `test_remote_refusals.py` covers what plan 041
+added: the local admin's create is refused for `person`, `lease` from anyone
+but a service client is 422 `FEATURE_UNSUPPORTED`, an extend outside 1 to
+720 hours is 400 and of a missing shed 404, and a local admin's cloud usage
+is the organization's alone.
+
+`make test-integration-compute` runs these shared `[remote]` cases with no
+cloud too (`SHED_REMOTE_HERMETIC=1`): against one compute world for the
+session, with the local link, as `itest-alice`. A case that needs a real
+guest (the shed user's `/home/shed`, `sudo` in the guest) carries
+`@pytest.mark.real_guest(reason)` and skips there with the reason.
+
+## Cloud sheds from the account service (`test_remote_compute.py`)
+
+Plan 041's seven cases: create, list, stop, start and delete; extend; a
+lease ending; quotas and usage; the lease banner; a service client's lease
+and the local admin's create; the service down. Each acts as the service's
+people `itest-alice` and `itest-bob`, the server's local admin and its
+registered service client. Two parameters:
+
+- **`[hermetic]`**, no cloud: each case starts its own reference service
+  (directory and compute) and a private `shed-server` from `bin/` with
+  `remote.provider: service` and the local link (a machine is a shed-agent
+  on this host), on loopback (`fixtures/directory.py`: `compute_world`).
+  The server reaches the service through a relay the case can take down and
+  bring back, the service's state kept (`fixtures/compute.py`:
+  `ServiceGate`), so the service-down case runs here too. Linux only, not
+  in CI. The same target runs the shared `[remote]` cases against one such
+  world (see [Remote backend](#remote-backend-cloud-sheds)); about twelve
+  minutes in all:
+
+  ```sh
+  make test-integration-compute
+  make test-integration-compute PYTEST_ARGS="-k quotas"
+  make test-integration-compute COMPUTE_ITEST_FILES=test_remote_compute.py
+  ```
+
+- **`[remote]`**, the remote dev server (`make test-integration-remote`
+  with `SHED_REMOTE_SERVICE`). Against the reference service
+  (`SHED_REMOTE_SERVICE=ref`, `make dev-compute-ref-up`, the dev server with
+  `SHED_REMOTE_TRANSPORT=local`) the cases list the itest people in its
+  `users.json`, register the client and steer it through `compute.json`;
+  the quota case fills the quotas there and then raises the limits by what
+  it filled; the service-down cases skip (the reference service keeps its
+  state in its process; the hermetic run is their run). Against a local
+  account service (`SHED_REMOTE_SERVICE=service`) the itest people
+  (`itest-alice`, `itest-bob`, `itest-admin`, with the keys of
+  `SHED_ITEST_USERS_DIR`) must be on its list, the client registered for
+  the server and compute allowed; the cases that change its policy or stop
+  it need `SHED_COMPUTE_CONTROL`, and the quota case runs when the policy is
+  1 per person and 2 per organization (set through the hook, or already in
+  force):
+
+  ```sh
+  SHED_REMOTE_SERVICE=ref make test-integration-remote PYTEST_ARGS="test_remote_compute.py"
+  SHED_REMOTE_SERVICE=service SHED_COMPUTE_CONTROL=/path/to/hook \
+    SHED_REMOTE_RESTART="make -C $PWD dev-server-restart-remote" \
+    make test-integration-remote PYTEST_ARGS="test_remote_compute.py"
+  ```
+
+  The clean-up confirms by shed id, from the service itself: every listed
+  shed the module made must delete, then every machine it made (by its shed
+  id) must be gone from the service's inventory (the reference service's
+  `inventory.json`, which `make dev-compute-ref-up` has it write; the hook's
+  `machines`), polled for five minutes, else the module fails naming each.
+  Every clean-up step is tried, and every failure reported together. For a
+  run against a real cloud, the cloud's own inventories, taken before and
+  after the run (plan 041 §7.4), stay the authority.
+
+  Against a real cloud every create is a billed machine. The cases share
+  two machines for the module (alice's shed and the client's, deleted at its
+  end) and case 3 makes a pair with a ten-minute lease: four in a full run,
+  at most four at once (refused creates make none). The module prints the
+  number it made at its end.
 
 ## Orchestrated sheds: exec, service clients, mounts, network profiles
 

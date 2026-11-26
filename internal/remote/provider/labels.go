@@ -3,201 +3,77 @@ package provider
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 )
 
-// Label keys. Labels are how a server finds its sheds again after a restart
-// or a move, so they are the record of which sheds exist. Keys and values are
-// at most 63 characters of lowercase letters, digits, "_" and "-".
+// Working labels: what the server writes on a machine to remember where its
+// shed is in its life. Who the machine is (its shed id, name and owner) is
+// not a label: those are the machine's own members, fixed at create.
 const (
-	// LabelSchema is the version of this label set: SchemaVersion. An
-	// instance with another value is reported and never touched.
-	LabelSchema = "shed_schema"
-	// LabelEnv is the environment (one server's named slice of a project).
-	// A server acts only on instances that carry its own.
-	LabelEnv = "shed_env"
-	// LabelID is the shed's permanent ID.
-	LabelID = "shed_id"
-	// LabelName is the shed's name.
-	LabelName = "shed_name"
-	// LabelOwner is the service client that owns the shed, or the empty
-	// string for a shed an admin created. The label is always present.
-	LabelOwner = "shed_owner"
-	// LabelUser is the person the shed belongs to, or the empty string for
-	// the implicit user (a server with no user list). It was added to
-	// SchemaVersion "1" without changing it, so an instance labelled
-	// before it existed carries no such key: absent means no user, the
-	// same as empty. The server writes it on every new instance. A shed
-	// never carries both a non-empty owner and a non-empty user.
-	LabelUser = "shed_user"
-	// LabelUserOrigin is where the shed's user came from when the shed was
-	// made (or given its user): "local" or "directory" (plan 040, section
-	// 3.2). Added to SchemaVersion "1" without changing it: an instance
-	// labelled before it carries none, and absent means not known. It is the
-	// durable evidence a server adopting the instance recovers the shed's
-	// origin from; it is never inferred from the configuration of the day.
-	LabelUserOrigin = "shed_user_origin"
-	// LabelState is the lifecycle marker; see ShedState. It is on the
-	// instance only, not its disk.
+	// LabelState is the lifecycle marker; see ShedState.
 	LabelState = "shed_state"
 	// LabelLayout is the guest layout the agent reported, as a decimal
 	// integer. The server writes it in the same SetLabels call that sets
-	// shed_state=ready; before that the label is absent. It is on the
-	// instance only.
+	// shed_state=ready; before that the label is absent.
 	LabelLayout = "shed_layout"
-
-	// SchemaVersion is the only LabelSchema value this build understands.
-	SchemaVersion = "1"
 )
 
-// DiskLabelKeys are the labels a provider copies from Spec.Labels to the
-// boot disk at create, so a disk that outlives its instance can be traced.
-//
-// A disk is labelled once, at create, so the disk of an instance made before
-// LabelUser existed carries no user label, and nothing adds one later.
-var DiskLabelKeys = []string{LabelSchema, LabelEnv, LabelID, LabelName, LabelOwner, LabelUser}
+// ReservedLabels are labels no server writes and no provider returns: their
+// facts are the machine's own members (its shed id, name, server and owner).
+var ReservedLabels = []string{"shed_schema", "shed_env", "shed_id", "shed_name", "shed_owner", "shed_user", "shed_user_origin"}
+
+// MaxLabels is the most labels a machine holds.
+const MaxLabels = 32
 
 // ShedState is the value of LabelState.
 type ShedState string
 
 const (
-	// ShedStateCreating is set by Create. The instance is not a usable
-	// shed yet: the host key is not pinned or the agent has not answered.
-	// The start-up and periodic passes destroy a creating instance that
-	// is over 15 minutes old and has no local record (remote.StaleCreateAge).
+	// ShedStateCreating is set by Create. The machine is not a usable shed
+	// yet: the host key is not pinned or the agent has not answered. The
+	// start-up and periodic passes destroy a creating machine that is over
+	// 15 minutes old and has no local record (remote.StaleCreateAge).
 	ShedStateCreating ShedState = "creating"
-	// ShedStateReady is set by the backend once the host key pin is
-	// written and read back and the agent has answered a probe. It is
-	// never set back to creating. Reconcile never deletes a ready
-	// instance.
+	// ShedStateReady is set by the backend once the host key is pinned and
+	// the agent has answered a probe. It is never set back to creating.
+	// Reconcile never deletes a ready machine.
 	ShedStateReady ShedState = "ready"
 	// ShedStateDeleting is set by the backend before a delete is
-	// acknowledged to the client. Reconcile destroys a deleting instance
+	// acknowledged to the client. Reconcile destroys a deleting machine
 	// whenever it sees one.
 	ShedStateDeleting ShedState = "deleting"
 )
 
 var (
-	envRegex    = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,18}[a-z0-9])?$`)
-	shedIDRegex = regexp.MustCompile(`^[a-z0-9]{8,32}$`)
-	labelRegex  = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
+	shedIDRegex   = regexp.MustCompile(`^[a-z2-7]{26}$`)
+	shedNameRegex = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	handleRegex   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	labelKeyRegex = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	labelValRegex = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
 )
 
-// ValidEnv reports whether s is a legal environment name: 1 to 20 characters,
-// lowercase letters, digits and hyphens, starting with a letter and not
-// ending with a hyphen.
-func ValidEnv(s string) bool { return envRegex.MatchString(s) }
-
-// ValidShedID reports whether s is a legal shed ID: 8 to 32 lowercase letters
-// and digits. The server mints 26 (16 random bytes in lowercase base32).
+// ValidShedID reports whether s is a shed id as the server mints it and the
+// compute contract names a machine: 26 lower-case base32 characters.
 func ValidShedID(s string) bool { return shedIDRegex.MatchString(s) }
 
+// ValidShedName reports whether s may be a machine's name.
+func ValidShedName(s string) bool { return shedNameRegex.MatchString(s) }
+
+// ValidHandle reports whether s may be a machine's user or client.
+func ValidHandle(s string) bool { return handleRegex.MatchString(s) }
+
+// ValidLabelKey reports whether s may be a label key (reserved or not).
+func ValidLabelKey(s string) bool { return labelKeyRegex.MatchString(s) }
+
 // ValidLabelValue reports whether s may be a label value.
-func ValidLabelValue(s string) bool { return labelRegex.MatchString(s) }
-
-// InstanceName returns the cloud name of a shed's instance:
-// "shed-<env>-<id>", at most 58 characters.
-func InstanceName(env, id string) string { return "shed-" + env + "-" + id }
-
-// NetworkTag returns the network tag every instance of an environment
-// carries: "shed-<env>". The environment's firewall rule targets it.
-func NetworkTag(env string) string { return "shed-" + env }
-
-// FirewallRuleName returns the name of an environment's one ingress rule:
-// "shed-<env>-ssh". The setup script creates it; the server never creates or
-// deletes it.
-func FirewallRuleName(env string) string { return "shed-" + env + "-ssh" }
-
-// Identity is who a shed is, as its labels carry it.
-type Identity struct {
-	// Env is the environment that owns the shed.
-	Env string
-	// ID is the permanent shed ID.
-	ID string
-	// Name is the shed name. A name is unique among an environment's
-	// sheds; the ID is what tells a recreated shed from the one before.
-	Name string
-	// Owner is the owning service client, or "" for an admin's shed.
-	Owner string
-	// User is the person the shed belongs to, or "" for the implicit
-	// user. Read from LabelUser; an instance without that label has none.
-	User string
-	// UserOrigin is LabelUserOrigin: "local", "directory", or "" when the
-	// instance carries none (or another value): not known.
-	UserOrigin string
-}
-
-// Validate checks that every field can be a label and that the instance name
-// fits.
-func (i Identity) Validate() error {
-	switch {
-	case !ValidEnv(i.Env):
-		return Errorf(ErrInvalid, "", "environment %q is not a valid name", i.Env)
-	case !ValidShedID(i.ID):
-		return Errorf(ErrInvalid, "", "shed id %q is not valid", i.ID)
-	case i.Name == "" || !ValidLabelValue(i.Name):
-		return Errorf(ErrInvalid, "", "shed name %q cannot be a label", i.Name)
-	case !ValidLabelValue(i.Owner):
-		return Errorf(ErrInvalid, "", "owner %q cannot be a label", i.Owner)
-	case !ValidLabelValue(i.User):
-		return Errorf(ErrInvalid, "", "user %q cannot be a label", i.User)
-	case i.UserOrigin != "" && !ValidUserOrigin(i.UserOrigin):
-		return Errorf(ErrInvalid, "", "user origin %q is not local or directory", i.UserOrigin)
-	}
-	return nil
-}
-
-// ValidUserOrigin reports whether s is a LabelUserOrigin value.
-func ValidUserOrigin(s string) bool { return s == "local" || s == "directory" }
-
-// InstanceName returns the cloud name for this shed's instance.
-func (i Identity) InstanceName() string { return InstanceName(i.Env, i.ID) }
-
-// Labels returns the label set for an instance in the given lifecycle state.
-// It holds every key but LabelLayout.
-func (i Identity) Labels(state ShedState) map[string]string {
-	l := map[string]string{
-		LabelSchema: SchemaVersion,
-		LabelEnv:    i.Env,
-		LabelID:     i.ID,
-		LabelName:   i.Name,
-		LabelOwner:  i.Owner,
-		LabelUser:   i.User,
-		LabelState:  string(state),
-	}
-	if i.UserOrigin != "" {
-		l[LabelUserOrigin] = i.UserOrigin
-	}
-	return l
-}
-
-// IdentityFromLabels reads an Identity back from an instance's labels. It
-// fails with ErrInvalid when the schema is missing or not SchemaVersion, or
-// when the environment, ID or name is missing or malformed. Reconcile reports
-// such an instance and leaves it alone.
-func IdentityFromLabels(labels map[string]string) (Identity, error) {
-	if got := labels[LabelSchema]; got != SchemaVersion {
-		return Identity{}, Errorf(ErrInvalid, "", "label %s is %q, want %q", LabelSchema, got, SchemaVersion)
-	}
-	id := Identity{
-		Env:   labels[LabelEnv],
-		ID:    labels[LabelID],
-		Name:  labels[LabelName],
-		Owner: labels[LabelOwner],
-		User:  labels[LabelUser],
-	}
-	// Only a known value is evidence; any other reads as not known.
-	if o := labels[LabelUserOrigin]; ValidUserOrigin(o) {
-		id.UserOrigin = o
-	}
-	if err := id.Validate(); err != nil {
-		return Identity{}, err
-	}
-	return id, nil
-}
+func ValidLabelValue(s string) bool { return labelValRegex.MatchString(s) }
 
 // LayoutLabel formats a guest layout number as a LabelLayout value.
 func LayoutLabel(layout int) string { return strconv.Itoa(layout) }
+
+// Str returns a pointer to s, for a SetLabels value.
+func Str(s string) *string { return &s }
 
 func parseLayout(s string) int {
 	n, err := strconv.Atoi(s)
@@ -207,14 +83,39 @@ func parseLayout(s string) int {
 	return n
 }
 
-// checkLabels verifies that every key and value in a label map is legal.
-func checkLabels(labels map[string]string) error {
+// CheckLabels verifies that every key and value of a label write is legal
+// and that no key is reserved. A nil value (a removal, or "must be absent")
+// is legal.
+func CheckLabels(labels map[string]*string) error {
 	for k, v := range labels {
-		if k == "" || !ValidLabelValue(k) || k[0] < 'a' || k[0] > 'z' {
-			return fmt.Errorf("label key %q is not valid", k)
+		if err := checkLabel(k, v); err != nil {
+			return err
 		}
-		if !ValidLabelValue(v) {
-			return fmt.Errorf("label %s has an invalid value %q", k, v)
+	}
+	return nil
+}
+
+func checkLabel(k string, v *string) error {
+	if slices.Contains(ReservedLabels, k) {
+		return fmt.Errorf("label %s is reserved", k)
+	}
+	if !ValidLabelKey(k) {
+		return fmt.Errorf("label key %q is not valid", k)
+	}
+	if v != nil && !ValidLabelValue(*v) {
+		return fmt.Errorf("label %s has an invalid value %q", k, *v)
+	}
+	return nil
+}
+
+// checkLabelMap is CheckLabels for a map of values.
+func checkLabelMap(labels map[string]string) error {
+	if len(labels) > MaxLabels {
+		return fmt.Errorf("%d labels, over %d", len(labels), MaxLabels)
+	}
+	for k, v := range labels {
+		if err := checkLabel(k, &v); err != nil {
+			return err
 		}
 	}
 	return nil

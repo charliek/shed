@@ -27,6 +27,7 @@ import (
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/remote/provider/service"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/sshd"
@@ -249,6 +250,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return cfg.UserOrigin(user) == delivery.OriginDirectory
 	})
 
+	// On a directory server the directory runtime (its client and token
+	// caches) is built now, before the backend: a remote backend whose
+	// machines come from the account service needs its compute token for
+	// the start-up pass's first list (S0 ruling 2). Its pulls start later,
+	// once the SSH server exists.
+	stateDir := serverStateDir(cfg)
+	var dirRuntime *directory.Runtime
+	if cfg.DirectoryConfigured() {
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return fmt.Errorf("state dir %s: %w", stateDir, err)
+		}
+		rt, err := newDirectoryUsers(cfg, stateDir)
+		if err != nil {
+			return fmt.Errorf("ssh auth: %w", err)
+		}
+		dirRuntime = rt
+	}
+
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
 	// place its control socket next to the active backend's sockets and hand
@@ -265,9 +284,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// metadata and starts their presence check (Firecracker only; nil
 	// otherwise). It runs before the resume walk and the listeners.
 	var startNetPolicy func(context.Context)
-	// waitBackendReady blocks until the backend may serve shed routes
-	// (remote only: its first complete list of the cloud; nil otherwise).
+	// waitBackendReady blocks until the backend's first complete list of
+	// its machines (remote only; nil otherwise), or until it finds a reason
+	// the server must not run: past backendReadyTimeout the server starts
+	// degraded and the start-up steps that need the list run when it
+	// arrives.
 	var waitBackendReady func(context.Context) error
+	// auditLog is the server's audit log (openAuditLog; nil when audit is
+	// off), and auditOpened says it has been opened. The remote backend's
+	// is opened before the backend is built: its start-up pass drops the
+	// sheds whose machines the account service deleted while the server
+	// was stopped, and records each one there. Every other backend's is
+	// opened below, before the front doors.
+	var auditLog *audit.Log
+	auditOpened := false
 	// releaseResumes lets the creates the start-up pass resumed run their
 	// delivery steps, once the origin migration has run (remote only; a
 	// no-op otherwise).
@@ -311,22 +341,34 @@ func runServe(cmd *cobra.Command, args []string) error {
 		resumeChannels = vzClient.ResumeRunningInstances
 
 	case config.BackendRemote:
-		rb, err := newRemoteBackend(cfg, pluginBridge)
+		var session service.Session
+		if dirRuntime != nil {
+			session = dirRuntime
+		}
+		// Egress control is refused on remote at load, so these two are
+		// never used; they are set so nothing below sees an empty path.
+		egressSocketDir = cfg.Remote.StateDirPath(serverStateDir(cfg))
+		egressStateDir = egressSocketDir
+		l, err := openRemoteAuditLog(cfg, egressStateDir, log.Printf)
 		if err != nil {
 			return err
 		}
-		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
-			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
+		if l != nil {
+			// Closed after the backend (deferred before be.Close).
+			defer func() { _ = l.Close() }()
+		}
+		auditLog, auditOpened = l, true
+		rb, err := newRemoteBackend(cfg, pluginBridge, session, auditLog)
+		if err != nil {
+			return err
+		}
+		log.Printf("Initialized remote backend (provider=%s, transport=%s)", cfg.Remote.Provider, cfg.Remote.Transport)
 		rb.SetDelivery(deliveryService)
 		// Creates resumed by the start-up pass wait for the origin
 		// migration below (stampUserOrigins).
 		rb.HoldResumes()
 		releaseResumes = rb.ReleaseResumes
 		be = rb
-		// Egress control is refused on remote at load, so these two are
-		// never used; they are set so nothing below sees an empty path.
-		egressSocketDir = cfg.Remote.StateDirPath(serverStateDir(cfg))
-		egressStateDir = egressSocketDir
 		// The start-up pass lists the cloud, repairs the record cache and
 		// resumes the jobs and message channels a previous server left.
 		resumeChannels = rb.Reconcile
@@ -393,24 +435,56 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
+	// backendFatal carries a reason the server must not run that the
+	// backend finds after a degraded start (the front doors are serving by
+	// then): it ends serve as a failed listener does.
+	backendFatal := make(chan error, 1)
 	log.Printf("Resuming message channels for already-running sheds in the background")
 	go resumeChannels(resumeCtx)
 	if waitBackendReady != nil {
-		// Shed routes may be served only after the backend's first
-		// complete list of the cloud, so the listeners wait for it.
-		log.Printf("Waiting up to %s for the %s backend's first cloud list", backendReadyTimeout, cfg.DefaultBackend)
+		// The backend's first complete list of its machines rebuilds the
+		// records the start-up steps below act on. The listeners wait for it
+		// a bounded time; past that the server starts degraded (reads from
+		// the records, existing links, every call that needs the service
+		// refused) and the steps run once the list arrives.
+		log.Printf("Waiting up to %s for the %s backend's first list of its machines", backendReadyTimeout, cfg.DefaultBackend)
 		readyCtx, cancelReady := context.WithTimeout(context.Background(), backendReadyTimeout)
 		err := waitBackendReady(readyCtx)
+		// Only the wait's own time running out is a degraded start; read
+		// before cancelReady, which would end the context in every case.
+		timedOut := errors.Is(err, context.DeadlineExceeded)
 		cancelReady()
-		if err != nil {
-			return err
-		}
-		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
+		switch {
+		case err == nil:
+			if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
+				releaseResumes()
+				return err
+			}
+			stampUserOrigins(cfg, be)
 			releaseResumes()
+		case !timedOut:
+			// The start-up pass found a reason the server must not run.
 			return err
+		default:
+			log.Printf("WARNING: the account service did not give the %s backend a complete list of its machines within %s; starting degraded: sheds are listed from the records and existing sessions keep working, and creates, starts, stops, deletes and extends answer 503 %s until it does (the list is retried every few seconds)",
+				cfg.DefaultBackend, backendReadyTimeout, config.ErrComputeUnavailable)
+			go func() {
+				// Ready, or a reason the server must not run (the start-up
+				// pass that ran once the service answered found one).
+				if err := waitBackendReady(resumeCtx); err != nil {
+					if resumeCtx.Err() == nil {
+						backendFatal <- err
+					}
+					return
+				}
+				log.Printf("The %s backend has its first list of its machines; leaving degraded mode", cfg.DefaultBackend)
+				if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
+					log.Printf("ERROR: the one-time user list step after a degraded start: %v", err)
+				}
+				stampUserOrigins(cfg, be)
+				releaseResumes()
+			}()
 		}
-		stampUserOrigins(cfg, be)
-		releaseResumes()
 	}
 
 	reportReservedSheds(be)
@@ -483,7 +557,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// server and the mtls API ask it. GitHub-seeded keys are cached next to
 	// the host key. Fails closed (returns an error) when mode=enforce but no
 	// keys resolved.
-	stateDir := serverStateDir(cfg)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return fmt.Errorf("state dir %s: %w", stateDir, err)
 	}
@@ -494,8 +567,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// shutdown so a fetch in flight ends then.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
-	userLookup, err := newUserLookup(refreshCtx, cfg, stateDir)
-	if err != nil {
+	var userLookup userSource
+	if dirRuntime != nil {
+		userLookup = dirRuntime
+	} else if userLookup, err = newUserLookup(refreshCtx, cfg, stateDir); err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
 	log.Printf("SSH auth mode: %s", userLookup.Mode())
@@ -577,12 +652,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// directory (openAuditLog). Once serving, runFrontDoors closes it, after
 	// every server has drained; this close (a no-op then) is for a return
 	// before that.
-	auditLog, err := openAuditLog(cfg, egressStateDir, log.Printf)
-	if err != nil {
-		return err
-	}
-	if auditLog != nil {
-		defer func() { _ = auditLog.Close() }()
+	if !auditOpened {
+		auditLog, err = openAuditLog(cfg, egressStateDir, log.Printf)
+		if err != nil {
+			return err
+		}
+		if auditLog != nil {
+			defer func() { _ = auditLog.Close() }()
+		}
 	}
 
 	// Initialize HTTP API server
@@ -691,6 +768,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
 		},
 		timeout: shutdownTimeout,
+		fatal:   backendFatal,
 	}, sigChan)
 }
 
@@ -769,6 +847,9 @@ type frontDoors struct {
 	stopping func(shutdownServers func())
 	// timeout bounds the servers' shutdown.
 	timeout time.Duration
+	// fatal, when set, carries a reason the server must not run found
+	// after the doors opened; it ends serve like a door's failure.
+	fatal <-chan error
 }
 
 // runFrontDoors hands the audit log to both front doors (attachAuditLog),
@@ -819,6 +900,9 @@ func runFrontDoors(fd frontDoors, signals <-chan os.Signal) error {
 	case serveErr = <-errChan:
 		log.Printf("Server error: %v", serveErr)
 		log.Printf("Shutting down the other servers after the error...")
+	case serveErr = <-fd.fatal:
+		log.Printf("ERROR: %v", serveErr)
+		log.Printf("Shutting down: the server must not run")
 	}
 
 	closeEntryGates(fd.api, fd.ssh)
@@ -1204,6 +1288,19 @@ func openAuditLog(cfg *config.ServerConfig, dir string, logf func(format string,
 	}
 	logf("Audit log: %s", path)
 	return l, nil
+}
+
+// openRemoteAuditLog is openAuditLog for the remote backend, which opens it
+// before the backend is built (so the start-up pass records the sheds it
+// drops): the backend's state directory, which the backend's store would
+// create, is created first, owner-only as the store makes it.
+func openRemoteAuditLog(cfg *config.ServerConfig, dir string, logf func(format string, args ...any)) (*audit.Log, error) {
+	if cfg.AuditEnabled() {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("remote backend: state directory %s: %w", dir, err)
+		}
+	}
+	return openAuditLog(cfg, dir, logf)
 }
 
 // attachAuditLog hands the one audit log to both front doors: the API server

@@ -3,19 +3,19 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Error kinds. Test for them with errors.Is; providers return them wrapped in
 // an *Error that says which call failed and why.
 var (
-	// ErrNotFound: the instance (or, for HostKeyReader, the published key)
-	// does not exist. Destroy never returns it: there, not found is
-	// success.
-	ErrNotFound = errors.New("instance not found")
+	// ErrNotFound: the machine (or the operation) does not exist. Destroy
+	// never returns it: there, not found is success.
+	ErrNotFound = errors.New("machine not found")
 
-	// ErrExists: Create's instance name is taken by an instance with a
-	// different shed_id.
-	ErrExists = errors.New("instance name already in use")
+	// ErrExists: Create's name is held by another machine of this server
+	// (another shed id).
+	ErrExists = errors.New("machine name already in use")
 
 	// ErrQuota: the cloud refused because the project is at a quota (CPUs,
 	// addresses, disk). Retrying soon will not help; someone must free
@@ -35,28 +35,96 @@ var (
 	// SERVER_LIMIT_REACHED.
 	ErrLimit = errors.New("server limit reached")
 
-	// ErrBusy: the instance is in a transition that does not allow this
+	// ErrBusy: the machine is in a transition that does not allow this
 	// call. Nothing was changed. The caller waits for the transition with
 	// Wait(ctx, Settle(ref)) and calls again.
-	ErrBusy = errors.New("instance is busy with another operation")
+	ErrBusy = errors.New("machine is busy with another operation")
 
-	// ErrForeign: the instance's shed_env label names another environment.
-	// Nothing was changed. This is the guard that keeps one server off
-	// another server's sheds.
-	ErrForeign = errors.New("instance belongs to another environment")
-
-	// ErrInvalid: the request is malformed (a bad spec, a label that
-	// cannot be set). Nothing was sent to the cloud.
+	// ErrInvalid: the request is malformed (a bad spec, a reserved label).
+	// Nothing was changed.
 	ErrInvalid = errors.New("invalid request")
 
-	// ErrLabelTaken: ClaimLabel found the label holding another non-empty
-	// value. Nothing was changed.
-	ErrLabelTaken = errors.New("label already holds another value")
+	// ErrLabelTaken: a SetLabels condition (expect) did not hold. Nothing
+	// was changed.
+	ErrLabelTaken = errors.New("the labels are not as expected")
 
-	// ErrUnexpectedState: Wait saw the instance settle in a state other
-	// than the one asked for. The instance is returned alongside.
-	ErrUnexpectedState = errors.New("instance settled in an unexpected state")
+	// ErrUnexpectedState: Wait saw the machine settle in a state other than
+	// the one asked for. The machine is returned alongside.
+	ErrUnexpectedState = errors.New("machine settled in an unexpected state")
 )
+
+// Error kinds of a compute service (tests/compute-contract/v1): what each
+// of the contract's codes and failures means to the backend. The
+// contract's fixtures/mapping.json names, for each code, one of these or
+// one of the kinds above.
+var (
+	// ErrSpecMismatch: a create named a shed_id the service holds under a
+	// different create body. Nothing was changed.
+	ErrSpecMismatch = errors.New("the machine was created with another body")
+
+	// ErrComputeLimit: the service's limit on machines per person or per
+	// organization is reached (any state counts). A client may retry once
+	// a machine is deleted. The API answers 503 COMPUTE_LIMIT_REACHED.
+	ErrComputeLimit = errors.New("compute limit reached")
+
+	// ErrPolicy: the service's policy refused the create (a size, an
+	// image, a lease, an access kind, the person or the client). Nothing
+	// was sent to the cloud, and retrying will not help. The API answers
+	// 422 COMPUTE_POLICY_REFUSED.
+	ErrPolicy = errors.New("refused by the compute service's policy")
+
+	// ErrLease: the machine's lease or owner does not allow the start or
+	// extend (the lease ended or is at its cap, extends are not allowed,
+	// or the machine's person is not active). Nothing was changed.
+	ErrLease = errors.New("refused by the machine's lease")
+
+	// ErrDeleting: the machine is being deleted; nothing but the delete
+	// will finish.
+	ErrDeleting = errors.New("the machine is being deleted")
+
+	// ErrIngress: the service will not apply the ingress sources (it does
+	// not let servers write ingress, or a source is wider than it allows).
+	ErrIngress = errors.New("ingress refused")
+
+	// ErrDenied: the service does not let this server manage compute (the
+	// grant is off, the server is disabled, or compute is refused by
+	// policy). The API answers 403 COMPUTE_DENIED.
+	ErrDenied = errors.New("compute denied for this server")
+
+	// ErrUnavailable: the service could not be reached or did not answer
+	// in time, or answered 5xx, 429 past the deadline, or 401 twice. For
+	// a call that changes something, the outcome is unknown: the caller
+	// retries with the same request_id or reads the machine. The API
+	// answers 503 COMPUTE_UNAVAILABLE.
+	ErrUnavailable = errors.New("compute service unavailable")
+
+	// ErrNotActed: the service provably did not act on the request: it was
+	// never delivered (ErrNotDelivered, which matches this too), or every
+	// attempt was answered with a refusal made before any judgement of
+	// the call (a 429 whose Retry-After runs past the call's deadline, a
+	// second 401). It comes with ErrUnavailable (503 COMPUTE_UNAVAILABLE),
+	// and unlike a lost reply it changed nothing: a create not acted on
+	// made no machine, and a start or stop not acted on changed none. A
+	// 429's wait is the Error's RetryAfter.
+	ErrNotActed = errors.New("the service did not act on the request")
+
+	// ErrNotDelivered: the request provably never reached the service: the
+	// connection was never made (refused, no such host, a TLS handshake
+	// that failed), no token could be had for it, or the request was never
+	// written. It is one case of ErrNotActed (errors.Is matches both).
+	ErrNotDelivered error = notActed("the request was never delivered")
+
+	// ErrInvalidReply: the service answered 2xx with a body the contract
+	// refuses (too large, not the call's shape, a machine object that
+	// breaks a rule, or one that echoes the bearer token).
+	ErrInvalidReply = errors.New("compute service sent an invalid reply")
+)
+
+// notActed is a kind of ErrNotActed with words of its own.
+type notActed string
+
+func (e notActed) Error() string        { return string(e) }
+func (e notActed) Is(target error) bool { return target == ErrNotActed }
 
 // Status reasons for a refusal, as they appear in a shed's status_reason.
 const (
@@ -73,11 +141,20 @@ type Error struct {
 	Kind error
 	// Op is the provider call that failed: "create", "wait", and so on.
 	Op string
-	// Detail is the cloud's own words, safe to log and to show an
-	// operator. It never contains credentials.
+	// Code is the compute contract's code the failure carried (an error
+	// code of the service's reply, or a failed operation's), "" when it
+	// carried none. The backend maps a refusal to the shed API by it.
+	Code string
+	// Detail says what failed in the provider's own words, safe to log
+	// and to show an operator. It never contains credentials, and never a
+	// service's message.
 	Detail string
 	// Err is the underlying error, if any.
 	Err error
+	// RetryAfter is how long the service asked the caller to wait before
+	// sending the call again (a 429's Retry-After), zero when it asked
+	// nothing.
+	RetryAfter time.Duration
 }
 
 // Errorf builds an *Error of the given kind for a provider call.
@@ -89,6 +166,9 @@ func (e *Error) Error() string {
 	msg := "provider"
 	if e.Op != "" {
 		msg += " " + e.Op
+	}
+	if e.Code != "" {
+		msg += " (" + e.Code + ")"
 	}
 	switch {
 	case e.Kind != nil && e.Detail != "":
@@ -118,21 +198,42 @@ func (e *Error) Unwrap() []error {
 }
 
 // Reason returns the status_reason for a refusal: ReasonQuota, ReasonCapacity
-// or ReasonLimit. It returns "" for every other error.
+// or ReasonLimit (for the server's limit and the compute service's). It
+// returns "" for every other error.
 func Reason(err error) string {
 	switch {
 	case errors.Is(err, ErrQuota):
 		return ReasonQuota
 	case errors.Is(err, ErrCapacity):
 		return ReasonCapacity
-	case errors.Is(err, ErrLimit):
+	case errors.Is(err, ErrLimit), errors.Is(err, ErrComputeLimit):
 		return ReasonLimit
 	}
 	return ""
 }
 
-// IsRefusal reports whether err is one of the three refusals a client may
-// retry later: quota, zone capacity or the server limit.
+// IsRefusal reports whether err is one of the refusals a client may retry
+// later: quota, zone capacity, the server limit or the compute service's
+// limit.
 func IsRefusal(err error) bool {
 	return Reason(err) != ""
+}
+
+// CodeOf returns the compute contract's code err carries (Error.Code), or "".
+func CodeOf(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code
+	}
+	return ""
+}
+
+// RetryAfterOf returns the wait the service asked for before the call is
+// sent again (Error.RetryAfter), or zero.
+func RetryAfterOf(err error) time.Duration {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.RetryAfter
+	}
+	return 0
 }

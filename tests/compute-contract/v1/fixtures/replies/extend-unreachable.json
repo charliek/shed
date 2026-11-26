@@ -1,0 +1,14 @@
+{
+  "name": "extend-unreachable",
+  "description": "The connection is refused, for an extend: the outcome is unknown.",
+  "call": "extend",
+  "replies": [
+    {
+      "unreachable": true
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

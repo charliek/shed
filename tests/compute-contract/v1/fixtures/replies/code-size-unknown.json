@@ -1,0 +1,25 @@
+{
+  "name": "code-size-unknown",
+  "description": "SIZE_UNKNOWN at 422: a refusal of kind ErrPolicy.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SIZE_UNKNOWN",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "SIZE_UNKNOWN",
+    "kind": "ErrPolicy"
+  }
+}

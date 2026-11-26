@@ -1,0 +1,24 @@
+{
+  "name": "retry-after-absent",
+  "description": "429 with Retry-After absent: wait 5 s.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 429,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "RATE_LIMITED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "retry",
+    "retry_after_s": 5
+  }
+}

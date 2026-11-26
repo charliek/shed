@@ -1,0 +1,68 @@
+{
+  "name": "create-payload-too-large",
+  "description": "A body over 64 KiB: 413 PAYLOAD_TOO_LARGE (a server classifies a 413 by its status alone).",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=compute%3Amanage"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{compute_token}}",
+      "expires_in": 600,
+      "scope": "compute:manage",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/v1/compute/machines/q6c3g4ymb5m2dkxwe7kyz5hhzu",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}",
+          "Content-Type": "application/json"
+        },
+        "body_bytes": 65537
+      },
+      "response": {
+        "status": 413,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "error": {
+            "code": "PAYLOAD_TOO_LARGE",
+            "message": "{{message}}"
+          }
+        }
+      }
+    }
+  ]
+}

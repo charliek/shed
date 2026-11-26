@@ -1,0 +1,25 @@
+{
+  "name": "operation-done-both",
+  "description": "Done, with both machine and error: invalid.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "done": true,
+        "machine": null,
+        "error": {
+          "code": "CLOUD_QUOTA"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

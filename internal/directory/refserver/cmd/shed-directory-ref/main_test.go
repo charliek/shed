@@ -156,3 +156,78 @@ func TestServes(t *testing.T) {
 		t.Error("the banner was not printed")
 	}
 }
+
+// TestIssuerFlag checks --issuer takes only http on a loopback address and
+// port, and that the command then prints and serves under it.
+func TestIssuerFlag(t *testing.T) {
+	for _, bad := range []string{"https://127.0.0.1:9", "http://192.0.2.1:9", "http://localhost:9", "http://127.0.0.1",
+		"http://127.0.0.1:9/", "http://127.0.0.1:9/x", "http://u@127.0.0.1:9", "127.0.0.1:9"} {
+		if err := checkLoopbackIssuer(bad); err == nil {
+			t.Errorf("--issuer %q accepted", bad)
+		}
+	}
+	for _, good := range []string{"http://127.0.0.1:9", "http://[::1]:9", "http://127.0.0.2:40000"} {
+		if err := checkLoopbackIssuer(good); err != nil {
+			t.Errorf("--issuer %q refused: %v", good, err)
+		}
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdout, stderr := &lockedBuffer{}, &lockedBuffer{}
+	done := make(chan int, 1)
+	const issuer = "http://127.0.0.1:9"
+	go func() { done <- run(ctx, []string{"--control", dir, "--issuer", issuer}, stdout, stderr) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(stdout.String(), "listening on ") && time.Now().Before(deadline) {
+		select {
+		case code := <-done:
+			t.Fatalf("exited %d: %s", code, stderr.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !strings.Contains(stdout.String(), "listening on "+issuer+"\n") {
+		t.Fatalf("stdout %q", stdout.String())
+	}
+	cancel()
+	<-done
+	code := run(context.Background(), []string{"--control", dir, "--issuer", "http://192.0.2.1:9"}, io.Discard, io.Discard)
+	if code != 2 {
+		t.Fatalf("a non-loopback --issuer: exit %d, want 2", code)
+	}
+}
+
+// TestInventoryFlag checks --inventory is written each second, mode 0600,
+// with the machines by server (none here).
+func TestInventoryFlag(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inv := filepath.Join(t.TempDir(), "inventory.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, []string{"--control", dir, "--inventory", inv}, io.Discard, io.Discard) }()
+	deadline := time.Now().Add(10 * time.Second)
+	var b []byte
+	for time.Now().Before(deadline) {
+		if got, err := os.ReadFile(inv); err == nil {
+			b = got
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if string(b) != "{\"servers\":{}}\n" {
+		t.Fatalf("inventory %q", b)
+	}
+	st, err := os.Stat(inv)
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("inventory mode: %v %v", st, err)
+	}
+	cancel()
+	<-done
+}

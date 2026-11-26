@@ -1,0 +1,24 @@
+{
+  "name": "payload-too-large",
+  "description": "413: the server sent a body over 64 KiB, its own bug.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 413,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "PAYLOAD_TOO_LARGE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalid"
+  }
+}

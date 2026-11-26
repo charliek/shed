@@ -1,0 +1,106 @@
+{
+  "name": "usage-refused-handle",
+  "description": "usage for a handle the create judgement would refuse (not on the list, or opted out of this server): person is null.",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    },
+    {
+      "person.optout": [
+        "linus",
+        "srv-a"
+      ]
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=compute%3Amanage"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{compute_token}}",
+      "expires_in": 600,
+      "scope": "compute:manage",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/usage?user=grace",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "person": null,
+          "org": {
+            "machines": 0,
+            "running": 0,
+            "stopped": 0,
+            "max": 10
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/usage?user=linus",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "person": null,
+          "org": {
+            "machines": 0,
+            "running": 0,
+            "stopped": 0,
+            "max": 10
+          }
+        }
+      }
+    }
+  ]
+}

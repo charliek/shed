@@ -1,0 +1,27 @@
+{
+  "name": "usage-counts-too-many",
+  "description": "Usage that counts more running and stopped than machines: invalid.",
+  "call": "usage",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "person": null,
+        "org": {
+          "machines": 1,
+          "running": 1,
+          "stopped": 1,
+          "max": 10
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

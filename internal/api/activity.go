@@ -56,7 +56,7 @@ type ActivityResponse struct {
 // ActivityEvent is one event. ID is opaque and unique on the server (passed
 // as since, the page starts with the event just older); At is when it was written (RFC
 // 3339, UTC). Kind is the audit kind: shed.create, shed.start, shed.stop,
-// shed.delete, shed.reset, shed.assign, shed.provision.start,
+// shed.delete, shed.reset, shed.assign, shed.extend, shed.provision.start,
 // shed.provision.end and delivery for everyone who may see them, and an
 // older kind (api, exec.end, reap, ssh, connect) for an admin. Result (ok or
 // failed) is a lifecycle event's; Delivery a delivery event's.

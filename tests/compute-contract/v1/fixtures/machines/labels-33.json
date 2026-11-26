@@ -1,0 +1,92 @@
+{
+  "name": "labels-33",
+  "description": "33 labels.",
+  "context": {
+    "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+    "server": "srv-a",
+    "test_drivers": false
+  },
+  "machine": {
+    "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+    "name": "widgets",
+    "server": "srv-a",
+    "user": "ada",
+    "client": null,
+    "state": "running",
+    "size": {
+      "name": "standard",
+      "cpus": 2,
+      "memory_mb": 8192,
+      "arch": "amd64"
+    },
+    "disk_gb": 50,
+    "image": {
+      "requested": "default",
+      "resolved": "shed-remote-full-v1-0-0-20261120-120000"
+    },
+    "provider": "cloud-a",
+    "created_at": "2026-11-16T06:00:00Z",
+    "started_at": "2026-11-16T06:00:00Z",
+    "stopped_at": null,
+    "lease": {
+      "expires_at": "2026-11-17T06:00:00Z",
+      "max_expires_at": "2026-11-21T06:00:00Z",
+      "extendable": true,
+      "presets_h": [
+        6,
+        12,
+        24,
+        48
+      ]
+    },
+    "access": [
+      {
+        "kind": "ssh",
+        "host": "203.0.113.7",
+        "port": 22,
+        "user": "shed-link",
+        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTs41aR1tvqm53eXWSYYaVa4vzPYlXSTKnKr5nW/t9C"
+      }
+    ],
+    "labels": {
+      "l00": "v",
+      "l01": "v",
+      "l02": "v",
+      "l03": "v",
+      "l04": "v",
+      "l05": "v",
+      "l06": "v",
+      "l07": "v",
+      "l08": "v",
+      "l09": "v",
+      "l10": "v",
+      "l11": "v",
+      "l12": "v",
+      "l13": "v",
+      "l14": "v",
+      "l15": "v",
+      "l16": "v",
+      "l17": "v",
+      "l18": "v",
+      "l19": "v",
+      "l20": "v",
+      "l21": "v",
+      "l22": "v",
+      "l23": "v",
+      "l24": "v",
+      "l25": "v",
+      "l26": "v",
+      "l27": "v",
+      "l28": "v",
+      "l29": "v",
+      "l30": "v",
+      "l31": "v",
+      "l32": "v"
+    },
+    "spec": "spec-v1 layout=1 repo=example/widgets"
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "labels_invalid"
+  }
+}

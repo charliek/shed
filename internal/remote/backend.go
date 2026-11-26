@@ -1,11 +1,13 @@
-// Package remote is the backend that runs each shed as one VM in a cloud. It
-// holds a provider.Provider (the cloud) and a transport.Factory (the way to a
+// Package remote is the backend that runs each shed as one cloud machine. It
+// holds a provider.Provider (where machines come from: the account service's
+// compute, over the compute contract) and a transport.Factory (the way to a
 // guest's agent) and nothing cloud-specific of its own.
 //
 // Create, start, stop and delete each save the new status, start a job on a
 // context the server owns and return. A job is background work for one shed
 // that outlives the HTTP request. GetShed and ListSheds read only the local
-// record cache (internal/remote/state).
+// record cache (internal/remote/state), so they answer, and existing links
+// keep working, while the service is down.
 package remote
 
 import (
@@ -13,16 +15,22 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/provider"
+	"github.com/charliek/shed/internal/remote/provider/service"
 	"github.com/charliek/shed/internal/remote/state"
 	"github.com/charliek/shed/internal/remote/transport"
 	"github.com/charliek/shed/internal/vmutil"
@@ -44,6 +52,11 @@ const (
 	// labelTimeout bounds the shed_state=deleting write made before a
 	// delete is acknowledged.
 	labelTimeout = 10 * time.Second
+	// DefaultUnknownRetryPause is the pause before a call that changes
+	// something is sent again, with the same request id, after its reply
+	// was lost (provider.ErrUnavailable); unknownRetries is how many times.
+	DefaultUnknownRetryPause = 2 * time.Second
+	unknownRetries           = 2
 	// cleanupTimeout bounds best-effort cloud work after a failed job.
 	cleanupTimeout = 3 * time.Minute
 	// closeGrace is how long Close waits for jobs to notice the shutdown.
@@ -58,27 +71,32 @@ const (
 	// before the periodic pass retries it. A delete that was just
 	// acknowledged has its own job on the way.
 	DefaultDeleteRetryAge = 2 * time.Minute
-	// StaleCreateAge is how long after the cloud made it an instance may
+	// StaleCreateAge is how long after the provider made it a machine may
 	// stay labelled creating with no local record before the start-up and
 	// periodic passes destroy it as an abandoned create. A create waits 15 s
-	// for the insert, 5 minutes for the agent and less for everything else,
+	// for the accept, 5 minutes for the agent and less for everything else,
 	// and has a record throughout; this is three times that.
 	StaleCreateAge = 15 * time.Minute
-	// DefaultImageResolveTimeout bounds the image lookup a create makes
-	// before it saves anything. With the fast-fail window it keeps the JSON
-	// create's reply under the 30 s a client waits.
-	DefaultImageResolveTimeout = 10 * time.Second
 	// sweepTimeout bounds one periodic pass.
 	sweepTimeout = 2 * time.Minute
 	// localAuthorizedKey stands in for the server's public key when the
-	// transport needs none (the local link).
-	localAuthorizedKey = "none local-transport"
+	// transport needs none (the local link). It is one well-formed
+	// authorized_keys line, as the compute contract requires of every key a
+	// create names (a service refuses anything else as INVALID); its private
+	// half was discarded when it was made, so nobody can log in with it.
+	localAuthorizedKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN7Ig741G+LZ7HvFwT5YGDMQ8q+YVi5wYbcntd2EqsrE shed-local-transport"
 )
 
-// ErrNotReady is returned by shed calls made before the first complete list
-// of the cloud. The server waits for Ready before it serves shed routes, so
-// a client sees it only if that wait was skipped.
-var ErrNotReady = errors.New("remote backend has not finished listing the cloud")
+// ErrNotReady is the cause of the refusal (503 COMPUTE_UNAVAILABLE) a create,
+// start, stop, delete or extend gets before the first complete list of the
+// machines: a server that started degraded, with the service down, answers
+// reads from its records and refuses everything that needs the service
+// until the list arrives.
+var ErrNotReady = errors.New("the remote backend has not listed its machines yet: the account service could not be reached")
+
+// ErrLegacyState is New's error for a state directory that holds what the
+// in-tree cloud provider of earlier releases wrote.
+var ErrLegacyState = errors.New("the remote state directory holds sheds of the in-tree cloud provider this server no longer has")
 
 // Options configures a Backend.
 type Options struct {
@@ -100,37 +118,42 @@ type Options struct {
 	// Bridge is the plugin bridge message channels register with. May be
 	// nil.
 	Bridge *plugin.Bridge
-	// KeepFailedCreate leaves the VM of a failed create in place, for
-	// inspection, until the shed is deleted. By default it is destroyed.
-	KeepFailedCreate bool
-
+	// AuditLog is the server's audit log, where a shed whose machine the
+	// account service deleted (its lease ended, a delete at the service)
+	// is recorded. Nil records nothing. It is given here, not later, so
+	// that the start-up pass (Reconcile), which drops such sheds too, has
+	// it from its first line.
+	AuditLog *audit.Log
 	// FastFailWindow, BootTimeout, AuthGrace and ProbeInterval override the
 	// defaults; tests shorten them.
 	FastFailWindow time.Duration
 	BootTimeout    time.Duration
 	AuthGrace      time.Duration
 	ProbeInterval  time.Duration
-	// HostKeyPollInterval is the least time between two reads of a guest's
-	// published host key. Default 6 s, which keeps under Google's limit on
-	// guest-attribute reads.
+	// HostKeyPollInterval is the least time between two reads of a
+	// machine whose access, or attested host key, is not known yet.
+	// Default 3 s.
 	HostKeyPollInterval time.Duration
+	// UnknownRetryPause is the pause before a call whose reply was lost is
+	// sent again. Default 2 s.
+	UnknownRetryPause time.Duration
 	// CloneTimeout bounds one attempt at a create's --repo clone and
 	// CloneRetryPause is the pause before the next attempt.
 	CloneTimeout    time.Duration
 	CloneRetryPause time.Duration
+	// ListRetry is the pause between two attempts at the start-up pass's
+	// first list. Default 5 s.
+	ListRetry time.Duration
 	// SweepInterval is the time between two periodic passes (see Sweep).
 	// Default 60 s; a negative value turns the periodic pass off.
 	SweepInterval time.Duration
 	// DeleteRetryAge is how old a delete marker with no job must be before
 	// the periodic pass retries it. Default 2 minutes.
 	DeleteRetryAge time.Duration
-	// ImageResolveTimeout bounds the image lookup a create makes before it
-	// saves anything. Default 10 s.
-	ImageResolveTimeout time.Duration
-	// FirewallSources are the source ranges the environment's firewall
-	// rule must have with remote.firewall.mode: static, as the server
-	// resolved them at start-up (config.RemoteRuntime.FirewallSources).
-	// Required in static mode.
+	// FirewallSources are the sources the machines' ingress must admit
+	// with remote.firewall.mode: static, as the server resolved them at
+	// start-up (config.RemoteRuntime.FirewallSources). Required in static
+	// mode.
 	FirewallSources []string
 	// EchoClient, when set, supplies the HTTP transport for auto mode's
 	// echo requests. Tests pass one that trusts their servers.
@@ -149,6 +172,7 @@ type Backend struct {
 	prov    provider.Provider
 	links   transport.Factory
 	fw      *firewallState
+	access  accessRule
 	store   *state.Store
 	credMgr *vmutil.CredentialManager
 	logf    func(format string, args ...any)
@@ -168,6 +192,15 @@ type Backend struct {
 	// saveRecord is the store's SaveRecord for a delivery step's write
 	// (tests fail it).
 	saveRecord func(*state.Record) error
+	// saveMarker is the store's SaveMarker for the write of a delete
+	// marker's request id (tests fail it).
+	saveMarker func(*state.Marker) error
+	// flushedIDs are the request ids, of delete markers and of records
+	// (a create's, a start's, a stop's, a label write's), this process has
+	// written with a save whose flush succeeded: only those are sent. An
+	// id read back from disk is saved again, durably, before it is sent
+	// (markerRequestID, confirmFlushed). Guarded by mu.
+	flushedIDs map[string]bool
 
 	// deliverySvc asks a shed user's source for its credentials (nil: no
 	// delivery). stepLocks holds a provision's step in hand against a stop
@@ -183,6 +216,14 @@ type Backend struct {
 	// halting is raised by a stop or a delete of the shed while it waits
 	// for the step lock: a provision's next step gives way to it.
 	halting lockmap.Flags
+	// extending holds one extend per shed (by shed id) at a time, so an
+	// extend's stored request id (Record.Extend) is read and written by one
+	// call only. Its wait ends with the caller's context (extendSlots).
+	extending extendSlots
+	// usage keeps GET /api/cloud/usage's answers for usageTTL, by the user
+	// asked about ("" for the organization only).
+	usageMu sync.Mutex
+	usage   map[string]usageEntry
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -191,20 +232,31 @@ type Backend struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 	sweepOnce sync.Once
+	// failed is closed, with startErr, when the start-up pass finds a
+	// reason the server must not run (remote.firewall.mode: auto against a
+	// service whose ingress is managed elsewhere); WaitReady returns it.
+	failed     chan struct{}
+	failedOnce sync.Once
+	startErr   error
 
-	// assignMu serializes AssignUser, which writes a label and then the
-	// record without holding mu across the cloud call.
-	assignMu sync.Mutex
+	// auditLog, when set (Options.AuditLog, at New), is where a machine
+	// the service deleted (its lease ended, a page delete) is recorded as
+	// a shed.delete event.
+	auditLog *audit.Log
+
 	// busApplyMu serializes every application of a shed's reported user to
-	// its bus route (applyBusRoute and busSyncWorker): each reads the record
-	// and the hold's epoch, applies the user and lifts the hold as one, so
-	// a stale user is never applied after a newer one. Taken before mu,
-	// never under it.
+	// its bus route (busSyncWorker): each reads the record and the hold's
+	// epoch, applies the user and lifts the hold as one, so a stale user is
+	// never applied after a newer one. Taken before mu, never under it.
 	busApplyMu sync.Mutex
 
-	mu      sync.Mutex
-	closed  bool
-	records map[string]*state.Record // by shed name
+	mu     sync.Mutex
+	closed bool
+	// catalog is the provider's last catalog, read at start-up and at every
+	// periodic pass; haveCatalog is false until the first read.
+	catalog     provider.Catalog
+	haveCatalog bool
+	records     map[string]*state.Record // by shed name
 	// busSyncs are the bus routes held for a change of the shed's reported
 	// user and not yet lifted; busStarting counts the message-channel starts
 	// in progress. Both by shed name (see busUserChangedLocked).
@@ -235,8 +287,6 @@ func New(opts Options) (*Backend, error) {
 		return nil, errors.New("remote: no provider")
 	case opts.Links == nil:
 		return nil, errors.New("remote: no link factory")
-	case !provider.ValidEnv(opts.Config.Environment):
-		return nil, fmt.Errorf("remote: environment %q is not a valid name", opts.Config.Environment)
 	}
 	if len(opts.AuthorizedKeys) == 0 {
 		if opts.Links.Name() != transport.NameLocal {
@@ -257,7 +307,13 @@ func New(opts Options) (*Backend, error) {
 		opts.ProbeInterval = DefaultProbeInterval
 	}
 	if opts.HostKeyPollInterval <= 0 {
-		opts.HostKeyPollInterval = guestAttrInterval
+		opts.HostKeyPollInterval = accessRetry
+	}
+	if opts.UnknownRetryPause <= 0 {
+		opts.UnknownRetryPause = DefaultUnknownRetryPause
+	}
+	if opts.ListRetry <= 0 {
+		opts.ListRetry = listRetry
 	}
 	if opts.CloneTimeout <= 0 {
 		opts.CloneTimeout = DefaultCloneTimeout
@@ -271,9 +327,6 @@ func New(opts Options) (*Backend, error) {
 	if opts.DeleteRetryAge <= 0 {
 		opts.DeleteRetryAge = DefaultDeleteRetryAge
 	}
-	if opts.ImageResolveTimeout <= 0 {
-		opts.ImageResolveTimeout = DefaultImageResolveTimeout
-	}
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
 	}
@@ -282,6 +335,10 @@ func New(opts Options) (*Backend, error) {
 	}
 
 	fw, err := newFirewallState(opts.Config, opts.FirewallSources, opts.EchoClient)
+	if err != nil {
+		return nil, err
+	}
+	access, err := newAccessRule(opts.Config)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +354,9 @@ func New(opts Options) (*Backend, error) {
 	for _, p := range bad {
 		opts.Logf("remote: ignoring unreadable shed record %s", p)
 	}
+	if err := refuseLegacy(store, records); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Backend{
@@ -305,6 +365,7 @@ func New(opts Options) (*Backend, error) {
 		prov:     opts.Provider,
 		links:    opts.Links,
 		fw:       fw,
+		access:   access,
 		store:    store,
 		credMgr:  vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
 		logf:     opts.Logf,
@@ -318,6 +379,7 @@ func New(opts Options) (*Backend, error) {
 		rootCtx:     ctx,
 		rootCancel:  cancel,
 		ready:       make(chan struct{}),
+		failed:      make(chan struct{}),
 		records:     make(map[string]*state.Record),
 		busSyncs:    make(map[string]*busSync),
 		busStarting: make(map[string]int),
@@ -329,6 +391,9 @@ func New(opts Options) (*Backend, error) {
 	}
 	b.rmPartial = b.removePartialClone
 	b.saveRecord = b.store.SaveRecord
+	b.saveMarker = b.store.SaveMarker
+	b.flushedIDs = map[string]bool{}
+	b.auditLog = opts.AuditLog
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
 	}
@@ -358,27 +423,140 @@ func (b *Backend) SupportsNetworkProfile(profile string) bool {
 	return false
 }
 
-// Ready is closed once the first reconcile pass has listed the cloud and
-// repaired the cache. Shed routes may be served only after that.
+// Ready is closed once the first reconcile pass has listed the machines and
+// repaired the cache. Before it the backend is degraded: reads answer from
+// the records, and every call that needs the service is refused.
 func (b *Backend) Ready() <-chan struct{} { return b.ready }
 
-// WaitReady blocks until Ready or until ctx ends.
+// WaitReady blocks until Ready, until the start-up pass finds a reason the
+// server must not run (that error), or until ctx ends.
 func (b *Backend) WaitReady(ctx context.Context) error {
 	select {
 	case <-b.ready:
 		return nil
+	case <-b.failed:
+		return b.startErr
 	case <-ctx.Done():
-		return fmt.Errorf("remote backend: waiting for the first cloud list: %w", ctx.Err())
+		return fmt.Errorf("remote backend: waiting for the first list of the machines: %w", ctx.Err())
 	}
 }
 
+// fail records a reason the server must not run.
+func (b *Backend) fail(err error) {
+	b.failedOnce.Do(func() {
+		b.startErr = err
+		close(b.failed)
+	})
+}
+
+// checkReady refuses a call that needs the service while the backend is
+// degraded: 503 COMPUTE_UNAVAILABLE.
 func (b *Backend) checkReady() error {
 	select {
 	case <-b.ready:
 		return nil
 	default:
-		return ErrNotReady
+		return computeUnavailable(ErrNotReady)
 	}
+}
+
+// computeUnavailable is the 503 COMPUTE_UNAVAILABLE refusal: the service
+// could not be asked, or the backend is degraded.
+func computeUnavailable(err error) error {
+	return &config.ComputeRefusal{Status: http.StatusServiceUnavailable, Code: config.ErrComputeUnavailable, Err: err}
+}
+
+// Catalog returns the provider's last catalog, ok false before the first
+// read.
+func (b *Backend) Catalog() (provider.Catalog, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.catalog, b.haveCatalog
+}
+
+// ComputeCatalog reports the catalog to the API (backend.Cataloger).
+func (b *Backend) ComputeCatalog() (backend.ComputeCatalog, bool) {
+	c, ok := b.Catalog()
+	if !ok {
+		return backend.ComputeCatalog{}, false
+	}
+	return computeCatalog(c), true
+}
+
+// computeCatalog is the provider's catalog as the API's type holds it.
+func computeCatalog(c provider.Catalog) backend.ComputeCatalog {
+	out := backend.ComputeCatalog{DefaultSize: c.DefaultSize, DefaultImage: c.DefaultImage, Images: append([]string(nil), c.Aliases...), GuestArch: c.GuestArch()}
+	for _, s := range c.Sizes {
+		out.Sizes = append(out.Sizes, backend.CatalogSize{Name: s.Name, CPUs: s.CPUs, MemoryMB: s.MemoryMB, Arch: s.Arch, DiskGBDefault: s.DiskGBDefault})
+	}
+	return out
+}
+
+// refreshCatalog reads the provider's catalog and keeps it. The first read
+// logs the service clients' images the catalog does not name (S0 ruling 3).
+func (b *Backend) refreshCatalog(ctx context.Context) error {
+	c, err := b.prov.Catalog(ctx)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	first := !b.haveCatalog
+	b.catalog, b.haveCatalog = c, true
+	b.mu.Unlock()
+	if first && b.opts.Server != nil && b.opts.Server.Auth != nil {
+		for _, name := range slices.Sorted(maps.Keys(b.opts.Server.Auth.Clients)) {
+			for _, img := range b.opts.Server.Auth.Clients[name].Policy.Images {
+				if !c.HasImage(img) {
+					b.logf("remote: auth.clients.%s.policy.images names %q, which the account service's catalog does not offer; that client's creates naming it are refused", name, img)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// refuseLegacy is the start-up refusal of plan 041 R15: a record or a delete
+// marker an earlier server wrote stops the server, naming what to do with the
+// old binary. A file is an earlier server's when it lacks this build's
+// schema (recognised before the rest of it is decoded, since an earlier
+// shape may not decode at all), or when it carries the in-tree cloud
+// provider's reference or environment.
+func refuseLegacy(store *state.Store, records []*state.Record) error {
+	var found []string
+	stale, err := store.StaleFiles()
+	if err != nil {
+		return fmt.Errorf("remote: reading the state directory %s: %w", store.Dir(), err)
+	}
+	for _, f := range stale {
+		name := f.Name
+		if name == "" {
+			name = filepath.Base(f.Path)
+		}
+		if f.Marker {
+			found = append(found, fmt.Sprintf("an unfinished delete of shed %s (%s)", name, f.ID))
+		} else {
+			found = append(found, fmt.Sprintf("shed %s (it was written by an earlier server)", name))
+		}
+	}
+	for _, r := range records {
+		if why := r.Legacy(); why != "" {
+			found = append(found, fmt.Sprintf("shed %s (%s)", r.Shed.Name, why))
+		}
+	}
+	markers, err := store.Markers()
+	if err != nil {
+		return fmt.Errorf("remote: reading the delete markers in %s: %w", store.Dir(), err)
+	}
+	for _, m := range markers {
+		if m.Legacy() {
+			found = append(found, fmt.Sprintf("an unfinished delete of shed %s (%s)", m.Name, m.ID))
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("remote: %w: %s. Run the previous shed-server release once more and `shed delete` each of these sheds; or, once their VMs are confirmed gone from the cloud, remove the directories sheds/ and deleting/ in %s (not the directory itself: it holds the audit log). Then start this server (see %s)",
+		ErrLegacyState, strings.Join(found, "; "), store.Dir(), config.RemoteUpgradePage)
 }
 
 // Close stops every job where it stands, closes every link and message
@@ -454,6 +632,12 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	// on the copy only; the stored record carries none.
 	shed.Mounts = config.SelectedMounts(nil)
 	shed.Delivery = config.NewShedDelivery(r.Delivery, b.now())
+	var warn *time.Duration
+	if b.haveCatalog {
+		w := b.catalog.Policy.Warn
+		warn = &w
+	}
+	shed.Cloud = cloudOf(r, warn)
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen
@@ -465,9 +649,64 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	return &shed
 }
 
+// cloudOf is a shed's cloud facts. From the machine the service last
+// answered: its size, disk, image, times and lease, with the catalog's
+// warning time (warn; nil when the catalog has not been read, which the
+// record then leaves out). Before the first answer, what the server asked
+// for: the size, the disk, the image name and the shed's creation time, with
+// no lease (unknown). Every remote record carries it. Nothing of it names a
+// project, a zone or an address.
+func cloudOf(r *state.Record, warn *time.Duration) *config.ShedCloud {
+	m := r.Machine
+	if m == nil || m.Ref == "" {
+		c := &config.ShedCloud{
+			Size:      config.CloudSize{CPUs: r.Shed.CPUs, MemoryMB: r.Shed.MemoryMB},
+			Image:     r.Shed.Image,
+			CreatedAt: r.Shed.CreatedAt,
+		}
+		if sp := r.Spec; sp != nil {
+			c.Size.Name, c.DiskGB = sp.Size, sp.DiskGB
+			if c.Image == "" {
+				c.Image = sp.Image
+			}
+		}
+		return c
+	}
+	lease := &config.CloudLease{
+		ExpiresAt:    m.Lease.ExpiresAt,
+		MaxExpiresAt: m.Lease.MaxExpiresAt,
+		Extendable:   m.Lease.Extendable,
+		PresetsH:     slices.Clone(m.Lease.PresetsH),
+	}
+	if warn != nil {
+		s := int64(*warn / time.Second)
+		lease.WarnS = &s
+	}
+	c := &config.ShedCloud{
+		Provider:  m.Provider,
+		Size:      config.CloudSize{Name: m.Size.Name, CPUs: m.Size.CPUs, MemoryMB: m.Size.MemoryMB},
+		DiskGB:    m.DiskGB,
+		Image:     m.ImageResolved,
+		CreatedAt: m.CreatedAt,
+		Lease:     lease,
+	}
+	if c.Image == "" {
+		c.Image = m.Image
+	}
+	if !m.StartedAt.IsZero() {
+		t := m.StartedAt
+		c.StartedAt = &t
+	}
+	if !m.StoppedAt.IsZero() {
+		t := m.StoppedAt
+		c.StoppedAt = &t
+	}
+	return c
+}
+
 // ownership returns the service client and user a record is reported with.
-// A record that names both, or whose instance's shed_user label names
-// another user (Record.UserConflict), fails closed: no owner, and
+// A record that names both, or whose machine belongs to another user or
+// client (Record.UserConflict), fails closed: no owner, and
 // config.UserUnresolved, which no caller's user can equal.
 func ownership(r *state.Record) (owner, user string) {
 	if r.UserConflict != "" {
@@ -543,6 +782,15 @@ func (b *Backend) inPlace(err error) error {
 
 // dropLocked removes a record from memory and disk.
 func (b *Backend) dropLocked(name string) {
+	if r := b.records[name]; r != nil {
+		// Its request ids are never sent again.
+		if r.Mutation != nil {
+			delete(b.flushedIDs, r.Mutation.RequestID)
+		}
+		if r.Spec != nil {
+			delete(b.flushedIDs, r.Spec.RequestID)
+		}
+	}
 	delete(b.records, name)
 	if err := b.store.DeleteRecord(name); err != nil {
 		b.logf("remote: removing the record of shed %s: %v", name, err)
@@ -604,20 +852,52 @@ func unsupported(what string) error {
 	return fmt.Errorf("%w: %w: %s on the remote backend", config.ErrFeatureUnsupportedSentinel, config.ErrNotSupportedSentinel, what)
 }
 
-// mapRefusal turns a provider refusal into the API's sentinel. Other errors
-// pass through.
+// mapRefusal turns a provider error into what the API answers. A failure
+// that carries a compute contract code is mapped by the code, through the
+// contract's table (service.Codes), to a *config.ComputeRefusal with its
+// status, code and reason; the cloud's quota and capacity keep their own
+// sentinels. A failure with no code is mapped by its kind: unavailable or an
+// invalid reply is COMPUTE_UNAVAILABLE. The server's own limit and a request
+// the provider refused as malformed keep theirs. Other errors pass through.
 func mapRefusal(err error) error {
-	switch {
-	case err == nil:
+	if err == nil {
 		return nil
+	}
+	var cr *config.ComputeRefusal
+	if errors.As(err, &cr) {
+		return err
+	}
+	switch {
 	case errors.Is(err, provider.ErrLimit):
 		return fmt.Errorf("%w: %w", config.ErrServerLimitReachedSentinel, err)
 	case errors.Is(err, provider.ErrQuota):
 		return fmt.Errorf("%w: %w", config.ErrCloudQuotaExceededSentinel, err)
 	case errors.Is(err, provider.ErrCapacity):
 		return fmt.Errorf("%w: %w", config.ErrZoneCapacityUnavailableSentinel, err)
+	}
+	if code := provider.CodeOf(err); code != "" {
+		if info, ok := service.Codes[code]; ok {
+			switch info.ShedAPI.Code {
+			case config.ErrShedNotFound:
+				return fmt.Errorf("%w: %w", config.ErrShedNotFoundSentinel, err)
+			case config.ErrShedAlreadyExists:
+				return fmt.Errorf("%w: %w", config.ErrShedAlreadyExistsSentinel, err)
+			case config.ErrBackendError:
+				return err
+			}
+			return &config.ComputeRefusal{Status: info.ShedAPI.Status, Code: info.ShedAPI.Code, Reason: info.ShedAPI.Reason, Err: err}
+		}
+	}
+	switch {
+	case errors.Is(err, provider.ErrUnavailable), errors.Is(err, provider.ErrInvalidReply):
+		return computeUnavailable(err)
+	case errors.Is(err, provider.ErrDenied):
+		return &config.ComputeRefusal{Status: http.StatusForbidden, Code: config.ErrComputeDenied, Err: err}
 	case errors.Is(err, provider.ErrInvalid):
-		return fmt.Errorf("%w: %w", config.ErrInvalidShedRequestSentinel, err)
+		// The service refused the request this server built (a 413, an
+		// invalid body): the server's bug, not the caller's (mapping.json
+		// payload_too_large and INVALID: 500 BACKEND_ERROR).
+		return &config.ComputeRefusal{Status: http.StatusInternalServerError, Code: config.ErrBackendError, Err: err}
 	}
 	return err
 }
@@ -629,8 +909,8 @@ func (b *Backend) ResetShed(context.Context, string) (*config.Shed, error) {
 	return nil, unsupported("reset")
 }
 
-// ListImages returns no images: a cloud image is named in the server config,
-// not managed through the API.
+// ListImages returns no images: a cloud image is the account service's, not
+// managed through the API.
 func (b *Backend) ListImages(context.Context) ([]config.ImageInfo, error) {
 	return []config.ImageInfo{}, nil
 }

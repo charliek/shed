@@ -40,17 +40,6 @@ func (e *env) userOf(name string) string {
 	return shed.User
 }
 
-// labelOf is a label on a shed's instance.
-func (e *env) labelOf(name, key string) (string, bool) {
-	e.t.Helper()
-	inst, err := e.prov.Get(context.Background(), e.ref(name))
-	if err != nil {
-		e.t.Fatalf("Get(%s): %v", name, err)
-	}
-	v, ok := inst.Labels[key]
-	return v, ok
-}
-
 // storedRecord reads a shed's record from disk, as the next server would.
 func (e *env) storedRecord(name string) *state.Record {
 	e.t.Helper()
@@ -85,11 +74,26 @@ func (e *env) rewriteRecord(name string, fn func(*state.Record)) {
 	}
 }
 
+// setUserLabel has the service report the shed's machine as user's (with
+// the client it has), as a service that answers otherwise than it was asked
+// would: the machine's owner is the truth the record is reconciled with.
 func (e *env) setUserLabel(name, user string) {
 	e.t.Helper()
-	if err := e.prov.SetLabels(context.Background(), e.ref(name), map[string]string{provider.LabelUser: user}); err != nil {
-		e.t.Fatalf("SetLabels(%s): %v", name, err)
+	inst, err := e.prov.Get(context.Background(), e.ref(name))
+	if err != nil {
+		e.t.Fatalf("Get(%s): %v", name, err)
 	}
+	e.prov.SetOwner(e.ref(name), user, inst.Client)
+}
+
+// machineUser is the user the shed's machine reports.
+func (e *env) machineUser(name string) (string, bool) {
+	e.t.Helper()
+	inst, err := e.prov.Get(context.Background(), e.ref(name))
+	if err != nil {
+		e.t.Fatalf("Get(%s): %v", name, err)
+	}
+	return inst.User, true
 }
 
 // A shed's user is stored in its record and on its instance, and stays the
@@ -102,11 +106,11 @@ func TestUserSurvivesStopStartAndRestart(t *testing.T) {
 	if got := e.userOf("mine"); got != "alice" {
 		t.Fatalf("user after create = %q, want alice", got)
 	}
-	if v, ok := e.labelOf("mine", provider.LabelUser); !ok || v != "alice" {
-		t.Fatalf("instance label %s = %q (present %v), want alice", provider.LabelUser, v, ok)
+	if v, ok := e.machineUser("mine"); !ok || v != "alice" {
+		t.Fatalf("the machine's user = %q (%v), want alice", v, ok)
 	}
-	if v, ok := e.labelOf("implicit", provider.LabelUser); !ok || v != "" {
-		t.Fatalf("implicit user's instance label %s = %q (present %v), want present and empty", provider.LabelUser, v, ok)
+	if v, ok := e.machineUser("implicit"); !ok || v != "" {
+		t.Fatalf("the implicit user's machine's user = %q (%v), want none", v, ok)
 	}
 
 	if _, err := e.b.StopShed(ctxT(t), "mine"); err != nil {
@@ -155,19 +159,6 @@ func TestAdoptionCarriesTheUserLabel(t *testing.T) {
 	if err := e.b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// "legacy" was labelled by a build that predates shed_user.
-	legacy := e.ref("legacy")
-	e.prov.Seed(func() provider.Instance {
-		inst, err := e.prov.Get(context.Background(), legacy)
-		if err != nil {
-			t.Fatal(err)
-		}
-		delete(inst.Labels, provider.LabelUser)
-		return inst
-	}())
-	if _, ok := e.labelOf("legacy", provider.LabelUser); ok {
-		t.Fatal("test set-up: the legacy instance still carries the user label")
-	}
 	if err := os.RemoveAll(e.dir); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +170,7 @@ func TestAdoptionCarriesTheUserLabel(t *testing.T) {
 		t.Errorf("adopted user = %q, want alice", got)
 	}
 	if got := e.userOf("legacy"); got != "" {
-		t.Errorf("adopted user of an instance with no %s label = %q, want none", provider.LabelUser, got)
+		t.Errorf("adopted user of a machine with no user = %q, want none", got)
 	}
 	if r := e.storedRecord("alices"); r.Shed.User != "alice" {
 		t.Errorf("adopted record stores user %q, want alice", r.Shed.User)
@@ -288,7 +279,7 @@ func TestUserLabelConflictFailsClosed(t *testing.T) {
 	if got := e.userOf("mine"); got != config.UserUnresolved {
 		t.Fatalf("user with the label naming bob = %q, want %q", got, config.UserUnresolved)
 	}
-	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, `shed mine is recorded with user "alice"`) || !strings.Contains(rep, `shed_user="bob"`) {
+	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, `shed mine is recorded with user "alice"`) || !strings.Contains(rep, `belongs to "bob"`) {
 		t.Fatalf("the conflict was not reported: %q", rep)
 	}
 	r := e.storedRecord("mine")
@@ -382,7 +373,7 @@ func TestAdoptedOwnerAndUserFailsClosed(t *testing.T) {
 	if _, err := e.b.GetShed(backend.WithRequiredOwner(context.Background(), "nocturn"), "odd"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
 		t.Errorf("the service client reaches the shed: %v, want not found", err)
 	}
-	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, `labelled with owner "nocturn" and user "alice"`) {
+	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, `belongs to client "nocturn" and user "alice"`) {
 		t.Errorf("the adoption was not reported: %q", rep)
 	}
 }
@@ -403,8 +394,8 @@ func TestCreateRefusesBadOwnership(t *testing.T) {
 	e.idle()
 	// Refused up front, with the request's own error, not by the provider
 	// later when the labels are built.
-	if n := e.prov.Count(fake.OpResolveImage); n != 0 {
-		t.Errorf("%d image resolutions for refused creates, want none", n)
+	if n := e.prov.Count(fake.OpCreate); n != 0 {
+		t.Errorf("%d creates sent for refused creates, want none", n)
 	}
 	if sheds, _ := e.b.ListSheds(context.Background()); len(sheds) != 0 {
 		t.Errorf("%d sheds recorded after refused creates", len(sheds))
@@ -488,7 +479,7 @@ func TestUserLabelReconciledThroughTheStoredReference(t *testing.T) {
 	}
 	e.setUserLabel("theirs", "alice")
 	e.rewriteRecord("lost", func(r *state.Record) { r.Shed.User = "" })
-	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+	h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
 
 	e.b = e.open()
 	e.idle()
@@ -590,7 +581,7 @@ func TestResumedCreateReconcilesTheUserLabel(t *testing.T) {
 		t.Fatalf("test set-up: record user %q ready %v, want an unfinished create with no user", r.Shed.User, r.Ready)
 	}
 	e.setUserLabel(name, "alice")
-	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+	h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
 	e.b = e.open()
 	e.auto()
 	if got := e.settled(name); got.Status != config.StatusRunning || got.ID != id {
@@ -622,16 +613,16 @@ func TestResumedFinishedCreateReconcilesTheUserLabel(t *testing.T) {
 	}
 	ref := e.ref(name)
 	e.prov.Complete(ref)
-	if err := e.prov.SetLabels(context.Background(), ref, map[string]string{
-		provider.LabelState: string(provider.ShedStateReady),
-		provider.LabelUser:  "alice",
-	}); err != nil {
+	if _, err := e.prov.SetLabels(context.Background(), ref, "", map[string]*string{
+		provider.LabelState: provider.Str(string(provider.ShedStateReady)),
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
+	e.prov.SetOwner(ref, "alice", "")
 	if err := e.prov.ExternalStop(ref); err != nil {
 		t.Fatal(err)
 	}
-	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+	h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
 	e.b = e.open()
 	if got := e.settled(name); got.Status != config.StatusStopped || got.ID != id {
 		t.Fatalf("came to rest %q (%q), want stopped", got.Status, got.StatusReason)
@@ -746,7 +737,7 @@ func TestStoppedProbeReconcilesTheUserLabel(t *testing.T) {
 type readHooks struct {
 	*fake.Provider
 	get  func(ctx context.Context, ref provider.Ref) (provider.Instance, error)
-	stop func(ctx context.Context, ref provider.Ref) (provider.Pending, error)
+	stop func(ctx context.Context, ref provider.Ref, rid string) (provider.Pending, error)
 }
 
 func (h *readHooks) Get(ctx context.Context, ref provider.Ref) (provider.Instance, error) {
@@ -756,11 +747,11 @@ func (h *readHooks) Get(ctx context.Context, ref provider.Ref) (provider.Instanc
 	return h.Provider.Get(ctx, ref)
 }
 
-func (h *readHooks) Stop(ctx context.Context, ref provider.Ref) (provider.Pending, error) {
+func (h *readHooks) Stop(ctx context.Context, ref provider.Ref, rid string) (provider.Pending, error) {
 	if h.stop != nil {
-		return h.stop(ctx, ref)
+		return h.stop(ctx, ref, rid)
 	}
-	return h.Provider.Stop(ctx, ref)
+	return h.Provider.Stop(ctx, ref, rid)
 }
 
 func withReadHooks(h *readHooks) envOpt {
@@ -793,16 +784,18 @@ func TestStopJobReconcilesTheUserLabel(t *testing.T) {
 				}
 				return h.Provider.Get(ctx, ref)
 			}
-			h.stop = func(context.Context, provider.Ref) (provider.Pending, error) { return provider.Pending{}, stopFailed }
+			h.stop = func(context.Context, provider.Ref, string) (provider.Pending, error) {
+				return provider.Pending{}, stopFailed
+			}
 		}},
 		{"the instance the wait returns", func(e *env, h *readHooks) {
-			h.stop = func(ctx context.Context, ref provider.Ref) (provider.Pending, error) {
+			h.stop = func(ctx context.Context, ref provider.Ref, rid string) (provider.Pending, error) {
 				e.setUserLabel("mine", "bob")
-				return h.Provider.Stop(ctx, ref)
+				return h.Provider.Stop(ctx, ref, rid)
 			}
 		}},
 		{"the read after a failed stop", func(e *env, h *readHooks) {
-			h.stop = func(context.Context, provider.Ref) (provider.Pending, error) {
+			h.stop = func(context.Context, provider.Ref, string) (provider.Pending, error) {
 				e.setUserLabel("mine", "bob")
 				return provider.Pending{}, stopFailed
 			}

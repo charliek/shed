@@ -1,0 +1,25 @@
+{
+  "name": "code-reserved-label",
+  "description": "RESERVED_LABEL at 422: a refusal of kind ErrInvalid.",
+  "call": "labels",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "RESERVED_LABEL",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "RESERVED_LABEL",
+    "kind": "ErrInvalid"
+  }
+}

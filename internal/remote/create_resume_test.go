@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestRestartNeverDestroysAShedTheCloudCallsReady(t *testing.T) {
 				}
 			}
 			if tt.unlisted {
-				h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+				h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
 			}
 			e.restart()
 			got := e.settled(name)
@@ -101,11 +102,11 @@ func TestResumedCreateDoesNotInsertASecondInstance(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// The new server lists another zone: the instance is not in the list.
-	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
-	h.create = func(context.Context, provider.Spec) (provider.Pending, error) {
+	// The new server's list does not show the machine.
+	h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
+	h.create = func(context.Context, provider.Spec) (provider.Pending, provider.Instance, error) {
 		t.Error("the resumed create sent a second insert")
-		return provider.Pending{}, errors.New("no second insert")
+		return provider.Pending{}, provider.Instance{}, errors.New("no second insert")
 	}
 	e.restart()
 	e.auto()
@@ -117,17 +118,20 @@ func TestResumedCreateDoesNotInsertASecondInstance(t *testing.T) {
 	}
 }
 
-// When the instance of an unfinished create is gone, the resumed create makes
-// it again.
-func TestResumedCreateInsertsAgainWhenItsInstanceIsGone(t *testing.T) {
-	e := newEnv(t, manual())
+// When the machine of an unfinished create that was accepted is gone and
+// the list names no deletion of it (the service kept none, as after its 24
+// hours), the machine was made and deleted: the record is dropped and the
+// create is never sent again (createGone).
+func TestResumedAcceptedCreateWhoseMachineIsGoneIsDropped(t *testing.T) {
+	h := &hookProvider{}
+	e := newEnv(t, manual(), hooked(h))
 	const name = "again"
 	e.put(name, config.StatusStarting)
 	id := e.settledID(name)
 	deadline := time.Now().Add(testTimeout)
 	for e.b.snapshot(name, id).Ref == "" {
 		if time.Now().After(deadline) {
-			t.Fatal("the create never recorded its instance")
+			t.Fatal("the create never recorded its machine")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -135,12 +139,54 @@ func TestResumedCreateInsertsAgainWhenItsInstanceIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.prov.ExternalDelete(e.ref(name))
+	h.list = func(ctx context.Context) (provider.Listing, error) {
+		l, err := h.Provider.List(ctx)
+		l.Deleted = nil
+		return l, err
+	}
 	e.b = e.open()
 	e.auto()
-	if got := e.settled(name); got.Status != config.StatusRunning || got.ID != id {
-		t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
+	e.idle()
+	if _, err := e.b.GetShed(context.Background(), name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("GetShed = %v, want the record dropped", err)
 	}
-	if n := e.prov.Count(fake.OpCreate); n != 2 {
-		t.Fatalf("%d create calls, want 2", n)
+	if n := e.prov.Count(fake.OpCreate); n != 1 {
+		t.Fatalf("%d create calls, want the first only", n)
+	}
+	if !strings.Contains(strings.Join(e.logLines(), "\n"), "has no machine any more; dropping its record (seen by its create)") {
+		t.Errorf("no log line says why:\n%s", strings.Join(e.logLines(), "\n"))
+	}
+}
+
+// When the list names the deletion of an unfinished create's machine (its
+// lease ended, a delete at the service, gone from the cloud), the record is
+// dropped once an exact read confirms it, with a line naming the cause, and
+// nothing is created again.
+func TestResumedCreateOfADeletedMachineIsDropped(t *testing.T) {
+	e := newEnv(t, manual())
+	const name = "deleted"
+	e.put(name, config.StatusStarting)
+	id := e.settledID(name)
+	deadline := time.Now().Add(testTimeout)
+	for e.b.snapshot(name, id).Ref == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("the create never recorded its machine")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e.prov.DeleteAs(e.ref(name), provider.CausePage)
+	e.b = e.open()
+	e.idle()
+	if _, err := e.b.GetShed(context.Background(), name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("GetShed = %v, want the record dropped", err)
+	}
+	if n := e.prov.Count(fake.OpCreate); n != 1 {
+		t.Fatalf("%d create calls, want the first only", n)
+	}
+	if !strings.Contains(strings.Join(e.logLines(), "\n"), "deleted its machine (cause page)") {
+		t.Errorf("no log line names the cause:\n%s", strings.Join(e.logLines(), "\n"))
 	}
 }

@@ -11,55 +11,23 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/charliek/shed/internal/redact"
-	"github.com/charliek/shed/internal/remote/provider"
+	"gopkg.in/yaml.v3"
 )
 
-var (
-	envVarNameRegex     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	remoteSizeNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
-	machineTypeRegex    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
-)
+var envVarNameRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // applyDefaults fills the zero-valued fields of a remote block. It never
-// sets environment, state_dir, default_image or agent_dir: the first and
-// third are required, the other two default relative to the server's state
-// directory (StateDirPath, AgentDirPath).
+// sets state_dir or agent_dir, which default relative to the server's state
+// directory (StateDirPath, AgentDirPath), nor disk_gb or the limits, which
+// are off at zero.
 func (c *RemoteConfig) applyDefaults() {
 	if c.Provider == "" {
-		c.Provider = RemoteProviderGCE
+		c.Provider = RemoteProviderService
 	}
 	if c.Transport == "" {
 		c.Transport = RemoteTransportSSH
-	}
-	if c.DefaultSize == "" {
-		c.DefaultSize = provider.SizeStandard
-	}
-	if len(c.Sizes) == 0 {
-		c.Sizes = make(map[string]RemoteSizeConfig)
-		for _, s := range provider.DefaultSizes() {
-			c.Sizes[s.Name] = RemoteSizeConfig{MachineType: s.MachineType, CPUs: s.CPUs, MemoryMB: s.MemoryMB, Arch: s.Arch}
-		}
-	}
-	for name, s := range c.Sizes {
-		if s.Arch == "" {
-			s.Arch = provider.ArchAMD64
-			c.Sizes[name] = s
-		}
-	}
-	if c.DiskGB == 0 {
-		c.DiskGB = provider.DefaultDiskGB
-	}
-	if c.Limits.MaxRunning == 0 {
-		c.Limits.MaxRunning = DefaultRemoteMaxRunning
-	}
-	if c.Limits.MaxSheds == 0 {
-		c.Limits.MaxSheds = DefaultRemoteMaxSheds
-	}
-	if c.MaxRunDuration == 0 {
-		c.MaxRunDuration = Duration(DefaultRemoteMaxRunDuration)
 	}
 	if c.AgentInstall == "" {
 		c.AgentInstall = RemoteAgentInstallIncompatible
@@ -76,37 +44,22 @@ func (c *RemoteConfig) applyDefaults() {
 	if c.Firewall.Mode == RemoteFirewallStatic && len(c.Firewall.SourceRanges) == 0 && c.Firewall.SourceRangesEnv == "" {
 		c.Firewall.SourceRangesEnv = DefaultRemoteFirewallSourceRangesEnv
 	}
-	if c.Provider == RemoteProviderGCE {
-		if c.GCE == nil {
-			c.GCE = &RemoteGCEConfig{}
-		}
-		g := c.GCE
-		setDefault := func(field *string, def string) {
-			if *field == "" {
-				*field = def
-			}
-		}
-		setDefault(&g.ProjectEnv, DefaultRemoteGCEProjectEnv)
-		setDefault(&g.ZoneEnv, DefaultRemoteGCEZoneEnv)
-		setDefault(&g.NetworkEnv, DefaultRemoteGCENetworkEnv)
-		setDefault(&g.SubnetEnv, DefaultRemoteGCESubnetEnv)
-		setDefault(&g.CredentialsEnv, DefaultRemoteGCECredentialsEnv)
-		setDefault(&g.CredentialsFileEnv, DefaultRemoteGCECredentialsFileEnv)
-	}
 }
 
 // Validate checks a remote block after applyDefaults. It reads nothing from
 // the environment: whether the *_env variables are set is Resolve's job, at
 // server start-up, so a config loads on a machine that has none of them.
+// That remote.provider: service has an account service to ask
+// (auth.directory) is the server's check (validateRemote).
 func (c *RemoteConfig) Validate() error {
 	switch c.Provider {
-	case RemoteProviderGCE:
+	case RemoteProviderService:
 	case RemoteProviderFake:
 		if !c.AllowTestDrivers {
 			return fmt.Errorf("provider: %s is a test driver; set allow_test_drivers: true to use it", RemoteProviderFake)
 		}
 	default:
-		return fmt.Errorf("invalid provider: %q (must be %s or %s)", c.Provider, RemoteProviderGCE, RemoteProviderFake)
+		return fmt.Errorf("invalid provider: %q (must be %s, or %s with test drivers; see %s)", c.Provider, RemoteProviderService, RemoteProviderFake, RemoteUpgradePage)
 	}
 	switch c.Transport {
 	case RemoteTransportSSH:
@@ -118,52 +71,24 @@ func (c *RemoteConfig) Validate() error {
 		return fmt.Errorf("invalid transport: %q (must be %s or %s)", c.Transport, RemoteTransportSSH, RemoteTransportLocal)
 	}
 
-	if c.Environment == "" {
-		return fmt.Errorf("environment is required")
-	}
-	if !provider.ValidEnv(c.Environment) {
-		return fmt.Errorf("invalid environment: %q (1 to 20 lowercase letters, digits and hyphens, starting with a letter and not ending with a hyphen)", c.Environment)
-	}
-
 	for _, d := range []struct{ key, value string }{{"state_dir", c.StateDir}, {"agent_dir", c.AgentDir}} {
 		if d.value != "" && !filepath.IsAbs(ExpandPath(d.value)) {
 			return fmt.Errorf("%s must be an absolute path or start with ~/ (got %q)", d.key, d.value)
 		}
 	}
 
-	if c.DefaultImage == "" {
-		return fmt.Errorf("default_image is required")
-	}
-	if err := validateRemoteImageName("default_image", c.DefaultImage); err != nil {
-		return err
-	}
-	for alias, name := range c.ImageAliases {
-		if alias == "" || strings.ContainsAny(alias, " \t\n/") {
-			return fmt.Errorf("invalid image_aliases name %q", alias)
-		}
-		if err := validateRemoteImageName("image_aliases."+alias, name); err != nil {
-			return err
-		}
+	if c.DiskGB != 0 && (c.DiskGB < RemoteMinDiskGB || c.DiskGB > RemoteMaxDiskGB) {
+		return fmt.Errorf("invalid disk_gb: %d (must be %d to %d, or 0 for the size's own default)", c.DiskGB, RemoteMinDiskGB, RemoteMaxDiskGB)
 	}
 
-	if err := c.validateSizes(); err != nil {
-		return err
+	if c.Limits.MaxRunning < 0 {
+		return fmt.Errorf("invalid limits.max_running: %d (0 is off)", c.Limits.MaxRunning)
 	}
-	if c.DiskGB < RemoteMinDiskGB || c.DiskGB > RemoteMaxDiskGB {
-		return fmt.Errorf("invalid disk_gb: %d (must be %d to %d)", c.DiskGB, RemoteMinDiskGB, RemoteMaxDiskGB)
+	if c.Limits.MaxSheds < 0 {
+		return fmt.Errorf("invalid limits.max_sheds: %d (0 is off)", c.Limits.MaxSheds)
 	}
-
-	if c.Limits.MaxRunning < 1 {
-		return fmt.Errorf("invalid limits.max_running: %d (must be at least 1)", c.Limits.MaxRunning)
-	}
-	if c.Limits.MaxSheds < 1 {
-		return fmt.Errorf("invalid limits.max_sheds: %d (must be at least 1)", c.Limits.MaxSheds)
-	}
-	if c.Limits.MaxRunning > c.Limits.MaxSheds {
+	if c.Limits.MaxRunning > 0 && c.Limits.MaxSheds > 0 && c.Limits.MaxRunning > c.Limits.MaxSheds {
 		return fmt.Errorf("limits.max_running (%d) must not exceed limits.max_sheds (%d)", c.Limits.MaxRunning, c.Limits.MaxSheds)
-	}
-	if d := c.MaxRunDuration.Duration(); d < RemoteMinRunDuration || d > RemoteMaxRunDuration {
-		return fmt.Errorf("invalid max_run_duration: %s (must be %s to %s)", d, RemoteMinRunDuration, RemoteMaxRunDuration)
 	}
 
 	switch c.AgentInstall {
@@ -178,32 +103,46 @@ func (c *RemoteConfig) Validate() error {
 			return err
 		}
 	}
-	if err := c.validateFirewall(); err != nil {
+	if _, err := c.Access.Prefixes(); err != nil {
 		return err
 	}
-	if c.Provider == RemoteProviderGCE {
-		if c.GCE == nil {
-			return fmt.Errorf("gce block is required with provider: %s", RemoteProviderGCE)
-		}
-		g := c.GCE
-		for _, v := range []struct{ key, name string }{
-			{"gce.project_env", g.ProjectEnv}, {"gce.zone_env", g.ZoneEnv},
-			{"gce.network_env", g.NetworkEnv}, {"gce.subnet_env", g.SubnetEnv},
-		} {
-			if !envVarNameRegex.MatchString(v.name) {
-				return fmt.Errorf("invalid %s: %q is not an environment variable name", v.key, v.name)
-			}
-		}
-		if err := validateEnvPair("gce.credentials_env", g.CredentialsEnv, "gce.credentials_file_env", g.CredentialsFileEnv); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.validateFirewall()
 }
 
-func validateRemoteImageName(key, name string) error {
-	if name == "" || strings.ContainsAny(name, " \t\n") {
-		return fmt.Errorf("invalid %s: %q (a cloud image name, or %s<name> for an image family)", key, name, provider.ImagePrefixFamily)
+// Prefixes returns remote.access.allow parsed, in canonical form (nil when
+// empty: every unicast address outside the refused classes).
+func (a RemoteAccessConfig) Prefixes() ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, raw := range a.Allow {
+		p, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("invalid access.allow entry %q (must be an IPv4 or IPv6 CIDR such as 203.0.113.0/24)", raw)
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
+}
+
+// rejectRemovedRemoteKeys fails loudly when the remote block names a key an
+// earlier release took (RemoteRemovedKeys): the typed unmarshal ignores
+// unknown keys, and a server that silently dropped them would run without
+// the sizes, images or run limit its operator wrote.
+func rejectRemovedRemoteKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, ok := raw["remote"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, key := range RemoteRemovedKeys {
+		if _, present := block[key]; present {
+			return fmt.Errorf("config key remote.%s was removed: a remote server gets its machines, sizes, images and lifetimes from the account service (remote.provider: service with auth.directory); remove it (see %s)", key, RemoteUpgradePage)
+		}
+	}
+	if p, ok := block["provider"].(string); ok && p == "gce" {
+		return fmt.Errorf("remote.provider: gce was removed: a remote server gets its machines from the account service (remote.provider: service with auth.directory); see %s", RemoteUpgradePage)
 	}
 	return nil
 }
@@ -217,33 +156,6 @@ func validateEnvPair(key, name, fileKey, fileName string) error {
 	}
 	if name == fileName {
 		return fmt.Errorf("%s and %s must name different variables (both are %q)", key, fileKey, name)
-	}
-	return nil
-}
-
-func (c *RemoteConfig) validateSizes() error {
-	if len(c.Sizes) == 0 {
-		return fmt.Errorf("sizes must list at least one size")
-	}
-	for name, s := range c.Sizes {
-		if !remoteSizeNameRegex.MatchString(name) {
-			return fmt.Errorf("invalid sizes name %q (lowercase letters, digits and hyphens, starting with a letter)", name)
-		}
-		if !machineTypeRegex.MatchString(s.MachineType) {
-			return fmt.Errorf("invalid sizes.%s.machine_type: %q", name, s.MachineType)
-		}
-		if s.CPUs < 1 {
-			return fmt.Errorf("invalid sizes.%s.cpus: %d (must be at least 1)", name, s.CPUs)
-		}
-		if s.MemoryMB < 1 {
-			return fmt.Errorf("invalid sizes.%s.memory_mb: %d (must be at least 1)", name, s.MemoryMB)
-		}
-		if s.Arch != provider.ArchAMD64 && s.Arch != provider.ArchARM64 {
-			return fmt.Errorf("invalid sizes.%s.arch: %q (must be %s or %s)", name, s.Arch, provider.ArchAMD64, provider.ArchARM64)
-		}
-	}
-	if _, ok := c.Sizes[c.DefaultSize]; !ok {
-		return fmt.Errorf("default_size %q is not one of sizes (%s)", c.DefaultSize, strings.Join(c.sizeNames(), ", "))
 	}
 	return nil
 }
@@ -452,45 +364,10 @@ func (c *RemoteConfig) resolveFirewallSources(getenv func(string) string) (sourc
 	return sources, true, err
 }
 
-func (c *RemoteConfig) sizeNames() []string {
-	names := make([]string, 0, len(c.Sizes))
-	for name := range c.Sizes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// SizeList returns remote.sizes as the provider's type, ordered by name.
-func (c *RemoteConfig) SizeList() []provider.Size {
-	out := make([]provider.Size, 0, len(c.Sizes))
-	for _, name := range c.sizeNames() {
-		s := c.Sizes[name]
-		out = append(out, provider.Size{Name: name, MachineType: s.MachineType, CPUs: s.CPUs, MemoryMB: s.MemoryMB, Arch: s.Arch})
-	}
-	return out
-}
-
-// ResolveSize picks the size for a create request's cpus and memory_mb. Both
-// zero gives default_size; otherwise the smallest size that provides at
-// least both (a zero in one means "no requirement"). When nothing fits the
-// error wraps ErrInvalidShedRequestSentinel (400 INVALID_REQUEST) and names
-// the sizes that exist. The shed's record reports the returned size's CPUs
-// and MemoryMB, and client caps apply to them.
-func (c *RemoteConfig) ResolveSize(cpus, memoryMB int) (provider.Size, error) {
-	if cpus < 0 || memoryMB < 0 {
-		return provider.Size{}, fmt.Errorf("%w: cpus and memory_mb must not be negative", ErrInvalidShedRequestSentinel)
-	}
-	size, err := provider.ResolveSize(c.SizeList(), c.DefaultSize, cpus, memoryMB)
-	if err != nil {
-		return provider.Size{}, fmt.Errorf("%w: %w", ErrInvalidShedRequestSentinel, err)
-	}
-	return size, nil
-}
-
-// ResolveDiskGB turns a create's upper_size_bytes into the boot disk size in
-// whole GB, rounding up. Zero gives disk_gb. A size outside RemoteMinDiskGB
-// to RemoteMaxDiskGB wraps ErrInvalidShedRequestSentinel.
+// ResolveDiskGB turns a create's upper_size_bytes into the disk size in
+// whole GB, rounding up. Zero gives disk_gb (itself zero, the size's own
+// default, when unset). A size outside RemoteMinDiskGB to RemoteMaxDiskGB
+// wraps ErrInvalidShedRequestSentinel.
 func (c *RemoteConfig) ResolveDiskGB(upperSizeBytes int64) (int, error) {
 	if upperSizeBytes == 0 {
 		return c.DiskGB, nil
@@ -504,44 +381,6 @@ func (c *RemoteConfig) ResolveDiskGB(upperSizeBytes int64) (int, error) {
 		return 0, fmt.Errorf("%w: disk size must be %d to %d GB on the remote backend", ErrInvalidShedRequestSentinel, RemoteMinDiskGB, RemoteMaxDiskGB)
 	}
 	return n, nil
-}
-
-// ResolveImage maps a create's image to a cloud image name: empty gives
-// default_image, an image_aliases name gives its value. Anything else wraps
-// ErrUnknownImageSentinel: a create never names a cloud image directly.
-func (c *RemoteConfig) ResolveImage(image string) (string, error) {
-	if image == "" {
-		return c.DefaultImage, nil
-	}
-	if name, ok := c.ImageAliases[image]; ok {
-		return name, nil
-	}
-	aliases := make([]string, 0, len(c.ImageAliases))
-	for a := range c.ImageAliases {
-		aliases = append(aliases, a)
-	}
-	sort.Strings(aliases)
-	return "", fmt.Errorf("%w: %q (image aliases: %s)", ErrUnknownImageSentinel, image, strings.Join(aliases, ", "))
-}
-
-// GuestArch is the architecture every configured size shares (every shed
-// this backend can create runs it), or "" when the sizes mix architectures,
-// or one names none (a config not yet defaulted), or there are none.
-func (c *RemoteConfig) GuestArch() string {
-	arch := ""
-	for _, s := range c.Sizes {
-		if s.Arch == "" || (arch != "" && s.Arch != arch) {
-			return ""
-		}
-		arch = s.Arch
-	}
-	return arch
-}
-
-// RunLimit is the run limit a shed gets: the larger of max_run_duration and
-// the owning service client's max_age (zero for an admin's shed).
-func (c *RemoteConfig) RunLimit(clientMaxAge time.Duration) time.Duration {
-	return max(c.MaxRunDuration.Duration(), clientMaxAge)
 }
 
 // StateDirPath is where the record cache and delete markers live: state_dir
@@ -566,41 +405,15 @@ func (c *RemoteConfig) AgentDirPath(serverStateDir string) string {
 // The server calls it once at start-up, after the config has loaded and
 // validated; loading a config never calls it. getenv is os.Getenv when nil.
 //
-// With provider: gce it needs the project, zone, network and subnet
-// variables and exactly one of the credentials pair; with transport: ssh,
-// exactly one of the client key pair; with firewall.mode: static and
-// firewall.source_ranges_env, that variable. An error names the variable
-// (never a secret's value). A test driver needs none of its half.
+// With transport: ssh it needs exactly one of the client key pair; with
+// firewall.mode: static and firewall.source_ranges_env, that variable. An
+// error names the variable (never a secret's value). A test driver needs
+// none of its half.
 func (c *RemoteConfig) Resolve(getenv func(string) string) (*RemoteRuntime, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
 	rt := &RemoteRuntime{}
-	if c.Provider == RemoteProviderGCE {
-		if c.GCE == nil {
-			return nil, fmt.Errorf("remote.gce block is required with provider: %s", RemoteProviderGCE)
-		}
-		for _, v := range []struct {
-			key, name string
-			dst       *string
-		}{
-			{"remote.gce.project_env", c.GCE.ProjectEnv, &rt.Project},
-			{"remote.gce.zone_env", c.GCE.ZoneEnv, &rt.Zone},
-			{"remote.gce.network_env", c.GCE.NetworkEnv, &rt.Network},
-			{"remote.gce.subnet_env", c.GCE.SubnetEnv, &rt.Subnet},
-		} {
-			value := strings.TrimSpace(getenv(v.name))
-			if value == "" {
-				return nil, fmt.Errorf("environment variable %s (%s) is not set", v.name, v.key)
-			}
-			*v.dst = value
-		}
-		creds, err := resolveEnvPair(getenv, "remote.gce.credentials_env", c.GCE.CredentialsEnv, "remote.gce.credentials_file_env", c.GCE.CredentialsFileEnv)
-		if err != nil {
-			return nil, err
-		}
-		rt.Credentials = creds
-	}
 	if c.Transport == RemoteTransportSSH {
 		key, err := resolveEnvPair(getenv, "remote.ssh.client_key_env", c.SSH.ClientKeyEnv, "remote.ssh.client_key_file_env", c.SSH.ClientKeyFileEnv)
 		if err != nil {
@@ -610,9 +423,9 @@ func (c *RemoteConfig) Resolve(getenv func(string) string) (*RemoteRuntime, erro
 	}
 	if c.Firewall.Mode == RemoteFirewallStatic {
 		sources, set, err := c.resolveFirewallSources(getenv)
-		// A test provider has no real rule to compare with, so it may be
+		// A test provider has no real ingress to compare with, so it may be
 		// given no ranges; a list that is given must still be valid.
-		if err != nil && (set || c.Provider == RemoteProviderGCE) {
+		if err != nil && (set || c.Provider == RemoteProviderService) {
 			return nil, err
 		}
 		rt.FirewallSources = sources
@@ -673,6 +486,9 @@ func (c *ServerConfig) validateRemote() error {
 	if err := c.Remote.Validate(); err != nil {
 		return fmt.Errorf("remote config: %w", err)
 	}
+	if c.Remote.Provider == RemoteProviderService && !c.DirectoryConfigured() {
+		return fmt.Errorf("remote config: provider: %s gets each machine from the account service, which needs auth.directory (see %s)", RemoteProviderService, RemoteUpgradePage)
+	}
 	if c.EnvFile != "" {
 		return fmt.Errorf("env_file is not supported by the %s backend (a cloud shed gets no host environment); remove it", BackendRemote)
 	}
@@ -701,7 +517,7 @@ func (c *ServerConfig) validateRemote() error {
 			return fmt.Errorf("remote.firewall.acknowledge_any is not allowed with auth.clients (one client's shed could reach another's SSH port)")
 		}
 	}
-	// A client's images must be remote image aliases. Checked here as well
-	// as in Validate so the image-only loader refuses the same configs.
-	return c.validateClientImages()
+	// A client's images are checked at create against the account
+	// service's catalog (it is not known at load).
+	return nil
 }

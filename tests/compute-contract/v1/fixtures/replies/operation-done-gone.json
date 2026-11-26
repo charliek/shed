@@ -1,0 +1,22 @@
+{
+  "name": "operation-done-gone",
+  "description": "Done, with machine null: a finished delete.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "done": true,
+        "machine": null
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "operation": "gone"
+  }
+}

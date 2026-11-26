@@ -23,42 +23,34 @@ import (
 // hookProvider is the fake with single calls replaced.
 type hookProvider struct {
 	*fake.Provider
-	create  func(ctx context.Context, spec provider.Spec) (provider.Pending, error)
-	list    func(ctx context.Context, sel provider.Selector) ([]provider.Instance, error)
-	resolve func(ctx context.Context, image string) (string, error)
+	create func(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error)
+	list   func(ctx context.Context) (provider.Listing, error)
 	// setLabels, when set, runs before the provider's SetLabels; an error
 	// from it is returned instead.
-	setLabels func(ctx context.Context, ref provider.Ref, labels map[string]string) error
+	setLabels func(ctx context.Context, ref provider.Ref, set map[string]*string) error
 }
 
-func (h *hookProvider) SetLabels(ctx context.Context, ref provider.Ref, labels map[string]string) error {
+func (h *hookProvider) SetLabels(ctx context.Context, ref provider.Ref, rid string, set, expect map[string]*string) (provider.Instance, error) {
 	if h.setLabels != nil {
-		if err := h.setLabels(ctx, ref, labels); err != nil {
-			return err
+		if err := h.setLabels(ctx, ref, set); err != nil {
+			return provider.Instance{}, err
 		}
 	}
-	return h.Provider.SetLabels(ctx, ref, labels)
+	return h.Provider.SetLabels(ctx, ref, rid, set, expect)
 }
 
-func (h *hookProvider) Create(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
+func (h *hookProvider) Create(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error) {
 	if h.create != nil {
 		return h.create(ctx, spec)
 	}
 	return h.Provider.Create(ctx, spec)
 }
 
-func (h *hookProvider) List(ctx context.Context, sel provider.Selector) ([]provider.Instance, error) {
+func (h *hookProvider) List(ctx context.Context) (provider.Listing, error) {
 	if h.list != nil {
-		return h.list(ctx, sel)
+		return h.list(ctx)
 	}
-	return h.Provider.List(ctx, sel)
-}
-
-func (h *hookProvider) ResolveImage(ctx context.Context, image string) (string, error) {
-	if h.resolve != nil {
-		return h.resolve(ctx, image)
-	}
-	return h.Provider.ResolveImage(ctx, image)
+	return h.Provider.List(ctx)
 }
 
 func hooked(h *hookProvider) envOpt {
@@ -74,31 +66,9 @@ func tuned(fn func(*Options)) envOpt {
 	return func(e *env, _ *fake.Options) { e.tune = fn }
 }
 
-// clock is a settable clock for the fake provider.
-type clock struct {
-	mu sync.Mutex
-	t  time.Time
-}
-
-func (c *clock) now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t
-}
-
-func (c *clock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t = c.t.Add(d)
-}
-
-func clocked(c *clock) envOpt {
-	return func(_ *env, o *fake.Options) { o.Now = c.now }
-}
-
 func (e *env) instances() int {
 	e.t.Helper()
-	insts, err := e.prov.List(context.Background(), provider.Selector{})
+	insts, err := instances(e.prov, context.Background())
 	if err != nil {
 		e.t.Fatalf("List: %v", err)
 	}
@@ -131,100 +101,94 @@ func (e *env) reason(name string) string {
 	return shed.StatusReason
 }
 
-// --- a failed create never leaks its VM ---
+// --- a failed create keeps its machine until a person deletes it ---
 
-// The destroy after a failed create fails once. The VM must not be forgotten:
-// a delete marker stands, and the periodic pass (or a restart) finishes it.
-// The shed's record stays, in "error".
+// A create that failed after it was accepted keeps its record and its
+// machine (the clean-up rule in failCreate). The person's delete destroys
+// it; a destroy that fails once is not forgotten: the marker stands, and the
+// periodic pass (or a restart) finishes it.
 func TestFailedCreateDestroyIsRetried(t *testing.T) {
 	for _, how := range []string{"periodic pass", "restart"} {
 		t.Run(how, func(t *testing.T) {
 			e := newEnv(t)
 			e.fl.failAlways("late", transport.ErrHostKeyMismatch)
-			e.prov.FailNext(fake.OpDestroy, errors.New("the cloud is having a moment"))
-			// The failure may land inside the fast-fail window, and the
-			// create call then reports it; the shed is recorded in error
-			// either way.
 			_, _ = e.create("late")
 			if got := e.settled("late"); got.Status != config.StatusError || got.StatusReason != config.StatusReasonHostKey {
 				t.Fatalf("settled %q (%q), want error (host_key)", got.Status, got.StatusReason)
 			}
 			e.idle()
-			if n := e.instances(); n != 1 {
-				t.Fatalf("%d instances after the failed destroy, want the 1 that is still to go", n)
+			if n, m := e.instances(), markerCount(t, e.dir); n != 1 || m != 0 {
+				t.Fatalf("%d instances and %d markers after the failed create, want its machine and no marker", n, m)
 			}
-			if n := markerCount(t, e.dir); n != 1 {
-				t.Fatalf("%d delete markers after the failed destroy, want 1: nothing would retry it", n)
+			e.prov.FailNext(fake.OpDestroy, errors.New("the cloud is having a moment"))
+			if err := e.b.DeleteShed(ctxT(t), "late"); err != nil {
+				t.Fatalf("delete of the error shed: %v", err)
 			}
-
+			e.idle()
+			if n, m := e.instances(), markerCount(t, e.dir); n != 1 || m != 1 {
+				t.Fatalf("%d instances and %d markers after the failed destroy, want 1 and 1: nothing would retry it", n, m)
+			}
 			if how == "restart" {
 				e.restart()
 			} else {
 				e.sweep()
 			}
 			e.idle()
-			if n := e.instances(); n != 0 {
-				t.Fatalf("%d instances after the %s, want 0", n, how)
-			}
-			if n := markerCount(t, e.dir); n != 0 {
-				t.Fatalf("%d delete markers left", n)
-			}
-			if got := e.status("late"); got != config.StatusError {
-				t.Fatalf("the failed shed is %q after the %s, want it still listed in error", got, how)
-			}
-			if err := e.b.DeleteShed(ctxT(t), "late"); err != nil {
-				t.Fatalf("delete of the error shed: %v", err)
-			}
-			e.idle()
-			if n := markerCount(t, e.dir); n != 0 {
-				t.Fatalf("%d delete markers left after the shed was deleted", n)
+			if n, m := e.instances(), markerCount(t, e.dir); n != 0 || m != 0 {
+				t.Fatalf("%d instances and %d markers after the %s, want none", n, m, how)
 			}
 		})
 	}
 }
 
-// The cloud makes the instance and the reply is lost. The create fails with
-// no instance handle, and the instance must still be found and destroyed.
-func TestCreateWithLostReplyIsCleanedUp(t *testing.T) {
-	tests := []struct {
-		name      string
-		listFails int
+// The service makes the machine and the reply is lost: the outcome is
+// unknown, so nothing is cleaned up. The shed is kept starting, and the next
+// pass finds the machine by its shed id (a read that fails first only puts
+// it off) and finishes the create on it.
+func TestCreateWithLostReplyIsKept(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		getFails int
 	}{
 		{"found by shed id", 0},
-		// Every look for the instance fails: the marker must stand.
-		{"the cloud cannot be listed", findInsertAttempts},
-	}
-	for _, tt := range tests {
+		{"the first read fails", 1},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := &hookProvider{}
-			h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
-				if _, err := h.Provider.Create(ctx, spec); err != nil {
-					return provider.Pending{}, err
+			lose := true
+			h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error) {
+				p, i, err := h.Provider.Create(ctx, spec)
+				if err != nil || !lose {
+					return p, i, err
 				}
-				for range tt.listFails {
-					h.FailNext(fake.OpList, errors.New("list failed"))
-				}
-				return provider.Pending{}, errors.New("the reply was lost")
+				return provider.Pending{}, provider.Instance{}, &provider.Error{Kind: provider.ErrUnavailable, Op: "create", Detail: "the reply was lost"}
 			}
 			e := newEnv(t, hooked(h))
-			_, _ = e.create("lost")
-			if got := e.settled("lost"); got.Status != config.StatusError {
-				t.Fatalf("settled %q, want error", got.Status)
+			if _, err := e.create("lost"); err != nil {
+				t.Fatalf("create = %v; an unknown outcome is not a refusal", err)
 			}
 			e.idle()
-			if tt.listFails > 0 {
-				if e.instances() != 1 || markerCount(t, e.dir) != 1 {
-					t.Fatalf("%d instances and %d markers while the cloud could not be listed, want 1 and 1",
-						e.instances(), markerCount(t, e.dir))
-				}
+			if st, why := e.status("lost"), e.reason("lost"); st != config.StatusStarting || why != config.StatusReasonCloudUnreadable {
+				t.Fatalf("shed %s (%s), want starting (cloud_unreadable)", st, why)
+			}
+			if n, m := e.instances(), markerCount(t, e.dir); n != 1 || m != 0 {
+				t.Fatalf("%d instances and %d markers, want the machine and no marker", n, m)
+			}
+			lose = false
+			for range tt.getFails {
+				h.FailNext(fake.OpGet, &provider.Error{Kind: provider.ErrUnavailable, Op: "get"})
 				e.sweep()
 				e.idle()
+				if st := e.status("lost"); st != config.StatusStarting {
+					t.Fatalf("after a failed read: %s, want still starting", st)
+				}
 			}
-			if n := e.instances(); n != 0 {
-				t.Fatalf("%d instances left by a create whose reply was lost", n)
+			e.sweep()
+			if got := e.settled("lost"); got.Status != config.StatusRunning {
+				t.Fatalf("after the pass: %q (%q)", got.Status, got.StatusReason)
 			}
-			if n := markerCount(t, e.dir); n != 0 {
-				t.Fatalf("%d delete markers left", n)
+			if n := e.instances(); n != 1 {
+				t.Fatalf("%d instances, want the one", n)
 			}
 		})
 	}
@@ -244,7 +208,7 @@ func TestCleanupMarkerKeepsTheRecordAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveMarker(&state.Marker{ID: rec.Shed.ID, Name: "half", Env: testEnv, Ref: rec.Ref, At: time.Now(), KeepRecord: true}); err != nil {
+	if err := store.SaveMarker(&state.Marker{ID: rec.Shed.ID, Name: "half", Ref: rec.Ref, At: time.Now(), KeepRecord: true}); err != nil {
 		t.Fatal(err)
 	}
 	e.b = e.open()
@@ -317,17 +281,30 @@ func TestSweepCorrectsStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("stopped by the run limit", func(t *testing.T) {
-		c := &clock{t: time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)}
-		e := newEnv(t, clocked(c))
+	t.Run("being deleted by the service", func(t *testing.T) {
+		e := newEnv(t)
 		e.running("s")
-		c.advance(24 * time.Hour)
-		if err := e.prov.ExternalStop(e.ref("s")); err != nil {
-			t.Fatal(err)
-		}
+		e.prov.SetDeleting(e.ref("s"))
 		e.sweep()
-		if got, why := e.status("s"), e.reason("s"); got != config.StatusStopped || why != config.StatusReasonRunLimit {
-			t.Fatalf("shed is %q (%q), want stopped (run_limit)", got, why)
+		e.idle()
+		if n := e.prov.Count(fake.OpStop); n != 0 {
+			t.Fatalf("%d stop calls for a machine the service is deleting, want none", n)
+		}
+		if got := e.status("s"); got != config.StatusRunning {
+			t.Fatalf("shed is %q, want it left running until its machine is gone", got)
+		}
+	})
+
+	t.Run("deleted at its lease's end", func(t *testing.T) {
+		e := newEnv(t)
+		e.running("s")
+		e.prov.DeleteAs(e.ref("s"), provider.CauseLeaseEnded)
+		e.sweep()
+		if _, err := e.b.GetShed(context.Background(), "s"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+			t.Fatalf("GetShed after the lease ended = %v, want not found", err)
+		}
+		if !strings.Contains(strings.Join(e.logLines(), "\n"), "deleted its machine (cause lease_ended)") {
+			t.Errorf("no log line names the cause")
 		}
 	})
 
@@ -348,7 +325,7 @@ func TestSweepCorrectsStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 		e.settled("s")
-		if _, err := e.prov.Start(context.Background(), e.ref("s"), provider.StartOptions{}); err != nil {
+		if _, err := e.prov.Start(context.Background(), e.ref("s"), ""); err != nil {
 			t.Fatal(err)
 		}
 		e.sweep()
@@ -364,16 +341,15 @@ func TestSweepCorrectsStatus(t *testing.T) {
 	t.Run("left stopping by a failed cloud call", func(t *testing.T) {
 		e := newEnv(t)
 		e.running("s")
-		// The stop job cannot read the instance, twice: before the stop and
-		// when it asks what the instance is doing.
-		e.prov.FailNext(fake.OpGet, errors.New("get failed"))
+		// The stop job cannot read the instance before the stop: the stop
+		// is kept as it is (job, request id, anything queued) for the pass.
 		e.prov.FailNext(fake.OpGet, errors.New("get failed"))
 		if _, err := e.b.StopShed(ctxT(t), "s"); err != nil {
 			t.Fatal(err)
 		}
 		e.idle()
-		if got := e.status("s"); got != config.StatusStopping {
-			t.Fatalf("shed is %q after the failed stop, want stopping", got)
+		if got := e.storedRecord("s"); got.Shed.Status != config.StatusStopping || got.Job != state.JobStop {
+			t.Fatalf("shed is %q (job %q) after the failed stop, want stopping with its job", got.Shed.Status, got.Job)
 		}
 		e.sweep()
 		if got := e.settled("s"); got.Status != config.StatusStopped {
@@ -386,19 +362,8 @@ func TestSweepCorrectsStatus(t *testing.T) {
 // instance, not another environment's, not a shed with a job in flight.
 func TestSweepTouchesNothingWithoutAMarker(t *testing.T) {
 	e := newEnv(t, manual())
-	seed := func(name, id string, st provider.ShedState, env string) {
-		ident := provider.Identity{Env: env, ID: id, Name: name}
-		spec, _ := provider.ShedSpec{CreatedAt: time.Now(), Image: "img", Size: "standard", Network: "open"}.Encode()
-		e.prov.Seed(provider.Instance{
-			Name:     ident.InstanceName(),
-			State:    provider.StateRunning,
-			Labels:   ident.Labels(st),
-			Metadata: map[string]string{provider.MetadataShedSpec: spec},
-		})
-	}
-	seed("half-made", "aaaaaaaaaaaa", provider.ShedStateCreating, testEnv)
-	seed("unknown", "dddddddddddd", provider.ShedStateReady, testEnv)
-	seed("theirs", "cccccccccccc", provider.ShedStateReady, "other")
+	e.seedMachine("half-made", newID(t), provider.ShedStateCreating, time.Now())
+	e.seedMachine("unknown", newID(t), provider.ShedStateReady, time.Now())
 	e.put("busy", config.StatusStarting)
 	e.put("up", config.StatusRunning)
 
@@ -408,8 +373,8 @@ func TestSweepTouchesNothingWithoutAMarker(t *testing.T) {
 	if n := e.prov.Count(fake.OpDestroy) + e.prov.Count(fake.OpStop) + e.prov.Count(fake.OpStart); n != 0 {
 		t.Fatalf("the periodic pass made %d destroy, stop or start calls, want none", n)
 	}
-	if n := e.instances(); n != 5 {
-		t.Fatalf("%d instances after the periodic pass, want all 5", n)
+	if n := e.instances(); n != 4 {
+		t.Fatalf("%d machines after the periodic pass, want all 4", n)
 	}
 	if got := e.status("busy"); got != config.StatusStarting {
 		t.Fatalf("the shed being created is %q, want starting", got)
@@ -543,27 +508,27 @@ func TestCloneHasATimeoutAndABoundedRetry(t *testing.T) {
 // The image lookup runs before the fast-fail window on the request's own
 // context, which the API never cancels. It must have a bound of its own, or a
 // slow cloud API holds the create's reply past the time a client waits.
-func TestCreateBoundsTheImageLookup(t *testing.T) {
-	h := &hookProvider{resolve: func(ctx context.Context, _ string) (string, error) {
-		<-ctx.Done()
-		return "", ctx.Err()
-	}}
-	e := newEnv(t, hooked(h), tuned(func(o *Options) { o.ImageResolveTimeout = 50 * time.Millisecond }))
-	done := make(chan error, 1)
-	go func() {
-		_, err := e.b.CreateShed(context.Background(), config.CreateShedRequest{Name: "slow", NoProvision: true})
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("create succeeded although the image could not be resolved")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("create is still waiting on the image lookup")
+// A create naming an image the service's catalog does not offer is refused
+// before anything is sent or recorded: 422 COMPUTE_POLICY_REFUSED, reason
+// image. One naming an offered alias, or none, goes through.
+func TestCreateRefusesAnImageTheServiceDoesNotOffer(t *testing.T) {
+	e := newEnv(t)
+	_, err := e.b.CreateShed(context.Background(), config.CreateShedRequest{Name: "odd", NoProvision: true, Image: "nightly"})
+	var cr *config.ComputeRefusal
+	if !errors.As(err, &cr) || cr.Code != config.ErrComputePolicyRefused || cr.Reason != "image" || cr.Status != 422 {
+		t.Fatalf("create with an image the catalog lacks = %v, want 422 COMPUTE_POLICY_REFUSED (image)", err)
+	}
+	if n := e.prov.Count(fake.OpCreate); n != 0 {
+		t.Fatalf("%d creates sent", n)
 	}
 	if sheds, _ := e.b.ListSheds(context.Background()); len(sheds) != 0 {
-		t.Fatalf("%d sheds recorded by a create that never resolved its image", len(sheds))
+		t.Fatalf("%d sheds recorded by a refused create", len(sheds))
+	}
+	if _, err := e.b.CreateShed(context.Background(), config.CreateShedRequest{Name: "cloudy", NoProvision: true, Image: "cloud"}); err != nil {
+		t.Fatalf("create with an alias of the catalog: %v", err)
+	}
+	if got := e.settled("cloudy"); got.Image != "shed-remote-cloud-fake" {
+		t.Errorf("the shed's image = %q, want the alias's resolved name", got.Image)
 	}
 }
 
@@ -603,7 +568,7 @@ func TestRestartKeepsARecordWhoseInstanceIsOnlyUnlisted(t *testing.T) {
 	e.running("here")
 	e.running("gone")
 	e.prov.ExternalDelete(e.ref("gone"))
-	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+	h.list = func(context.Context) (provider.Listing, error) { return provider.Listing{}, nil }
 	e.restart()
 	e.idle()
 	if got := e.status("here"); got != config.StatusRunning {

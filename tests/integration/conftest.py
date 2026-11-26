@@ -85,6 +85,9 @@ REMOTE_LOG_PATH = os.environ.get(
     "SHED_REMOTE_LOG_PATH", str(Path.home() / ".shed" / "dev-remote" / "server.log")
 )
 REMOTE_IMAGE = os.environ.get("SHED_REMOTE_IMAGE", "")
+# `make test-integration-compute` sets it: the `[remote]` server is a private
+# compute world on this host (fixtures/directory.py: compute_world), no cloud.
+REMOTE_HERMETIC = os.environ.get("SHED_REMOTE_HERMETIC", "") == "1"
 
 
 # ----------------------------------------------------------------------------
@@ -152,14 +155,42 @@ def fc_server() -> RemoteServer:
 
 
 @pytest.fixture(scope="session")
-def remote_server() -> CloudServer:
+def hermetic_remote_world():
+    """The `[remote]` server of a hermetic run (`SHED_REMOTE_HERMETIC=1`,
+    `make test-integration-compute`): one compute world for the session (a
+    private reference service and shed-server from bin/, the local link, no
+    cloud), listing the itest people (`fixtures.identity.directory_users`)."""
+    from fixtures.directory import compute_skip_reason, compute_world
+    from fixtures.identity import directory_users, ensure_keys
+
+    why = compute_skip_reason()
+    if why:
+        pytest.skip(why)
+    with compute_world() as w:
+        for u in directory_users(ensure_keys()):
+            w.users[u["name"]] = u
+        w.publish()
+        w.refresh_ok()
+        yield w
+
+
+@pytest.fixture(scope="session")
+def remote_server(request) -> CloudServer:
     """A shed-server running `default_backend: remote` (each shed is a
-    cloud VM), reached through the local CLI.
+    cloud VM), reached through the local CLI as its local admin (the
+    developer's own entry).
 
     Skips unless `SHED_REMOTE_SERVER` names a `~/.shed/config.yaml` entry,
     so no run creates a cloud VM by accident. `make test-integration-remote`
     sets it (default `remote-dev`) together with `SHED_REMOTE_LOG_PATH`.
+    Under `SHED_REMOTE_HERMETIC=1` it is the hermetic world's server instead,
+    as its local admin.
     """
+    if REMOTE_HERMETIC:
+        from fixtures.directory import ENTRY
+
+        w = request.getfixturevalue("hermetic_remote_world")
+        return CloudServer(name=ENTRY, log_path=w.server.log_path, env=w.admin.env(), home=Path(w.admin.home))
     if not REMOTE_SERVER_NAME:
         pytest.skip(
             "SHED_REMOTE_SERVER not set: no remote-backend server for this run "
@@ -180,6 +211,52 @@ def remote_server() -> CloudServer:
     return s
 
 
+@pytest.fixture(scope="session")
+def remote_compute(remote_server) -> bool:
+    """Whether the remote server takes its machines from the account
+    service (plan 041: `/api/info` lists `lease`). Its local admins create no
+    cloud shed there."""
+    from fixtures.compute import FEATURE_LEASE
+
+    return FEATURE_LEASE in remote_server.features()
+
+
+@pytest.fixture(scope="session")
+def remote_person(remote_server, remote_compute):
+    """Who the shared `[remote]` cases act as: on a server whose machines
+    come from the account service (`remote_compute`), the service's person
+    `itest-alice` (an identity of its own, with the itest key; a local admin
+    creates no cloud shed); on any other remote server, the developer's
+    entry (`remote_server`).
+
+    Against the reference service (`SHED_REMOTE_SERVICE=ref`) alice is put in
+    its users.json first; against any other service she must already be on
+    its list (the case skips, saying so, otherwise)."""
+    if not remote_compute:
+        yield remote_server
+        return
+    from fixtures.compute import list_itest_people, person_identity, unlisted_people
+    from fixtures.identity import ALICE
+    from fixtures.server import resolve_server_entry
+
+    if not REMOTE_HERMETIC and os.environ.get("SHED_REMOTE_SERVICE", "").strip() == "ref":
+        ref_dir = Path(os.environ.get("SHED_COMPUTE_REF_DIR", "") or Path.home() / ".shed" / "dev-remote" / "ref")
+        users = ref_dir / "control" / "users.json"
+        if users.parent.is_dir():
+            list_itest_people(users)
+    if unlisted_people(remote_server, [ALICE]):
+        pytest.skip(f"{remote_server.name!r} takes its machines from the account service, whose list lacks "
+                    f"{ALICE}; the shared [remote] cases act as {ALICE} there (a local admin creates no cloud "
+                    f"shed): list the itest people (`uv run python -m fixtures.identity users-yaml`)")
+    entry = resolve_server_entry(remote_server.name, env=remote_server.env) or {}
+    ident = person_identity(ALICE, remote_server.name, entry.get("host", "localhost"), int(entry.get("ssh_port") or 0))
+    try:
+        ident.add_server()
+        yield remote_server.as_person(ident)
+    finally:
+        ident.remove()
+
+
 @pytest.fixture(params=["vz", "fc", "remote"])
 def shed_server(request):
     """Parameterized across backends.
@@ -196,6 +273,10 @@ def shed_server(request):
         if marker is not None:
             reason = marker.args[0] if marker.args else "not supported"
             pytest.skip(f"not on the remote backend: {reason}")
+    if request.param == "remote":
+        # On a compute server, the service's person (a local admin creates
+        # no cloud shed there).
+        return request.getfixturevalue("remote_person")
     return request.getfixturevalue(f"{request.param}_server")
 
 
@@ -340,8 +421,9 @@ def shed_server_dev(request):
 #            reconfigure it: it must have been STARTED with the user list,
 #            and `SHED_ITEST_USERS` must list `fc`; otherwise it skips saying
 #            what to set.
-#   [remote] the remote dev server (`SHED_REMOTE_SERVER`), likewise with
-#            `remote` in `SHED_ITEST_USERS`. Every shed there is a billed VM:
+#   [remote] the remote dev server (`SHED_REMOTE_SERVER`). Its people come
+#            from the account service it is enrolled with (the directory
+#            source), never a user list. Every shed there is a billed VM:
 #            a users case the remote backend need not run carries
 #            `@pytest.mark.local_vm_only(reason)` and skips on [remote]
 #            before any fixture runs (pytest_runtest_setup below).
@@ -381,6 +463,9 @@ def users_env(request):
         reconfigure, image = False, "base"
     else:
         server = request.getfixturevalue("remote_server")
+        if request.getfixturevalue("remote_compute"):
+            # Its people come from the account service (auth.directory).
+            source = "directory"
         skip_unless_users_source_ready("remote", server.name, source)
         reconfigure, image = False, server.image
     with users_environment(backend, server, reconfigure=reconfigure, image=image, source=source) as env:
@@ -395,6 +480,15 @@ def pytest_runtest_setup(item):
     otherwise create a billed VM first). `shed_server` does the same for its
     own parameter. A case marked `not_under_directory_source(reason)` skips
     under the directory source."""
+    marker = item.get_closest_marker("real_guest")
+    if marker is not None and REMOTE_HERMETIC:
+        callspec = getattr(item, "callspec", None)
+        params = callspec.params if callspec is not None else {}
+        on_remote = (params.get("shed_server") == "remote" or params.get("users_env") == "remote"
+                     or not params)
+        if on_remote:
+            pytest.skip("needs a real guest; the hermetic compute world's machines are shed-agents on this "
+                        f"host: {marker.args[0] if marker.args else 'not supported'}")
     marker = item.get_closest_marker("not_under_directory_source")
     if marker is not None:
         why = skip_reason_under_directory_source(marker.args[0] if marker.args else "not supported")

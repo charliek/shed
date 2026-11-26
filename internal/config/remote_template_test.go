@@ -10,11 +10,25 @@ import (
 
 const devRemoteTemplate = "../../configs/server.dev-remote.yaml.tmpl"
 
+// devRemoteReplacer is the Make target's render: the reference service on
+// loopback with the local transport, or an https service with ssh.
+func devRemoteReplacer(t *testing.T, dir, mode, setting string, local bool) *strings.Replacer {
+	t.Helper()
+	url, dirSetting, transport, transportSetting := "https://accounts.example.test", "# https: no allow_plain_http", "ssh", "allow_test_drivers: false"
+	if local {
+		url, dirSetting, transport, transportSetting = "http://127.0.0.1:18700", "allow_plain_http: true", "local", "allow_test_drivers: true"
+	}
+	return strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@ADMIN_KEY@", userKeyLine(t),
+		"@DIRECTORY_URL@", url, "@DIRECTORY_SETTING@", dirSetting, "@TRANSPORT@", transport, "@TRANSPORT_SETTING@", transportSetting,
+		"@FIREWALL_MODE@", mode, "@FIREWALL_SETTING@", setting)
+}
+
 // TestDevRemoteTemplate keeps configs/server.dev-remote.yaml.tmpl loadable
-// in both firewall modes `make dev-server-up-remote` renders it in, and free
-// of any address. The replacements are the Make target's own: a static
-// render names the variable, an auto render lists SHED_REMOTE_ECHO_URLS as a
-// flow sequence.
+// in both firewall modes `make dev-server-up-remote` renders it in, against
+// an https account service and against the reference service on loopback,
+// and free of any address. The replacements are the Make target's own: a
+// static render names the variable, an auto render lists
+// SHED_REMOTE_ECHO_URLS as a flow sequence.
 func TestDevRemoteTemplate(t *testing.T) {
 	raw, err := os.ReadFile(devRemoteTemplate)
 	if err != nil {
@@ -26,13 +40,13 @@ func TestDevRemoteTemplate(t *testing.T) {
 			t.Fatalf("the template must hold the line %q exactly once", placeholder)
 		}
 	}
-	render := func(mode, setting string) string {
-		return strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@SHED_REMOTE_ENV@", "dev-box", "@GITHUB_USER@", "example",
-			"@FIREWALL_MODE@", mode, "@FIREWALL_SETTING@", setting).Replace(string(raw))
+	render := func(mode, setting string, local bool) string {
+		return devRemoteReplacer(t, dir, mode, setting, local).Replace(string(raw))
 	}
-	rendered := render("static", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES")
-	auto := render("auto", "echo_urls: [https://echo-one.example/, https://echo-two.example/]")
-	for name, y := range map[string]string{"static": rendered, "auto": auto} {
+	rendered := render("static", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES", false)
+	auto := render("auto", "echo_urls: [https://echo-one.example/, https://echo-two.example/]", false)
+	ref := render("static", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES", true)
+	for name, y := range map[string]string{"static": rendered, "auto": auto, "reference service": ref} {
 		if strings.Contains(y, "@") && regexp.MustCompile(`@[A-Z_]+@`).MatchString(y) {
 			t.Fatalf("the %s render still holds a placeholder", name)
 		}
@@ -47,6 +61,8 @@ func TestDevRemoteTemplate(t *testing.T) {
 			RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "SHED_REMOTE_SOURCE_RANGES"}},
 		{"auto: echo services from the env file", auto,
 			RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://echo-one.example/", "https://echo-two.example/"}}},
+		{"the reference service on loopback, the local transport", ref,
+			RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "SHED_REMOTE_SOURCE_RANGES"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,6 +73,9 @@ func TestDevRemoteTemplate(t *testing.T) {
 			cfg, err := LoadServerConfigFromPath(path)
 			if err != nil {
 				t.Fatalf("the rendered template does not load: %v", err)
+			}
+			if cfg.Remote.Provider != RemoteProviderService || !cfg.DirectoryConfigured() {
+				t.Errorf("provider %q, directory %v: want the service and a directory", cfg.Remote.Provider, cfg.DirectoryConfigured())
 			}
 			got := cfg.Remote.Firewall
 			if got.Mode != tt.want.Mode || got.SourceRangesEnv != tt.want.SourceRangesEnv || len(got.SourceRanges) != 0 ||
@@ -79,16 +98,15 @@ func TestDevRemoteTemplate(t *testing.T) {
 }
 
 // TestRemoteUnknownKeysRefused: a misspelt key under remote: stops the load.
-// Every setting there bounds a billed VM or who may reach it, and the typed
-// decode alone would drop the key and use the default.
+// Every setting there bounds a billed machine or who may reach it, and the
+// typed decode alone would drop the key and use the default.
 func TestRemoteUnknownKeysRefused(t *testing.T) {
 	raw, err := os.ReadFile(devRemoteTemplate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	good := strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@SHED_REMOTE_ENV@", "dev-box", "@GITHUB_USER@", "example",
-		"@FIREWALL_MODE@", "static", "@FIREWALL_SETTING@", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES").Replace(string(raw))
+	good := devRemoteReplacer(t, dir, "static", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES", false).Replace(string(raw))
 	load := func(t *testing.T, y string) error {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "server.yaml")
@@ -105,13 +123,11 @@ func TestRemoteUnknownKeysRefused(t *testing.T) {
 	tests := []struct {
 		name, old, new, want string
 	}{
-		{"a limit", "    max_running: 2\n", "    max_runs: 2\n", "max_runs"},
-		{"a limit at the wrong level", "  disk_gb: 50\n", "  disk_gb: 50\n  max_running: 1\n", "max_running"},
-		{"the run limit", "  max_run_duration: 24h\n", "  max_run: 24h\n", "max_run"},
+		{"a limit at the wrong level", "  agent_install: never\n", "  agent_install: never\n  max_running: 1\n", "max_running"},
+		{"the state directory", "  state_dir: " + dir + "/remote\n", "  state_dirs: " + dir + "/remote\n", "state_dirs"},
 		{"a firewall setting", "    source_ranges_env: SHED_REMOTE_SOURCE_RANGES\n", "    source_range_env: SHED_REMOTE_SOURCE_RANGES\n", "source_range_env"},
 		{"the firewall acknowledgement", "    mode: static\n", "    mode: static\n    acknowledge: false\n", "acknowledge"},
 		{"an ssh setting", "    client_key_env: SHED_REMOTE_SSH_KEY\n", "    client_key: SHED_REMOTE_SSH_KEY\n", "client_key"},
-		{"a gce setting", "    zone_env: SHED_GCE_ZONE\n", "    zone: SHED_GCE_ZONE\n", "zone"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

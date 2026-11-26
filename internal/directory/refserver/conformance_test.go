@@ -169,6 +169,9 @@ type exStep struct {
 		Text    *string            `json:"text"`
 		// Answer is a hosted exchange's: the 200 judged as an answer.
 		Answer json.RawMessage `json:"answer"`
+		// ReplayOf is a compute exchange's: the body is, byte for byte,
+		// that of the step it names (the first step is 0).
+		ReplayOf *int `json:"replay_of"`
 	} `json:"response"`
 }
 
@@ -283,9 +286,16 @@ type scenario struct {
 	// hosted is a hosted exchange (the provision contract's): its own
 	// members, set-up steps and placeholder are allowed, and canned is the
 	// items sources.set gives a person.
-	hosted   bool
-	canned   json.RawMessage
-	sent     []byte // the step's request body, for an answer's judgement
+	hosted bool
+	canned json.RawMessage
+	// compute is a compute exchange (the compute contract's): its own
+	// set-up steps and placeholders are allowed. ctoken is the bound
+	// {{compute_token}}; ops the bound {{operation_N}}.
+	compute  bool
+	ctoken   string
+	ops      map[string]string
+	raws     [][]byte // each step's response body, for replay_of
+	sent     []byte   // the step's request body, for an answer's judgement
 	listGen  int
 	versions map[int]string
 	jtiSeq   int
@@ -421,6 +431,15 @@ func (s *scenario) before(steps []map[string]json.RawMessage) {
 				s.in.mu.Lock()
 				s.in.fail = true
 				s.in.mu.Unlock()
+			case "compute.allow", "compute.deny", "client.register", "policy.set", "quota.fill",
+				"cloud.fail", "cloud.settle", "guest.publish_key", "clock.advance", "person.optout",
+				"ingress.break", "machine.delete":
+				if !s.compute {
+					s.t.Fatalf("the set-up step %q is the compute contract's, not this one's", name)
+				}
+				if err := s.srv.applyComputeStep(name, raw, func(d time.Duration) { s.clock = s.clock.Add(d) }); err != nil {
+					s.t.Fatalf("%s: %v", name, err)
+				}
 			case "sources.set", "deliveries.deny":
 				if !s.hosted {
 					s.t.Fatalf("the set-up step %q is the provision contract's, not this one's", name)
@@ -457,9 +476,12 @@ func (s *scenario) limitCaller(kind string) (string, error) {
 	switch limitKind(kind) {
 	case limitEnroll, limitToken:
 		return strings.Split(callerAddr, ":")[0], nil
-	case limitDeliveries:
-		if !s.hosted {
+	case limitDeliveries, limitCompute:
+		if limitKind(kind) == limitDeliveries && !s.hosted {
 			return "", fmt.Errorf("the delivery limit is the provision contract's")
+		}
+		if limitKind(kind) == limitCompute && !s.compute {
+			return "", fmt.Errorf("the compute limit is the compute contract's")
 		}
 		fallthrough
 	case limitDirectory:
@@ -685,8 +707,8 @@ func (s *scenario) accessToken(raw json.RawMessage) string {
 func (s *scenario) request(st *exStep, assertion string) *http.Request {
 	var body io.Reader
 	raw := st.Request.Body
-	if st.Request.BodyBytes != nil && (!s.hosted || raw != nil) {
-		s.t.Fatalf("body_bytes is a hosted exchange's, instead of body")
+	if st.Request.BodyBytes != nil && ((!s.hosted && !s.compute) || raw != nil) {
+		s.t.Fatalf("body_bytes is a hosted or compute exchange's, instead of body")
 	}
 	s.sent = nil
 	switch {
@@ -705,7 +727,7 @@ func (s *scenario) request(st *exStep, assertion string) *http.Request {
 		s.sent = []byte(s.resolve(string(raw)))
 		body = bytes.NewReader(s.sent)
 	}
-	req := httptest.NewRequest(st.Request.Method, st.Request.Path, body)
+	req := httptest.NewRequest(st.Request.Method, s.resolvePath(st.Request.Path), body)
 	req.RemoteAddr = callerAddr
 	for k, v := range st.Request.Headers {
 		if strings.Contains(v, "{{access_token}}") {
@@ -713,6 +735,12 @@ func (s *scenario) request(st *exStep, assertion string) *http.Request {
 				s.t.Fatal("{{access_token}} is used before it is bound")
 			}
 			v = strings.ReplaceAll(v, "{{access_token}}", s.token)
+		}
+		if strings.Contains(v, "{{compute_token}}") {
+			if s.ctoken == "" {
+				s.t.Fatal("{{compute_token}} is used before it is bound")
+			}
+			v = strings.ReplaceAll(v, "{{compute_token}}", s.ctoken)
 		}
 		if strings.Contains(v, "{{delivery_token}}") {
 			if s.dtoken == "" {
@@ -747,6 +775,15 @@ func (s *scenario) step(i int, st *exStep) {
 	res := rec.Result()
 	got, _ := io.ReadAll(res.Body)
 	where := fmt.Sprintf("step %d (%s %s)", i, st.Request.Method, st.Request.Path)
+	s.raws = append(s.raws, got)
+	if r := st.Response.ReplayOf; r != nil {
+		if !s.compute || *r < 0 || *r >= i {
+			t.Fatalf("%s: replay_of %d is a compute exchange's, naming an earlier step", where, *r)
+		}
+		if !bytes.Equal(got, s.raws[*r]) {
+			t.Errorf("%s: the body is not step %d's byte for byte:\n%s\n%s", where, *r, got, s.raws[*r])
+		}
+	}
 
 	if res.StatusCode != st.Response.Status {
 		t.Fatalf("%s: status %d, want %d; body %s", where, res.StatusCode, st.Response.Status, got)
@@ -878,7 +915,7 @@ func strictValue(dec *json.Decoder) error {
 }
 
 var (
-	placeholderRx = regexp.MustCompile(`^\{\{([a-z_]+)\}\}$`)
+	placeholderRx = regexp.MustCompile(`^\{\{([a-z_0-9]+)\}\}$`)
 	clientIDRx    = regexp.MustCompile(`^srv_[0-9a-f]{32}$`)
 	versionRx     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
@@ -977,6 +1014,12 @@ func (s *scenario) placeholder(where, name string, got any) {
 	case "access_token":
 		s.checkAccessToken(where, str, scopeDirectory)
 		s.token = str
+	case "compute_token":
+		if !s.compute {
+			t.Errorf("%s: {{compute_token}} is the compute contract's placeholder", where)
+		}
+		s.checkAccessToken(where, str, scopeCompute)
+		s.ctoken = str
 	case "delivery_token":
 		if !s.hosted {
 			t.Errorf("%s: {{delivery_token}} is the provision contract's placeholder", where)
@@ -984,6 +1027,10 @@ func (s *scenario) placeholder(where, name string, got any) {
 		s.checkAccessToken(where, str, scopeDeliveries)
 		s.dtoken = str
 	default:
+		if s.compute && operationNameRx.MatchString(name) {
+			s.bindOperation(where, name, str)
+			return
+		}
 		t.Errorf("%s: {{%s}} is not a placeholder the contract names", where, name)
 	}
 }

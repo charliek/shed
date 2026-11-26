@@ -1,0 +1,19 @@
+{
+  "name": "get-echo-bearer-escaped",
+  "description": "A machine whose spec is the bearer, its first character written as a \\u escape (generated): the bearer is not in the body's bytes but is in what it decodes to; refused before it is used.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "echo_bearer_escaped"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

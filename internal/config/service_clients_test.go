@@ -82,10 +82,12 @@ func TestValidateClientImages(t *testing.T) {
 	if err := cfg.validateClientImages(); err == nil || !strings.Contains(err.Error(), "not an image alias") {
 		t.Fatalf("a ref that is not an alias was accepted: %v", err)
 	}
-	// The remote backend's aliases are its own block's.
+	// A remote server's images are its account service's catalog, not
+	// known at load: a client's images are checked at create (S0 ruling 3),
+	// so any name loads.
 	remote := mtlsWithClients(map[string]ServiceClientConfig{"nocturn": validClient()})
 	remote.DefaultBackend = BackendRemote
-	remote.Remote = &RemoteConfig{ImageAliases: map[string]string{"cloud": "family/shed-full-amd64"}}
+	remote.Remote = &RemoteConfig{}
 	rc := remote.Auth.Clients["nocturn"]
 	for _, tt := range []struct {
 		name    string
@@ -94,8 +96,8 @@ func TestValidateClientImages(t *testing.T) {
 	}{
 		{"remote alias", []string{"cloud"}, ""},
 		{"remote no images", nil, ""},
-		{"remote raw image name", []string{"family/shed-full-amd64"}, "not an image alias of the remote backend"},
-		{"remote local alias", []string{"itest"}, "not an image alias of the remote backend"},
+		{"remote raw image name", []string{"family/shed-full-amd64"}, ""},
+		{"remote local alias", []string{"itest"}, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rc.Policy.Images = tt.images

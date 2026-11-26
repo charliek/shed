@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -209,13 +211,25 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 	// dir) and SHED_ADD_DIRS (any --add-dir mounts) the install/startup hooks do.
 	env = append(env, projectSessionEnv(shed)...)
 
-	// Create resize channel for window changes.
+	// Create resize channel for window changes. It is closed only once the
+	// goroutine that sends on it has returned: a window change that arrives
+	// as the command ends must not be sent on a closed channel.
 	resizeChan := make(chan backend.TerminalSize, 10)
-	defer close(resizeChan)
+	resizeCtx, stopResize := context.WithCancel(ctx)
+	var resizing sync.WaitGroup
+	defer func() {
+		stopResize()
+		resizing.Wait()
+		close(resizeChan)
+	}()
 
 	// Handle window resize events in a goroutine.
 	if isPTY && winCh != nil {
-		go s.handleWindowResize(ctx, winCh, resizeChan)
+		resizing.Add(1)
+		go func() {
+			defer resizing.Done()
+			s.handleWindowResize(resizeCtx, winCh, resizeChan)
+		}()
 	}
 
 	// Build initial terminal size.
@@ -249,7 +263,42 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 	// logged.
 	log.Printf("Executing in shed %s: tty=%v cmd=%v", shed.Name, isPTY, redact.Args(cmd))
 
+	// A session with a terminal (a console, an attach, an interactive
+	// exec, a raw ssh login, the desktop's terminal) is told once, on
+	// stderr, that its cloud shed's lease is ending. A session without one
+	// (rsync, `ssh host cmd`, a piped exec) never is: its output is data.
+	// Nor is one whose client asked not to be (SHED_LEASE_BANNER=0: the
+	// CLI under --json, or with a stderr nobody reads).
+	if isPTY && !bannerDeclined(sess.Environ()) {
+		writeLeaseBanner(sess.Stderr(), shed, time.Now())
+	}
+
 	return s.backend.Exec(ctx, shed.Name, opts)
+}
+
+// writeLeaseBanner writes the lease banner (config.LeaseBanner) for a
+// session with a terminal, when the shed's lease ends within its warning
+// time. The client's terminal is raw, so the line ends with a carriage
+// return too.
+func writeLeaseBanner(w io.Writer, shed *config.Shed, now time.Time) {
+	if line, ok := config.LeaseBanner(shed, now); ok {
+		_, _ = io.WriteString(w, line+"\r\n")
+	}
+}
+
+// bannerEnvName is the environment request a client sends, with the value
+// "0", to keep the lease banner out of its session.
+const bannerEnvName = "SHED_LEASE_BANNER"
+
+// bannerDeclined reports whether the session's environment requests hold
+// SHED_LEASE_BANNER=0.
+func bannerDeclined(environ []string) bool {
+	for _, kv := range environ {
+		if kv == bannerEnvName+"=0" {
+			return true
+		}
+	}
+	return false
 }
 
 // projectSessionEnv returns the SHED_WORKSPACE / SHED_ADD_DIRS variables for a

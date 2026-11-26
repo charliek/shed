@@ -1,0 +1,20 @@
+{
+  "name": "error-leading-whitespace",
+  "description": "A 409 whose JSON starts with whitespace: its code is read.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "text": "\n {\"error\": {\"code\": \"CLOUD_QUOTA\", \"message\": \"words for people, never read\"}}"
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "CLOUD_QUOTA",
+    "kind": "ErrQuota"
+  }
+}

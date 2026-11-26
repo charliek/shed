@@ -1,0 +1,24 @@
+{
+  "name": "error-echoes-bearer",
+  "description": "A 409 whose message holds the bearer: refused whole, before its code is read; for a read, a failure.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "BUSY",
+          "message": "token {{bearer}} is busy"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

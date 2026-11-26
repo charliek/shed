@@ -150,9 +150,6 @@ func stageOneOwed(rec *state.Record) bool {
 // job in flight, no stop or delete waiting, and the delivery record this run
 // last saw.
 func (b *Backend) BeginProvision(ctx context.Context, name string) (backend.ProvisionRun, error) {
-	if err := b.checkReady(); err != nil {
-		return nil, err
-	}
 	release, ok := b.provisioning.TryAcquire(name)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", config.ErrProvisionBusySentinel, name)

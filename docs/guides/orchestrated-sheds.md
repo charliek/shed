@@ -367,10 +367,10 @@ The client's policy on a remote server:
 | Policy key | On the remote backend |
 |---|---|
 | `name_prefix`, `max_sheds` | As on any backend. |
-| `max_age` | As on any backend, and the cloud's run limit for the client's sheds is the larger of `remote.max_run_duration` and `max_age`, counted from each start. So the cloud does not stop a client's shed before it is `max_age` old. |
+| `max_age` | As on any backend, and it is also the **lease** of each cloud shed the client creates: the account service deletes the machine, running or stopped, that long after its create (a create may name a shorter one in `lease`; above `max_age` is `POLICY_VIOLATION`). A client's lease cannot be extended. |
 | `network` | `isolated` (the default) or `open`; see the table above. |
-| `images` | Names from `remote.image_aliases` only; any other entry stops the server from starting. `GET /api/images` lists nothing on a remote server. |
-| `caps` | Compared with the [size](../reference/remote-backend.md#sizes) a create gets, not with the numbers it asked for. A create that names neither `cpus` nor `memory_mb` gets `default_size`, so caps below that size's numbers refuse such a create. |
+| `images` | Names from the account service's catalog (`default` and its aliases), checked at create: a create naming one the catalog lacks is refused, and the server logs the name when it first reads the catalog. `GET /api/images` lists nothing on a remote server. |
+| `caps` | Compared with the [size](../reference/remote-backend.md#sizes-and-images) a create gets, not with the numbers it asked for. A create that names neither `cpus` nor `memory_mb` gets the catalog's default size, so caps below that size's numbers refuse such a create. |
 | `server_mounts` | Must be empty: a client that names any stops the server from starting. |
 
 A client's create may carry `name`, `repo`, `image`, `cpus` and `memory_mb`
@@ -425,47 +425,54 @@ Statuses](../reference/remote-backend.md#statuses)):
 
 | `status` (`status_reason`) | What the client does |
 |---|---|
-| `starting` (none, `no_pin`, `unreachable`, `cloud_unreadable`) | Keep polling: the server is still bringing the VM up, reaching it, or reading the cloud. A create whose VM never answers ends in `error` (`create_failed`) after the server's 5-minute wait for the agent. |
+| `starting` (none, `no_pin`, `unreachable`, `cloud_unreadable`) | Keep polling: the server is still bringing the machine up, reaching it, or asking the account service. A create whose guest never answers stays `starting (unreachable)` and is tried again each pass until it is deleted or its lease ends: give up on it by deleting it. |
 | `running` | Exec works. |
 | `stopping` | Wait; exec answers `409 SHED_NOT_RUNNING`. |
-| `stopped` (none, `run_limit` or `external`) | A stop request stopped it, a start failed for a reason with no code of its own (the server log has it), the cloud stopped the VM at its run limit, or someone stopped the VM outside shed. Start it again, or delete it. |
-| `stopped` (`capacity`, `quota`, `limit` or `firewall`) | A start was refused, by the cloud, the server's `max_running` or the firewall check. Start it again later, or delete it. |
+| `stopped` (none or `external`) | A stop request stopped it, a start failed for a reason with no code of its own (the server log has it), or someone stopped the machine outside shed. Start it again, or delete it. A start at or after the lease's end is `409 LEASE_ENDED`: the machine is being deleted. |
+| `stopped` (`capacity`, `quota`, `limit` or `firewall`) | A start was refused, by the cloud, the server's `max_running` or the ingress check. Start it again later, or delete it. |
 | `stopped` (`unreachable`) | The VM came up but its agent did not answer, so the server stopped it again. Start it again; if it happens again, ask an admin to read the server log. |
 | `stopped` (`host_key` or `layout`) | The VM presented a host key other than the pinned one, or its agent is one this server cannot drive. Starting again is not expected to help: delete it, and tell an admin. |
 | `error` (`capacity`, `quota`, `create_failed`, `host_key`, `layout` or `firewall`) | The create failed. Only a delete leaves this state, and until then the shed counts against `max_sheds`. Delete it; after `capacity`, `quota` or `firewall`, create again later. |
 
-A create or start that the server's limits, the cloud or the firewall check
-refuses at once answers `503`, never `409`: `SERVER_LIMIT_REACHED`,
-`CLOUD_QUOTA_EXCEEDED`,
+A create or start that the account service's limits, the cloud, the server's
+limits or the ingress check refuses at once answers `503`, never `409`:
+`COMPUTE_LIMIT_REACHED` (with a `reason` of `person` or `organization`),
+`COMPUTE_UNAVAILABLE`, `SERVER_LIMIT_REACHED`, `CLOUD_QUOTA_EXCEEDED`,
 `ZONE_CAPACITY_UNAVAILABLE` or `FIREWALL_CHECK_FAILED` ([Remote backend ›
-Error codes](../reference/remote-backend.md#error-codes)). Wait and try
-again.
+Codes and reasons](../reference/remote-backend.md#codes-and-reasons)). Wait
+and try again. A policy refusal is a `422 COMPUTE_POLICY_REFUSED` with the
+rule in `reason` (`size`, `lease`, `image`, `access`, `person`, `client`) and
+is not retried: a `client` refusal means the account service has not
+registered this client for this server. A create whose name is held by a
+machine still being deleted is `409 COMPUTE_DELETING`: wait and send it
+again (it is never `SHED_ALREADY_EXISTS`).
 
 For a service client the server shortens one message: `FIREWALL_CHECK_FAILED`,
-whose full text names the server's public address and the firewall rule's
-source ranges. Every other error message is the server's error text as it
-is, and a refusal or failure from the cloud carries the cloud's own text,
-which can name the cloud project, the zone or the VM. An operator should
-expect those in a client's error messages, and so in the client's own logs.
+whose full text names the server's public address and the ingress sources.
+The account service's refusals reach a client by their code and reason only:
+the text the service sends is never relayed, and nothing in a client's
+responses names a cloud project, zone or address.
 
 **Size the server-wide limits for the client.** They count every shed on the
 server, people's and every client's together:
 
 | Setting | Counts | Set it to |
 |---|---|---|
-| `remote.limits.max_sheds` (default 8), checked at create | Every shed, in any state (`error` included) | At least the clients' `max_sheds` added up, plus what people need |
-| `remote.limits.max_running` (default 2, at most `max_sheds`), checked at create and at start | Every shed that is `starting`, `running` or `stopping`, plus each VM the server is cleaning up (a deleted shed's, or that of a failed create whose record shows `error`) whose clean-up has not finished two minutes after it began | At least the client sheds that run at once, plus what people need |
+| `remote.limits.max_sheds` (default off), checked at create | Every shed, in any state (`error` included) | At least the clients' `max_sheds` added up, plus what people need |
+| `remote.limits.max_running` (default off, at most `max_sheds`), checked at create and at start | Every shed that is `starting`, `running` or `stopping`, plus each machine the server is deleting whose delete has not finished two minutes after it began | At least the client sheds that run at once, plus what people need |
 
 A create past either limit, or a start past `max_running`, is refused with
 `503 SERVER_LIMIT_REACHED`, and a start refused this way leaves the shed
 `stopped (limit)`. A start does not check `max_sheds`.
-With the defaults, a client whose `max_sheds` is 4 can have at most two of its
-sheds running, and fewer while people's sheds run. Firecracker and VZ have no
-server-wide shed limit: there the client's `max_sheds` is its only bound.
+Both limits are off unless set: the account service holds the quotas
+(`COMPUTE_LIMIT_REACHED`). Firecracker and VZ have no server-wide shed limit:
+there the client's `max_sheds` is its only bound.
 
-Every remote shed is a cloud VM, billed while it runs. The `max_age` reaper
-runs only while `serve` runs: a stopped server leaves the client's VMs
-running, and the cloud's run limit is then what stops them.
+Every remote shed is a cloud machine, billed while it exists. The `max_age`
+reaper is off for cloud sheds: the account service deletes each machine at
+its lease's end (the client's `max_age`, or the `lease` its create named), so
+a stopped server leaves the client's machines to be deleted by the service.
+Read a shed's lease in `cloud.lease.expires_at`.
 
 On a remote server the audit log is `audit.jsonl` in `remote.state_dir`,
 which by default is `remote` under the server's state directory
@@ -497,8 +504,8 @@ without an account service.
 [Revoking a client](#revoking-a-client) is unchanged: remove it from
 `auth.clients`, restart `serve`, and give a replacement client a new name.
 The reaper leaves a removed client's sheds alone. On a remote server a
-running one keeps running, and billed, until the cloud's run limit stops it
-or an admin stops or deletes it.
+running one keeps running, and billed, until its machine's lease ends at the
+account service or an admin stops or deletes it.
 
 ## What a leaked bundle gives
 

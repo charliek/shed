@@ -26,6 +26,7 @@ config-load test in internal/config.
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -43,6 +44,9 @@ def bus_server(request):
     which skips unless `SHED_REMOTE_SERVER` is set). Lazily instantiated, so
     each backend skips only when it would have run."""
     if request.param == "remote":
+        if os.environ.get("SHED_REMOTE_HERMETIC", "") == "1":
+            pytest.skip("the hermetic compute world's entry is not a *-dev entry, the only kind the dev-control "
+                        "primitives (bootstrap_cert) reach")
         return request.getfixturevalue("remote_server")
     return request.getfixturevalue(f"{request.param}_server_dev")
 

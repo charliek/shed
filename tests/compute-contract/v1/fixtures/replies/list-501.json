@@ -1,0 +1,19 @@
+{
+  "name": "list-501",
+  "description": "A complete list of 501 machines (generated): over the 500 a list holds, invalid.",
+  "call": "list",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "list_501"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

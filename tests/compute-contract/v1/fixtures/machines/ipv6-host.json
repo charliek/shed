@@ -1,0 +1,106 @@
+{
+  "name": "ipv6-host",
+  "description": "An ssh option at an IPv6 literal in its canonical form.",
+  "context": {
+    "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+    "server": "srv-a",
+    "test_drivers": false
+  },
+  "machine": {
+    "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+    "name": "widgets",
+    "server": "srv-a",
+    "user": "ada",
+    "client": null,
+    "state": "running",
+    "size": {
+      "name": "standard",
+      "cpus": 2,
+      "memory_mb": 8192,
+      "arch": "amd64"
+    },
+    "disk_gb": 50,
+    "image": {
+      "requested": "default",
+      "resolved": "shed-remote-full-v1-0-0-20261120-120000"
+    },
+    "provider": "cloud-a",
+    "created_at": "2026-11-16T06:00:00Z",
+    "started_at": "2026-11-16T06:00:00Z",
+    "stopped_at": null,
+    "lease": {
+      "expires_at": "2026-11-17T06:00:00Z",
+      "max_expires_at": "2026-11-21T06:00:00Z",
+      "extendable": true,
+      "presets_h": [
+        6,
+        12,
+        24,
+        48
+      ]
+    },
+    "access": [
+      {
+        "kind": "ssh",
+        "host": "2001:db8::7",
+        "port": 22,
+        "user": "shed-link",
+        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTs41aR1tvqm53eXWSYYaVa4vzPYlXSTKnKr5nW/t9C"
+      }
+    ],
+    "labels": {
+      "shed_layout": "1"
+    },
+    "spec": "spec-v1 layout=1 repo=example/widgets"
+  },
+  "expect": {
+    "result": "accepted",
+    "decoded": {
+      "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+      "name": "widgets",
+      "server": "srv-a",
+      "user": "ada",
+      "client": null,
+      "state": "running",
+      "disk_gb": 50,
+      "provider": "cloud-a",
+      "created_at": "2026-11-16T06:00:00Z",
+      "started_at": "2026-11-16T06:00:00Z",
+      "stopped_at": null,
+      "labels": {
+        "shed_layout": "1"
+      },
+      "spec": "spec-v1 layout=1 repo=example/widgets",
+      "size": {
+        "name": "standard",
+        "cpus": 2,
+        "memory_mb": 8192,
+        "arch": "amd64"
+      },
+      "image": {
+        "requested": "default",
+        "resolved": "shed-remote-full-v1-0-0-20261120-120000"
+      },
+      "lease": {
+        "expires_at": "2026-11-17T06:00:00Z",
+        "max_expires_at": "2026-11-21T06:00:00Z",
+        "extendable": true,
+        "presets_h": [
+          6,
+          12,
+          24,
+          48
+        ]
+      },
+      "access": [
+        {
+          "host": "2001:db8::7",
+          "port": 22,
+          "user": "shed-link",
+          "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTs41aR1tvqm53eXWSYYaVa4vzPYlXSTKnKr5nW/t9C"
+        }
+      ],
+      "ignored_access": 0
+    }
+  }
+}

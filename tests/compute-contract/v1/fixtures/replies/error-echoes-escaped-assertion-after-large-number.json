@@ -1,0 +1,19 @@
+{
+  "name": "error-echoes-escaped-assertion-after-large-number",
+  "description": "A 409 to a create with 1e400 before an error message that is the client assertion, its first character escaped: refused whole; the create's outcome is unknown.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "text": "{\"future\":1e400,\"error\":{\"code\":\"BUSY\",\"message\":\"{{assertion_escaped}}\"}}"
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrInvalidReply"
+  }
+}

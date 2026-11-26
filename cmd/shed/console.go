@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -180,8 +181,8 @@ func baseSSHArgs(serverName, shedName string, entry *config.ServerEntry, extraOp
 // pre-existing console/exec behavior (ssh treats everything after the
 // destination as the command, and the argv is already single-quoted), so adding
 // a "--" would change what the server's bash -lc receives.
-func sshSessionArgs(flag, serverName, name string, entry *config.ServerEntry, quotedCmd []string) ([]string, error) {
-	base, err := baseSSHArgs(serverName, name, entry)
+func sshSessionArgs(flag, serverName, name string, entry *config.ServerEntry, quotedCmd []string, extraOpts ...string) ([]string, error) {
+	base, err := baseSSHArgs(serverName, name, entry, extraOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +202,8 @@ func sshToShed(name string, command []string) error {
 
 	// Ensure the shed is running (auto-start if stopped)
 	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
-	if _, err := ensureRunningShed(client, name); err != nil {
+	shed, err := ensureRunningShed(client, name)
+	if err != nil {
 		return err
 	}
 
@@ -222,10 +224,19 @@ func sshToShed(name string, command []string) error {
 	}
 
 	// Pick -t (PTY) vs -T (clean 8-bit) by terminal detection — see ttyFlag.
+	// A cloud shed whose lease ends soon: the server warns a session with a
+	// terminal, unless this one asks it not to (bannerOptOut: --json, or a
+	// stderr nobody reads), which leaves the terminal choice as it is; an
+	// exec without a terminal is warned here, on stderr, when a person reads
+	// it. stdout is never touched.
 	flag := ttyFlag(len(command) > 0, isStdinTTY(), isStdoutTTY())
-	sshArgs, err := sshSessionArgs(flag, serverName, name, entry, quoted)
+	stderrTTY := isStderrTTY()
+	sshArgs, err := sshSessionArgs(flag, serverName, name, entry, quoted, bannerOptOut(stderrTTY, jsonFlag)...)
 	if err != nil {
 		return err
+	}
+	if execBannerShown(len(command) > 0, flag, stderrTTY, jsonFlag) {
+		writeCLIBanner(os.Stderr, shed, time.Now())
 	}
 
 	// Find ssh binary

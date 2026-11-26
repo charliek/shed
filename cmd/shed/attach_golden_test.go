@@ -75,11 +75,16 @@ func TestAttachPlainTmuxArgvGolden(t *testing.T) {
 	origSession, origNew := attachSessionFlag, attachNewFlag
 	origExec := execSSH
 	origConfig := clientConfig
+	origTTY, origJSON := stderrIsTerminal, jsonFlag
 	t.Cleanup(func() {
 		attachSessionFlag, attachNewFlag = origSession, origNew
 		execSSH = origExec
 		clientConfig = origConfig
+		stderrIsTerminal, jsonFlag = origTTY, origJSON
 	})
+	// The golden is a person at a terminal: no banner opt-out
+	// (TestAttachPlainBannerOptOut covers the rest).
+	stderrIsTerminal, jsonFlag = func() bool { return true }, false
 
 	for _, sc := range golden.Scenarios {
 		t.Run(sc.Name, func(t *testing.T) {

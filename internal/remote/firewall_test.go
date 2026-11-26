@@ -50,15 +50,19 @@ func tune(fn func(*Options)) envOpt {
 	}
 }
 
-func withClock(c *testClock) envOpt {
-	return tune(func(o *Options) { o.Now = c.Now })
+// readOnlyIngress gives the fake a catalog whose ingress is managed
+// elsewhere: static mode then compares only (plan 041 R7), which is what
+// the tests of a failing check exercise.
+func readOnlyIngress() envOpt {
+	return func(_ *env, o *fake.Options) {
+		c := fake.DefaultCatalog()
+		c.IngressWritable = false
+		o.Catalog = &c
+	}
 }
 
-func sshRule(name, tag string, sources ...string) provider.FirewallRule {
-	return provider.FirewallRule{
-		Name: name, Direction: provider.DirectionIngress, Priority: 1000, SourceRanges: sources,
-		TargetTags: []string{tag}, Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
-	}
+func withClock(c *testClock) envOpt {
+	return tune(func(o *Options) { o.Now = c.Now })
 }
 
 func (e *env) count(op fake.Op) int { return e.prov.Count(op) }
@@ -66,13 +70,8 @@ func (e *env) count(op fake.Op) int { return e.prov.Count(op) }
 // TestFirewallCheckClauses has one case for every reason the check can fail,
 // and for the things that look wrong and are not.
 func TestFirewallCheckClauses(t *testing.T) {
-	const ruleName = "shed-" + testEnv + "-ssh"
-	const tag = "shed-" + testEnv
-	edit := func(fn func(*provider.FirewallRule)) func(*fake.Provider) {
-		return func(p *fake.Provider) { p.EditEnvRule(fn) }
-	}
-	add := func(r provider.FirewallRule) func(*fake.Provider) {
-		return func(p *fake.Provider) { p.AddFirewallRule(r) }
+	ingress := func(exclusive bool, sources ...string) func(*fake.Provider) {
+		return func(p *fake.Provider) { p.SetIngressState(sources, exclusive) }
 	}
 	tests := []struct {
 		name string
@@ -82,126 +81,36 @@ func TestFirewallCheckClauses(t *testing.T) {
 		mode    string
 		arrange func(p *fake.Provider)
 		want    FirewallReason // "" means the check passes
-		// wantRule is the rule the failure names; wantMsg are words its
-		// message must hold.
-		wantRule string
-		wantMsg  []string
+		// wantMsg are words the failure's message must hold.
+		wantMsg []string
+		// wantExclusive is the status's exclusive.
+		wantExclusive bool
 	}{
-		{name: "as the setup script made it"},
+		{name: "as the service applied it", wantExclusive: true},
+		{name: "exclusive false passes the check (isolated sheds are gated apart)", arrange: ingress(false, fake.DefaultIngressSource)},
 
-		{name: "rule missing", arrange: func(p *fake.Provider) { p.RemoveFirewallRule(ruleName) },
-			want: FirewallRuleMissing, wantRule: ruleName, wantMsg: []string{ruleName, "does not exist", "tcp:22", tag}},
-		{name: "rule on another network", arrange: edit(func(r *provider.FirewallRule) { r.Network = "some-other-net" }),
-			want: FirewallRuleNetwork, wantRule: ruleName, wantMsg: []string{"expected network " + fake.DefaultNetwork, "found network some-other-net"}},
-		{name: "rule is egress", arrange: edit(func(r *provider.FirewallRule) { r.Direction = provider.DirectionEgress }),
-			want: FirewallRuleDirection, wantRule: ruleName, wantMsg: []string{"expected direction INGRESS", "found direction EGRESS"}},
-		{name: "rule disabled", arrange: edit(func(r *provider.FirewallRule) { r.Disabled = true }),
-			want: FirewallRuleDisabled, wantRule: ruleName, wantMsg: []string{"is disabled"}},
-
-		{name: "rule allows a second port", arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Ports = []string{"22", "80"} }),
-			want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"expected allow tcp:22", "found allow tcp:22,80"}},
-		{name: "rule allows a port range", arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Ports = []string{"22-23"} }),
-			want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found allow tcp:22-23"}},
-		{name: "rule allows every tcp port", arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Ports = nil }),
-			want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found allow tcp"}},
-		{name: "rule allows udp", arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Protocol = "udp" }),
-			want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found allow udp:22"}},
-		{name: "rule allows every protocol", arrange: edit(func(r *provider.FirewallRule) {
-			r.Allowed = []provider.FirewallPorts{{Protocol: "all"}}
-		}), want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found allow all"}},
-		{name: "rule allows a second protocol", arrange: edit(func(r *provider.FirewallRule) {
-			r.Allowed = append(r.Allowed, provider.FirewallPorts{Protocol: "icmp"})
-		}), want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found allow tcp:22 icmp"}},
-		{name: "rule is a deny rule", arrange: edit(func(r *provider.FirewallRule) { r.Allowed, r.Denied = nil, r.Allowed }),
-			want: FirewallRuleAllow, wantRule: ruleName, wantMsg: []string{"found deny tcp:22"}},
-		{name: "rule protocol in capitals is the same rule", arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Protocol = "TCP" })},
-
-		{name: "rule has no target", arrange: edit(func(r *provider.FirewallRule) { r.TargetTags = nil }),
-			want: FirewallRuleTarget, wantRule: ruleName, wantMsg: []string{"expected target tag " + tag, "every instance"}},
-		{name: "rule targets another tag", arrange: edit(func(r *provider.FirewallRule) { r.TargetTags = []string{"web"} }),
-			want: FirewallRuleTarget, wantRule: ruleName, wantMsg: []string{"found target tags [web]"}},
-		{name: "rule targets a second tag", arrange: edit(func(r *provider.FirewallRule) { r.TargetTags = append(r.TargetTags, "web") }),
-			want: FirewallRuleTarget, wantRule: ruleName, wantMsg: []string{"found target tags [" + tag + ", web]"}},
-		{name: "rule targets a service account", arrange: edit(func(r *provider.FirewallRule) {
-			r.TargetServiceAccounts = []string{"sa@example.iam.gserviceaccount.com"}
-		}), want: FirewallRuleTarget, wantRule: ruleName, wantMsg: []string{"target service accounts"}},
-
-		{name: "rule admits a source tag", arrange: edit(func(r *provider.FirewallRule) { r.SourceTags = []string{"bastion"} }),
-			want: FirewallRuleSourceKind, wantRule: ruleName, wantMsg: []string{"by address only", "bastion"}},
-		{name: "rule admits a source service account", arrange: edit(func(r *provider.FirewallRule) {
-			r.SourceServiceAccounts = []string{"sa@example.iam.gserviceaccount.com"}
-		}), want: FirewallRuleSourceKind, wantRule: ruleName},
-
-		{name: "rule admits another address", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} }),
-			want: FirewallRuleSources, wantRule: ruleName,
-			wantMsg: []string{"expected source ranges [192.0.2.1/32]", "found source ranges [198.51.100.9/32]"}},
-		{name: "rule admits a second address", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = append(r.SourceRanges, "198.51.100.9/32") }),
-			want: FirewallRuleSources, wantRule: ruleName, wantMsg: []string{"found source ranges [192.0.2.1/32, 198.51.100.9/32]"}},
-		{name: "rule admits everyone", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"0.0.0.0/0"} }),
-			want: FirewallRuleSources, wantRule: ruleName, wantMsg: []string{"found source ranges [0.0.0.0/0]"}},
-		{name: "rule admits no address", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = nil }),
-			want: FirewallRuleSources, wantRule: ruleName, wantMsg: []string{"found source ranges []"}},
-		{name: "rule lacks one of two expected ranges", sources: []string{"192.0.2.1/32", "203.0.113.0/24"},
-			want: FirewallRuleSources, wantRule: ruleName, wantMsg: []string{"expected source ranges [192.0.2.1/32, 203.0.113.0/24]"}},
-		{name: "rule has an ipv6 source", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"2001:db8::/32"} }),
-			want: FirewallRuleSources, wantRule: ruleName, wantMsg: []string{"not an IPv4 CIDR"}},
+		{name: "another address", arrange: ingress(true, "198.51.100.9/32"),
+			want: FirewallSources, wantMsg: []string{"expected sources [192.0.2.1/32]", "found sources [198.51.100.9/32]"}},
+		{name: "a second address", arrange: ingress(true, fake.DefaultIngressSource, "198.51.100.9/32"),
+			want: FirewallSources, wantMsg: []string{"found sources [192.0.2.1/32, 198.51.100.9/32]"}},
+		{name: "everyone", arrange: ingress(true, "0.0.0.0/0"),
+			want: FirewallSources, wantMsg: []string{"found sources [0.0.0.0/0]"}},
+		{name: "no address", arrange: ingress(true),
+			want: FirewallSources, wantMsg: []string{"found sources []"}},
+		{name: "one of two expected ranges missing", sources: []string{"192.0.2.1/32", "203.0.113.0/24"},
+			want: FirewallSources, wantMsg: []string{"expected sources [192.0.2.1/32, 203.0.113.0/24]"}},
 		{name: "two expected ranges in the other order", sources: []string{"203.0.113.0/24", "192.0.2.1/32"},
-			arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"192.0.2.1/32", "203.0.113.0/24"} })},
-		{name: "a bare address is its /32", arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"192.0.2.1"} })},
-		{name: "a range written with host bits is the same range", sources: []string{"203.0.113.0/24"},
-			arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"203.0.113.9/24"} })},
+			arrange: ingress(true, "192.0.2.1/32", "203.0.113.0/24"), wantExclusive: true},
 
-		{name: "stray rule to every instance", arrange: add(provider.FirewallRule{
-			Name: "allow-internal", Priority: 65534, SourceRanges: []string{"10.128.0.0/9"}, Allowed: []provider.FirewallPorts{{Protocol: "all"}},
-		}), want: FirewallStrayRule, wantRule: "allow-internal", wantMsg: []string{"allow-internal", "every instance on the network", "10.128.0.0/9", ruleName}},
-		{name: "stray rule to the shed tag", arrange: add(provider.FirewallRule{
-			Name: "debug-http", SourceRanges: []string{"0.0.0.0/0"}, TargetTags: []string{"web", tag},
-			Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"80", "443"}}},
-		}), want: FirewallStrayRule, wantRule: "debug-http", wantMsg: []string{"allow tcp:80,443", "instances tagged " + tag}},
-		{name: "stray rule admitting by tag", arrange: add(provider.FirewallRule{
-			Name: "shed-to-shed", SourceTags: []string{tag}, TargetTags: []string{tag}, Allowed: []provider.FirewallPorts{{Protocol: "tcp"}},
-		}), want: FirewallStrayRule, wantRule: "shed-to-shed", wantMsg: []string{"tags [" + tag + "]"}},
-		{name: "a disabled stray is not one", arrange: add(provider.FirewallRule{
-			Name: "allow-internal", Disabled: true, SourceRanges: []string{"10.128.0.0/9"}, Allowed: []provider.FirewallPorts{{Protocol: "all"}},
-		})},
-		{name: "a deny rule is not a stray", arrange: add(provider.FirewallRule{
-			Name: "deny-all", SourceRanges: []string{"0.0.0.0/0"}, Denied: []provider.FirewallPorts{{Protocol: "all"}},
-		})},
-		{name: "an egress rule is not a stray", arrange: add(provider.FirewallRule{
-			Name: "egress-all", Direction: provider.DirectionEgress, DestinationRanges: []string{"0.0.0.0/0"}, Allowed: []provider.FirewallPorts{{Protocol: "all"}},
-		})},
-		{name: "a rule on another network is not a stray", arrange: add(provider.FirewallRule{
-			Name: "default-allow-ssh", Network: "default", SourceRanges: []string{"0.0.0.0/0"}, Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
-		})},
-		{name: "a rule for a service account only is not a stray", arrange: add(provider.FirewallRule{
-			Name: "for-a-service", SourceRanges: []string{"0.0.0.0/0"}, TargetServiceAccounts: []string{"sa@example.iam.gserviceaccount.com"},
-			Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"443"}}},
-		})},
-		// Two environments share one network: the other one's rule targets
-		// its own tag, even when that environment is open to anyone.
-		{name: "another environment in mode any on the same network", arrange: add(sshRule("shed-otherenv-ssh", "shed-otherenv", "0.0.0.0/0"))},
+		{name: "the ingress cannot be read", arrange: func(p *fake.Provider) {
+			p.FailNext(fake.OpIngress, &provider.Error{Kind: provider.ErrUnavailable, Op: "ingress_get", Code: "UNAVAILABLE", Detail: "HTTP 503"})
+		}, want: FirewallUnreadable, wantMsg: []string{"could not read", "HTTP 503"}},
 
-		{name: "the default network", arrange: func(p *fake.Provider) { p.SetDefaultNetwork(true) },
-			want: FirewallDefaultNetwork, wantMsg: []string{"default network", "custom-mode network"}},
-
-		{name: "the rule cannot be read", arrange: func(p *fake.Provider) {
-			p.FailNext(fake.OpEnvFirewallRule, provider.Errorf(nil, "env_firewall_rule", "HTTP 403: Required 'compute.firewalls.list' permission"))
-		}, want: FirewallUnreadable, wantMsg: []string{"could not read", "compute.firewalls.list"}},
-		{name: "the network's rules cannot be read", arrange: func(p *fake.Provider) {
-			p.FailNext(fake.OpNetworkIngress, errors.New("connection reset"))
-		}, want: FirewallUnreadable, wantMsg: []string{"could not read the ingress rules", "connection reset"}},
-
-		{name: "mode any does not compare sources", mode: config.RemoteFirewallAny,
-			arrange: edit(func(r *provider.FirewallRule) { r.SourceRanges = []string{"0.0.0.0/0"} })},
-		{name: "mode any still checks the rule's shape", mode: config.RemoteFirewallAny,
-			arrange: edit(func(r *provider.FirewallRule) { r.Allowed[0].Ports = nil }), want: FirewallRuleAllow, wantRule: ruleName},
-		{name: "mode any still refuses a stray rule", mode: config.RemoteFirewallAny, arrange: add(provider.FirewallRule{
-			Name: "allow-internal", SourceRanges: []string{"10.128.0.0/9"}, Allowed: []provider.FirewallPorts{{Protocol: "all"}},
-		}), want: FirewallStrayRule, wantRule: "allow-internal"},
+		{name: "mode any does not compare sources", mode: config.RemoteFirewallAny, arrange: ingress(true, "0.0.0.0/0"), wantExclusive: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := newEnv(t, func(e *env, _ *fake.Options) {
+			e := newEnv(t, readOnlyIngress(), func(e *env, _ *fake.Options) {
 				if tt.mode != "" {
 					e.cfg.Firewall.Mode = tt.mode
 					e.cfg.Firewall.AcknowledgeAny = tt.mode == config.RemoteFirewallAny
@@ -218,9 +127,15 @@ func TestFirewallCheckClauses(t *testing.T) {
 			if got := e.b.FirewallStatus(); got.OK != status.OK || got.Failure != status.Failure || got.CheckedAt.IsZero() {
 				t.Errorf("FirewallStatus = %+v, the check returned %+v", got, status)
 			}
+			if n := e.count(fake.OpSetIngress); n != 0 {
+				t.Errorf("%d writes of the ingress in mode %q", n, tt.mode)
+			}
 			if tt.want == "" {
 				if !status.OK || status.Failure != nil {
 					t.Fatalf("the check failed: %v", status.Failure)
+				}
+				if status.Exclusive != tt.wantExclusive {
+					t.Errorf("exclusive %v, want %v", status.Exclusive, tt.wantExclusive)
 				}
 				return
 			}
@@ -228,19 +143,46 @@ func TestFirewallCheckClauses(t *testing.T) {
 				t.Fatalf("the check passed, want reason %s", tt.want)
 			}
 			f := status.Failure
-			if f.Reason != tt.want || f.Rule != tt.wantRule {
-				t.Errorf("reason %q rule %q, want %q %q (%v)", f.Reason, f.Rule, tt.want, tt.wantRule, f)
+			if f.Reason != tt.want {
+				t.Errorf("reason %q, want %q (%v)", f.Reason, tt.want, f)
 			}
 			for _, w := range tt.wantMsg {
 				if !strings.Contains(f.Error(), w) {
 					t.Errorf("message lacks %q:\n%s", w, f.Error())
 				}
 			}
-			// The check only ever reads in static and any mode.
-			if n := e.count(fake.OpSetFirewallSources); n != 0 {
-				t.Errorf("%d patches of the rule", n)
-			}
 		})
+	}
+}
+
+// An isolated shed needs the service's word that the ingress is exclusive:
+// without it, creates and starts of isolated sheds are refused, and open
+// ones go on (plan 041 §3.2).
+func TestIsolatedNeedsExclusive(t *testing.T) {
+	clock := newTestClock()
+	e := newEnv(t, withClock(clock))
+	ctx := ctxT(t)
+	if _, err := e.b.CreateShed(ctx, config.CreateShedRequest{Name: "iso", NoProvision: true, Network: config.NetworkProfileIsolated}); err != nil {
+		t.Fatalf("an isolated create with an exclusive ingress: %v", err)
+	}
+	if got := e.settled("iso").Status; got != config.StatusRunning {
+		t.Fatalf("iso settled %q", got)
+	}
+	if _, err := e.b.StopShed(ctx, "iso"); err != nil {
+		t.Fatal(err)
+	}
+	e.settled("iso")
+	e.prov.SetIngressState([]string{fake.DefaultIngressSource}, false)
+	clock.Advance(FirewallMaxAge + time.Second)
+	_, err := e.b.CreateShed(ctx, config.CreateShedRequest{Name: "iso-2", NoProvision: true, Network: config.NetworkProfileIsolated})
+	if !errors.Is(err, config.ErrFirewallCheckFailedSentinel) || !strings.Contains(err.Error(), "exclusive") {
+		t.Fatalf("an isolated create without exclusive = %v, want FIREWALL_CHECK_FAILED naming exclusive", err)
+	}
+	if _, err := e.b.StartShed(ctx, "iso"); !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
+		t.Fatalf("an isolated start without exclusive = %v, want FIREWALL_CHECK_FAILED", err)
+	}
+	if _, err := e.create("open-one"); err != nil {
+		t.Fatalf("an open create without exclusive: %v", err)
 	}
 }
 
@@ -262,8 +204,8 @@ func TestNewNeedsStaticSources(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b, err := New(Options{
-				Config:   &config.RemoteConfig{Environment: testEnv, Firewall: config.RemoteFirewallConfig{Mode: tt.mode}},
-				Provider: fake.New(fake.Options{Env: testEnv}), Links: newFakeLinks(), StateDir: t.TempDir(),
+				Config:   &config.RemoteConfig{Firewall: config.RemoteFirewallConfig{Mode: tt.mode}},
+				Provider: fake.New(fake.Options{}), Links: newFakeLinks(), StateDir: t.TempDir(),
 				AuthorizedKeys: []string{testKey}, FirewallSources: tt.sources, SweepInterval: -1,
 			})
 			if b != nil {
@@ -282,21 +224,21 @@ func TestNewNeedsStaticSources(t *testing.T) {
 	}
 }
 
-// brokenSources makes the environment's rule admit an address the config
-// does not name; fixedSources puts it back.
+// brokenSources makes the ingress admit an address the config does not
+// name; fixedSources puts it back.
 func brokenSources(p *fake.Provider) {
-	p.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} })
+	p.SetIngressState([]string{"198.51.100.9/32"}, true)
 }
 
 func fixedSources(p *fake.Provider) {
-	p.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{fake.DefaultFirewallSource} })
+	p.SetIngressState([]string{fake.DefaultIngressSource}, true)
 }
 
 // TestFirewallGate: while the check fails, creates and starts are refused and
 // nothing else changes; when it passes again they work.
 func TestFirewallGate(t *testing.T) {
 	clock := newTestClock()
-	e := newEnv(t, withClock(clock))
+	e := newEnv(t, readOnlyIngress(), withClock(clock))
 	ctx := ctxT(t)
 
 	for _, name := range []string{"runs", "rests"} {
@@ -318,12 +260,12 @@ func TestFirewallGate(t *testing.T) {
 	// still stands, and no extra cloud read is made for it.
 	brokenSources(e.prov)
 	clock.Advance(FirewallMaxAge - time.Second)
-	reads := e.count(fake.OpEnvFirewallRule)
+	reads := e.count(fake.OpIngress)
 	if _, err := e.create("inside-the-minute"); err != nil {
 		t.Fatalf("create on a fresh passing result: %v", err)
 	}
 	e.settled("inside-the-minute")
-	if n := e.count(fake.OpEnvFirewallRule); n != reads {
+	if n := e.count(fake.OpIngress); n != reads {
 		t.Errorf("a fresh result was checked again (%d reads, was %d)", n, reads)
 	}
 
@@ -337,10 +279,10 @@ func TestFirewallGate(t *testing.T) {
 			t.Fatalf("create = %v, want the firewall refusal", err)
 		}
 		var f *FirewallFailure
-		if !errors.As(err, &f) || f.Reason != FirewallRuleSources {
-			t.Fatalf("create error carries %+v, want reason %s", f, FirewallRuleSources)
+		if !errors.As(err, &f) || f.Reason != FirewallSources {
+			t.Fatalf("create error carries %+v, want reason %s", f, FirewallSources)
 		}
-		for _, w := range []string{"shed-" + testEnv + "-ssh", "expected source ranges [192.0.2.1/32]", "found source ranges [198.51.100.9/32]"} {
+		for _, w := range []string{"expected sources [192.0.2.1/32]", "found sources [198.51.100.9/32]"} {
 			if !strings.Contains(err.Error(), w) {
 				t.Errorf("message lacks %q: %v", w, err)
 			}
@@ -401,7 +343,7 @@ func TestFirewallGate(t *testing.T) {
 		if got := e.status("runs"); got != config.StatusRunning {
 			t.Errorf("runs is %q", got)
 		}
-		if s := e.b.FirewallStatus(); s.OK || s.Failure == nil || s.Failure.Reason != FirewallRuleSources {
+		if s := e.b.FirewallStatus(); s.OK || s.Failure == nil || s.Failure.Reason != FirewallSources {
 			t.Errorf("status after the pass = %+v", s)
 		}
 	})
@@ -424,7 +366,7 @@ func TestFirewallGate(t *testing.T) {
 	})
 	t.Run("the failure is in the log", func(t *testing.T) {
 		log := strings.Join(e.logLines(), "\n")
-		for _, w := range []string{"firewall check FAILED", "reason rule_sources", "found source ranges [198.51.100.9/32]"} {
+		for _, w := range []string{"firewall check FAILED", "reason sources", "found sources [198.51.100.9/32]"} {
 			if !strings.Contains(log, w) {
 				t.Errorf("log lacks %q", w)
 			}
@@ -460,7 +402,7 @@ func TestFirewallGate(t *testing.T) {
 // would start a VM later, so it is refused too and nothing is queued.
 func TestFirewallGateQueuedStart(t *testing.T) {
 	clock := newTestClock()
-	e := newEnv(t, manual(), withClock(clock))
+	e := newEnv(t, readOnlyIngress(), manual(), withClock(clock))
 	e.put("q", config.StatusStopping)
 	e.put("up", config.StatusStarting)
 	brokenSources(e.prov)
@@ -481,19 +423,19 @@ func TestFirewallGateQueuedStart(t *testing.T) {
 // TestFirewallFailingAtStartup: a failing check does not keep the server
 // from starting; existing sheds can be listed, stopped and deleted.
 func TestFirewallFailingAtStartup(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, readOnlyIngress())
 	if _, err := e.create("old"); err != nil {
 		t.Fatal(err)
 	}
 	e.settled("old")
-	e.prov.RemoveFirewallRule(provider.FirewallRuleName(testEnv))
+	brokenSources(e.prov)
 	e.restart() // fails the test if the backend does not become ready
 	ctx := ctxT(t)
 
-	if s := e.b.FirewallStatus(); s.OK || s.Failure == nil || s.Failure.Reason != FirewallRuleMissing || s.CheckedAt.IsZero() {
+	if s := e.b.FirewallStatus(); s.OK || s.Failure == nil || s.Failure.Reason != FirewallSources || s.CheckedAt.IsZero() {
 		t.Fatalf("status after start-up = %+v", s)
 	}
-	if !strings.Contains(strings.Join(e.logLines(), "\n"), "firewall check FAILED (mode static, reason rule_missing)") {
+	if !strings.Contains(strings.Join(e.logLines(), "\n"), "firewall check FAILED (mode static, reason sources)") {
 		t.Error("the start-up failure is not in the log")
 	}
 	sheds, err := e.b.ListSheds(ctx)
@@ -518,9 +460,11 @@ func TestFirewallFailingAtStartup(t *testing.T) {
 // one check.
 func TestFirewallGateCheckedOnce(t *testing.T) {
 	clock := newTestClock()
-	e := newEnv(t, withClock(clock), limits(16, 32))
+	// Eight creates at once: a window long enough on a loaded machine
+	// for each first run's sends to end inside it (they are bound to it).
+	e := newEnv(t, withClock(clock), limits(16, 32), tune(func(o *Options) { o.FastFailWindow = 5 * time.Second }))
 	clock.Advance(FirewallMaxAge + time.Second)
-	before := e.count(fake.OpEnvFirewallRule)
+	before := e.count(fake.OpIngress)
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
 	for i := range errs {
@@ -536,7 +480,7 @@ func TestFirewallGateCheckedOnce(t *testing.T) {
 			t.Errorf("create %d: %v", i, err)
 		}
 	}
-	if n := e.count(fake.OpEnvFirewallRule) - before; n != 1 {
+	if n := e.count(fake.OpIngress) - before; n != 1 {
 		t.Errorf("%d checks for 8 creates, want 1", n)
 	}
 	e.idle()
@@ -567,29 +511,6 @@ func TestNetworkProfileWithAcknowledgedRanges(t *testing.T) {
 	}
 }
 
-func TestNormalizeSources(t *testing.T) {
-	tests := []struct {
-		name    string
-		in      []string
-		want    string
-		wantBad string
-	}{
-		{"sorted and deduplicated", []string{"203.0.113.7/32", "192.0.2.0/24", "203.0.113.7"}, "192.0.2.0/24, 203.0.113.7/32", ""},
-		{"host bits masked", []string{"192.0.2.99/24"}, "192.0.2.0/24", ""},
-		{"empty", nil, "", ""},
-		{"ipv6", []string{"192.0.2.0/24", "2001:db8::/32"}, "", "2001:db8::/32"},
-		{"junk", []string{"everyone"}, "", "everyone"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, bad := normalizeSources(tt.in)
-			if joinPrefixes(got) != tt.want || bad != tt.wantBad {
-				t.Errorf("normalizeSources = %q bad %q, want %q bad %q", joinPrefixes(got), bad, tt.want, tt.wantBad)
-			}
-		})
-	}
-}
-
 // TestFirewallGateInTheJob: a create or start is let in by the firewall check
 // when it is asked for, and may reach the cloud much later: resumed by the
 // next server after a restart, or queued behind a stop. The job asks the
@@ -598,15 +519,15 @@ func TestNormalizeSources(t *testing.T) {
 func TestFirewallGateInTheJob(t *testing.T) {
 	t.Run("a create resumed after a restart", func(t *testing.T) {
 		h := &hookProvider{}
-		e := newEnv(t, hooked(h))
+		e := newEnv(t, readOnlyIngress(), hooked(h))
 		const name = "resumed"
 		// The first server dies while the insert is on its way: the record
 		// holds the create and names no instance.
 		entered := make(chan struct{})
-		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, error) {
+		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, provider.Instance, error) {
 			close(entered)
 			<-ctx.Done()
-			return provider.Pending{}, ctx.Err()
+			return provider.Pending{}, provider.Instance{}, ctx.Err()
 		}
 		if _, err := e.create(name); err != nil {
 			t.Fatalf("create: %v", err)
@@ -615,18 +536,29 @@ func TestFirewallGateInTheJob(t *testing.T) {
 		// While it is down, the rule is opened to another address.
 		brokenSources(e.prov)
 		inserts := 0
-		h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
+		h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error) {
 			inserts++
 			return h.Provider.Create(ctx, spec)
 		}
 		e.restart()
-		got := e.settled(name)
 		e.idle()
+		got, _ := e.b.GetShed(ctxT(t), name)
 		if inserts != 0 || e.instances() != 0 {
 			t.Fatalf("%d inserts sent and %d instances exist while the firewall check fails, want none", inserts, e.instances())
 		}
-		if got.Status != config.StatusError || got.StatusReason != config.StatusReasonFirewall {
-			t.Errorf("came to rest %q (%q), want error (%s)", got.Status, got.StatusReason, config.StatusReasonFirewall)
+		// A resumed create (its first send may have been delivered) is
+		// kept for the next pass, not ended: the clean-up rule.
+		if got.Status != config.StatusStarting || got.StatusReason != config.StatusReasonFirewall {
+			t.Errorf("came to rest %q (%q), want starting (%s)", got.Status, got.StatusReason, config.StatusReasonFirewall)
+		}
+		if n := markerCount(t, e.dir); n != 0 {
+			t.Errorf("%d delete markers, want none", n)
+		}
+		// Once the rule is right, the next pass creates it.
+		fixedSources(e.prov)
+		e.sweep()
+		if got := e.settled(name); got.Status != config.StatusRunning || inserts != 1 {
+			t.Errorf("after the fix: %q (%q), %d inserts", got.Status, got.StatusReason, inserts)
 		}
 		if n := e.count(fake.OpDestroy); n != 0 {
 			t.Errorf("%d destroy calls, want none: nothing was made", n)
@@ -635,13 +567,13 @@ func TestFirewallGateInTheJob(t *testing.T) {
 
 	t.Run("a create resumed after a restart, the check passing", func(t *testing.T) {
 		h := &hookProvider{}
-		e := newEnv(t, hooked(h))
+		e := newEnv(t, readOnlyIngress(), hooked(h))
 		const name = "resumed"
 		entered := make(chan struct{})
-		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, error) {
+		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, provider.Instance, error) {
 			close(entered)
 			<-ctx.Done()
-			return provider.Pending{}, ctx.Err()
+			return provider.Pending{}, provider.Instance{}, ctx.Err()
 		}
 		if _, err := e.create(name); err != nil {
 			t.Fatalf("create: %v", err)
@@ -656,7 +588,7 @@ func TestFirewallGateInTheJob(t *testing.T) {
 
 	t.Run("a start queued behind a stop", func(t *testing.T) {
 		clock := newTestClock()
-		e := newEnv(t, manual(), withClock(clock))
+		e := newEnv(t, readOnlyIngress(), manual(), withClock(clock))
 		const name = "queued"
 		e.put(name, config.StatusStopping)
 		// Let in while the check passes, and queued behind the stop.
@@ -692,7 +624,7 @@ func TestFirewallGateInTheJob(t *testing.T) {
 	})
 
 	t.Run("a start resumed after a restart, the VM already up", func(t *testing.T) {
-		e := newEnv(t)
+		e := newEnv(t, readOnlyIngress())
 		const name = "up"
 		e.running(name)
 		id := e.settledID(name)

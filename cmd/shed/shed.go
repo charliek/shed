@@ -551,20 +551,24 @@ func runList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Tier 3: key-value display (verboseLevel >= 2)
-	if verboseLevel >= 2 {
+	switch {
+	case verboseLevel >= 2:
+		// Tier 3: key-value display
 		renderShedDetails(os.Stdout, allSheds, listAll)
-		return nil
-	}
-
-	// Tier 2: verbose table (verboseLevel == 1)
-	if verboseLevel >= 1 {
+	case verboseLevel >= 1:
+		// Tier 2: verbose table
 		renderShedTableVerbose(os.Stdout, allSheds, listAll)
-		return nil
+	default:
+		// Tier 1: default table
+		renderShedTable(os.Stdout, allSheds, listAll)
 	}
-
-	// Tier 1: default table
-	renderShedTable(os.Stdout, allSheds, listAll)
+	// One usage line per server that lists a cloud shed.
+	if footers := cloudFooters(allSheds, listAll, listUsage); len(footers) > 0 {
+		fmt.Println()
+		for _, f := range footers {
+			fmt.Println(f)
+		}
+	}
 	return nil
 }
 
@@ -607,6 +611,9 @@ type shedJSON struct {
 	Arch      string `json:"arch,omitempty"`
 	// Delivery is the record's delivery, as the server sends it.
 	Delivery *config.ShedDelivery `json:"delivery,omitempty"`
+	// Cloud is a cloud shed's machine (size, image, times, lease), as the
+	// server sends it.
+	Cloud *config.ShedCloud `json:"cloud,omitempty"`
 }
 
 // shedListJSON is the `shed list --json` document.
@@ -636,6 +643,7 @@ func shedListJSON(sheds []listedShed) []shedJSON {
 			Isolation:      s.shed.Isolation,
 			Arch:           s.shed.Arch,
 			Delivery:       s.shed.Delivery,
+			Cloud:          s.shed.Cloud,
 		}
 		if s.shed.Status == config.StatusRunning {
 			sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -699,6 +707,8 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 	}
 	withUser := mixedUsers(users)
 	withDelivery := deliveryShown(sheds)
+	withCloud := cloudShown(sheds)
+	now := time.Now()
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	header := []string{"NAME"}
@@ -711,6 +721,9 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 	}
 	if withDelivery {
 		header = append(header, "DELIVERY")
+	}
+	if withCloud {
+		header = append(header, "SIZE", "LEASE")
 	}
 	header = append(header, "CREATED")
 	fmt.Fprintln(w, strings.Join(header, "\t"))
@@ -730,6 +743,9 @@ func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
 		}
 		if withDelivery {
 			row = append(row, sdkbootstrap.SafeText(deliveryCell(s.shed)))
+		}
+		if withCloud {
+			row = append(row, sizeCell(s.shed), leaseCell(s.shed, now))
 		}
 		row = append(row, s.shed.CreatedAt.Format("2006-01-02 15:04"))
 		fmt.Fprintln(w, strings.Join(row, "\t"))
@@ -751,6 +767,8 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 		withUser = withUser || s.shed.User != ""
 	}
 	withDelivery := deliveryShown(sheds)
+	withCloud := cloudShown(sheds)
+	now := time.Now()
 	header := []string{"NAME"}
 	if listAll {
 		header = append(header, "SERVER")
@@ -763,6 +781,9 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 	if withDelivery {
 		header = append(header, "DELIVERY")
 	}
+	if withCloud {
+		header = append(header, "SIZE", "LEASE", "IMAGE")
+	}
 	if withID {
 		header = append(header, "ID")
 	}
@@ -772,7 +793,10 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 		uptime := "-"
 		if s.shed.Status == config.StatusRunning {
 			ssh = shedSSHString(s.shed.Name, s.server)
-			if s.shed.StartedAt != nil {
+			if run := cloudRunTime(s.shed, now); run != "" {
+				// A cloud shed has run since its machine's last start.
+				uptime = run
+			} else if s.shed.StartedAt != nil {
 				uptime = formatUptime(*s.shed.StartedAt)
 			} else {
 				uptime = formatUptime(s.shed.CreatedAt)
@@ -805,6 +829,13 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 		if withDelivery {
 			row = append(row, sdkbootstrap.SafeText(deliveryCell(s.shed)))
 		}
+		if withCloud {
+			image := "-"
+			if s.shed.Cloud != nil && s.shed.Cloud.Image != "" {
+				image = sdkbootstrap.SafeText(s.shed.Cloud.Image)
+			}
+			row = append(row, sizeCell(s.shed), leaseCell(s.shed, now), image)
+		}
 		if withID {
 			row = append(row, valueOrDash(s.shed.ID))
 		}
@@ -815,6 +846,7 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 
 // renderShedDetails is `shed list -vv`: one key-value block per shed.
 func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
+	now := time.Now()
 	for i, s := range sheds {
 		if i > 0 {
 			fmt.Fprintln(out, "---")
@@ -849,8 +881,11 @@ func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
 			fmt.Fprintf(out, "Image:          %s\n", img)
 		}
 		if s.shed.Status == config.StatusRunning {
-			// Use agent boot time for uptime if available
-			if s.shed.StartedAt != nil {
+			// A cloud shed's run time is from its machine's last start;
+			// otherwise the agent's boot time, when known.
+			if run := cloudRunTime(s.shed, now); run != "" {
+				fmt.Fprintf(out, "Uptime:         %s\n", run)
+			} else if s.shed.StartedAt != nil {
 				fmt.Fprintf(out, "Uptime:         %s\n", formatUptime(*s.shed.StartedAt))
 			} else {
 				fmt.Fprintf(out, "Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
@@ -897,6 +932,8 @@ func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
 				fmt.Fprintf(out, "  Memory:       %d MB\n", s.shed.MemoryMB)
 			}
 		}
+
+		writeCloudBlock(out, s.shed, now)
 
 		// Repo / Local Dir
 		if s.shed.Repo != "" {
@@ -1000,6 +1037,9 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Confirm deletion unless --force
 	if !deleteForce {
 		prompt := fmt.Sprintf("Delete shed %q on %s? This will also delete the data volume. [y/N] ", name, serverName)
+		if isCloudShed(serverName, entry, name) {
+			prompt = fmt.Sprintf("Delete shed %q on %s? This deletes the machine and its disk. [y/N] ", name, serverName)
+		}
 		ok, err := confirmAction(prompt, "--force")
 		if err != nil {
 			return err

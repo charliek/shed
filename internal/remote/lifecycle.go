@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +17,49 @@ import (
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 )
+
+// ownerFor decides whom a create's machine is for. A service client's shed
+// is the client's, with its lease; a person's (a user of the account
+// service's list) is theirs. On a server whose provider is the account
+// service (the compute contract takes exactly one of user and client on
+// every create), whatever the catalog says, and where a test provider's
+// catalog asks for it, anyone else (a local admin, the implicit user) is
+// refused 422 COMPUTE_POLICY_REFUSED with reason person: local admins
+// manage cloud sheds and do not create them.
+func (b *Backend) ownerFor(cat provider.Catalog, req config.CreateShedRequest, origin string) (provider.Owner, error) {
+	required := cat.OwnerRequired || b.cfg.Provider == config.RemoteProviderService
+	switch {
+	case req.Owner != "" && req.ClientLease > 0:
+		// The client's own lease, checked by the API against its
+		// policy.max_age.
+		return provider.Owner{Client: req.Owner, Lease: req.ClientLease}, nil
+	case req.Owner != "":
+		return provider.Owner{Client: req.Owner, Lease: b.clientLease(cat, req.Owner)}, nil
+	case !required:
+		return provider.Owner{User: req.User}, nil
+	case req.User != "" && origin == delivery.OriginDirectory:
+		return provider.Owner{User: req.User}, nil
+	}
+	return provider.Owner{}, &config.ComputeRefusal{Status: http.StatusUnprocessableEntity, Code: config.ErrComputePolicyRefused, Reason: "person",
+		Err: errors.New("only a person of the account service or a service client creates a cloud shed; a local admin can list, stop, delete and extend them")}
+}
+
+// clientLease is the lease a service client's machine gets when its create
+// names none: the client's policy.max_age (with nothing configured, the
+// service's longest client lease). A create that names one
+// (CreateShedRequest.Lease) gets that, refused POLICY_VIOLATION by the API
+// above max_age.
+func (b *Backend) clientLease(cat provider.Catalog, client string) time.Duration {
+	if b.opts.Server != nil && b.opts.Server.Auth != nil {
+		if c, ok := b.opts.Server.Auth.Clients[client]; ok && c.Policy.MaxAge.Duration() > 0 {
+			return c.Policy.MaxAge.Duration()
+		}
+	}
+	if cat.Policy.ClientMaxLease >= provider.MinClientLease {
+		return cat.Policy.ClientMaxLease
+	}
+	return provider.MinClientLease
+}
 
 // settledPoll is how often WaitSettled re-reads a record that is in a
 // transient status with no job to follow.
@@ -82,7 +126,19 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		return nil, fmt.Errorf("%w: %q", config.ErrNetworkProfileUnsupportedSentinel, network)
 	}
 
-	size, err := b.cfg.ResolveSize(req.CPUs, req.MemoryMB)
+	cat, ok := b.Catalog()
+	if !ok {
+		return nil, computeUnavailable(ErrNotReady)
+	}
+	// Who the machine is for: only a person or a client creates one where
+	// the provider says so (a local admin manages cloud sheds and does not
+	// create them). Decided before anything else is asked of the service.
+	origin := b.deliverySvc.Origin(req.User)
+	owner, err := b.ownerFor(cat, req, origin)
+	if err != nil {
+		return nil, err
+	}
+	size, err := resolveSize(cat, req)
 	if err != nil {
 		return nil, err
 	}
@@ -90,9 +146,13 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if err != nil {
 		return nil, err
 	}
-	image, err := b.cfg.ResolveImage(req.Image)
-	if err != nil {
-		return nil, err
+	image := req.Image
+	if image == "" {
+		image = provider.ImageDefault
+	}
+	if !cat.HasImage(image) {
+		return nil, &config.ComputeRefusal{Status: http.StatusUnprocessableEntity, Code: config.ErrComputePolicyRefused, Reason: "image",
+			Err: fmt.Errorf("image %q is not one the account service offers (%s or %s)", image, provider.ImageDefault, strings.Join(cat.Aliases, ", "))}
 	}
 	// A name that is taken is answered as such whatever the firewall check
 	// says: a client reads that 409 as "the shed exists".
@@ -102,23 +162,9 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if exists {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
-	// No VM is created while the firewall check fails.
-	if err := b.firewallGate(ctx); err != nil {
+	// No machine is created while the firewall check fails.
+	if err := b.firewallGate(ctx, network); err != nil {
 		return nil, err
-	}
-	if resolver, ok := b.prov.(provider.ImageResolver); ok {
-		// Bounded: this runs before the fast-fail window, and the two
-		// together must fit in the time a client waits for a create.
-		rctx, cancel := context.WithTimeout(ctx, b.opts.ImageResolveTimeout)
-		exact, err := resolver.ResolveImage(rctx, image)
-		cancel()
-		if err != nil {
-			if errors.Is(err, provider.ErrNotFound) {
-				return nil, fmt.Errorf("%w: %s: %w", config.ErrUnknownImageSentinel, image, err)
-			}
-			return nil, fmt.Errorf("resolving image %s: %w", image, err)
-		}
-		image = exact
 	}
 
 	id := req.ID
@@ -128,8 +174,8 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		}
 	}
 	repoURL := httpsRepoURL(req.Repo)
-	// Everything that is stored, labelled or reported is derived from the
-	// URL with its user and password removed; only the clone sees repoURL.
+	// Everything that is stored or reported is derived from the URL with
+	// its user and password removed; only the clone sees repoURL.
 	storedRepo := provider.StripRepoUserinfo(repoURL)
 	landingDir := ""
 	if repoURL != "" {
@@ -142,16 +188,13 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		landingDir = config.HomePath + "/" + dir
 	}
 	createdAt := b.now().UTC().Round(0)
-	// Where the user came from, by the configuration now: recorded on the
-	// shed and on its instance's labels (the evidence an adoption recovers
-	// it from).
-	origin := b.deliverySvc.Origin(req.User)
-	maxRun := b.runLimit(req.Owner)
 
-	spec, err := provider.NewSpec(
-		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User, UserOrigin: origin},
-		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir},
-		b.opts.AuthorizedKeys, size, diskGB, image, maxRun,
+	// The create is stored whole and replayed verbatim on a resume, its
+	// request id included. Where the user came from, by the configuration
+	// now, is in its spec: the evidence an adoption recovers it from.
+	spec, err := provider.NewSpec(id, req.Name, owner,
+		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir, UserOrigin: origin},
+		b.opts.AuthorizedKeys, size.Name, diskGB, image,
 	)
 	if err != nil {
 		return nil, mapRefusal(err)
@@ -174,7 +217,6 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 			NetworkProfile: network,
 			Arch:           size.Arch,
 		},
-		Env:         b.cfg.Environment,
 		Spec:        &spec,
 		Job:         state.JobCreate,
 		NoProvision: req.NoProvision,
@@ -183,9 +225,6 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		NoServerEnv: req.NoServerEnv,
 		ScriptKey:   req.ScriptKey,
 		UserOrigin:  origin,
-		Size:        size.Name,
-		DiskGB:      diskGB,
-		MaxRun:      maxRun,
 	}
 
 	b.mu.Lock()
@@ -217,6 +256,8 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	j.ticket = b.deliverySvc.Admit(req.Name, id)
 	j.actor, j.hasActor = audit.ActorFrom(ctx)
 	j.fastWindow = true
+	j.nameDeadline = time.Now().Add(b.nameWait())
+	j.firstRun = true
 	first := b.shedOf(rec)
 	b.mu.Unlock()
 	b.launch(j)
@@ -227,6 +268,18 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	case <-j.accepted:
 	case <-j.done:
 	case <-window.C:
+		// A create deciding what holds its name (nameHeld) has one answer
+		// to give, and gives it within a bounded time: it is waited for.
+		b.mu.Lock()
+		naming := j.naming
+		b.mu.Unlock()
+		if naming != nil {
+			select {
+			case <-naming:
+			case <-j.done:
+			case <-ctx.Done():
+			}
+		}
 	case <-ctx.Done():
 	}
 
@@ -249,11 +302,10 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	return shed, nil
 }
 
-// GetShed returns a shed from the local record cache.
+// GetShed returns a shed from the local record cache. It answers while the
+// backend is degraded too: the SSH server reads a shed through it, so an
+// existing shed's sessions keep working while the service is down.
 func (b *Backend) GetShed(ctx context.Context, name string) (*config.Shed, error) {
-	if err := b.checkReady(); err != nil {
-		return nil, err
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	r, err := b.lookupLocked(ctx, name)
@@ -263,11 +315,9 @@ func (b *Backend) GetShed(ctx context.Context, name string) (*config.Shed, error
 	return b.shedOf(r), nil
 }
 
-// ListSheds returns every shed in the local record cache, ordered by name.
+// ListSheds returns every shed in the local record cache, ordered by name,
+// degraded or not.
 func (b *Backend) ListSheds(context.Context) ([]config.Shed, error) {
-	if err := b.checkReady(); err != nil {
-		return nil, err
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]config.Shed, 0, len(b.records))
@@ -303,8 +353,9 @@ relock:
 	if !gated && (r.Shed.Status == config.StatusStopped || r.Shed.Status == config.StatusStopping) {
 		// The gate may read the cloud, so it runs without the lock; the
 		// shed is then looked at afresh.
+		network := r.Shed.NetworkProfile
 		b.mu.Unlock()
-		if err := b.firewallGate(ctx); err != nil {
+		if err := b.firewallGate(ctx, network); err != nil {
 			return nil, err
 		}
 		gated = true
@@ -438,10 +489,11 @@ func (b *Backend) healLocked(r *state.Record) *job {
 	return b.newJobLocked(kind, r.Shed.Name, r.Shed.ID)
 }
 
-// DeleteShed hides the shed at once and destroys its VM in the background.
-// It succeeds in every status. Before it returns it writes a local delete
-// marker and, for a bounded time, sets shed_state=deleting on the instance,
-// so the delete is finished even if this server dies right after.
+// DeleteShed hides the shed at once and destroys its machine in the
+// background. It succeeds in every status. Before it returns it writes a
+// local delete marker and, for a bounded time, sets shed_state=deleting on
+// the machine, so the delete is finished even if this server dies right
+// after.
 func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 	if err := b.checkReady(); err != nil {
 		return err
@@ -463,7 +515,7 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 	// through the marker is bound to what its caller was authorized on.
 	reportedOwner, _ := ownership(r)
 	marker := &state.Marker{
-		ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC(),
+		ID: r.Shed.ID, Name: name, Ref: r.Ref, At: b.now().UTC(),
 		Owner: reportedOwner, CreatedAt: r.Shed.CreatedAt,
 	}
 	cleanup := b.deletes[marker.ID]
@@ -498,8 +550,8 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 
 	if ref != "" {
 		lctx, cancel := context.WithTimeout(b.rootCtx, labelTimeout)
-		if err := b.markDeleting(lctx, ref, marker.ID); err != nil {
-			b.logf("remote: delete %s: could not label the instance %s=%s (the local marker stands): %v",
+		if err := b.markDeleting(lctx, marker, ref); err != nil {
+			b.logf("remote: delete %s: could not label the machine %s=%s (the local marker stands): %v",
 				name, provider.LabelState, provider.ShedStateDeleting, err)
 		}
 		cancel()
@@ -508,16 +560,23 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 	return nil
 }
 
-// markDeleting sets shed_state=deleting on the instance after checking that
-// it is the shed's own. A missing instance is success.
-func (b *Backend) markDeleting(ctx context.Context, ref provider.Ref, id string) error {
-	if err := b.verify(ctx, ref, id); err != nil {
-		if errors.Is(err, provider.ErrNotFound) {
-			return nil
-		}
+// markDeleting sets shed_state=deleting on the machine, with the request id
+// the delete's marker keeps for it. A missing machine, or one the service is
+// deleting already, is success.
+func (b *Backend) markDeleting(ctx context.Context, m *state.Marker, ref provider.Ref) error {
+	set := map[string]*string{provider.LabelState: provider.Str(string(provider.ShedStateDeleting))}
+	rid, err := b.markerRequestID(m, &m.LabelID)
+	if err != nil {
 		return err
 	}
-	return b.prov.SetLabels(ctx, ref, map[string]string{provider.LabelState: string(provider.ShedStateDeleting)})
+	err = b.retryUnknown(ctx, rid, func(rid string) error {
+		_, err := b.prov.SetLabels(ctx, ref, rid, set, nil)
+		return err
+	})
+	if errors.Is(err, provider.ErrNotFound) || errors.Is(err, provider.ErrDeleting) {
+		return nil
+	}
+	return err
 }
 
 // WaitSettled blocks until the shed has no job in flight and returns it as it
@@ -526,9 +585,6 @@ func (b *Backend) markDeleting(ctx context.Context, ref provider.Ref, id string)
 // ctx. Cancelling ctx ends the wait, not the job. A shed deleted meanwhile
 // gives config.ErrShedNotFoundSentinel.
 func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, error) {
-	if err := b.checkReady(); err != nil {
-		return nil, err
-	}
 	var following *job
 	sent := 0
 	for {
@@ -693,4 +749,22 @@ func (j *job) replay(ctx context.Context, from int) int {
 		backend.EmitProgress(ctx, ev)
 	}
 	return next
+}
+
+// resolveSize is the size a create gets. The API resolved it already
+// (req.SizeName, with the numbers a service client's caps were checked
+// against): that size is used as it is, and a catalog that has changed
+// since (the size gone, or other numbers) is refused SIZE_UNAVAILABLE, never
+// resolved again to a size nobody checked. A caller other than the API
+// (SizeName empty) has the numbers resolved here.
+func resolveSize(cat provider.Catalog, req config.CreateShedRequest) (backend.CatalogSize, error) {
+	if req.SizeName == "" {
+		return computeCatalog(cat).ResolveSize(req.CPUs, req.MemoryMB)
+	}
+	s, ok := cat.SizeNamed(req.SizeName)
+	if !ok || s.CPUs != req.CPUs || s.MemoryMB != req.MemoryMB {
+		return backend.CatalogSize{}, fmt.Errorf("%w: the size %s (%d CPUs, %d MB) the request was checked against is no longer offered as such; send the create again",
+			config.ErrSizeUnavailableSentinel, req.SizeName, req.CPUs, req.MemoryMB)
+	}
+	return backend.CatalogSize{Name: s.Name, CPUs: s.CPUs, MemoryMB: s.MemoryMB, Arch: s.Arch, DiskGBDefault: s.DiskGBDefault}, nil
 }

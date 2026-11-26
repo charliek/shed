@@ -29,6 +29,10 @@ const (
 	// optionalServer: used only by the server's own start-up work on the raw
 	// backend, never through a Guard, which does not implement it.
 	optionalServer = "server-only"
+	// optionalCaller: a call that acts on no shed but answers by who is
+	// asking; the guard returns a guarded implementation that applies its
+	// own rule (CloudUsager: AuthorizeUsage), tested on its own.
+	optionalCaller = "caller"
 )
 
 // optionalInterfaces classifies every exported interface declared in this
@@ -42,8 +46,11 @@ var optionalInterfaces = map[string]string{
 	// ProvisionRun is what a guarded BeginProvision returns: reached only
 	// through it, so its methods are walked through it.
 	"ProvisionRun":           optionalGuarded,
+	"Extender":               optionalGuarded,
+	"CloudUsager":            optionalCaller,
 	"NetworkProfiles":        optionalQuestion,
 	"CapabilityReporter":     optionalQuestion,
+	"Cataloger":              optionalQuestion,
 	"CountingLister":         optionalServer,
 	"CountingSnapshotLister": optionalServer,
 	"SnapshotStamper":        optionalServer,
@@ -58,8 +65,11 @@ var optionalTypes = map[string]reflect.Type{
 	"EgressController":       reflect.TypeOf((*EgressController)(nil)).Elem(),
 	"Provisioner":            reflect.TypeOf((*Provisioner)(nil)).Elem(),
 	"ProvisionRun":           reflect.TypeOf((*ProvisionRun)(nil)).Elem(),
+	"Extender":               reflect.TypeOf((*Extender)(nil)).Elem(),
+	"CloudUsager":            reflect.TypeOf((*CloudUsager)(nil)).Elem(),
 	"NetworkProfiles":        reflect.TypeOf((*NetworkProfiles)(nil)).Elem(),
 	"CapabilityReporter":     reflect.TypeOf((*CapabilityReporter)(nil)).Elem(),
+	"Cataloger":              reflect.TypeOf((*Cataloger)(nil)).Elem(),
 	"CountingLister":         reflect.TypeOf((*CountingLister)(nil)).Elem(),
 	"CountingSnapshotLister": reflect.TypeOf((*CountingSnapshotLister)(nil)).Elem(),
 	"SnapshotStamper":        reflect.TypeOf((*SnapshotStamper)(nil)).Elem(),
@@ -156,6 +166,14 @@ func optionalCases() map[string]optionalCall {
 			}
 			run.Release()
 			return nil
+		},
+		"Extender.ExtendShed": func(t *testing.T, g *Guard, ctx context.Context) error {
+			ex, ok := AsExtender(g)
+			if !ok {
+				t.Fatal("the guard hides the extend capability")
+			}
+			_, err := ex.ExtendShed(ctx, "box", 6, "")
+			return err
 		},
 		"Provisioner.BeginProvision": func(t *testing.T, g *Guard, ctx context.Context) error {
 			pv, ok := AsProvisioner(g)

@@ -3,69 +3,42 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
-
-	"github.com/charliek/shed/internal/remote/guest"
 )
 
-// Instance metadata keys. Every shed key begins "shed-". The first three are
-// read by the guest's boot unit and are defined in internal/remote/guest; the
-// last two are read only by the server. None holds a secret.
-const (
-	// MetadataShedName is the shed's name.
-	MetadataShedName = guest.MetadataShedName
-	// MetadataShedID is the shed's permanent ID.
-	MetadataShedID = guest.MetadataShedID
-	// MetadataAuthorizedKeys is the server's SSH public key, one
-	// authorized_keys line per key.
-	MetadataAuthorizedKeys = guest.MetadataAuthorizedKeys
-	// MetadataShedSpec is the ShedSpec as JSON: what a server needs, beyond
-	// the labels, to rebuild the shed's record. Written once, at create.
-	MetadataShedSpec = "shed-spec"
-	// MetadataHostKeyPin is the one SSH host key the server accepts from
-	// this instance, in authorized_keys form with no comment. The server
-	// writes it once, at first contact, and it is absent before that. Only
-	// the cloud API can change it, which is why the pin lives here and not
-	// in a guest attribute.
-	MetadataHostKeyPin = "shed-host-key"
-)
-
-// MaxMetadataBytes caps the total size of Spec.Metadata, keys plus values.
-const MaxMetadataBytes = 4096
+// MaxSpec is the largest Spec.Spec, in bytes.
+const MaxSpec = 4096
 
 // ShedSpecSchema is the current ShedSpec.Schema.
-const ShedSpecSchema = 1
+const ShedSpecSchema = 2
 
-// ShedSpec is the JSON document stored under MetadataShedSpec. Together with
-// the labels and the cloud's own facts (state, address, disk size, planned
-// stop) it is everything adoption needs: a record rebuilt from them equals
-// the one that was lost. Readers ignore fields they do not know.
+// ShedSpec is the document the server stores in a machine's spec, which the
+// provider keeps and returns verbatim. Together with the machine's own
+// members (name, owner, size, image, state) it is everything adoption needs:
+// a record rebuilt from them equals the one that was lost. Readers ignore
+// fields they do not know.
 type ShedSpec struct {
 	// Schema is ShedSpecSchema.
 	Schema int `json:"schema"`
-	// CreatedAt is when the shed was created, in UTC. It is the shed's
-	// created_at, which the reaper and ownership checks compare; the
-	// cloud's own creation time is not used for that.
+	// CreatedAt is when the shed was created, in UTC: the server's own
+	// time, which ownership checks compare. The provider's creation time is
+	// not used for that.
 	CreatedAt time.Time `json:"created_at"`
 	// Repo is the repository cloned at create, with any user name and
 	// password removed (see StripRepoUserinfo). Empty when none.
 	Repo string `json:"repo,omitempty"`
-	// Image is the exact image name the instance was created from, never
-	// a family or an alias.
-	Image string `json:"image"`
-	// Size is the named size: SizeStandard, SizeLarge or another name from
-	// the server config.
-	Size string `json:"size"`
 	// Network is the shed's network profile: "open" or "isolated".
 	Network string `json:"network"`
 	// LandingDir is where interactive logins land. Empty means the home
 	// directory.
 	LandingDir string `json:"landing_dir,omitempty"`
+	// UserOrigin is where the shed's user came from when it was made:
+	// "local" or "directory" (plan 040). Empty: not known.
+	UserOrigin string `json:"user_origin,omitempty"`
 }
 
-// Encode returns the JSON stored under MetadataShedSpec. The schema is set to
+// Encode returns the JSON stored as the spec. The schema is set to
 // ShedSpecSchema, the time is converted to UTC and the repo is stripped of
 // credentials, so a caller cannot store them by mistake.
 func (s ShedSpec) Encode() (string, error) {
@@ -74,23 +47,26 @@ func (s ShedSpec) Encode() (string, error) {
 	s.Repo = StripRepoUserinfo(s.Repo)
 	data, err := json.Marshal(s)
 	if err != nil {
-		return "", fmt.Errorf("encode shed-spec: %w", err)
+		return "", fmt.Errorf("encode the shed spec: %w", err)
+	}
+	if len(data) > MaxSpec {
+		return "", Errorf(ErrInvalid, "create", "the shed spec is %d bytes, over %d (a repository URL that long cannot be stored)", len(data), MaxSpec)
 	}
 	return string(data), nil
 }
 
-// DecodeShedSpec parses a MetadataShedSpec value. An empty value or a schema
-// newer than ShedSpecSchema is an error wrapping ErrInvalid.
+// DecodeShedSpec parses a machine's spec. An empty value, or a schema this
+// build does not read, is an error wrapping ErrInvalid.
 func DecodeShedSpec(value string) (ShedSpec, error) {
 	if strings.TrimSpace(value) == "" {
-		return ShedSpec{}, Errorf(ErrInvalid, "", "metadata %s is empty", MetadataShedSpec)
+		return ShedSpec{}, Errorf(ErrInvalid, "", "the machine's spec is empty")
 	}
 	var s ShedSpec
 	if err := json.Unmarshal([]byte(value), &s); err != nil {
-		return ShedSpec{}, &Error{Kind: ErrInvalid, Detail: "metadata " + MetadataShedSpec + " is not valid JSON", Err: err}
+		return ShedSpec{}, &Error{Kind: ErrInvalid, Detail: "the machine's spec is not valid JSON", Err: err}
 	}
-	if s.Schema < 1 || s.Schema > ShedSpecSchema {
-		return ShedSpec{}, Errorf(ErrInvalid, "", "metadata %s has schema %d, want %d", MetadataShedSpec, s.Schema, ShedSpecSchema)
+	if s.Schema != ShedSpecSchema {
+		return ShedSpec{}, Errorf(ErrInvalid, "", "the machine's spec has schema %d, want %d", s.Schema, ShedSpecSchema)
 	}
 	return s, nil
 }
@@ -127,120 +103,83 @@ func StripRepoUserinfo(repo string) string {
 	return out
 }
 
-// Architectures.
+// Limits of a create.
 const (
-	ArchAMD64 = "amd64"
-	ArchARM64 = "arm64"
+	// MaxAuthorizedKeys bounds Spec.AuthorizedKeys.
+	MaxAuthorizedKeys = 4
+	// MaxAuthorizedKey bounds one authorized key line.
+	MaxAuthorizedKey = 8 << 10
+	// MinClientLease bounds a client's lease from below.
+	MinClientLease = 60 * time.Second
+	// MaxDiskGB bounds Spec.DiskGB.
+	MaxDiskGB = 65536
 )
 
-// Named sizes every remote server has unless its config replaces them.
-const (
-	// SizeStandard is the default: 2 vCPUs and 8 GB.
-	SizeStandard = "standard"
-	// SizeLarge is for heavy builds: 8 vCPUs and 32 GB.
-	SizeLarge = "large"
-	// DefaultDiskGB is the boot disk size when a create names none.
-	DefaultDiskGB = 50
-)
-
-// Size is a named machine shape. A create request never names a machine
-// type; it names a size, or gives CPUs and memory that ResolveSize maps to
-// one.
-type Size struct {
-	// Name is the size's name in config and in ShedSpec.Size.
-	Name string
-	// MachineType is the cloud's name for the shape.
-	MachineType string
-	// CPUs and MemoryMB are what the shape provides; a shed's record
-	// reports them.
-	CPUs     int
-	MemoryMB int
-	// Arch is ArchAMD64 or ArchARM64. It must match the image.
-	Arch string
-}
-
-// DefaultSizes returns the built-in size table for GCE.
-func DefaultSizes() []Size {
-	return []Size{
-		{Name: SizeStandard, MachineType: "e2-standard-2", CPUs: 2, MemoryMB: 8192, Arch: ArchAMD64},
-		{Name: SizeLarge, MachineType: "e2-standard-8", CPUs: 8, MemoryMB: 32768, Arch: ArchAMD64},
-	}
-}
-
-// ResolveSize picks the size for a create request. With cpus and memoryMB
-// both zero it returns the size named defaultName. Otherwise it returns the
-// smallest size (fewest CPUs, then least memory) that provides at least cpus
-// and at least memoryMB; a zero in one of them means "no requirement". When
-// nothing fits, or defaultName is not in sizes, the error wraps ErrInvalid
-// and names the sizes that exist.
-func ResolveSize(sizes []Size, defaultName string, cpus, memoryMB int) (Size, error) {
-	if cpus == 0 && memoryMB == 0 {
-		for _, s := range sizes {
-			if s.Name == defaultName {
-				return s, nil
-			}
-		}
-		return Size{}, Errorf(ErrInvalid, "", "default size %q is not defined (sizes: %s)", defaultName, describeSizes(sizes))
-	}
-	sorted := append([]Size(nil), sizes...)
-	sort.SliceStable(sorted, func(a, b int) bool {
-		if sorted[a].CPUs != sorted[b].CPUs {
-			return sorted[a].CPUs < sorted[b].CPUs
-		}
-		return sorted[a].MemoryMB < sorted[b].MemoryMB
-	})
-	for _, s := range sorted {
-		if s.CPUs >= cpus && s.MemoryMB >= memoryMB {
-			return s, nil
-		}
-	}
-	return Size{}, Errorf(ErrInvalid, "", "no size provides %d CPUs and %d MB (sizes: %s)", cpus, memoryMB, describeSizes(sizes))
-}
-
-func describeSizes(sizes []Size) string {
-	parts := make([]string, 0, len(sizes))
-	for _, s := range sizes {
-		parts = append(parts, fmt.Sprintf("%s=%d CPUs/%d MB", s.Name, s.CPUs, s.MemoryMB))
-	}
-	return strings.Join(parts, ", ")
-}
-
-// Spec is everything a provider needs to create one instance. Build it with
-// NewSpec so every provider is handed the same labels and metadata.
-//
-// What a Spec does not carry comes from the provider's own configuration and
-// is the same for every instance: project, zone, network, the network tag
-// NetworkTag(env), no service account, and whatever switches the cloud needs
-// (on GCE, block-project-ssh-keys and enable-guest-attributes).
+// Spec is a create: everything a provider needs to make one machine. Build
+// it with NewSpec. The backend stores it in the shed's record and replays it
+// verbatim on a resumed create, RequestID included; a provider compares two
+// creates of one shed id by every member but RequestID.
 type Spec struct {
-	// Name is the instance name, InstanceName(env, id).
-	Name string
-	// Labels are set on the instance; the DiskLabelKeys among them are also
-	// set on the boot disk.
-	Labels map[string]string
-	// Metadata is set on the instance. It is not secret, and at most
-	// MaxMetadataBytes in total.
-	Metadata map[string]string
-	// Size is the machine shape.
-	Size Size
-	// DiskGB is the boot disk size. The disk is deleted with the instance.
-	DiskGB int
-	// Image is the exact image to boot.
-	Image string
-	// MaxRun is the run limit: how long the instance may run after each
-	// start before the cloud stops it (never deletes it). Zero means no
-	// limit. A provider without Capabilities.EnforcesRunLimit ignores it.
-	MaxRun time.Duration
+	// RequestID is the create's request id (NewRequestID).
+	RequestID string `json:"request_id"`
+	// ShedID is the shed's id: the machine's Ref.
+	ShedID string `json:"shed_id"`
+	// Name is the shed's name.
+	Name string `json:"name"`
+	// User or Client is who owns the machine: a person's handle or a
+	// client's name, never both. A provider whose catalog says
+	// OwnerRequired needs one.
+	User   string `json:"user,omitempty"`
+	Client string `json:"client,omitempty"`
+	// Size is a catalog size's name.
+	Size string `json:"size"`
+	// Image is ImageDefault or a catalog alias.
+	Image string `json:"image"`
+	// DiskGB is the disk; zero gives the size's default.
+	DiskGB int `json:"disk_gb,omitempty"`
+	// Labels are the working labels the machine starts with.
+	Labels map[string]string `json:"labels"`
+	// AuthorizedKeys are the public keys the guest's link user accepts
+	// (one normally, two during a rotation).
+	AuthorizedKeys []string `json:"authorized_keys"`
+	// Spec is the encoded ShedSpec, kept and returned verbatim.
+	Spec string `json:"spec"`
+	// AccessKinds are the access kinds the server can use, in its order of
+	// preference.
+	AccessKinds []string `json:"access_kinds"`
+	// LeaseS is a client's lease in seconds (clients only, required there).
+	LeaseS int64 `json:"lease_s,omitempty"`
 }
 
-// NewSpec builds the Spec for a shed. authorizedKeys are the server's SSH
+// Clone returns a deep copy.
+func (s *Spec) Clone() *Spec {
+	if s == nil {
+		return nil
+	}
+	out := *s
+	if s.Labels != nil {
+		out.Labels = make(map[string]string, len(s.Labels))
+		for k, v := range s.Labels {
+			out.Labels[k] = v
+		}
+	}
+	out.AuthorizedKeys = append([]string(nil), s.AuthorizedKeys...)
+	out.AccessKinds = append([]string(nil), s.AccessKinds...)
+	return &out
+}
+
+// Owner says who a create is for.
+type Owner struct {
+	// User is a person's handle, Client a client's name; at most one.
+	User, Client string
+	// Lease is a client's lease (clients only).
+	Lease time.Duration
+}
+
+// NewSpec builds the create for a shed. authorizedKeys are the server's SSH
 // public keys in authorized_keys form (one normally, two during a rotation).
-// The labels are id.Labels(ShedStateCreating); the metadata holds the shed's
-// name, ID, the keys and the encoded ShedSpec, whose Image and Size are
-// filled from the arguments.
-func NewSpec(id Identity, shed ShedSpec, authorizedKeys []string, size Size, diskGB int, image string, maxRun time.Duration) (Spec, error) {
-	shed.Image = image
-	shed.Size = size.Name
+// The labels hold shed_state=creating; the spec is shed, encoded.
+func NewSpec(shedID, name string, owner Owner, shed ShedSpec, authorizedKeys []string, size string, diskGB int, image string) (Spec, error) {
 	encoded, err := shed.Encode()
 	if err != nil {
 		return Spec{}, err
@@ -251,19 +190,25 @@ func NewSpec(id Identity, shed ShedSpec, authorizedKeys []string, size Size, dis
 			keys = append(keys, k)
 		}
 	}
+	if image == "" {
+		image = ImageDefault
+	}
 	spec := Spec{
-		Name:   id.InstanceName(),
-		Labels: id.Labels(ShedStateCreating),
-		Metadata: map[string]string{
-			MetadataShedName:       id.Name,
-			MetadataShedID:         id.ID,
-			MetadataAuthorizedKeys: strings.Join(keys, "\n"),
-			MetadataShedSpec:       encoded,
-		},
-		Size:   size,
-		DiskGB: diskGB,
-		Image:  image,
-		MaxRun: maxRun,
+		RequestID:      NewRequestID(),
+		ShedID:         shedID,
+		Name:           name,
+		User:           owner.User,
+		Client:         owner.Client,
+		Size:           size,
+		Image:          image,
+		DiskGB:         diskGB,
+		Labels:         map[string]string{LabelState: string(ShedStateCreating)},
+		AuthorizedKeys: keys,
+		Spec:           encoded,
+		AccessKinds:    []string{AccessSSH},
+	}
+	if owner.Client != "" {
+		spec.LeaseS = int64(owner.Lease / time.Second)
 	}
 	if err := spec.Validate(); err != nil {
 		return Spec{}, err
@@ -271,48 +216,63 @@ func NewSpec(id Identity, shed ShedSpec, authorizedKeys []string, size Size, dis
 	return spec, nil
 }
 
-// Validate checks a Spec before anything is sent to a cloud. Providers call
-// it first in Create and return its error, which wraps ErrInvalid.
+// Validate checks a Spec before anything is sent. Providers call it first in
+// Create and return its error, which wraps ErrInvalid.
 func (s Spec) Validate() error {
-	id, err := IdentityFromLabels(s.Labels)
-	if err != nil {
-		return err
-	}
-	if err := checkLabels(s.Labels); err != nil {
-		return Errorf(ErrInvalid, "create", "%v", err)
-	}
+	bad := func(format string, args ...any) error { return Errorf(ErrInvalid, "create", format, args...) }
 	switch {
-	case s.Name != id.InstanceName():
-		return Errorf(ErrInvalid, "create", "instance name %q does not match its labels (want %q)", s.Name, id.InstanceName())
-	case id.Owner != "" && id.User != "":
-		return Errorf(ErrInvalid, "create", "labels %s and %s are both set: a shed belongs to a service client or to a user, not both", LabelOwner, LabelUser)
-	case s.Labels[LabelState] != string(ShedStateCreating):
-		return Errorf(ErrInvalid, "create", "label %s must be %q at create", LabelState, ShedStateCreating)
-	case s.Metadata[MetadataShedName] != id.Name || s.Metadata[MetadataShedID] != id.ID:
-		return Errorf(ErrInvalid, "create", "metadata name and id do not match the labels")
-	case strings.TrimSpace(s.Metadata[MetadataAuthorizedKeys]) == "":
-		return Errorf(ErrInvalid, "create", "metadata %s is empty: the server could never log in", MetadataAuthorizedKeys)
-	case s.Size.MachineType == "" || s.Size.Arch == "":
-		return Errorf(ErrInvalid, "create", "size %q has no machine type or architecture", s.Size.Name)
-	case s.DiskGB <= 0:
-		return Errorf(ErrInvalid, "create", "disk size must be positive")
+	case s.RequestID == "":
+		return bad("no request id")
+	case !ValidShedID(s.ShedID):
+		return bad("shed id %q is not valid", s.ShedID)
+	case !ValidShedName(s.Name):
+		return bad("shed name %q cannot name a machine", s.Name)
+	case s.User != "" && s.Client != "":
+		return bad("a machine belongs to a person or to a client, not both")
+	case s.User != "" && !ValidHandle(s.User):
+		return bad("user %q is not a valid handle", s.User)
+	case s.Client != "" && !ValidHandle(s.Client):
+		return bad("client %q is not a valid name", s.Client)
+	case s.Client != "" && s.LeaseS < int64(MinClientLease/time.Second):
+		return bad("a client's machine needs a lease of at least %s", MinClientLease)
+	case s.Client == "" && s.LeaseS != 0:
+		return bad("only a client's machine carries a lease")
+	case s.Size == "":
+		return bad("no size")
 	case s.Image == "":
-		return Errorf(ErrInvalid, "create", "image is empty")
-	case s.MaxRun < 0:
-		return Errorf(ErrInvalid, "create", "run limit is negative")
+		return bad("no image")
+	case s.DiskGB < 0 || s.DiskGB > MaxDiskGB:
+		return bad("disk size %d is not 1 to %d GB", s.DiskGB, MaxDiskGB)
+	case s.Labels[LabelState] != string(ShedStateCreating):
+		return bad("label %s must be %q at create", LabelState, ShedStateCreating)
+	case len(s.AuthorizedKeys) == 0:
+		return bad("no authorized key: the server could never log in")
+	case len(s.AuthorizedKeys) > MaxAuthorizedKeys:
+		return bad("%d authorized keys, over %d", len(s.AuthorizedKeys), MaxAuthorizedKeys)
+	case len(s.Spec) > MaxSpec:
+		return bad("the spec is %d bytes, over %d", len(s.Spec), MaxSpec)
+	case len(s.AccessKinds) == 0 || len(s.AccessKinds) > 8:
+		return bad("1 to 8 access kinds")
 	}
-	if _, err := DecodeShedSpec(s.Metadata[MetadataShedSpec]); err != nil {
-		return err
+	if err := checkLabelMap(s.Labels); err != nil {
+		return bad("%v", err)
 	}
-	total := 0
-	for k, v := range s.Metadata {
-		if !strings.HasPrefix(k, "shed-") {
-			return Errorf(ErrInvalid, "create", "metadata key %q does not begin \"shed-\"", k)
+	for _, k := range s.AuthorizedKeys {
+		if len(k) > MaxAuthorizedKey || strings.ContainsAny(k, "\r\n") {
+			return bad("an authorized key is not one line of at most %d bytes", MaxAuthorizedKey)
 		}
-		total += len(k) + len(v)
 	}
-	if total > MaxMetadataBytes {
-		return Errorf(ErrInvalid, "create", "metadata is %d bytes, over the %d limit", total, MaxMetadataBytes)
+	if _, err := DecodeShedSpec(s.Spec); err != nil {
+		return err
 	}
 	return nil
+}
+
+// SameCreate reports whether two creates are the same body: every member
+// but RequestID equal.
+func SameCreate(a, b Spec) bool {
+	a.RequestID, b.RequestID = "", ""
+	ja, err1 := json.Marshal(a)
+	jb, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && string(ja) == string(jb)
 }

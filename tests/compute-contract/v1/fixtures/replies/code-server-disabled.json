@@ -1,0 +1,25 @@
+{
+  "name": "code-server-disabled",
+  "description": "SERVER_DISABLED at 403: a refusal of kind ErrDenied.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SERVER_DISABLED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "SERVER_DISABLED",
+    "kind": "ErrDenied"
+  }
+}

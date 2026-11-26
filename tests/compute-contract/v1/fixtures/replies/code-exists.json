@@ -1,0 +1,25 @@
+{
+  "name": "code-exists",
+  "description": "EXISTS at 409: a refusal of kind ErrExists.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "EXISTS",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "EXISTS",
+    "kind": "ErrExists"
+  }
+}

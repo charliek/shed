@@ -1,0 +1,25 @@
+{
+  "name": "unprocessable-unlisted-code",
+  "description": "422 with a code outside the list: the 422 default, INVALID.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SOMETHING_NEW",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

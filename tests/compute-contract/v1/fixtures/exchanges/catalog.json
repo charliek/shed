@@ -1,0 +1,114 @@
+{
+  "name": "catalog",
+  "description": "The catalog: sizes, the default size, the default image and the aliases, the access kinds, the policy, the limits and whether ingress is writable.",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=compute%3Amanage"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{compute_token}}",
+      "expires_in": 600,
+      "scope": "compute:manage",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/catalog",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "sizes": [
+            {
+              "name": "standard",
+              "cpus": 2,
+              "memory_mb": 8192,
+              "arch": "amd64",
+              "disk_gb_default": 50
+            },
+            {
+              "name": "large",
+              "cpus": 8,
+              "memory_mb": 32768,
+              "arch": "amd64",
+              "disk_gb_default": 100
+            }
+          ],
+          "default_size": "standard",
+          "images": {
+            "default": "shed-remote-full-v1-0-0-20261101-000000",
+            "aliases": [
+              "base",
+              "cloud"
+            ]
+          },
+          "access_kinds": [
+            "ssh"
+          ],
+          "policy": {
+            "person": {
+              "initial_lease_s": 86400,
+              "max_age_s": 432000,
+              "extend_allowed": true,
+              "presets_h": [
+                6,
+                12,
+                24,
+                48
+              ]
+            },
+            "client": {
+              "max_lease_s": 432000
+            },
+            "warn_s": 7200
+          },
+          "limits": {
+            "person_max": 4,
+            "org_max": 10
+          },
+          "ingress": {
+            "writable": true
+          }
+        }
+      }
+    }
+  ]
+}

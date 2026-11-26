@@ -16,58 +16,81 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
-// listRetry is the pause between attempts at the first cloud list.
+// listRetry is the default pause between attempts at the first list.
 const listRetry = 5 * time.Second
 
-// Reconcile is the start-up pass. It lists this environment's instances once
-// (retrying until the list is complete or ctx ends), repairs the local cache
-// against it, resumes the jobs a previous server left in flight, and then
-// closes Ready. The server runs it once, in the background; shed routes wait
-// for Ready.
+// Reconcile is the start-up pass. It reads the provider's catalog and lists
+// this server's machines once (retrying both every listRetry until they
+// answer or ctx ends), repairs the local cache against them, resumes the
+// jobs a previous server left in flight, and then closes Ready. The server
+// runs it once, in the background. Until Ready the backend is degraded:
+// reads answer from the records, and calls that need the service are
+// refused.
 //
 // What the pass does:
-//   - a "ready" instance with no record is adopted: its record is rebuilt
-//     from labels, shed-spec metadata and cloud state. A running one stays
-//     "starting" until its agent answers a probe;
+//   - a "ready" machine with no record is adopted: its record is rebuilt
+//     from the machine (its owner, size, image, spec and labels). A running
+//     one stays "starting" until its agent answers a probe;
 //   - a record that was "starting" or "stopping" gets a new job that carries
-//     on from what the cloud says now;
-//   - an instance with a local delete marker, or labelled
-//     shed_state=deleting, is destroyed. Nothing else is ever destroyed;
-//   - a record whose instance is not in the list is dropped once a read of
-//     that one instance confirms it is gone, unless the record is in "error"
-//     or its create had not reached the cloud yet;
+//     on from what the provider says now;
+//   - a machine with a local delete marker, or labelled shed_state=deleting,
+//     is destroyed. Nothing else is ever destroyed but an abandoned create;
+//   - a record whose machine is not in the list is dropped once a read of
+//     that one machine confirms it is gone (and logged with the cause when
+//     the list names its deletion), unless the record is in "error" or its
+//     create is unfinished and the list names no deletion of its machine
+//     (the create is resumed, and decides in createGone);
 //   - anything else is logged and left alone.
 func (b *Backend) Reconcile(ctx context.Context) {
-	var insts []provider.Instance
+	var listing provider.Listing
 	for {
-		var err error
-		insts, err = b.prov.List(ctx, provider.Selector{Env: b.cfg.Environment})
+		err := b.refreshCatalog(ctx)
+		if err == nil {
+			listing, err = b.prov.List(ctx)
+		}
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		b.logf("remote: reconcile: listing environment %s failed; retrying in %s: %v", b.cfg.Environment, listRetry, err)
+		b.logf("remote: reconcile: reading the account service's machines failed; retrying in %s: %v", b.opts.ListRetry, err)
 		select {
-		case <-time.After(listRetry):
+		case <-time.After(b.opts.ListRetry):
 		case <-ctx.Done():
 			return
 		case <-b.rootCtx.Done():
 			return
 		}
 	}
-	b.reconcile(ctx, insts)
+	if cat, _ := b.Catalog(); b.fw.mode == config.RemoteFirewallAuto && !cat.IngressWritable {
+		err := fmt.Errorf("remote: remote.firewall.mode: %s writes the machines' ingress, and the account service says its ingress is managed elsewhere (not writable); use remote.firewall.mode: %s with the sources it applies",
+			config.RemoteFirewallAuto, config.RemoteFirewallStatic)
+		b.logf("%v", err)
+		b.fail(err)
+		return
+	}
 	// The firewall check's first run, so a result exists before the first
-	// create or start. It only logs: a failing check never keeps the server
-	// from starting, because existing sheds must stay listable and
-	// deletable.
+	// create or start, and before any job is resumed. A failing check never
+	// keeps the server from starting, because existing sheds must stay
+	// listable and deletable, with one exception: auto mode against a
+	// service that refuses to write the ingress (INGRESS_NOT_WRITABLE) is a
+	// configuration that cannot work, and stops the start as the catalog's
+	// word does above.
 	b.CheckFirewall(ctx)
+	if st := b.FirewallStatus(); b.fw.mode == config.RemoteFirewallAuto && st.Failure != nil && st.Failure.Reason == FirewallNotWritable {
+		err := fmt.Errorf("remote: remote.firewall.mode: %s writes the machines' ingress, and the account service refuses to (%s); use remote.firewall.mode: %s with the sources it applies",
+			config.RemoteFirewallAuto, st.Failure.What, config.RemoteFirewallStatic)
+		b.logf("%v", err)
+		b.fail(err)
+		return
+	}
+	b.reconcile(ctx, listing)
 	b.readyOnce.Do(func() { close(b.ready) })
 	b.startSweeper()
 }
 
-func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
+func (b *Backend) reconcile(ctx context.Context, listing provider.Listing) {
 	var report []string
 	note := func(format string, args ...any) {
 		line := fmt.Sprintf(format, args...)
@@ -83,8 +106,9 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 	for _, m := range markers {
 		marked[m.ID] = m
 	}
+	deleted := deletionCauses(listing.Deleted)
 
-	byID := make(map[string]provider.Instance, len(insts))
+	byID := make(map[string]provider.Instance, len(listing.Instances))
 	var deletes []*state.Marker
 	var launch []*job
 	var resumeChannels []*state.Record
@@ -113,7 +137,7 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 			if r := b.records[name]; r.Shed.Status != config.StatusError {
 				r.Shed.Status = config.StatusError
 				r.Shed.StatusReason = config.StatusReasonCreateFailed
-				r.Job, r.Queued, r.Pending = "", "", nil
+				r.Job, r.Queued, r.Pending, r.Mutation = "", "", nil, nil
 				b.saveLocked(r)
 			}
 			continue
@@ -122,86 +146,79 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		delete(recordIDs, id)
 	}
 
-	for _, inst := range insts {
-		id, err := inst.Identity()
-		if err != nil {
-			note("instance %s has labels this server cannot read (%v); leaving it alone", inst.Name, err)
-			continue
-		}
-		if id.Env != b.cfg.Environment {
-			continue
-		}
-		if _, dup := byID[id.ID]; dup {
-			note("two instances carry shed id %s; leaving %s alone", id.ID, inst.Name)
-			continue
-		}
-		byID[id.ID] = inst
+	for _, inst := range listing.Instances {
+		id := string(inst.Ref)
+		byID[id] = inst
 
-		if m := marked[id.ID]; m != nil {
+		if m := marked[id]; m != nil {
 			if m.Ref == "" {
 				m.Ref = inst.Ref
 			}
 			continue // destroyed below, with every other marker
 		}
 		if inst.ShedState() == provider.ShedStateDeleting {
-			m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: b.now().UTC()}
+			m := &state.Marker{ID: id, Name: inst.Name, Ref: inst.Ref, At: b.now().UTC()}
 			if err := b.saveMarkerLocked(m); err != nil {
-				note("instance %s is labelled deleting but its marker could not be written: %v", inst.Name, err)
+				note("machine %s is labelled deleting but its marker could not be written: %v", id, err)
 				continue
 			}
-			if name, ok := recordIDs[id.ID]; ok {
+			if name, ok := recordIDs[id]; ok {
 				b.dropLocked(name)
-				delete(recordIDs, id.ID)
+				delete(recordIDs, id)
 			}
 			deletes = append(deletes, m)
 			continue
 		}
-		if _, known := recordIDs[id.ID]; known {
+		if _, known := recordIDs[id]; known {
 			continue
 		}
 
 		// No record. A create that no one is finishing is destroyed: its
-		// VM would run to its limit and its disk would be billed for
-		// ever, on no list and under no limit.
+		// machine would run to its lease and hold a place under the
+		// service's limits, on no list.
 		if b.abandonedCreate(inst) {
-			m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: b.now().UTC()}
+			m := &state.Marker{ID: id, Name: inst.Name, Ref: inst.Ref, At: b.now().UTC()}
 			if err := b.saveMarkerLocked(m); err != nil {
-				note("instance %s (shed %s) is an abandoned create but its marker could not be written: %v", inst.Name, id.Name, err)
+				note("machine %s (shed %s) is an abandoned create but its marker could not be written: %v", id, inst.Name, err)
 				continue
 			}
-			note("instance %s (shed %s) has been %q since %s with no local record; destroying it", inst.Name, id.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
+			note("machine %s (shed %s) has been %q since %s with no local record; destroying it", id, inst.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
 			deletes = append(deletes, m)
 			continue
 		}
 		// Otherwise adopt it only if it was a finished shed.
 		if inst.ShedState() != provider.ShedStateReady {
-			note("instance %s (shed %s) is %q with no local record; leaving it alone", inst.Name, id.Name, inst.ShedState())
+			note("machine %s (shed %s) is %q with no local record; leaving it alone", id, inst.Name, inst.ShedState())
 			continue
 		}
-		if other := b.records[id.Name]; other != nil {
-			note("instance %s claims shed name %s, which shed %s already has; leaving it alone", inst.Name, id.Name, other.Shed.ID)
+		if inst.State == provider.StateDeleting {
+			note("machine %s (shed %s) is being deleted by the account service; not adopting it", id, inst.Name)
 			continue
 		}
-		rec, err := b.adoptedRecord(inst, id)
+		if other := b.records[inst.Name]; other != nil {
+			note("machine %s claims shed name %s, which shed %s already has; leaving it alone", id, inst.Name, other.Shed.ID)
+			continue
+		}
+		rec, err := b.adoptedRecord(inst)
 		if err != nil {
-			note("instance %s (shed %s) cannot be adopted: %v", inst.Name, id.Name, err)
+			note("machine %s (shed %s) cannot be adopted: %v", id, inst.Name, err)
 			continue
 		}
 		if err := b.store.SaveRecord(rec); err != nil {
-			note("instance %s (shed %s) could not be recorded: %v", inst.Name, id.Name, err)
+			note("machine %s (shed %s) could not be recorded: %v", id, inst.Name, err)
 			continue
 		}
-		b.records[id.Name] = rec
-		recordIDs[id.ID] = id.Name
-		b.logf("remote: reconcile: adopted shed %s (%s) as %s", id.Name, id.ID, rec.Shed.Status)
+		b.records[inst.Name] = rec
+		recordIDs[id] = inst.Name
+		b.logf("remote: reconcile: adopted shed %s (%s) as %s", inst.Name, id, rec.Shed.Status)
 		switch {
 		case rec.UserConflict != "":
-			note("adopted shed %s is labelled %s=%q, which is not a valid user name; only an admin can reach it until the label is corrected", id.Name, provider.LabelUser, id.User)
-		case id.Owner != "" && id.User != "":
-			note("adopted shed %s is labelled with owner %q and user %q; only an admin can reach it", id.Name, id.Owner, id.User)
+			note("adopted shed %s belongs to %q, which is not a valid user name; only an admin can reach it", inst.Name, rec.UserConflict)
+		case inst.Client != "" && inst.User != "":
+			note("adopted shed %s belongs to client %q and user %q; only an admin can reach it", inst.Name, inst.Client, inst.User)
 		}
 		if rec.Job != "" {
-			launch = append(launch, b.newJobLocked(rec.Job, id.Name, id.ID))
+			launch = append(launch, b.newJobLocked(rec.Job, inst.Name, id))
 		}
 	}
 
@@ -211,37 +228,51 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		}
 		inst, present := byID[r.Shed.ID]
 		if !present {
+			cause := deleted[r.Shed.ID]
 			switch {
 			case r.Shed.Status == config.StatusError:
-				// An error record outlives its instance.
+				// A shed in error whose create made a machine keeps its
+				// record while the machine stands; once the machine is gone
+				// (its lease ended, a delete at the service) it is dropped
+				// when a read confirms it, with the cause when the list
+				// names one. One refused before it made a machine stays
+				// (errorRecordGoes); one a delete marker names is the
+				// delete's to finish.
+				if errorRecordGoes(r) && marked[r.Shed.ID] == nil {
+					confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: cause})
+				}
+			case cause != "":
+				// The service deleted it: dropped once a read confirms. An
+				// unfinished create whose answer never came is one too
+				// (its machine's ref is its shed id): it is never sent
+				// again.
+				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: cause})
 			case r.Job == state.JobCreate && !r.Ready:
-				// The create had not finished; it is sent again,
-				// and Create is idempotent.
+				// The create had not finished; it is resumed, and decides
+				// from a read of its machine (createGone: one made and
+				// gone is not made again).
 				launch = append(launch, b.newJobLocked(state.JobCreate, name, r.Shed.ID))
 			case r.Ref != "":
-				// Not in the list. That is not proof the instance is
-				// gone (a server restarted with another zone lists
-				// none of its sheds), so the one instance is read
-				// before the record is dropped.
+				// Not in the list. A record is dropped only once a read
+				// of that one machine says it is gone.
 				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status})
 			default:
-				note("shed %s (%s) never had an instance; dropping its record", name, r.Shed.ID)
+				note("shed %s (%s) never had a machine; dropping its record", name, r.Shed.ID)
 				b.dropLocked(name)
 			}
 			continue
 		}
 		if r.Ref == "" {
 			r.Ref = inst.Ref
-			b.saveLocked(r)
 		}
-		if b.reconcileUserLocked(r, inst.Labels, note) {
-			b.saveLocked(r)
-		}
+		b.noteMachineLocked(r, inst)
+		b.reconcileUserLocked(r, inst, note)
+		b.saveLocked(r)
 		if r.Job == state.JobCreate && !r.Ready && inst.ShedState() == provider.ShedStateReady {
-			// The create's last cloud write landed and its last local one
-			// did not. It is a finished shed: resuming the create could
-			// only end in the clean-up of a failed one, which destroys
-			// the VM and its disk.
+			// The create's last provider write landed and its last local
+			// one did not. It is a finished shed: resuming the create could
+			// only end in the clean-up of a failed one, which destroys the
+			// machine and its disk.
 			b.commitCreatedLocked(r, inst)
 			note("shed %s is labelled %s and its record still held the create; recording it %s", name, provider.ShedStateReady, r.Shed.Status)
 		}
@@ -263,18 +294,18 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 				resumeChannels = append(resumeChannels, r.Clone())
 			case provider.StateStopped:
 				b.recordStoppedLocked(r, inst)
-				note("shed %s was running and the cloud reports it stopped; recording it stopped (%s)", name, r.Shed.StatusReason)
+				note("shed %s was running and the provider reports it stopped; recording it stopped (%s)", name, r.Shed.StatusReason)
 			case provider.StateStopping:
 				r.Shed.Status = config.StatusStopping
 				r.Job = state.JobStop
 				b.saveLocked(r)
 				launch = append(launch, b.newJobLocked(state.JobStop, name, r.Shed.ID))
 			default:
-				note("shed %s is recorded running and the cloud reports %s; leaving it alone", name, inst.State)
+				note("shed %s is recorded running and the provider reports %s; leaving it alone", name, inst.State)
 			}
 		case config.StatusStopped:
 			if inst.State != provider.StateStopped {
-				note("shed %s is recorded stopped and the cloud reports %s; leaving it alone", name, inst.State)
+				note("shed %s is recorded stopped and the provider reports %s; leaving it alone", name, inst.State)
 			}
 		}
 	}
@@ -306,47 +337,51 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 	}
 }
 
+// deletionCauses maps each recently deleted machine's shed id to why it was
+// deleted.
+func deletionCauses(dels []provider.Deletion) map[string]string {
+	out := make(map[string]string, len(dels))
+	for _, d := range dels {
+		out[string(d.Ref)] = d.Cause
+	}
+	return out
+}
+
 // abandonedCreate reports whether inst is a create nobody will finish: still
-// labelled creating StaleCreateAge after the cloud made it. The caller has
-// checked that it carries this environment's labels in a schema this server
-// reads, and that no record, delete marker or delete job names its shed ID. A
-// create this server is working on always has a record, so only a create
-// whose record was lost (the state directory, or a server that died with the
-// record unwritten) gets here. An instance whose age is unknown is left
-// alone.
+// labelled creating StaleCreateAge after the provider made it. The caller
+// has checked that no record, delete marker or delete job names its shed
+// ID. A create this server is working on always has a record, so only a
+// create whose record was lost (the state directory, or a server that died
+// with the record unwritten) gets here. A machine whose age is unknown is
+// left alone.
 func (b *Backend) abandonedCreate(inst provider.Instance) bool {
 	return inst.ShedState() == provider.ShedStateCreating &&
 		!inst.CreatedAt.IsZero() && b.now().Sub(inst.CreatedAt) >= StaleCreateAge
 }
 
-// reconcileUserLocked brings a record's user into line with the shed_user
-// label on its instance, and reports whether it changed the record (the
-// caller saves it). The label is written at create, beside the record, so the
-// two agree unless one was lost or changed:
+// reconcileUserLocked brings a record's owner into line with its machine's,
+// and reports whether it changed the record (the caller saves it). The
+// machine's user and client are fixed at create and are the truth about who
+// owns it, so the two agree unless the record was lost or changed:
 //
-//   - no user on the label (absent, or empty): the record stands;
-//   - a label that is a valid label value but not a valid user name
-//     (config.ValidUserName; no server writes one): a conflict, whatever the
-//     record says. It is never stored or reported as a user;
-//   - the record has neither a user nor an owner and the label has a user:
-//     the record lost it (a build that predates users rewrote it, or a
-//     rollback did) and takes the label's;
-//   - the record names another user, or an owner, and the label a user: a
+//   - the machine names no owner: the record stands;
+//   - the machine names a user that is not a valid user name
+//     (config.ValidUserName; no server asks for one): a conflict, whatever
+//     the record says. It is never stored or reported as a user;
+//   - the record has neither a user nor an owner and the machine a user:
+//     the record lost it and takes the machine's, with the origin its spec
+//     recorded;
+//   - the record names another user or client than the machine: a
 //     conflict.
 //
 // A conflict fails closed: the shed is reported with config.UserUnresolved,
-// so only an admin can reach it, until a read of the instance finds the two
+// so only an admin can reach it, until a read of the machine finds the two
 // in line again, which clears it. It is noted at every such read.
 //
-// It runs on every path that reads the shed's instance: the start-up pass,
-// whether the instance was in the list or read through the record's stored
-// reference (correct); the periodic pass, for every listed instance and every
-// correction it reads; and the create, start, probe and stop jobs
-// (noteInstance, resumeCommitted, reconcileUserFromLocked). A save that fails
-// leaves the record in memory as decided, and the next read decides again
-// from the label.
-func (b *Backend) reconcileUserLocked(r *state.Record, labels map[string]string, note func(string, ...any)) bool {
-	label := labels[provider.LabelUser]
+// It runs on every path that reads the shed's machine: the start-up pass,
+// the periodic pass and its corrections, and the create, start, probe and
+// stop jobs.
+func (b *Backend) reconcileUserLocked(r *state.Record, inst provider.Instance, note func(string, ...any)) bool {
 	before := busIdentity(r)
 	defer func() {
 		if after := busIdentity(r); after.User != before.User {
@@ -356,40 +391,37 @@ func (b *Backend) reconcileUserLocked(r *state.Record, labels map[string]string,
 	conflict := ""
 	changed := false
 	switch {
-	case label == "":
-	case !config.ValidUserName(label):
-		conflict = label
-		note("shed %s: its instance is labelled %s=%q, which is not a valid user name; only an admin can reach it until the label is corrected",
-			r.Shed.Name, provider.LabelUser, label)
-	case label == r.Shed.User && r.Shed.Owner == "":
-		// The same user: the origin label must agree with the record's
-		// too. A known origin that disagrees with the label's fails closed
-		// (unknown: no delivery), never taken from either side, since the
-		// two are only ever written together (create, and assignment in
-		// one label update). An instance with no origin label, or a record
-		// that is unknown or from before origins, is left as it is.
-		if o := labels[provider.LabelUserOrigin]; provider.ValidUserOrigin(o) && provider.ValidUserOrigin(r.UserOrigin) && o != r.UserOrigin {
-			note("shed %s is recorded with user origin %q and its instance is labelled %s=%q; it gets no delivery until it is recreated",
-				r.Shed.Name, r.UserOrigin, provider.LabelUserOrigin, o)
-			r.UserOrigin = delivery.OriginUnknown
-			changed = true
+	case inst.Client != "" && inst.User != "":
+		// No service answers so (a machine has one owner); fail closed.
+		conflict = inst.User
+		note("shed %s: its machine belongs to client %q and user %q; only an admin can reach it", r.Shed.Name, inst.Client, inst.User)
+	case inst.Client != "":
+		if inst.Client != r.Shed.Owner || r.Shed.User != "" {
+			conflict = "client " + inst.Client
+			note("shed %s is recorded with user %q and owner %q and its machine belongs to client %q; only an admin can reach it until the two agree",
+				r.Shed.Name, r.Shed.User, r.Shed.Owner, inst.Client)
 		}
+	case inst.User == "":
+	case !config.ValidUserName(inst.User):
+		conflict = inst.User
+		note("shed %s: its machine belongs to %q, which is not a valid user name; only an admin can reach it", r.Shed.Name, inst.User)
+	case inst.User == r.Shed.User && r.Shed.Owner == "":
 	case r.Shed.User == "" && r.Shed.Owner == "":
-		r.Shed.User = label
-		// Its origin only from the instance's label (what the create or an
-		// assignment wrote); with none it is not known, and the shed gets
-		// no delivery: never inferred from the configuration of the day.
-		r.UserOrigin = originEvidence(labels[provider.LabelUserOrigin])
+		r.Shed.User = inst.User
+		// Its origin only from the machine's spec (what the create
+		// recorded); with none it is not known, and the shed gets no
+		// delivery: never inferred from the configuration of the day.
+		r.UserOrigin = originEvidence(specOrigin(inst))
 		changed = true
-		note("shed %s had no user on record and its instance is labelled %s=%s; recording that user", r.Shed.Name, provider.LabelUser, label)
+		note("shed %s had no user on record and its machine belongs to %s; recording that user", r.Shed.Name, inst.User)
 	default:
-		conflict = label
-		note("shed %s is recorded with user %q and owner %q and its instance is labelled %s=%q; only an admin can reach it until the two agree",
-			r.Shed.Name, r.Shed.User, r.Shed.Owner, provider.LabelUser, label)
+		conflict = inst.User
+		note("shed %s is recorded with user %q and owner %q and its machine belongs to %q; only an admin can reach it until the two agree",
+			r.Shed.Name, r.Shed.User, r.Shed.Owner, inst.User)
 	}
 	if conflict != r.UserConflict {
 		if conflict == "" {
-			note("shed %s: its record and its instance's %s label agree again", r.Shed.Name, provider.LabelUser)
+			note("shed %s: its record and its machine agree on its owner again", r.Shed.Name)
 		}
 		r.UserConflict = conflict
 		changed = true
@@ -397,12 +429,20 @@ func (b *Backend) reconcileUserLocked(r *state.Record, labels map[string]string,
 	return changed
 }
 
-// originEvidence is the recorded origin an instance's origin label gives:
-// the label's when it is one, otherwise unknown (never empty, which is a
-// v0.11 record's, nor inferred from the configuration).
-func originEvidence(label string) string {
-	if provider.ValidUserOrigin(label) {
-		return label
+// specOrigin is the user origin a machine's spec recorded, or "".
+func specOrigin(inst provider.Instance) string {
+	if s, err := inst.ShedSpec(); err == nil {
+		return s.UserOrigin
+	}
+	return ""
+}
+
+// originEvidence is the recorded origin a machine's spec gives: the spec's
+// when it is one, otherwise unknown (never empty, which is a v0.11 record's,
+// nor inferred from the configuration).
+func originEvidence(origin string) string {
+	if origin == delivery.OriginLocal || origin == delivery.OriginDirectory {
+		return origin
 	}
 	return delivery.OriginUnknown
 }
@@ -468,8 +508,8 @@ func (b *Backend) runBusSyncLocked(name string, s *busSync) {
 // change since makes a new epoch and another round), and only while no
 // channel start is in progress (a start reads the record before it
 // registers, so it could register the previous user; its end runs the
-// worker again). Each round runs under busApplyMu, so it cannot interleave
-// with applyBusRoute; the test hook runs before it is taken.
+// worker again). Each round runs under busApplyMu; the test hook runs before
+// it is taken.
 func (b *Backend) busSyncWorker(name string, s *busSync) {
 	defer b.wg.Done()
 	if busSyncDoneHook != nil {
@@ -514,42 +554,6 @@ func (b *Backend) busSyncWorker(name string, s *busSync) {
 	}
 }
 
-// applyBusRoute applies the shed name's reported user to its message channel
-// at once, in the caller's goroutine, and lifts the route hold the change
-// made, so the route is usable when it returns (AssignUser), whatever the
-// shed's bus-route worker is doing. It is one round of that worker under
-// busApplyMu: it reads the record and the newest hold's epoch, applies the
-// user, and lifts the hold only if no change has come since (its epoch is
-// still the newest) and no channel start is in progress; otherwise the
-// worker, which a change always runs again, applies the newer user after it.
-// It leaves the worker's own state (running, again) alone: a worker that
-// runs later finds the user applied and the hold gone, and only tidies up.
-// The caller holds no lock.
-func (b *Backend) applyBusRoute(name string) {
-	b.busApplyMu.Lock()
-	defer b.busApplyMu.Unlock()
-	b.mu.Lock()
-	s := b.busSyncs[name]
-	r := b.records[name]
-	if s == nil || r == nil || b.closed {
-		b.mu.Unlock()
-		return
-	}
-	epoch := s.epoch
-	id := busIdentity(r)
-	b.mu.Unlock()
-
-	if !id.Owned && b.credMgr.SetShedUser(name, id.CreatedAt, id.User) {
-		b.logf("remote: shed %s now routes credential requests as user %q", name, id.User)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.busSyncs[name] == s && s.epoch == epoch && b.busStarting[name] == 0 && !b.closed {
-		b.credMgr.ResumeShedRoute(name, epoch)
-	}
-}
-
 // joinBus opens (or resumes) the shed incarnation (name, shedID)'s message
 // channel with start, passing the bus identity its record reports now. It
 // counts the start as in progress, so a route held meanwhile is not lifted
@@ -579,16 +583,14 @@ func (b *Backend) joinBus(name, shedID string, start func(vmutil.BusIdentity)) {
 	}
 }
 
-// reconcileUserFromLocked is reconcileUserLocked from an instance a job or the
+// reconcileUserFromLocked is reconcileUserLocked from a machine a job or the
 // periodic pass read, for a caller that holds b.mu and saves the record when
-// it reports a change. An instance that does not carry the record's shed ID
-// in this environment, or is labelled by another version of the label set,
-// decides nothing.
+// it reports a change. A machine that is not the record's decides nothing.
 func (b *Backend) reconcileUserFromLocked(r *state.Record, inst provider.Instance) bool {
-	if inst.Labels[provider.LabelID] != r.Shed.ID || inst.Labels[provider.LabelEnv] != b.cfg.Environment || schemaOf(inst) != nil {
+	if string(inst.Ref) != r.Shed.ID {
 		return false
 	}
-	return b.reconcileUserLocked(r, inst.Labels, b.logNote)
+	return b.reconcileUserLocked(r, inst, b.logNote)
 }
 
 // reconcileUserRead is reconcileUserFromLocked under b.mu, for the shed's
@@ -607,54 +609,51 @@ func (b *Backend) logNote(format string, args ...any) {
 	b.logf("remote: "+format, args...)
 }
 
-// adoptedRecord rebuilds a shed's record from its instance: name, ID, owner
-// and user from labels, the shed-spec metadata, and the cloud's own facts. A
-// label set that names both an owner and a user is adopted as it is, and
-// reported as config.ShedOwnership says (no one but an admin reaches it). A
-// shed_user label that is not a valid user name is not taken as the user: it
-// is adopted as a conflict (Record.UserConflict), reported unresolved.
-func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*state.Record, error) {
+// adoptedRecord rebuilds a shed's record from its machine: name, ID and
+// owner from the machine's members, the rest from its spec and its size and
+// image. Its host key is pinned at its first contact (Learn). A user that is not
+// a valid user name is not taken as the user: it is adopted as a conflict
+// (Record.UserConflict), reported unresolved.
+func (b *Backend) adoptedRecord(inst provider.Instance) (*state.Record, error) {
 	spec, err := inst.ShedSpec()
 	if err != nil {
 		return nil, err
 	}
 	rec := &state.Record{
 		Shed: config.Shed{
-			Name:           id.Name,
-			ID:             id.ID,
+			Name:           inst.Name,
+			ID:             string(inst.Ref),
 			CreatedAt:      spec.CreatedAt.UTC(),
 			Repo:           spec.Repo,
 			Backend:        config.BackendRemote,
-			CPUs:           inst.CPUs,
-			MemoryMB:       inst.MemoryMB,
+			CPUs:           inst.Size.CPUs,
+			MemoryMB:       inst.Size.MemoryMB,
 			LandingDir:     spec.LandingDir,
-			Image:          spec.Image,
-			Owner:          id.Owner,
+			Image:          inst.ImageResolved,
+			Owner:          inst.Client,
 			NetworkProfile: spec.Network,
-			Arch:           inst.Arch,
+			Arch:           inst.Size.Arch,
 		},
-		// Where its user came from: only from the instance's own label,
-		// the evidence its create wrote. None is recorded as unknown (the
-		// shed gets no delivery, and the start-up migration never fills
-		// it), never the configuration of the day.
-		UserOrigin: originEvidence(id.UserOrigin),
-		Env:        id.Env,
-		Zone:       inst.Zone,
+		// Where its user came from: only from the machine's spec, the
+		// evidence its create wrote. None is recorded as unknown (the shed
+		// gets no delivery, and the start-up migration never fills it),
+		// never the configuration of the day.
+		UserOrigin: originEvidence(spec.UserOrigin),
 		Ref:        inst.Ref,
 		Ready:      true,
 		// Its history is not known: nothing is marked done that the
 		// server did not see. Every step skipped, delivery none.
-		Delivery:   delivery.AdoptedRecord(),
-		HostKeyPin: inst.HostKeyPin(),
-		Layout:     inst.Layout(),
-		Size:       spec.Size,
-		DiskGB:     inst.DiskGB,
-		MaxRun:     inst.MaxRun,
+		Delivery: delivery.AdoptedRecord(),
+		Layout:   inst.Layout(),
 	}
-	if config.ValidUserName(id.User) {
-		rec.Shed.User = id.User
+	// No pin from the attestation alone: the first contact (a probe of a
+	// running machine, the first start of a stopped one) compares the key
+	// sshd presents with the attested one and pins it then (Learn).
+	b.noteMachineLocked(rec, inst)
+	if config.ValidUserName(inst.User) {
+		rec.Shed.User = inst.User
 	} else {
-		rec.UserConflict = id.User // "" for no user
+		rec.UserConflict = inst.User // "" for no user
 	}
 	switch inst.State {
 	case provider.StateStopped:
@@ -666,8 +665,6 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 		// Running, or on its way: "starting" until a probe succeeds.
 		rec.Shed.Status = config.StatusStarting
 		rec.Job = state.JobProbe
-		rec.Address = inst.Address
-		rec.AddressAt = b.now()
 	}
 	return rec, nil
 }
@@ -686,9 +683,7 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 	switch {
 	case ctx.Err() != nil:
 		return errSuperseded
-	case errors.Is(err, provider.ErrNotFound):
-		b.logf("remote: adopted shed %s: its instance is gone; dropping the record", j.name)
-		b.forget(j.name, j.id)
+	case errors.Is(err, provider.ErrNotFound) && b.goneFor(j, rec.Ref, "probe"):
 		return err
 	case err != nil:
 		b.update(j.name, j.id, func(r *state.Record) {
@@ -701,7 +696,7 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 			r.Shed.Status = config.StatusStopped
 			r.Shed.StatusReason = ""
 			r.Job = ""
-			r.Address = ""
+			b.noteMachineLocked(r, inst)
 			b.reconcileUserFromLocked(r, inst)
 		})
 		return nil
@@ -713,8 +708,11 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 		if ctx.Err() != nil {
 			return errSuperseded
 		}
-		reason := config.StatusReasonUnreachable
-		if errors.Is(err, transport.ErrNoHostKey) && rec.HostKeyPin == "" {
+		// The reasons a create or start gives: access (no way in this
+		// server can use, or a host it may not dial) and host_key (a key
+		// other than the pinned or attested one) are kept as such.
+		reason := linkReason(err, config.StatusReasonUnreachable)
+		if reason == config.StatusReasonUnreachable && errors.Is(err, transport.ErrNoHostKey) && rec.HostKeyPin == "" {
 			reason = config.StatusReasonNoPin
 		}
 		b.logf("remote: adopted shed %s could not be probed (%s): %v", j.name, reason, err)

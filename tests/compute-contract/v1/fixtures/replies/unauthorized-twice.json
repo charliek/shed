@@ -1,0 +1,37 @@
+{
+  "name": "unauthorized-twice",
+  "description": "401, and 401 again after a new token: unavailable, and the outcome of a create is unknown.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 401,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "invalid_token",
+          "message": "words for people, never read"
+        }
+      }
+    },
+    {
+      "status": 401,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "invalid_token",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "retry-after-date",
+  "description": "429 with Retry-After 'Wed, 21 Oct 2026 07:28:00 GMT': wait 5 s.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 429,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"
+      },
+      "body": {
+        "error": {
+          "code": "RATE_LIMITED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "retry",
+    "retry_after_s": 5
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "contract": 1,
+  "provider": "ref",
+  "catalog": {
+    "sizes": [
+      {
+        "name": "standard",
+        "cpus": 2,
+        "memory_mb": 8192,
+        "arch": "amd64",
+        "disk_gb_default": 50
+      },
+      {
+        "name": "large",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "arch": "amd64",
+        "disk_gb_default": 100
+      }
+    ],
+    "default_size": "standard",
+    "images": {
+      "default": "shed-remote-full-v1-0-0-20261101-000000",
+      "aliases": {
+        "base": "shed-remote-base-v1-0-0-20261101-000000",
+        "cloud": "shed-remote-full-v1-0-0-20261101-000000"
+      }
+    },
+    "access_kinds": [
+      "ssh"
+    ]
+  },
+  "policy": {
+    "initial_lease_s": 86400,
+    "max_age_s": 432000,
+    "extend_allowed": true,
+    "presets_h": [
+      6,
+      12,
+      24,
+      48
+    ],
+    "client_max_lease_s": 432000,
+    "warn_s": 7200,
+    "person_max": 4,
+    "org_max": 10,
+    "sizes": {
+      "admin": [
+        "standard",
+        "large"
+      ],
+      "member": [
+        "standard"
+      ]
+    },
+    "ingress_writable": true,
+    "ingress_min_prefix": {
+      "v4": 24,
+      "v6": 48
+    }
+  },
+  "access": {
+    "host": "127.0.0.1",
+    "port": 22
+  }
+}

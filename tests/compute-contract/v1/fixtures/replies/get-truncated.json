@@ -1,0 +1,19 @@
+{
+  "name": "get-truncated",
+  "description": "A 200 that ends before its body is complete (generated): a read fails.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "truncated"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

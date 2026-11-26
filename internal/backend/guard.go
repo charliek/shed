@@ -2,10 +2,13 @@ package backend
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1039,4 +1042,126 @@ func AuthorizeProvision(p Principal, shed *config.Shed) error {
 		return fmt.Errorf("%w: only the shed's user can provision shed %s", config.ErrForbiddenSentinel, shed.Name)
 	}
 	return nil
+}
+
+// Extender is the optional capability behind `shed extend`: move a cloud
+// shed's lease later by whole hours (1 to config.MaxExtendHours). The remote
+// backend implements it; a backend that does not gives a 501 at the API.
+//
+// requestID, when not empty, is the compute contract's request id to send:
+// the same id for the same extend, so a repeat moves the lease once. Through
+// a Guard it is derived from the caller's own id (ExtendRequestID); empty
+// means a new extend, for which the backend makes one.
+type Extender interface {
+	ExtendShed(ctx context.Context, name string, hours int, requestID string) (*config.Shed, error)
+}
+
+// ExtendRequestID is the compute contract's request id for an extend the
+// caller p asked for with its own id callerID, on the shed of id shedID (or,
+// for a shed with none, its name and creation time): a UUID derived from all
+// three, so the same caller retrying the same extend sends the same id, and
+// another shed or another caller never does.
+func ExtendRequestID(shed *config.Shed, p Principal, callerID string) string {
+	key := shed.ID
+	if key == "" {
+		key = shed.Name + "@" + shed.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	sum := sha256.Sum256([]byte("shed-extend\x00" + key + "\x00" + string(p.Kind) + ":" + p.String() + "\x00" + strings.ToLower(callerID)))
+	b := sum[:16]
+	b[6] = b[6]&0x0f | 0x80 // version 8: a name-derived UUID
+	b[8] = b[8]&0x3f | 0x80
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// AsExtender returns b as an Extender when it is one. Through a Guard it
+// returns a guarded one: a service client and a script key are refused
+// before any lookup (AuthorizeExtend), then the shed is bound with
+// ActionExtend (its own user, or an admin).
+func AsExtender(b Backend) (Extender, bool) {
+	if g, ok := b.(*Guard); ok {
+		ex, ok := AsExtender(g.inner)
+		if !ok {
+			return nil, false
+		}
+		return guardedExtender{g: g, inner: ex}, true
+	}
+	ex, ok := b.(Extender)
+	return ex, ok
+}
+
+type guardedExtender struct {
+	g     *Guard
+	inner Extender
+}
+
+// ExtendShed needs the right to extend the shed (ActionExtend), and writes a
+// shed.extend event. callerID is the caller's own request id ("" for none),
+// from which the id sent is derived (ExtendRequestID).
+func (e guardedExtender) ExtendShed(ctx context.Context, name string, hours int, callerID string) (*config.Shed, error) {
+	p, err := principal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := AuthorizeExtend(p); err != nil {
+		return nil, err
+	}
+	bctx, shed, err := e.g.bind(ctx, "ExtendShed", name, ActionExtend)
+	if err != nil {
+		return nil, err
+	}
+	rid := ""
+	if callerID != "" {
+		rid = ExtendRequestID(shed, p, callerID)
+	}
+	extended, err := e.inner.ExtendShed(withActor(bctx, p), name, hours, rid)
+	e.g.recordOn(ctx, audit.EventShedExtend, shed, err)
+	return e.g.showFor(ctx)(extended, err)
+}
+
+// CloudUsager is the optional capability behind GET /api/cloud/usage: the
+// machines a person and the organization hold against the account
+// service's limits. user is whose to count ("" for the organization only).
+// The remote backend implements it; a backend that does not gives a 501.
+type CloudUsager interface {
+	CloudUsage(ctx context.Context, user string) (config.CloudUsage, error)
+	// ServicePerson reports whether name is a person of the account
+	// service (not a local admin): who may name another user's usage.
+	ServicePerson(name string) bool
+}
+
+// AsCloudUsager returns b as a CloudUsager when it is one. Through a Guard it
+// returns a guarded one, whose user is the ?user= the caller named, judged by
+// AuthorizeUsage.
+func AsCloudUsager(b Backend) (CloudUsager, bool) {
+	if g, ok := b.(*Guard); ok {
+		cu, ok := AsCloudUsager(g.inner)
+		if !ok {
+			return nil, false
+		}
+		return guardedUsage{inner: cu}, true
+	}
+	cu, ok := b.(CloudUsager)
+	return cu, ok
+}
+
+type guardedUsage struct {
+	inner CloudUsager
+}
+
+// CloudUsage counts whom AuthorizeUsage lets the caller see: asked is the
+// user the caller named ("" for none).
+// ServicePerson is the wrapped backend's answer.
+func (u guardedUsage) ServicePerson(name string) bool { return u.inner.ServicePerson(name) }
+
+func (u guardedUsage) CloudUsage(ctx context.Context, asked string) (config.CloudUsage, error) {
+	p, err := principal(ctx)
+	if err != nil {
+		return config.CloudUsage{}, err
+	}
+	user, err := AuthorizeUsage(p, asked, u.inner.ServicePerson)
+	if err != nil {
+		return config.CloudUsage{}, err
+	}
+	return u.inner.CloudUsage(ctx, user)
 }

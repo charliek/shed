@@ -416,7 +416,9 @@ shed-server can keep a JSON Lines audit log, `audit.jsonl`, next to
 (`/var/lib/shed/firecracker/audit.jsonl` with the Firecracker defaults,
 `~/Library/Application Support/shed/vz/audit.jsonl` with the VZ defaults; on
 the remote backend it is `audit.jsonl` in `remote.state_dir`, `remote` under the
-server's `state_dir` when that is unset). It is
+server's `state_dir` when that is unset, beside the shed records (`sheds/`) and
+delete markers (`deleting/`): clearing old records means removing those two,
+never the directory). It is
 created `0600` and rotated at 50 MiB, keeping five old files (`audit.jsonl.1`
 is the newest). A server that needs the log and cannot open it does not start.
 

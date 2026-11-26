@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -105,6 +106,11 @@ var (
 	// check of its cloud firewall rule and network fails, or cannot be made.
 	// Creates and starts are refused until it passes; nothing else is.
 	ErrFirewallCheckFailedSentinel = errors.New("firewall check failed")
+
+	// ErrSizeUnavailableSentinel is returned when no size of the remote
+	// backend's catalog provides what a create asked for (422
+	// SIZE_UNAVAILABLE).
+	ErrSizeUnavailableSentinel = errors.New("no size provides what was asked for")
 
 	// ErrFeatureUnsupportedSentinel is returned when a request uses a
 	// feature the active backend does not offer (on remote: host directory
@@ -341,6 +347,10 @@ type Shed struct {
 	// adoption; a record written before it existed has none and reports
 	// none); for Firecracker and VZ the report step sets the host's.
 	Arch string `json:"arch,omitempty" yaml:"arch,omitempty"`
+	// Cloud is a cloud shed's machine as the account service reported it
+	// (the remote backend only; FeatureLease): its size, image, times and
+	// lease. Set when a record is reported, never stored as part of a Shed.
+	Cloud *ShedCloud `json:"cloud,omitempty" yaml:"-"`
 }
 
 // HostResources names what the shed, as its backend reports it, reaches that
@@ -480,9 +490,9 @@ const (
 	// StatusReasonUnreachable (starting): the agent has not answered yet.
 	StatusReasonUnreachable = "unreachable"
 	// StatusReasonCloudUnreadable (starting): the server could not learn
-	// from the cloud what the VM is doing (the read failed, or the VM's
-	// labels are another version's), so it changed nothing and looks again
-	// at every periodic pass.
+	// from the account service what the machine is doing (the read failed,
+	// or a reply never came), so it changed nothing and looks again at
+	// every periodic pass.
 	StatusReasonCloudUnreadable = "cloud_unreadable"
 	// StatusReasonCapacity (stopped, error): the zone had no room.
 	StatusReasonCapacity = "capacity"
@@ -491,9 +501,6 @@ const (
 	// StatusReasonLimit (stopped): a start was refused by the server's own
 	// limits.max_running.
 	StatusReasonLimit = "limit"
-	// StatusReasonRunLimit (stopped): the cloud stopped the VM at the end
-	// of its run limit.
-	StatusReasonRunLimit = "run_limit"
 	// StatusReasonExternal (stopped): something other than this server
 	// stopped the VM.
 	StatusReasonExternal = "external"
@@ -506,9 +513,13 @@ const (
 	// StatusReasonCreateFailed (error): the create failed for a reason that
 	// has no code of its own.
 	StatusReasonCreateFailed = "create_failed"
-	// StatusReasonHostKey (error): the VM presented a host key other than
-	// the pinned one.
+	// StatusReasonHostKey (error, stopped): the machine presented a host
+	// key other than the pinned one, or the service attests another.
 	StatusReasonHostKey = "host_key"
+	// StatusReasonAccess (error, stopped): the machine offers no way in
+	// this server can use (only access kinds it does not know), or one at
+	// a host remote.access.allow does not allow.
+	StatusReasonAccess = "access"
 	// StatusReasonFirewall (stopped, error): the firewall check was failing
 	// when the server was about to ask the cloud for the VM, so it did not.
 	StatusReasonFirewall = "firewall"
@@ -1344,6 +1355,23 @@ type CreateShedRequest struct {
 	// person): no delivery is requested for its shed. The access guard sets
 	// it from the caller; it never comes from the wire.
 	ScriptKey bool `json:"-"`
+	// SizeName is the compute size the API resolved the request's cpus and
+	// memory_mb to (a remote server), with CPUs and MemoryMB set to its
+	// numbers, before a service client's caps were checked against them.
+	// The backend creates exactly that size, or refuses (SIZE_UNAVAILABLE)
+	// when the catalog no longer offers it with those numbers; it never
+	// resolves the numbers again. Never from the wire.
+	SizeName string `json:"-"`
+	// Lease is a service client's lease for its cloud shed, a Go duration
+	// ("30h"): the account service deletes the machine that long after it
+	// is made. Only a service client may send it, and only to a server that
+	// advertises FeatureLease (422 FEATURE_UNSUPPORTED otherwise); above
+	// the client's policy.max_age it is refused POLICY_VIOLATION. Absent:
+	// the client's policy.max_age.
+	Lease string `json:"lease,omitempty"`
+	// ClientLease is Lease as the API parsed and checked it, for the
+	// backend. Never from the wire.
+	ClientLease time.Duration `json:"-"`
 }
 
 // ServerEnvWithheld reports whether the server's env_file variables are kept
@@ -1454,11 +1482,39 @@ type APIError struct {
 	Error APIErrorDetail `json:"error"`
 }
 
-// APIErrorDetail contains the error code and message.
+// APIErrorDetail contains the error code and message, and for a refusal of
+// the remote backend's compute service its reason (COMPUTE_LIMIT_REACHED:
+// person or organization; COMPUTE_POLICY_REFUSED: size, lease, image,
+// access, person or client).
 type APIErrorDetail struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Reason  string `json:"reason,omitempty"`
 }
+
+// ComputeRefusal is a refusal of the remote backend's compute service, or
+// the backend's own refusal on its behalf (a local admin's create, a
+// degraded start): the shed API's status, code and reason. Err is the cause.
+type ComputeRefusal struct {
+	Status int
+	Code   string
+	Reason string
+	Err    error
+}
+
+func (e *ComputeRefusal) Error() string {
+	msg := strings.ToLower(strings.ReplaceAll(e.Code, "_", " "))
+	if e.Reason != "" {
+		msg += " (" + e.Reason + ")"
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap exposes the cause.
+func (e *ComputeRefusal) Unwrap() error { return e.Err }
 
 // NewAPIError creates a new APIError with the given code and message.
 func NewAPIError(code, message string) APIError {
@@ -1577,6 +1633,46 @@ const (
 	// non-empty mounts, from_snapshot, egress profiles), 501 for a route
 	// (snapshot, reset, image and egress writes).
 	ErrFeatureUnsupported = "FEATURE_UNSUPPORTED"
+
+	// The remote backend's compute service (plan 041). Each is a
+	// ComputeRefusal; the reason, where one is named, is error.reason.
+	//
+	// ErrComputeLimitReached (503): the service's limit on machines per
+	// person (reason person) or per organization (reason organization) is
+	// reached, every state counted. A client waits for a machine to go.
+	ErrComputeLimitReached = "COMPUTE_LIMIT_REACHED"
+	// ErrComputePolicyRefused (422): the service's policy refused the
+	// create: reason size, lease, image, access, person (a local admin, or
+	// a person the service does not list for this server) or client.
+	ErrComputePolicyRefused = "COMPUTE_POLICY_REFUSED"
+	// ErrComputeDenied (403): the service does not let this server manage
+	// compute (the grant is off, the server is disabled).
+	ErrComputeDenied = "COMPUTE_DENIED"
+	// ErrComputeUnavailable (503): the service could not be reached, did
+	// not answer in time, or the server has not finished its first list of
+	// the machines (a degraded start).
+	ErrComputeUnavailable = "COMPUTE_UNAVAILABLE"
+	// ErrComputeDeleting (409): the service is deleting the machine (its
+	// lease ended, or it was deleted at the service).
+	ErrComputeDeleting = "COMPUTE_DELETING"
+	// The refusals of an extend (POST /api/sheds/{name}/extend), each a
+	// ComputeRefusal with the account service's own code:
+	//
+	// ErrExtendNotAllowed (403): the lease cannot be extended (a service
+	// client's machine, or the service's policy lets no person extend).
+	ErrExtendNotAllowed = "EXTEND_NOT_ALLOWED"
+	// ErrLeaseAtCap (409): the extend would take the lease past its cap;
+	// nothing changed.
+	ErrLeaseAtCap = "LEASE_AT_CAP"
+	// ErrLeaseEnded (409): the lease has ended; the machine is being
+	// deleted.
+	ErrLeaseEnded = "LEASE_ENDED"
+	// ErrPersonInactive (403): the machine's person is no longer a live
+	// person of the account service for this server.
+	ErrPersonInactive = "PERSON_INACTIVE"
+	// ErrSizeUnavailable (422): no size of the service's catalog provides
+	// the cpus and memory a create asked for.
+	ErrSizeUnavailable = "SIZE_UNAVAILABLE"
 
 	// The credential bus pin (one machine answers per user per server).
 	// Each refusal body is the usual error shape, under 1024 bytes.
@@ -2031,7 +2127,12 @@ func sanitizeMountTag(s string) string {
 
 // Remote backend drivers (remote.provider, remote.transport).
 const (
-	RemoteProviderGCE    = "gce"
+	// RemoteProviderService gets each machine from the account service
+	// the server is enrolled with (auth.directory), over the compute
+	// contract. The default.
+	RemoteProviderService = "service"
+	// RemoteProviderFake is the in-memory fake (tests; needs
+	// allow_test_drivers).
 	RemoteProviderFake   = "fake"
 	RemoteTransportSSH   = "ssh"
 	RemoteTransportLocal = "local"
@@ -2055,9 +2156,11 @@ const (
 const (
 	// RemoteFirewallStatic (the default): the firewall rule's sources are
 	// fixed and must equal the configured set (firewall.source_ranges, or
-	// the variable firewall.source_ranges_env names). The server reads the
-	// rule and refuses creates and starts while it differs; it never changes
-	// it.
+	// the variable firewall.source_ranges_env names). When they differ the
+	// server writes the configured set to the account service's ingress,
+	// if that ingress is writable (the catalog says so and the write is not
+	// refused); otherwise it only compares, and refuses creates and starts
+	// while the sources differ.
 	RemoteFirewallStatic = "static"
 	// RemoteFirewallAuto: the server follows its own public address
 	// (firewall.echo_urls) and patches the rule's sources to that one /32.
@@ -2073,77 +2176,57 @@ const (
 	RemoteFirewallMinPrefix = 24
 )
 
-// Defaults for the remote block. The *_env defaults are the variable names
-// the development environment file defines.
+// Defaults and bounds for the remote block. The *_env defaults are the
+// variable names the development environment file defines.
 const (
-	DefaultRemoteMaxRunning     = 2
-	DefaultRemoteMaxSheds       = 8
-	DefaultRemoteMaxRunDuration = 24 * time.Hour
-	// RemoteMinRunDuration and RemoteMaxRunDuration bound
-	// remote.max_run_duration.
-	RemoteMinRunDuration = 10 * time.Minute
-	RemoteMaxRunDuration = 120 * 24 * time.Hour
 	// RemoteMinDiskGB and RemoteMaxDiskGB bound remote.disk_gb and a
 	// create's --upper-size.
 	RemoteMinDiskGB = 10
 	RemoteMaxDiskGB = 500
 
-	DefaultRemoteSSHClientKeyEnv       = "SHED_REMOTE_SSH_KEY"
-	DefaultRemoteSSHClientKeyFileEnv   = "SHED_REMOTE_SSH_KEY_FILE"
-	DefaultRemoteGCEProjectEnv         = "SHED_GCE_PROJECT"
-	DefaultRemoteGCEZoneEnv            = "SHED_GCE_ZONE"
-	DefaultRemoteGCENetworkEnv         = "SHED_GCE_NETWORK"
-	DefaultRemoteGCESubnetEnv          = "SHED_GCE_SUBNET"
-	DefaultRemoteGCECredentialsEnv     = "GOOGLE_CREDENTIALS_BASE64"
-	DefaultRemoteGCECredentialsFileEnv = "SHED_GCE_CREDENTIALS_FILE"
+	DefaultRemoteSSHClientKeyEnv     = "SHED_REMOTE_SSH_KEY"
+	DefaultRemoteSSHClientKeyFileEnv = "SHED_REMOTE_SSH_KEY_FILE"
 	// DefaultRemoteFirewallSourceRangesEnv is firewall.source_ranges_env
 	// when static mode names neither it nor firewall.source_ranges.
 	DefaultRemoteFirewallSourceRangesEnv = "SHED_REMOTE_SOURCE_RANGES"
 )
 
+// RemoteUpgradePage is the upgrade page a removed remote key's refusal
+// names.
+const RemoteUpgradePage = "docs/upgrades/remote-compute.md"
+
+// RemoteRemovedKeys are the remote keys of earlier releases that this one
+// refuses by name: a remote server gets its machines, their sizes, images
+// and lifetimes from the account service (remote.provider: service).
+var RemoteRemovedKeys = []string{"environment", "sizes", "default_size", "default_image", "image_aliases", "max_run_duration", "gce"}
+
 // RemoteConfig is the `remote:` block: the backend that runs each shed as a
-// cloud VM (default_backend: remote). The file holds no project, zone,
+// cloud machine (default_backend: remote). The machines come from the
+// account service the server is enrolled with (auth.directory); the block
+// says how the server reaches them and what it checks. The file holds no
 // address or key: every *_env field names a process environment variable,
 // read at start-up by Resolve.
 type RemoteConfig struct {
-	// Provider is the cloud driver: RemoteProviderGCE (the default) or
-	// RemoteProviderFake (tests; needs AllowTestDrivers).
+	// Provider is where machines come from: RemoteProviderService (the
+	// default) or RemoteProviderFake (tests; needs AllowTestDrivers).
 	Provider string `yaml:"provider,omitempty"`
 	// Transport is how the server reaches a shed's agent: RemoteTransportSSH
 	// (the default) or RemoteTransportLocal (tests; needs AllowTestDrivers).
 	Transport string `yaml:"transport,omitempty"`
 	// AllowTestDrivers must be true for provider: fake or transport: local,
-	// so a production config cannot select them by a typo.
+	// so a production config cannot select them by a typo. It also lets an
+	// access host be loopback, link-local, unspecified or multicast.
 	AllowTestDrivers bool `yaml:"allow_test_drivers,omitempty"`
-	// Environment names this server's set of cloud VMs (label shed_env).
-	// Required, no default: 1 to 20 lowercase letters, digits and hyphens,
-	// starting with a letter and not ending with a hyphen. Two servers must
-	// never share one.
-	Environment string `yaml:"environment"`
 	// StateDir holds the record cache and delete markers. Empty means
 	// "remote" under the server's state directory (StateDirPath).
 	StateDir string `yaml:"state_dir,omitempty"`
-	// DefaultImage is the cloud image a create that names none gets.
-	// Required. "family/<name>" follows an image family; anything else is an
-	// exact image name.
-	DefaultImage string `yaml:"default_image"`
-	// ImageAliases maps the names a create may pass as its image to cloud
-	// image names. A create may name only an alias.
-	ImageAliases map[string]string `yaml:"image_aliases,omitempty"`
-	// DefaultSize is the Sizes entry a create that asks for no CPUs or
-	// memory gets (default "standard").
-	DefaultSize string `yaml:"default_size,omitempty"`
-	// Sizes are the machine shapes a shed may have, by name. Empty means the
-	// provider's built-in table (standard, large).
-	Sizes map[string]RemoteSizeConfig `yaml:"sizes,omitempty"`
-	// DiskGB is the boot disk size when a create names none (default 50).
+	// DiskGB is the disk a create that names none asks for. Zero (the
+	// default) asks for none, and the service gives the size's own default;
+	// set, it wins over that.
 	DiskGB int `yaml:"disk_gb,omitempty"`
-	// Limits caps what this server runs.
+	// Limits caps what this server runs. Each limit is off at zero (the
+	// default): the service holds the quotas.
 	Limits RemoteLimitsConfig `yaml:"limits,omitempty"`
-	// MaxRunDuration is the run limit: the cloud stops a VM that has run
-	// this long (default 24h). A service client's shed gets the larger of
-	// this and the client's max_age (RunLimit).
-	MaxRunDuration Duration `yaml:"max_run_duration,omitempty"`
 	// AgentDir holds the agent builds the server can install, one per
 	// architecture (shed-agent-linux-<arch>). Empty means "agent" under the
 	// server's state directory (AgentDirPath).
@@ -2153,31 +2236,18 @@ type RemoteConfig struct {
 	AgentInstall string `yaml:"agent_install,omitempty"`
 	// SSH names where the server's SSH client key comes from.
 	SSH RemoteSSHConfig `yaml:"ssh,omitempty"`
-	// Firewall says how the cloud firewall rule that admits the server is
-	// kept.
+	// Firewall says which sources the machines' SSH ingress must admit,
+	// and whether the server keeps it so.
 	Firewall RemoteFirewallConfig `yaml:"firewall,omitempty"`
-	// GCE names the environment variables the GCE provider reads. Only
-	// used with provider: gce.
-	GCE *RemoteGCEConfig `yaml:"gce,omitempty"`
+	// Access is the operator's rule on where the server dials a machine.
+	Access RemoteAccessConfig `yaml:"access,omitempty"`
 }
 
-// RemoteSizeConfig is one remote.sizes entry.
-type RemoteSizeConfig struct {
-	// MachineType is the cloud's name for the shape (e2-standard-2).
-	MachineType string `yaml:"machine_type"`
-	// CPUs and MemoryMB are what the shape provides; a shed's record
-	// reports them and client caps are checked against them.
-	CPUs     int `yaml:"cpus"`
-	MemoryMB int `yaml:"memory_mb"`
-	// Arch is "amd64" (the default) or "arm64"; it must match the image.
-	Arch string `yaml:"arch,omitempty"`
-}
-
-// RemoteLimitsConfig is remote.limits.
+// RemoteLimitsConfig is remote.limits. Zero is off.
 type RemoteLimitsConfig struct {
-	// MaxRunning caps VMs that are starting or running (default 2).
+	// MaxRunning caps machines that are starting, running or stopping.
 	MaxRunning int `yaml:"max_running,omitempty"`
-	// MaxSheds caps sheds in any state (default 8).
+	// MaxSheds caps sheds in any state.
 	MaxSheds int `yaml:"max_sheds,omitempty"`
 }
 
@@ -2191,12 +2261,21 @@ type RemoteSSHConfig struct {
 	ClientKeyFileEnv string `yaml:"client_key_file_env,omitempty"`
 }
 
+// RemoteAccessConfig is remote.access.
+type RemoteAccessConfig struct {
+	// Allow are the CIDRs (IPv4 or IPv6) a machine's access host must be
+	// in for the server to dial it. Empty (the default) allows every
+	// unicast address outside the refused classes (loopback, link-local,
+	// unspecified, multicast), which test drivers allow too.
+	Allow []string `yaml:"allow,omitempty"`
+}
+
 // RemoteFirewallConfig is remote.firewall.
 type RemoteFirewallConfig struct {
 	// Mode is one of the RemoteFirewall* values (default static).
 	Mode string `yaml:"mode,omitempty"`
-	// SourceRanges are the IPv4 CIDRs the rule admits, written in the
-	// config file. Static mode only, where the rule's sources must equal
+	// SourceRanges are the IPv4 CIDRs the ingress admits, written in the
+	// config file. Static mode only, where the ingress's sources must equal
 	// them. Exactly one of SourceRanges and SourceRangesEnv is used.
 	SourceRanges []string `yaml:"source_ranges,omitempty"`
 	// SourceRangesEnv names an environment variable holding the same list,
@@ -2214,42 +2293,21 @@ type RemoteFirewallConfig struct {
 	EchoURLs []string `yaml:"echo_urls,omitempty"`
 }
 
-// AdmitsAny reports whether the config accepts a rule that admits addresses
-// other than the server's own: mode any, or a static mode that acknowledged
-// wide ranges. Such a config is refused beside service clients and beside
-// the isolated network profile.
+// AdmitsAny reports whether the config accepts an ingress that admits
+// addresses other than the server's own: mode any, or a static mode that
+// acknowledged wide ranges. Such a config is refused beside service clients
+// and beside the isolated network profile.
 func (f RemoteFirewallConfig) AdmitsAny() bool {
 	return f.Mode == RemoteFirewallAny || f.AcknowledgeAny
-}
-
-// RemoteGCEConfig is remote.gce: the names of the environment variables that
-// carry the GCE provider's settings.
-type RemoteGCEConfig struct {
-	ProjectEnv string `yaml:"project_env,omitempty"`
-	ZoneEnv    string `yaml:"zone_env,omitempty"`
-	NetworkEnv string `yaml:"network_env,omitempty"`
-	SubnetEnv  string `yaml:"subnet_env,omitempty"`
-	// CredentialsEnv names a variable holding the service account JSON key
-	// in base64; CredentialsFileEnv names one holding a path to it. Exactly
-	// one must be set when the server starts.
-	CredentialsEnv     string `yaml:"credentials_env,omitempty"`
-	CredentialsFileEnv string `yaml:"credentials_file_env,omitempty"`
 }
 
 // RemoteRuntime is what Resolve read from the environment. It holds secrets:
 // never log it.
 type RemoteRuntime struct {
-	// Project, Zone, Network and Subnet are set for provider: gce.
-	Project string
-	Zone    string
-	Network string
-	Subnet  string
-	// Credentials is the service account JSON key (provider: gce).
-	Credentials []byte
 	// SSHClientKey is the server's OpenSSH private key (transport: ssh).
 	SSHClientKey []byte
-	// FirewallSources are the source ranges the firewall rule must have in
-	// static mode, as canonical IPv4 CIDRs. Nil in the other modes, and
-	// with a test provider that was given none.
+	// FirewallSources are the sources the ingress must admit in static
+	// mode, as canonical IPv4 CIDRs. Nil in the other modes, and with a
+	// test provider that was given none.
 	FirewallSources []string
 }

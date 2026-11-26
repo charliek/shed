@@ -1,0 +1,24 @@
+{
+  "name": "get-bad-request",
+  "description": "400, a status outside the matrix: a read fails.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 400,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "BAD_REQUEST",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "create-truncated",
+  "description": "A create's reply that ends early (generated): the outcome is unknown.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "truncated"
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

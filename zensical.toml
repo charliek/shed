@@ -41,6 +41,7 @@ nav = [
       { "v0.9.0 → v0.10.0" = "upgrades/v0.9.0-to-v0.10.0.md" },
       { "v0.10 → v0.11" = "upgrades/v0.10-to-v0.11.md" },
       { "v0.11 → v0.12" = "upgrades/v0.11-to-v0.12.md" },
+      { "Cloud sheds from the account service" = "upgrades/remote-compute.md" },
     ] },
   ] },
   { "Tutorials" = [
@@ -75,6 +76,8 @@ nav = [
     { "Firecracker Operations" = "reference/fc-operations.md" },
     { "VZ Operations (macOS)" = "reference/vz-operations.md" },
     { "Remote Backend (Cloud)" = "reference/remote-backend.md" },
+    { "Compute Contract" = "reference/compute-contract.md" },
+    { "Guest Contract" = "reference/guest-contract.md" },
     { "Images" = "reference/images.md" },
     { "Build Tools" = "reference/build-tools.md" },
     { "Extensions" = "reference/extensions.md" },

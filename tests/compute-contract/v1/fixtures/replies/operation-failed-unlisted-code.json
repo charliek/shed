@@ -1,0 +1,25 @@
+{
+  "name": "operation-failed-unlisted-code",
+  "description": "Done with an error code outside the list: the operation failed, unavailable.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "done": true,
+        "error": {
+          "code": "SOMETHING_NEW"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "operation": "SOMETHING_NEW",
+    "kind": "ErrUnavailable"
+  }
+}

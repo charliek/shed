@@ -601,7 +601,9 @@ func (c *ServerConfig) validateClients() error {
 // an alias in the active backend's image_aliases. Validate only: it needs the
 // resolved backend.
 func (c *ServerConfig) validateClientImages() error {
-	if c.Auth == nil || len(c.Auth.Clients) == 0 {
+	// A remote server's images are the account service's catalog, which
+	// is not known at load: a client's images are checked at create.
+	if c.Auth == nil || len(c.Auth.Clients) == 0 || c.DefaultBackend == BackendRemote {
 		return nil
 	}
 	aliases := c.ActiveImageAliases()
@@ -627,25 +629,16 @@ func (c *ServerConfig) ActiveImageAliases() map[string]string {
 		if c.VZ != nil {
 			return c.VZ.ImageAliases
 		}
-	case BackendRemote:
-		if c.Remote != nil {
-			return c.Remote.ImageAliases
-		}
 	}
 	return nil
 }
 
 // ActiveDefaultResources returns the active backend's default_cpus and
-// default_memory_mb, the values a create that sets neither gets. On remote
-// they are the CPUs and memory of remote.default_size.
+// default_memory_mb, the values a create that sets neither gets. A remote
+// server's are its account service's default size (backend.CatalogOf), not
+// config: zero here.
 func (c *ServerConfig) ActiveDefaultResources() (cpus, memoryMB int) {
 	switch c.DefaultBackend {
-	case BackendRemote:
-		if c.Remote != nil {
-			if s, ok := c.Remote.Sizes[c.Remote.DefaultSize]; ok {
-				return s.CPUs, s.MemoryMB
-			}
-		}
 	case BackendFirecracker:
 		if c.Firecracker != nil {
 			return c.Firecracker.DefaultCPUs, c.Firecracker.DefaultMemoryMB
@@ -2129,6 +2122,7 @@ func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys, rejectRenamedKeys,
 		rejectMiscasedTopLevelKeys,
+		rejectRemovedRemoteKeys,
 		rejectUnknownClientKeys, rejectUnknownAuthKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
 	} {
 		if err := check(data); err != nil {
@@ -2485,10 +2479,6 @@ func (c *ServerConfig) ActiveDefaultImage() string {
 	case BackendVZ:
 		if c.VZ != nil {
 			return c.VZ.DefaultImage
-		}
-	case BackendRemote:
-		if c.Remote != nil {
-			return c.Remote.DefaultImage
 		}
 	}
 	return ""

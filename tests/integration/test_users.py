@@ -29,8 +29,9 @@ restarted with another config: `test_users_upgrade.py` (Mac dev server).
 Service clients beside users: `test_service_client.py`.
 
 Backends: `users_env` (conftest) is [vz] (the Mac dev server, restarted with
-the itest user list for this module and restored after), [fc] and [remote]
-(a dev server STARTED with the user list, `SHED_ITEST_USERS`). On [remote]
+the itest user list for this module and restored after), [fc] (a dev server
+STARTED with the user list, `SHED_ITEST_USERS`) and [remote] (its people come
+from the account service it is enrolled with). On [remote]
 every shed is a billed cloud VM and at most two run at once, so only the
 cases that prove ownership run there (one shed per user); the rest carry
 `local_vm_only`.

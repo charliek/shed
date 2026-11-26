@@ -294,3 +294,18 @@ func TestStartReaperStopWaitsForAReapInProgress(t *testing.T) {
 	}
 	stop() // idempotent
 }
+
+// A cloud shed (remote) is never reaped: its lease, set from the client's
+// max_age at create, is the account service's to enforce (S0 ruling 9).
+func TestReaperLeavesCloudShedsToTheirLease(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	b := &reaperBackend{clientFakeBackend: newClientFakeBackend(
+		config.Shed{Name: "nocturn-cloud", Status: config.StatusRunning, Owner: testClientName, Backend: config.BackendRemote, CreatedAt: now.Add(-365 * 24 * time.Hour)},
+		config.Shed{Name: "nocturn-local", Status: config.StatusStopped, Owner: testClientName, CreatedAt: now.Add(-365 * 24 * time.Hour)},
+	)}
+	s, _ := clientTestServer(t, b, defaultTestPolicy())
+	s.reapOnce(context.Background(), now)
+	if got, want := b.callsSnapshot(), []string{"delete nocturn-local"}; !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v (the cloud shed untouched)", got, want)
+	}
+}

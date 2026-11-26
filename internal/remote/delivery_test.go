@@ -254,8 +254,8 @@ func TestRemoteCreateInterruptedByARestart(t *testing.T) {
 			case "request":
 				src.Set("", deliverytest.Silent, nil)
 			case "label":
-				h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]string) error {
-					if labels[provider.LabelState] == string(provider.ShedStateReady) {
+				h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]*string) error {
+					if v := labels[provider.LabelState]; v != nil && *v == string(provider.ShedStateReady) {
 						return g.at(ctx, "label")
 					}
 					return nil
@@ -385,8 +385,8 @@ func TestRemoteResumedCreateWithNoSourceRunsItsSteps(t *testing.T) {
 				h := &hookProvider{}
 				e, g, src := deliveryEnv(t, hooked(h))
 				if pt.point == "label" {
-					h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]string) error {
-						if labels[provider.LabelState] == string(provider.ShedStateReady) {
+					h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]*string) error {
+						if v := labels[provider.LabelState]; v != nil && *v == string(provider.ShedStateReady) {
 							return g.at(ctx, "label")
 						}
 						return nil
@@ -453,8 +453,8 @@ func TestRemoteResumedCreateNeverRetriesAFailedStep(t *testing.T) {
 		t.Run(ns.name, func(t *testing.T) {
 			h := &hookProvider{}
 			e, g, src := deliveryEnv(t, hooked(h))
-			h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]string) error {
-				if labels[provider.LabelState] == string(provider.ShedStateReady) {
+			h.setLabels = func(ctx context.Context, _ provider.Ref, labels map[string]*string) error {
+				if v := labels[provider.LabelState]; v != nil && *v == string(provider.ShedStateReady) {
 					return g.at(ctx, "label")
 				}
 				return nil
@@ -620,14 +620,15 @@ func TestRemoteStepWriteFailureEndsTheRun(t *testing.T) {
 			e, g, _ := deliveryEnv(t)
 			var mu sync.Mutex
 			writes := 0
-			// Only a delivery step's write goes through saveRecord: the
-			// first is stage 1's, the second the clone's.
+			// The durable writes go through saveRecord: the first is the
+			// create's note that it is being sent, the second stage 1's,
+			// the third the clone's.
 			e.b.saveRecord = func(r *state.Record) error {
 				mu.Lock()
 				writes++
 				n := writes
 				mu.Unlock()
-				if n != 2 {
+				if n != 3 {
 					return e.b.store.SaveRecord(r)
 				}
 				if errors.Is(tc.err, state.ErrNotDurable) {
@@ -841,7 +842,7 @@ func (c *countHosted) NotDelivering() bool { return false }
 func TestRemoteCreateStoppedDuringBootAsksNothing(t *testing.T) {
 	entered, gate := make(chan struct{}), make(chan struct{})
 	h := &hookProvider{}
-	h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
+	h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error) {
 		close(entered)
 		<-gate
 		return h.Provider.Create(ctx, spec)
@@ -869,13 +870,12 @@ func TestRemoteCreateStoppedDuringBootAsksNothing(t *testing.T) {
 }
 
 // TestRemoteAdoptionRecoversOriginOnlyFromEvidence: a shed whose record is
-// lost is adopted with the user origin its create wrote on the instance
-// (shed_user_origin), never with the configuration of the day: pat's shed,
-// made while pat was a directory user, stays directory after pat became a
-// local admin (so a provision is refused, SHED_ORIGIN_CHANGED); a shed whose
-// instance carries no origin (made before the label) is not known
-// (SHED_ORIGIN_UNKNOWN). A record that lost its user takes the label's user
-// with the label's origin, or none.
+// lost is adopted with the user origin its create wrote in the machine's
+// spec, never with the configuration of the day: pat's shed, made while pat
+// was a directory user, stays directory after pat became a local admin (so a
+// provision is refused, SHED_ORIGIN_CHANGED); a shed whose spec carries no
+// origin is not known (SHED_ORIGIN_UNKNOWN). A record that lost its user
+// takes the machine's user with the spec's origin, or none.
 func TestRemoteAdoptionRecoversOriginOnlyFromEvidence(t *testing.T) {
 	e, _, _ := deliveryEnv(t)
 	var patLocal atomic.Bool
@@ -888,27 +888,11 @@ func TestRemoteAdoptionRecoversOriginOnlyFromEvidence(t *testing.T) {
 	e.createFor("pats", "pat")
 	e.createFor("legacy", "bob")
 	e.createFor("forged", "carol")
-	if got, _ := e.labelOf("pats", provider.LabelUserOrigin); got != delivery.OriginDirectory {
-		t.Fatalf("the create labelled the origin %q, want directory", got)
+	if got := e.specOf("pats").UserOrigin; got != delivery.OriginDirectory {
+		t.Fatalf("the create recorded the origin %q, want directory", got)
 	}
-	legacy := e.ref("legacy")
-	e.prov.Seed(func() provider.Instance {
-		inst, err := e.prov.Get(context.Background(), legacy)
-		if err != nil {
-			t.Fatal(err)
-		}
-		delete(inst.Labels, provider.LabelUserOrigin)
-		return inst
-	}())
-	forged := e.ref("forged")
-	e.prov.Seed(func() provider.Instance {
-		inst, err := e.prov.Get(context.Background(), forged)
-		if err != nil {
-			t.Fatal(err)
-		}
-		inst.Labels[provider.LabelUserOrigin] = "bogus"
-		return inst
-	}())
+	e.reseedOrigin("legacy", "")
+	e.reseedOrigin("forged", "bogus")
 
 	// The record store is lost, and pat is now a local admin.
 	if err := e.b.Close(); err != nil {
@@ -948,7 +932,7 @@ func TestRemoteAdoptionRecoversOriginOnlyFromEvidence(t *testing.T) {
 	}
 
 	// A record that lost its user: the user and its origin come back from
-	// the labels, not from today's configuration.
+	// the machine and its spec, not from today's configuration.
 	id := e.settledID("pats")
 	e.b.update("pats", id, func(r *state.Record) { r.Shed.User, r.UserOrigin = "", delivery.OriginLocal })
 	if err := e.b.Close(); err != nil {
@@ -1005,4 +989,34 @@ func TestRemoteResumeWaitsForTheOriginMigration(t *testing.T) {
 	if len(src.Requests()) != 0 {
 		t.Fatal("a resumed create asked a source")
 	}
+}
+
+// specOf is the shed spec of a shed's machine.
+func (e *env) specOf(name string) provider.ShedSpec {
+	e.t.Helper()
+	inst, err := e.prov.Get(context.Background(), e.ref(name))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	spec, err := inst.ShedSpec()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return spec
+}
+
+// reseedOrigin puts a shed's machine back with another user origin in its
+// spec, as a service that answers it so would.
+func (e *env) reseedOrigin(name, origin string) {
+	e.t.Helper()
+	inst, err := e.prov.Get(context.Background(), e.ref(name))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	spec, _ := inst.ShedSpec()
+	spec.UserOrigin = origin
+	if inst.Spec, err = spec.Encode(); err != nil {
+		e.t.Fatal(err)
+	}
+	e.prov.Seed(inst)
 }

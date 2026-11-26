@@ -1,0 +1,24 @@
+{
+  "name": "create-server-error",
+  "description": "500 to a create: the outcome is unknown (retry with the same request_id).",
+  "call": "create",
+  "replies": [
+    {
+      "status": 500,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INTERNAL",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

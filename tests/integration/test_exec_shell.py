@@ -49,6 +49,7 @@ def test_ssh_exec_pipes(shed_server, test_shed_name):
     )
 
 
+@pytest.mark.real_guest("the guest user's $HOME is /home/shed")
 def test_ssh_exec_dollar_var(shed_server, test_shed_name):
     """`ssh host 'echo "$HOME"'` expands `$HOME` to `/home/shed`.
 
@@ -104,6 +105,7 @@ def test_ssh_exec_bash_builtin(shed_server, test_shed_name):
     )
 
 
+@pytest.mark.real_guest("it seeds /etc/profile.d with sudo in the guest")
 def test_ssh_exec_login_profile_sourced(shed_server, test_shed_name):
     """Seeding `/etc/profile.d/shedtest.sh` and then reading
     `$SHEDTEST` over raw SSH returns `ok`.
@@ -201,6 +203,7 @@ def test_shed_exec_metachar_safety(shed_server, test_shed_name):
     )
 
 
+@pytest.mark.real_guest("the guest user's $HOME is /home/shed")
 def test_shed_exec_with_explicit_bash_lc(shed_server, test_shed_name):
     """`shed exec name -- bash -lc 'echo $HOME'` works.
 

@@ -53,6 +53,7 @@ def test_disconnect_terminates_command(shed_server, test_shed_name, pty):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=shed_server.env,
     ) as proc:
         # Poll (from a fresh exec) for the PID the command records — robust to
         # PTY echo/control bytes that would complicate parsing the channel.
