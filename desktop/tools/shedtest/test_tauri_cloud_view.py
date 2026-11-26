@@ -51,8 +51,8 @@ PLAIN_SHEDS = [
      "memory_mb": 4096, "created_at": "2026-11-20T12:00:00Z"},
 ]
 
-#: How long after an unknown extend a lease still at its old end settles it as not
-#: applied, in this module's app (`SHED_TAURI_EXTEND_SETTLE_S`; 150 s by default).
+#: How long after an unknown extend a lease short of its old end plus the hours
+#: settles it as not applied, in this module's app (`SHED_TAURI_EXTEND_SETTLE_S`; 150 s by default).
 SETTLE_S = 10
 
 #: The usage line of the mock's recorded usage (`CLOUD_USAGE`).
@@ -290,6 +290,36 @@ def test_no_usage_line_when_usage_cannot_be_read(r: Rig):
                    what="nocturn-cloud gone")
     r.c.wait_until(lambda: r.cloud()["usage"] == [], timeout=10, what="no usage line")
     assert r.row("cloud-ok")["tag"] == "Cloud"
+
+
+def test_the_usage_line_is_read_again_past_the_servers_cache(r: Rig):
+    """shed-server caches usage 30 s, so the read made at once when a server's cloud
+    rows change may be its cached count: the line is read once more 31 s on, with no
+    further change to the rows, and shows the fresh count."""
+    _wait_rows(r)
+    r.c.wait_until(lambda: r.cloud()["usage"] == [{"server": "mock", "words": USAGE_WORDS}],
+                   timeout=10, what="mock's usage line")
+    stopped = cloud_sheds()
+    next(s for s in stopped if s["name"] == "cloud-ok")["status"] = "stopped"
+    base = r.mock.cloud_counts()["usage_arrived"]
+    # A stop: the rows change, and the read made at once is answered from the
+    # "cache", the count before the stop.
+    r.mock.serve_cloud(sheds=stopped)
+    r.c.sheds_refresh()
+    r.c.wait_until(lambda: r.row("cloud-ok")["status"] == "stopped", timeout=10,
+                   what="cloud-ok stopped")
+    r.c.wait_until(lambda: r.mock.cloud_counts()["usage_answered"] > base, timeout=10,
+                   what="the usage read at the change")
+    assert r.cloud()["usage"] == [{"server": "mock", "words": USAGE_WORDS}], r.cloud()["usage"]
+    # The server's cache has the count after the stop from now on; the rows do not
+    # change again.
+    fresh = json.loads(json.dumps(CLOUD_USAGE))
+    fresh["person"].update({"running": 0, "stopped": 2})
+    fresh["org"].update({"running": 0, "stopped": 2})
+    r.mock.serve_cloud(sheds=[dict(s) for s in stopped], usage=fresh)
+    words = "2 of 100 machines (0 running, 2 stopped) · organization 2 of 100"
+    r.c.wait_until(lambda: r.cloud()["usage"] == [{"server": "mock", "words": words}],
+                   timeout=45, what="the fresh usage line, past the server's cache")
 
 
 # ---------------------------------------------------------------------------

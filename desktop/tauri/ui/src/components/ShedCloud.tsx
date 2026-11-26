@@ -13,7 +13,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Clock, Trash2 } from "lucide-react";
 import { Scrim, DialogShell, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { extendShed, fetchCloudUsage, inTauri, reportShedCloud, type Shed } from "@/lib/bridge";
-import { customHours, extendKey, failureWords, presetLabel, pruneRuns, readCloudRow, type CloudRow } from "@/lib/cloud";
+import {
+  customHours,
+  extendKey,
+  failureWords,
+  presetLabel,
+  pruneRuns,
+  readCloudRow,
+  USAGE_FOLLOW_UP_MS,
+  usageStep,
+  type CloudRow,
+  type UsageAsk,
+} from "@/lib/cloud";
 
 /** Click `el` (or the button inside it) unless it is disabled, as a pointer would. */
 function press(el: Element | null | undefined) {
@@ -290,41 +301,37 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
   );
 }
 
-/** How long a server's usage line is kept before a list re-reads it, when its cloud
- *  rows have not changed (the server caches it this long too). */
-const USAGE_KEEP_MS = 30_000;
-
 /** The usage line of each server whose rows are cloud sheds: `host -> words`. Read
- *  again at once when that server's cloud rows change (a create, a delete, a start or
- *  a stop), and otherwise at most every [`USAGE_KEEP_MS`] as its rows are listed again.
- *  A server whose usage cannot be read has no line. */
+ *  at once when that server's cloud rows change (a create, a delete, a start or a
+ *  stop) and once more [`USAGE_FOLLOW_UP_MS`] later, since shed-server caches usage
+ *  [`USAGE_KEEP_MS`] and the first read may be its cached count; otherwise at most
+ *  every [`USAGE_KEEP_MS`] as its rows are listed again. A server whose usage cannot
+ *  be read has no line. */
 export function useCloudUsage(sheds: Shed[]): Record<string, string> {
   const [usage, setUsage] = useState<Record<string, string>>({});
   // host -> its cloud rows when its usage was last asked for, when, and that ask's
   // number. Numbers come from one counter that never repeats, so an ask made before a
   // server's rows went away and came back can never pass for a later one.
-  const asked = useRef<Record<string, { key: string; at: number; gen: number }>>({});
+  const asked = useRef<Record<string, UsageAsk>>({});
   const asks = useRef(0);
-  useEffect(() => {
-    const byHost: Record<string, string[]> = {};
-    for (const s of sheds) {
-      if (readCloudRow(s.cloud_row)) (byHost[s.host] ??= []).push(`${s.name}:${s.status}`);
+  // host -> its pending follow-up read.
+  const followUps = useRef<Record<string, number>>({});
+  const drop = useCallback(
+    (host: string) =>
+      setUsage((u) => (host in u ? Object.fromEntries(Object.entries(u).filter(([h]) => h !== host)) : u)),
+    [],
+  );
+  const cancelFollowUp = useCallback((host: string) => {
+    const t = followUps.current[host];
+    if (t !== undefined) {
+      window.clearTimeout(t);
+      delete followUps.current[host];
     }
-    const drop = (host: string) =>
-      setUsage((u) => (host in u ? Object.fromEntries(Object.entries(u).filter(([h]) => h !== host)) : u));
-    for (const host of Object.keys(asked.current)) {
-      if (!(host in byHost)) {
-        delete asked.current[host];
-        drop(host);
-      }
-    }
-    const now = Date.now();
-    for (const [host, rows] of Object.entries(byHost)) {
-      const key = JSON.stringify(rows);
-      const last = asked.current[host];
-      if (last && last.key === key && now - last.at < USAGE_KEEP_MS) continue;
+  }, []);
+  const ask = useCallback(
+    (host: string, key: string) => {
       const gen = ++asks.current;
-      asked.current[host] = { key, at: now, gen };
+      asked.current[host] = { key, at: Date.now(), gen };
       const current = () => asked.current[host]?.gen === gen;
       void fetchCloudUsage(host).then(
         (a) => {
@@ -336,8 +343,43 @@ export function useCloudUsage(sheds: Shed[]): Record<string, string> {
           if (current()) drop(host);
         },
       );
+    },
+    [drop],
+  );
+  useEffect(() => {
+    const byHost: Record<string, string[]> = {};
+    for (const s of sheds) {
+      if (readCloudRow(s.cloud_row)) (byHost[s.host] ??= []).push(`${s.name}:${s.status}`);
     }
-  }, [sheds]);
+    for (const host of Object.keys(asked.current)) {
+      if (!(host in byHost)) {
+        delete asked.current[host];
+        cancelFollowUp(host);
+        drop(host);
+      }
+    }
+    const now = Date.now();
+    for (const [host, rows] of Object.entries(byHost)) {
+      const key = JSON.stringify(rows);
+      const step = usageStep(asked.current[host], key, now);
+      if (!step.ask) continue;
+      ask(host, key);
+      if (!step.followUp) continue;
+      cancelFollowUp(host);
+      followUps.current[host] = window.setTimeout(() => {
+        delete followUps.current[host];
+        // Rows changed again since: that change has its own reads.
+        if (asked.current[host]?.key === key) ask(host, key);
+      }, USAGE_FOLLOW_UP_MS);
+    }
+  }, [sheds, ask, drop, cancelFollowUp]);
+  useEffect(
+    () => () => {
+      for (const t of Object.values(followUps.current)) window.clearTimeout(t);
+      followUps.current = {};
+    },
+    [],
+  );
   return usage;
 }
 

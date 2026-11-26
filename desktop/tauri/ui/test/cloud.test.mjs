@@ -3,7 +3,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { customHours, extendKey, failureWords, leaseTone, presetLabel, pruneRuns, readCloudRow } from "../dist-test/cloud.js";
+import {
+  customHours,
+  extendKey,
+  failureWords,
+  leaseTone,
+  presetLabel,
+  pruneRuns,
+  readCloudRow,
+  USAGE_FOLLOW_UP_MS,
+  USAGE_KEEP_MS,
+  usageStep,
+} from "../dist-test/cloud.js";
 
 const ROW = {
   badge: "Cloud",
@@ -95,4 +106,17 @@ test("pruneRuns forgets finished runs of incarnations no longer listed, never a 
   // A thousand finished runs of deleted sheds go at the next listing.
   const many = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [extendKey("mock", `s${i}`, "t"), i]));
   assert.deepEqual(pruneRuns(many, new Set(), new Set()), {});
+});
+
+test("usageStep: a change asks now and follows up; the same rows ask only once kept long enough", () => {
+  const last = { key: "k1", at: 1_000, gen: 1 };
+  // New to the pane: read now, and once more past the server's cache.
+  assert.deepEqual(usageStep(undefined, "k1", 1_000), { ask: true, followUp: true });
+  // A lifecycle change (the rows' key differs): the same, however soon.
+  assert.deepEqual(usageStep(last, "k2", 1_001), { ask: true, followUp: true });
+  // The same rows: nothing until the keep time has passed, then a read with no follow-up.
+  assert.deepEqual(usageStep(last, "k1", 1_000 + USAGE_KEEP_MS - 1), { ask: false, followUp: false });
+  assert.deepEqual(usageStep(last, "k1", 1_000 + USAGE_KEEP_MS), { ask: true, followUp: false });
+  // The follow-up lands past the server's cache window.
+  assert.ok(USAGE_FOLLOW_UP_MS > USAGE_KEEP_MS);
 });

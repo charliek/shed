@@ -130,3 +130,23 @@ export function failureWords(e: unknown): string {
   if (e instanceof Error && e.message) return e.message;
   return "the extend failed";
 }
+
+/** How long a server's usage line is kept before a listing reads it again, when its
+ *  cloud rows have not changed (shed-server caches usage this long too). */
+export const USAGE_KEEP_MS = 30_000;
+
+/** How long after a server's cloud rows change its usage is read once more: past
+ *  shed-server's usage cache ([`USAGE_KEEP_MS`]), so the second read is a fresh count
+ *  even when the first one, made at once, was answered from the cache. */
+export const USAGE_FOLLOW_UP_MS = 31_000;
+
+/** The last usage read of a server: its cloud rows then (`key`), when, and its number. */
+export type UsageAsk = { key: string; at: number; gen: number };
+
+/** What a listing does for one server's usage line, given its last read (`last`), its
+ *  cloud rows now (`key`) and the time: `ask` reads it now; `followUp` (the rows
+ *  changed, or are new) reads it once more [`USAGE_FOLLOW_UP_MS`] on. */
+export function usageStep(last: UsageAsk | undefined, key: string, now: number): { ask: boolean; followUp: boolean } {
+  const changed = !last || last.key !== key;
+  return { ask: changed || now - last.at >= USAGE_KEEP_MS, followUp: changed };
+}

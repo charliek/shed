@@ -171,9 +171,9 @@ func TestWaitSettledDoesNotCallADeleteGoneWhenItsMarkerFileCannotBeRead(t *testi
 
 	// The marker file's content is replaced by something that does not
 	// parse: unreadable for root too, and the directory still lists.
-	entries, err := os.ReadDir(filepath.Join(e.dir, "deleting"))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("marker directory: %v, %d entries", err, len(entries))
+	entries := stateFiles(t, filepath.Join(e.dir, "deleting"))
+	if len(entries) != 1 {
+		t.Fatalf("marker directory: %d entries", len(entries))
 	}
 	path := filepath.Join(e.dir, "deleting", entries[0].Name())
 	good, err := os.ReadFile(path)

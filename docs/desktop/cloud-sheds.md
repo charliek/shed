@@ -62,7 +62,7 @@ A refusal from the account service shows fixed words, never the server's own tex
 The app sends an extend up to three times, two seconds apart, with one request id, while no server answers or the server answers `5xx` (`COMPUTE_UNAVAILABLE` among them). When every try ends that way, the lease may or may not have moved, and the panel says *not known whether it was applied; it settles within a few minutes*. The app never sends that extend again; it settles it by what the shed's listings show next:
 
 - **Applied:** the lease ends at least that many hours later than it did before the extend.
-- **Not applied:** 150 seconds after the outcome became unknown (two of the server's passes and a margin), the lease still ends where it did before.
+- **Not applied:** 150 seconds after the outcome became unknown (two of the server's passes and a margin), the lease still ends where it did before. A lease moved by fewer hours (another, smaller extend) says nothing about this one, so the note stays until the shed is gone or 24 hours pass; restarting the app also clears it.
 - The shed is gone, or a shed created again under its name is listed: the record belonged to the old shed.
 - After 24 hours, whatever the listing says.
 

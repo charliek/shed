@@ -13,7 +13,8 @@
 //! The rules ([`settled`]):
 //! * applied: the lease's end is at least its end before the extend plus the hours;
 //! * not applied: at least [`EXTEND_SETTLE_S`] after the unknown outcome the lease
-//!   still ends where it did before;
+//!   ends exactly where it did before (a lease moved by fewer hours proves
+//!   nothing about this extend, so that record waits for the age limit);
 //! * the shed is gone from its server's listing, or is another incarnation;
 //! * [`EXTEND_UNKNOWN_MAX_S`] after the unknown outcome, whatever the listing says.
 //!
@@ -26,8 +27,9 @@ use shed_core::models::Shed;
 
 use crate::cloud::secs;
 
-/// How long after an unknown outcome a lease still at its old end means the extend
-/// was not applied: two of the server's sweeps (60 s each) and a margin.
+/// How long after an unknown outcome a lease short of its old end plus the hours
+/// means the extend was not applied: two of the server's sweeps (60 s each) and a
+/// margin.
 pub const EXTEND_SETTLE_S: i64 = 150;
 
 /// The longest an unknown outcome is kept: the account service keeps an extend's
@@ -90,7 +92,12 @@ pub fn settled(u: &UnknownExtend, observed: Option<&Shed>, now: i64, settle_s: i
     let (Some(before), Some(end)) = (u.before, lease_end(shed)) else {
         return false;
     };
-    let applied = end >= before + i64::from(u.hours) * 3600;
+    let target = before + i64::from(u.hours) * 3600;
+    let applied = end >= target;
+    // Not applied only when the lease has not moved at all: a lease that moved
+    // by fewer hours (another client's extend) proves nothing about this one,
+    // and the server's listing can be stale while the service is unreachable,
+    // so such a record waits for the age limit rather than risk a second add.
     let not_applied = end == before && now - u.at >= settle_s;
     applied || not_applied
 }
@@ -279,9 +286,9 @@ mod tests {
         // Further still (another extend landed too): applied.
         let further = shed("w", "c1", Some(BEFORE + 9 * 3600));
         assert!(settled(&u, Some(&further), T0 + 1, EXTEND_SETTLE_S));
-        // Moved by less: not decided.
+        // Moved by less: not applied, so it waits for the settle time.
         let less = shed("w", "c1", Some(BEFORE + 3 * 3600));
-        assert!(!settled(&u, Some(&less), T0 + 1000, EXTEND_SETTLE_S));
+        assert!(!settled(&u, Some(&less), T0 + 1, EXTEND_SETTLE_S));
     }
 
     #[test]
@@ -299,6 +306,27 @@ mod tests {
             &u,
             Some(&same),
             T0 + EXTEND_SETTLE_S,
+            EXTEND_SETTLE_S
+        ));
+    }
+
+    #[test]
+    fn a_lease_moved_by_fewer_hours_stays_unknown() {
+        // Another client's smaller extend moved the lease: this one's outcome is
+        // still unknown, so the record stays (to the age limit) rather than
+        // risk adding the hours twice.
+        let u = unknown(6, T0);
+        let less = shed("w", "c1", Some(BEFORE + 3 * 3600));
+        assert!(!settled(
+            &u,
+            Some(&less),
+            T0 + EXTEND_SETTLE_S + 600,
+            EXTEND_SETTLE_S
+        ));
+        assert!(settled(
+            &u,
+            Some(&less),
+            T0 + EXTEND_UNKNOWN_MAX_S,
             EXTEND_SETTLE_S
         ));
     }

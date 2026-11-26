@@ -483,8 +483,8 @@ impl Backend {
         self.extends.unknown_hours(host, name)
     }
 
-    /// This backend with another wait before a lease still at its old end settles
-    /// an unknown extend as not applied ([`crate::extend::EXTEND_SETTLE_S`]): a test
+    /// This backend with another wait before an unmoved lease settles an unknown
+    /// extend as not applied ([`crate::extend::EXTEND_SETTLE_S`]): a test
     /// seam.
     pub fn with_extend_settle_s(mut self, secs: i64) -> Self {
         self.extends = std::mem::take(&mut self.extends).with_settle_s(secs);

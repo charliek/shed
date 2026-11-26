@@ -450,11 +450,25 @@ func (e *env) put(name, status string) {
 
 func markerCount(t *testing.T, dir string) int {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "deleting"))
+	return len(stateFiles(t, filepath.Join(dir, "deleting")))
+}
+
+// stateFiles lists the state files in dir, leaving out the ".tmp-*" file a
+// write in flight puts beside its target (state.writeJSON): a marker or
+// record re-saved by a background operation would otherwise count twice.
+func stateFiles(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("read markers: %v", err)
+		t.Fatalf("read %s: %v", dir, err)
 	}
-	return len(entries)
+	files := entries[:0]
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".tmp-") {
+			files = append(files, e)
+		}
+	}
+	return files
 }
 
 // --- the call table ---
@@ -595,7 +609,7 @@ func TestCreateFastFailLeavesNoRecord(t *testing.T) {
 			if sheds, _ := e.b.ListSheds(context.Background()); len(sheds) != 0 {
 				t.Fatalf("a refused create left %d records", len(sheds))
 			}
-			if entries, _ := os.ReadDir(filepath.Join(e.dir, "sheds")); len(entries) != 0 {
+			if entries := stateFiles(t, filepath.Join(e.dir, "sheds")); len(entries) != 0 {
 				t.Fatalf("a refused create left %d record files", len(entries))
 			}
 			e.idle()
