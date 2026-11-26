@@ -45,11 +45,13 @@ The reference service (`internal/directory/refserver`, built by `make directory-
    ```bash
    make dev-compute-ref-up        # builds the service, starts it, prints the enrolment code
    make dev-server-up-remote      # renders the config, builds, starts the server
-   bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --code <code> --name remote-dev
+   # the one-time code, on standard input (there is no --code flag)
+   awk '{print $2}' ~/.shed/dev-remote/ref/control/codes \
+     | bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --name remote-dev
    make dev-compute-ref-grant     # lets remote-dev manage compute; registers the client nocturn
    ```
 
-   The enrolment happens once; `dev-compute-ref-up` prints the one-time code. If the server started before the enrolment or the grant, restart it (`make dev-server-restart-remote`) so it reads the service's machines.
+   The enrolment happens once. `shed-server directory enroll` reads the code from standard input, never from the command line: `dev-compute-ref-up` prints the one-time code and writes it to `~/.shed/dev-remote/ref/control/codes` (`remote-dev <code>`), so pipe it in as above, or run the command without the pipe and paste the code at its prompt (which does not echo). If the server started before the enrolment or the grant, restart it (`make dev-server-restart-remote`) so it reads the service's machines.
 
 3. Register the CLI entry once:
 
@@ -65,7 +67,7 @@ The reference service (`internal/directory/refserver`, built by `make directory-
    ssh-keygen -t ed25519 -N '' -C ada -f ~/.config/shed/remote-dev/ada_ed25519
    ```
 
-   List the person, with the `.pub` line of that key, in `~/.shed/dev-remote/ref/control/users.json`, as the reference service reads it:
+   List the person, with the public key of that key pair **without its comment** (the key type and the key only), in `~/.shed/dev-remote/ref/control/users.json`, as the reference service reads it. `cut -d' ' -f1,2 ~/.config/shed/remote-dev/ada_ed25519.pub` prints it:
 
    ```json
    [{"name": "ada", "admin": false, "keys": [{"key": "ssh-ed25519 AAAA...", "label": "laptop"}]}]

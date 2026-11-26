@@ -62,10 +62,13 @@ The server notices a machine stopped from outside shed at its next [pass over th
 | The account service | The server answers | Shed left |
 |---|---|---|
 | Refuses the create (a limit, its policy, the cloud's quota or capacity) | The refusal's [code](#codes-and-reasons) | None |
-| Was never reached (connection refused, no token could be had) | `503 COMPUTE_UNAVAILABLE` | None |
+| Was never reached (connection refused, no token could be had), or refused the create before acting on it (rate limited past the window, a second 401) | `503 COMPUTE_UNAVAILABLE` | None |
+| Could not be asked for the machines' ingress by the [ingress check](#ingress-and-the-firewall-modes) (unreachable, hanging, failing) | `503 COMPUTE_UNAVAILABLE` (not `FIREWALL_CHECK_FAILED`, which is for an ingress found wrong) | None |
 | Received the create and its reply never came | 201 `starting`, reason `cloud_unreadable` | Kept; the pass sends the same create again under the same request id |
 | Is still deleting a machine of that name | `409 COMPUTE_DELETING`, after waiting for the name up to the same 15 s | None |
 | Accepts it | 201 `starting` | The shed |
+
+So a service that is down answers differently depending on how it is down. One that **refuses connections** is `503 COMPUTE_UNAVAILABLE` at once: nothing reached it. One that **accepts the connection and hangs** may have read and acted on the create before it stopped answering, so the server cannot call it refused: the create is kept `starting (cloud_unreadable)`, the request (or its SSE stream) waits up to its bounds, and each periodic pass sends the same create again under the same request id until the service answers; it is made once. Once a pass has seen the ingress unreadable, later creates and starts are `503 COMPUTE_UNAVAILABLE` at once until the service answers again.
 
 A create is cleaned up (its machine deleted) only when the service **refused that create itself**, or the person deleted the shed. Once a create may have been received, every later failure keeps the shed (`starting` with a reason for the next pass, or `error` when no retry changes it) until it is deleted or its lease ends. A refusal that arrives after the fast-fail window (the cloud's quota or capacity found late) leaves the shed in `error` with reason `quota` or `capacity`.
 
@@ -127,7 +130,7 @@ The account service's refusals reach a client as these API codes (the full table
 | `CLOUD_QUOTA_EXCEEDED` | 503 | | The cloud's own quota refused the machine. |
 | `ZONE_CAPACITY_UNAVAILABLE` | 503 | | The cloud has no room for the machine. |
 | `SERVER_LIMIT_REACHED` | 503 | | The server's own `max_running` or `max_sheds` is reached. |
-| `FIREWALL_CHECK_FAILED` | 503 | | The [ingress check](#ingress-and-the-firewall-modes) is failing. The message says what was expected and what was found. |
+| `FIREWALL_CHECK_FAILED` | 503 | | The [ingress check](#ingress-and-the-firewall-modes) found the ingress wrong. The message says what was expected and what was found. A check that could not read the ingress is `COMPUTE_UNAVAILABLE`. |
 | `SIZE_UNAVAILABLE` | 422 | | No size of the service's catalog has the requested `cpus` and `memory_mb`. |
 | `FEATURE_UNSUPPORTED` | 422, 501 | | See [Unsupported features](#unsupported-features). |
 
@@ -264,7 +267,7 @@ The check passes when:
 
 The check runs when the server starts, in every periodic pass (once a minute), and before a create or start whose last result is more than 60 seconds old. While it fails:
 
-- `shed create` and `shed start` (and an SSH connection that would wake a stopped shed) are refused with `503 FIREWALL_CHECK_FAILED`. The message says what was expected and what was found.
+- `shed create` and `shed start` (and an SSH connection that would wake a stopped shed) are refused with `503 FIREWALL_CHECK_FAILED`. The message says what was expected and what was found. When the check failed because the service could not be asked for the ingress (reason `unreadable`), they are refused with `503 COMPUTE_UNAVAILABLE` instead.
 - `stop`, `delete`, `list`, `exec` and connections to running sheds work as before.
 - The server still starts, so existing sheds can be listed and deleted (with one exception: `auto` mode against a service whose ingress is not writable stops the start, below).
 - Nothing is stopped or deleted because of it.
@@ -323,7 +326,7 @@ Read the reason in the server log or in the `503` message, then:
 | `sources` (static or auto, writable) | The write was refused or has not happened yet: the message says why (a write at most every 5 minutes; the service refused the sources, usually too wide). |
 | `not_writable` | `auto` against a service that will not apply the sources. Use `static` with the sources the service applies. |
 | `address_unknown` | Check that the echo services answer from the server host. The message lists what each one said. |
-| `unreadable` | The service could not be asked: see [`COMPUTE_UNAVAILABLE`](#codes-and-reasons). The message carries the cause. |
+| `unreadable` | The service could not be asked. Creates and starts answer `503 COMPUTE_UNAVAILABLE` (not `FIREWALL_CHECK_FAILED`): see [`COMPUTE_UNAVAILABLE`](#codes-and-reasons). The message carries the cause. |
 
 The next periodic pass, at most a minute later, picks up the fix; no restart is needed unless the configured list changed.
 
@@ -351,7 +354,7 @@ The server deletes a machine only for a delete that was acknowledged, or a creat
 A server stop leaves every machine as it is: running sheds keep running and keep costing money until their leases end. At start-up the server reads the catalog and lists its machines from the service, and reconciles them with its record cache (`state_dir`):
 
 - A ready machine that has no record is adopted under its own shed ID, with the owner, size, image and spec the service holds for it. A running one stays `starting` until its agent answers a probe.
-- A record left `starting` or `stopping` resumes its job (so does one the periodic pass picks up after a read failed). A create resumed this way has lost its delivery bundle, which was held in memory only, and reads its record only: it never asks a source or probes the agent, whatever source would answer today, and never rewrites a step already recorded. When stage 1 was not recorded before the stop, no step runs, every step stays `owed`, and `shed provision <name>` finishes the shed. A step recorded `failed` is not tried again by the resumed job. A resumed job reads its create from the record, verbatim, and sends the request id it stored, so a create the service already holds is not made twice.
+- A record left `starting` or `stopping` resumes its job (so does one the periodic pass picks up after a read failed). A create resumed this way has lost its delivery bundle, which was held in memory only, and reads its record only: it never asks a source or probes the agent, whatever source would answer today, and never rewrites a step already recorded. When stage 1 was not recorded before the stop, no step runs, every step stays `owed`, and `shed provision <name>` finishes the shed. A step recorded `failed` is not tried again by the resumed job. A resumed job reads its create from the record, verbatim, and sends the request id it stored, so a create the service already holds is not made twice. A resumed create whose machine is gone is sent again only when no earlier send of it was accepted and the service's list names no deletion of its machine; otherwise the machine was made and deleted (its lease ended, a delete at the service), and the record is dropped, with the cause in the log and the audit log, as the periodic pass drops any shed whose machine the service deleted.
 - A record whose machine is stopped but was `running` becomes `stopped` with reason `external`.
 - A record whose machine is gone is dropped, unless the shed is in `error` or its create had not been accepted.
 - A machine with a local delete marker, or one the service reports as deleting, is deleted or waited for.

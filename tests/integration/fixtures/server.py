@@ -133,14 +133,12 @@ def resolve_server_entry(name: str, timeout: int = 10, env: Optional[dict] = Non
     return None
 
 
-def client_cert_pair(name: str, config_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
-    """The `(cert, key)` file pair the CLI keeps for an mtls entry, or None.
-
-    Read straight from the CLI's config file (`~/.shed/config.yaml`, honouring
-    `$HOME`), because `shed --json server list` does not report the
-    certificate paths. None when the file, the entry or either path is
-    missing: a token or open entry has no certificate.
-    """
+def config_entry(name: str, config_path: Optional[Path] = None) -> Optional[dict]:
+    """The raw entry `name` of the CLI's config file (`~/.shed/config.yaml`,
+    honouring `$HOME`), or None when the file or the entry is missing or
+    unreadable. It holds what `shed --json server list` does not report:
+    `auth_mode`, `api_url`, `tls_cert_fingerprint` and the client
+    certificate's `client_cert_file` and `client_key_file`."""
     path = config_path if config_path is not None else Path.home() / ".shed" / "config.yaml"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -148,7 +146,34 @@ def client_cert_pair(name: str, config_path: Optional[Path] = None) -> Optional[
         return None
     servers = data.get("servers") if isinstance(data, dict) else None
     entry = servers.get(name) if isinstance(servers, dict) else None
-    if not isinstance(entry, dict):
+    return entry if isinstance(entry, dict) else None
+
+
+def full_server_entry(name: str, timeout: int = 10, env: Optional[dict] = None,
+                      config_path: Optional[Path] = None) -> Optional[dict]:
+    """The entry for `name` as the CLI reports it (resolve_server_entry),
+    with the raw config entry (config_entry) merged under it: the keys the
+    JSON list leaves out (auth mode, API URL, TLS pin, client certificate)
+    come from the file, and every key the list reports wins. None when the
+    CLI does not list `name`."""
+    listed = resolve_server_entry(name, timeout=timeout, env=env)
+    if listed is None:
+        return None
+    if config_path is None and env and env.get("HOME"):
+        config_path = Path(env["HOME"]) / ".shed" / "config.yaml"
+    return {**(config_entry(name, config_path) or {}), **listed}
+
+
+def client_cert_pair(name: str, config_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
+    """The `(cert, key)` file pair the CLI keeps for an mtls entry, or None.
+
+    Read straight from the CLI's config file (config_entry), because
+    `shed --json server list` does not report the certificate paths. None
+    when the file, the entry or either path is missing: a token or open
+    entry has no certificate.
+    """
+    entry = config_entry(name, config_path)
+    if entry is None:
         return None
     cert, key = entry.get("client_cert_file"), entry.get("client_key_file")
     if not cert or not key:

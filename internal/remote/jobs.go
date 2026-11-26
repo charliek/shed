@@ -334,18 +334,27 @@ func (b *Backend) retryUnknown(ctx context.Context, rid string, call func(reques
 		if !errors.Is(err, provider.ErrUnavailable) || attempt >= unknownRetries || ctx.Err() != nil {
 			return result(err)
 		}
+		// A Retry-After the service gave is honoured: the call is not sent
+		// again before it, and not at all when it runs past the caller's
+		// deadline (a create's fast-fail window).
+		pause := max(b.opts.UnknownRetryPause, provider.RetryAfterOf(err))
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= pause {
+			return result(err)
+		}
 		select {
-		case <-time.After(b.opts.UnknownRetryPause):
+		case <-time.After(pause):
 		case <-ctx.Done():
 			return result(err)
 		}
 	}
 }
 
-// notDelivered reports whether a call provably never reached the service
-// (provider.ErrNotDelivered): it changed nothing.
-func notDelivered(err error) bool {
-	return errors.Is(err, provider.ErrNotDelivered)
+// notActed reports whether the service provably did not act on a call
+// (provider.ErrNotActed): it was never delivered, or every attempt was
+// refused before any judgement (a 429 past the deadline, a second 401). It
+// changed nothing.
+func notActed(err error) bool {
+	return errors.Is(err, provider.ErrNotActed)
 }
 
 // keep ends a create or start step that cannot decide what to do: the
@@ -453,10 +462,17 @@ func (b *Backend) mutateSeeing(ctx context.Context, ref provider.Ref, rid string
 // sent. An error (errSuperseded when the shed is gone, or the write's,
 // state.ErrNotDurable included) means the call must not be sent: a send whose
 // id is not on disk could be sent again under another id after a restart.
+//
+// An id the record already holds is returned only once a save holding it
+// has been flushed in this process (confirmFlushed): one read back from
+// disk is saved again first, as a delete marker's is (markerRequestID).
 func (b *Backend) requestID(j *job, call string) (string, error) {
 	if rec := b.snapshot(j.name, j.id); rec == nil {
 		return "", errSuperseded
 	} else if m := rec.Mutation; m != nil && m.Call == call && m.Ref == rec.Ref && m.RequestID != "" {
+		if err := b.confirmFlushed(j, m.RequestID); err != nil {
+			return "", err
+		}
 		return m.RequestID, nil
 	}
 	rid := provider.NewRequestID()
@@ -474,7 +490,47 @@ func (b *Backend) requestID(j *job, call string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	b.noteFlushed(rid)
+	if prev != nil {
+		b.forgetFlushed(prev.RequestID)
+	}
 	return rid, nil
+}
+
+// noteFlushed notes a request id that a save whose flush succeeded wrote
+// in this process (Backend.flushedIDs): it may be sent.
+func (b *Backend) noteFlushed(rid string) {
+	b.mu.Lock()
+	b.flushedIDs[rid] = true
+	b.mu.Unlock()
+}
+
+// forgetFlushed forgets a request id no record will send again.
+func (b *Backend) forgetFlushed(rid string) {
+	b.mu.Lock()
+	delete(b.flushedIDs, rid)
+	b.mu.Unlock()
+}
+
+// confirmFlushed returns nil once rid, a request id the shed's record holds,
+// is known to be on disk: a save holding it was flushed in this process. One
+// read back from disk (a save whose rename landed and whose flush failed
+// leaves it there, and a power cut could still take it away) is saved
+// again, durably, first. An error (state.ErrNotDurable included) means the
+// call must not be sent; the id stays on the record, and the next run saves
+// it again.
+func (b *Backend) confirmFlushed(j *job, rid string) error {
+	b.mu.Lock()
+	ok := b.flushedIDs[rid]
+	b.mu.Unlock()
+	if ok {
+		return nil
+	}
+	if err := b.updateDurable(j.name, j.id, func(*state.Record) {}); err != nil {
+		return err
+	}
+	b.noteFlushed(rid)
+	return nil
 }
 
 // unknownOutcome reports whether a call that changes something ended with
@@ -482,12 +538,13 @@ func (b *Backend) requestID(j *job, call string) (string, error) {
 // (provider.ErrUnavailable), the reply broke the contract
 // (provider.ErrInvalidReply), or the read before it failed after reaching
 // the service. Such a call may have taken effect: nothing is cleaned up for
-// it. A request that was never delivered (provider.ErrNotDelivered) is not
-// one: it is a refusal that changed nothing, unless a send of the same call
-// before it may have been delivered (sentBefore).
+// it. A request the service did not act on (provider.ErrNotActed: never
+// delivered, a 429 past the deadline, a second 401) is not one: it is a
+// refusal that changed nothing, unless a send of the same call before it
+// may have been delivered (sentBefore).
 func unknownOutcome(err error) bool {
-	if errors.Is(err, errNameDeleting) || errors.Is(err, errNameUnknown) || notDelivered(err) {
-		// Decided after an EXISTS, which made nothing; or never delivered,
+	if errors.Is(err, errNameDeleting) || errors.Is(err, errNameUnknown) || notActed(err) {
+		// Decided after an EXISTS, which made nothing; or not acted on,
 		// which changed nothing.
 		return false
 	}
@@ -528,12 +585,18 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		inst, err := b.prov.Get(ctx, ref)
 		switch {
 		case errors.Is(err, provider.ErrNotFound):
-			// Gone, or never made: the create is sent again, as a new
-			// request (the stored request id's answer may be a gone
-			// machine's), and the provider makes a new machine for the shed
-			// id. Nothing of a gone machine carries over: its pin, its
-			// facts, what was delivered to its guest and the link to it
-			// belong to another guest.
+			// Gone, or never made. A machine that was made (an earlier send
+			// was accepted, or the list names its deletion) and is gone was
+			// deleted at the service: the shed is dropped, never made again
+			// (createGone).
+			if again, gerr := b.createGone(ctx, j, rec, ref); !again {
+				return gerr
+			}
+			// Never made: the create is sent again, as a new request (the
+			// stored request id's answer may be a gone machine's), and the
+			// provider makes a machine for the shed id. Nothing that was
+			// recorded for it carries over: a pin, facts, what was
+			// delivered to a guest and the link belong to another guest.
 			b.closeLink(j.id)
 			// A new request id that is not flushed (state.ErrNotDurable)
 			// sends nothing either: the next run, finding the machine
@@ -547,6 +610,7 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			if rec = b.snapshot(j.name, j.id); rec == nil {
 				return errSuperseded
 			}
+			b.noteFlushed(rec.Spec.RequestID)
 		case err != nil:
 			// The read failed, so nothing is known: the machine may be a
 			// create half done, or a shed the server that died had
@@ -638,6 +702,16 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 				}
 				return b.keep(j, state.JobCreate, fmt.Errorf("recording the create before sending it: %w", err))
 			}
+			b.noteFlushed(rec.Spec.RequestID)
+		}
+		// A request id read back from disk (an earlier run's) is sent
+		// only once a save holding it has been flushed in this process
+		// (confirmFlushed).
+		if err := b.confirmFlushed(j, rec.Spec.RequestID); err != nil {
+			if errors.Is(err, errSuperseded) {
+				return errSuperseded
+			}
+			return b.keep(j, state.JobCreate, fmt.Errorf("recording the create's request id durably before sending it again: %w", err))
 		}
 		var inst provider.Instance
 		var err error
@@ -671,9 +745,10 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 				// The service judged this create and refused it.
 				return b.refuseCreate(j, err, config.StatusReasonCreateFailed)
 			case fresh && notSent(err):
-				// Never delivered, or refused at the token, on every send of
-				// the first run: nothing was made (503 COMPUTE_UNAVAILABLE,
-				// 403 COMPUTE_DENIED).
+				// Not acted on (never delivered, rate limited past the
+				// window, a second 401), or refused at the token, on every
+				// send of the first run: nothing was made (503
+				// COMPUTE_UNAVAILABLE, 403 COMPUTE_DENIED).
 				return b.refuseCreate(j, err, config.StatusReasonCreateFailed)
 			}
 			// It may have been accepted: kept, never cleaned up, and sent
@@ -748,8 +823,8 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		if afterAccept(err) || errors.Is(err, provider.ErrNotFound) {
 			// Everything but the label is done and the machine cannot be
 			// read just now, or is gone. The create is kept, not failed;
-			// run again, it skips the steps recorded as done, or makes the
-			// machine again.
+			// run again, it skips the steps recorded as done, or, finding
+			// the machine gone, drops the shed (createGone).
 			return b.keep(j, state.JobCreate, fmt.Errorf("reading machine %s before labelling it ready: %w", rec.Ref, err))
 		}
 		return b.failCreate(j, err, config.StatusReasonCreateFailed)
@@ -861,9 +936,10 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 // create, or when a person deleted the shed (DeleteShed). A definitive
 // refusal is a judgement refusal from mapping.json at the create call
 // itself (EXISTS, a policy or limit refusal, quota, capacity), or a create
-// never delivered on every attempt of the first run with no request id
-// stored by an earlier run (ErrNotDelivered, or ErrDenied at the first
-// send). Once any attempt may have been delivered or was accepted, every
+// the service did not act on at any attempt of the first run, with no
+// request id stored by an earlier run (ErrNotActed: never delivered, a 429
+// past the deadline, a second 401; or ErrDenied at the first send). Once
+// any attempt may have been delivered or was accepted, every
 // later failure keeps the record: a firewall or admission check on a later
 // run, an authorization refusal on a retry or a read, a read or poll that
 // never reached the service, a boot or probe timeout. Those keep it
@@ -874,6 +950,13 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 // failed) leaves it in error with the reason (failCreate). Neither writes a
 // marker: the machine stays until a person deletes the shed, and its lease
 // bounds the cost.
+//
+// A create resumed by a later run whose machine a read finds gone is sent
+// again ONLY when no earlier send of it was accepted (no Ref, machine or
+// operation recorded) and the list names no deletion of the shed's machine
+// (createGone): otherwise its machine was made and then deleted (its lease
+// ended, a delete at the service), and the record is dropped with the
+// cause, as the periodic pass drops a settled shed's.
 
 // refuseCreate ends a create the service definitively refused (see the rule
 // above): inside the fast-fail window the refusal is the create's answer
@@ -961,10 +1044,11 @@ func judgedCreate(err error) bool {
 }
 
 // notSent reports whether a create call's error says the request was never
-// acted on, which proves nothing was made only for a first send: never
-// delivered, or refused at the token or scope before any judgement.
+// acted on, which proves nothing was made only for a first send: not acted
+// on (never delivered, a 429 past the deadline, a second 401), or refused
+// at the token or scope before any judgement.
 func notSent(err error) bool {
-	return notDelivered(err) || errors.Is(err, provider.ErrDenied)
+	return notActed(err) || errors.Is(err, provider.ErrDenied)
 }
 
 // afterAccept reports whether an error on a create that may have been
@@ -1150,10 +1234,15 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 }
 
 // noteMachineLocked keeps the machine the provider answered in the record:
-// its facts for the shed's cloud view, and its access for a reconnect. A
-// zero machine (an answer that carried none) changes nothing.
+// its facts for the shed's cloud view, and its access for a reconnect. It is
+// every writer's way to Record.Machine (the periodic pass, the start-up
+// pass, the jobs, an extend, a host key read). A zero machine (an answer
+// that carried none) changes nothing, and neither does a view older than
+// the one the record holds (notOlder: a list or read answered before an
+// extend or a start or stop that a later answer already showed): a delayed
+// answer never moves a lease or a transition back.
 func (b *Backend) noteMachineLocked(r *state.Record, inst provider.Instance) {
-	if inst.Ref == "" {
+	if inst.Ref == "" || !notOlder(inst, r.Machine) {
 		return
 	}
 	m := inst.Clone()
@@ -1333,7 +1422,7 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 		pend, err = b.mutate(ctx, rec.Ref, rid, func(rid string) (provider.Pending, error) {
 			return b.prov.Start(ctx, rec.Ref, rid)
 		})
-		if unknownOutcome(err) || (sentBefore && notDelivered(err)) {
+		if unknownOutcome(err) || (sentBefore && notActed(err)) {
 			// The read that precedes the start call failed, or the start's
 			// reply never came: whether a start was accepted is not known.
 			// The machine may be up all the same, so it is not stopped on
@@ -1440,7 +1529,7 @@ func (b *Backend) failStart(j *job, cause error, reason string) error {
 	// A refusal leaves the machine stopped; a lease or person refusal, or a
 	// delete in progress, leaves nothing running to be stopped. Anything
 	// else may have left it running.
-	leftStopped := provider.IsRefusal(cause) || errors.Is(cause, provider.ErrLease) || errors.Is(cause, provider.ErrDeleting) || notDelivered(cause)
+	leftStopped := provider.IsRefusal(cause) || errors.Is(cause, provider.ErrLease) || errors.Is(cause, provider.ErrDeleting) || notActed(cause)
 	if !leftStopped {
 		b.stopQuietly(rec.Ref, "failed start of "+j.name)
 	}
@@ -1507,6 +1596,30 @@ func (b *Backend) confirmGone(ctx context.Context, ref provider.Ref) (gone bool,
 		return false, ""
 	}
 	return true, deletionCauses(l.Deleted)[string(ref)]
+}
+
+// createGone decides a resumed create whose machine a read answered 404 (see
+// the rule above refuseCreate). It reports again only when the create may
+// be sent again: no earlier send of it was accepted (no Ref, machine or
+// operation recorded) and the list names no deletion of the shed's
+// machine. A create that was accepted, or whose machine the list names as
+// deleted (its lease ended, a delete at the service), made a machine that
+// is gone: its record is dropped, with the cause in the log and as the
+// service-deletion audit event when the list names one, as the periodic
+// pass drops a settled shed's (forgetGone), and nothing is created again.
+// When the list cannot be read, or still shows the machine, nothing is
+// decided: the create is kept for the next pass.
+func (b *Backend) createGone(ctx context.Context, j *job, rec *state.Record, ref provider.Ref) (again bool, err error) {
+	gone, cause := b.confirmGone(ctx, ref)
+	if !gone {
+		return false, b.keep(j, state.JobCreate, fmt.Errorf("machine %s read as gone, and the list and a second read do not confirm it", ref))
+	}
+	accepted := rec.Ref != "" || rec.Machine != nil || rec.Pending != nil
+	if cause == "" && !accepted {
+		return true, nil
+	}
+	b.forgetGone(j.name, j.id, cause, "create")
+	return false, errSuperseded
 }
 
 // goneFor is confirmGone and, when the machine is gone, forgetGone, for a
@@ -1617,7 +1730,7 @@ func (b *Backend) failStop(j *job, ref provider.Ref, cause error) error {
 			return cause
 		}
 	}
-	if unknownOutcome(cause) || notDelivered(cause) {
+	if unknownOutcome(cause) || notActed(cause) {
 		// Whether the stop was sent, or where it stands, is not known: the
 		// stop is kept as it is (its Pending, its request id, a start
 		// queued behind it) and the next pass resumes it.

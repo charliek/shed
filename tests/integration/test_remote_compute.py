@@ -28,10 +28,15 @@ service client:
   6. `lease` on a client's create; above the client's `max_age` refused by
      the server, above the service's client cap by the service; a person's
      `lease` and the local admin's create refused;
-  7. the service down: create answers `COMPUTE_UNAVAILABLE`, existing sheds
-     stay listed and their sessions work, and it recovers (the shed stops
-     and starts through it again); a server restarted while the service is
-     down starts degraded and recovers.
+  7. the service down (it refuses connections): a create answers
+     `COMPUTE_UNAVAILABLE` at once (never delivered, or the firewall check's
+     ingress read failing, which is `COMPUTE_UNAVAILABLE` too, not
+     `FIREWALL_CHECK_FAILED`), existing sheds stay listed and their
+     sessions work, and it recovers (the shed stops and starts through it
+     again); a server restarted while the service is down starts degraded
+     and recovers. A service that accepts and hangs is not this case: a
+     create sent to it may have been acted on, so it is kept `starting
+     (cloud_unreadable)` and resumed (docs/reference/remote-backend.md).
 
 The cases share two machines: alice's shed (cases 1, 2, 4, 5, 7 and the
 delete) and the client's (cases 2, 4 and 6, made with the client's own
@@ -136,7 +141,7 @@ from fixtures.identity import (
     ensure_keys,
     users_environment,
 )
-from fixtures.server import resolve_server_entry
+from fixtures.server import full_server_entry
 from fixtures.tlsclient import Pinned, error_code
 
 # A create on a real cloud takes about a minute; a stop or start under one.
@@ -351,7 +356,9 @@ def remote_base(remote_server, request):
     kind, why = service_kind()
     if kind is None:
         pytest.skip(why)
-    entry = resolve_server_entry(remote_server.name)
+    # The JSON list leaves out the auth mode, the API URL, the TLS pin and the
+    # client certificate: they come from the raw config entry.
+    entry = full_server_entry(remote_server.name)
     if not entry or entry.get("auth_mode") != "mtls" or not entry.get("client_cert_file"):
         pytest.skip(f"~/.shed/config.yaml has no mtls entry {remote_server.name!r} with a client certificate")
     config_path = Path(os.environ.get("SHED_REMOTE_CONFIG", "") or Path.home() / ".shed" / "dev-remote" / "server.yaml")
@@ -1072,6 +1079,11 @@ def test_client_lease_above_the_service_cap(env):
 
 
 def test_service_down(env):
+    """The service refuses connections: a create is answered 503
+    `COMPUTE_UNAVAILABLE` at once with no shed left (the request never
+    reached the service, or the firewall check could not read the ingress),
+    the existing shed stays listed and running and its session works, and
+    once the service is back the shed stops and starts through it again."""
     alice = env.alice
     # Before any shed is made, so a run that cannot stop the service skips
     # without one.

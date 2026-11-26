@@ -235,6 +235,45 @@ def test_client_cert_pair_defaults_to_home(tmp_path, monkeypatch):
     assert fx.client_cert_pair("x-dev") == ("/c", "/k")
 
 
+def test_full_server_entry_merges_the_raw_entry(tmp_path, monkeypatch):
+    """`shed --json server list` has no auth mode, API URL, TLS pin or
+    certificate paths; the compute suite's remote_base reads them, so the
+    raw config entry is merged under the listed one (the listed keys win)."""
+    path = _write_client_config(tmp_path, {
+        "remote-dev": {
+            "host": "localhost",
+            "auth_mode": "mtls",
+            "api_url": "https://localhost:18490",
+            "tls_cert_fingerprint": "SHA256:abc",
+            "client_cert_file": "/h/c.pem",
+            "client_key_file": "/h/c.key",
+            "user": "raw-user",
+        },
+    })
+    listed = {"name": "remote-dev", "host": "localhost", "https_port": 18490, "security": "mtls", "user": "dev"}
+    monkeypatch.setattr(fx, "resolve_server_entry",
+                        lambda name, timeout=10, env=None: dict(listed) if name == "remote-dev" else None)
+    e = fx.full_server_entry("remote-dev", config_path=path)
+    assert e["auth_mode"] == "mtls" and e["api_url"] == "https://localhost:18490"
+    assert e["client_cert_file"] == "/h/c.pem" and e["client_key_file"] == "/h/c.key"
+    assert e["tls_cert_fingerprint"] == "SHA256:abc"
+    assert e["user"] == "dev" and e["https_port"] == 18490
+    assert fx.full_server_entry("missing", config_path=path) is None
+    # Listed, with no raw entry (or no file): the listed entry alone.
+    assert fx.full_server_entry("remote-dev", config_path=tmp_path / "none.yaml") == listed
+    # $HOME in env names the file.
+    (tmp_path / "home" / ".shed").mkdir(parents=True)
+    _write_client_config(tmp_path / "home" / ".shed", {"remote-dev": {"auth_mode": "mtls"}})
+    assert fx.full_server_entry("remote-dev", env={"HOME": str(tmp_path / "home")})["auth_mode"] == "mtls"
+
+
+def test_remote_compute_reads_the_full_entry():
+    """remote_base reads the merged entry, never the bare JSON list's."""
+    src = (Path(__file__).parent / "test_remote_compute.py").read_text(encoding="utf-8")
+    assert "full_server_entry(remote_server.name)" in src
+    assert "resolve_server_entry" not in src
+
+
 @pytest.mark.parametrize("content", [None, "servers: [unclosed", "just a string\n", "servers: [a, b]\n"])
 def test_client_cert_pair_unreadable_config(tmp_path, content):
     path = tmp_path / "config.yaml"

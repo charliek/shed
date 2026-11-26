@@ -38,7 +38,8 @@ const listRetry = 5 * time.Second
 //   - a record whose machine is not in the list is dropped once a read of
 //     that one machine confirms it is gone (and logged with the cause when
 //     the list names its deletion), unless the record is in "error" or its
-//     create had not been accepted yet;
+//     create is unfinished and the list names no deletion of its machine
+//     (the create is resumed, and decides in createGone);
 //   - anything else is logged and left alone.
 func (b *Backend) Reconcile(ctx context.Context) {
 	var listing provider.Listing
@@ -231,12 +232,16 @@ func (b *Backend) reconcile(ctx context.Context, listing provider.Listing) {
 			switch {
 			case r.Shed.Status == config.StatusError:
 				// An error record outlives its machine.
-			case cause != "" && r.Ref != "":
-				// The service deleted it: dropped once a read confirms.
-				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, cause: cause})
+			case cause != "":
+				// The service deleted it: dropped once a read confirms. An
+				// unfinished create whose answer never came is one too
+				// (its machine's ref is its shed id): it is never sent
+				// again.
+				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: cause})
 			case r.Job == state.JobCreate && !r.Ready:
-				// The create had not finished; it is sent again, and
-				// Create is idempotent.
+				// The create had not finished; it is resumed, and decides
+				// from a read of its machine (createGone: one made and
+				// gone is not made again).
 				launch = append(launch, b.newJobLocked(state.JobCreate, name, r.Shed.ID))
 			case r.Ref != "":
 				// Not in the list. A record is dropped only once a read

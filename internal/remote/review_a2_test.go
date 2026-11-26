@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
@@ -51,6 +50,9 @@ type callHooks struct {
 	// blackhole: a create never connects; it ends when its context does,
 	// never delivered.
 	blackhole atomic.Bool
+	// createNotMade: every create reply is lost and nothing is made (a
+	// send that never got as far as the service's judgement).
+	createNotMade atomic.Bool
 
 	mu   sync.Mutex
 	rids map[string][]string
@@ -79,6 +81,9 @@ func (h *callHooks) Create(ctx context.Context, spec provider.Spec) (provider.Pe
 	if h.blackhole.Load() {
 		<-ctx.Done()
 		return provider.Pending{}, provider.Instance{}, notDeliveredErr("create")
+	}
+	if h.createNotMade.Load() {
+		return provider.Pending{}, provider.Instance{}, lost("create")
 	}
 	if after := h.createDeniedAfter.Load(); after > 0 && n > after {
 		return provider.Pending{}, provider.Instance{}, &provider.Error{Kind: provider.ErrDenied, Op: "create", Code: "INSUFFICIENT_SCOPE"}
@@ -320,16 +325,22 @@ func TestAdoptedProbeKeepsItsReasons(t *testing.T) {
 
 // --- 4: a recreated create starts clean ---
 
-// An unfinished create whose machine is gone (past the service's retention,
-// so the list names no deletion) is created again for a new guest: the old
-// pin, layout and delivery history are not carried over, and the new
-// machine's key is learned.
+// An unfinished create that was never accepted (every reply lost, no
+// machine made) and whose machine the list names no deletion of is created
+// again for a new guest (createGone): the old pin, layout and delivery
+// history are not carried over, and the new machine's key is learned.
 func TestRecreatedCreateStartsClean(t *testing.T) {
 	h := &callHooks{}
 	e := newEnv(t, manual(), withHooks(h))
 	e.fl.presented = fake.DefaultHostKey
-	e.put("again", config.StatusStarting)
-	ref := e.ref("again")
+	h.createNotMade.Store(true)
+	if _, err := e.create("again"); err != nil {
+		t.Fatalf("create = %v; a lost reply is not a refusal", err)
+	}
+	e.idle()
+	if got := e.reason("again"); e.status("again") != config.StatusStarting || got != config.StatusReasonCloudUnreadable {
+		t.Fatalf("shed %s (%s), want starting (cloud_unreadable)", e.status("again"), got)
+	}
 	if err := e.b.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +350,9 @@ func TestRecreatedCreateStartsClean(t *testing.T) {
 	}
 	recs, _, _ := st.Records()
 	old := recs[0]
+	if old.Ref != "" || old.Machine != nil || old.Pending != nil {
+		t.Fatalf("the create was accepted: ref %q machine %v pending %v", old.Ref, old.Machine != nil, old.Pending != nil)
+	}
 	oldRID := old.Spec.RequestID
 	old.HostKeyPin = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOldOldOldOldOldOldOldOldOldOldOld"
 	old.Layout = 99
@@ -348,8 +362,7 @@ func TestRecreatedCreateStartsClean(t *testing.T) {
 	if err := st.SaveRecord(old); err != nil {
 		t.Fatal(err)
 	}
-	e.prov.ExternalDelete(ref)
-	h.dropDeleted.Store(true)
+	h.createNotMade.Store(false)
 	e.auto()
 	e.b = e.open()
 	if got := e.settled("again"); got.Status != config.StatusRunning {
@@ -361,6 +374,9 @@ func TestRecreatedCreateStartsClean(t *testing.T) {
 	}
 	if len(rec.Delivery.Items) != 0 {
 		t.Fatalf("the gone guest's delivery carried over: %+v", rec.Delivery.Items)
+	}
+	if n := e.instances(); n != 1 {
+		t.Fatalf("%d machines, want the one made", n)
 	}
 }
 
@@ -976,14 +992,8 @@ func TestUnresolvedStopKeepsItsQueuedStart(t *testing.T) {
 // service-deletion audit event, as the periodic pass would.
 func TestJobDropCarriesTheDeletionCause(t *testing.T) {
 	h := &callHooks{}
-	e := newEnv(t, withHooks(h))
-	path := filepath.Join(t.TempDir(), audit.FileName)
-	l, err := audit.Open(path, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Close() })
-	e.b.SetAuditLog(l)
+	auditOpt, path := withAudit(t)
+	e := newEnv(t, withHooks(h), auditOpt)
 	e.running("box")
 	if _, err := e.b.StopShed(ctxT(t), "box"); err != nil {
 		t.Fatal(err)
@@ -1001,9 +1011,7 @@ func TestJobDropCarriesTheDeletionCause(t *testing.T) {
 	if log := strings.Join(e.logLines(), "\n"); !strings.Contains(log, "deleted its machine (cause lease_ended)") {
 		t.Fatalf("no line names the cause:\n%s", log)
 	}
-	_ = l.Close()
-	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), `"cause":"lease_ended"`) || !strings.Contains(string(data), `"shed.delete"`) {
-		t.Fatalf("no service-deletion event in the audit log: %s", data)
+	if !auditHas(t, path, provider.CauseLeaseEnded) {
+		t.Fatal("no service-deletion event in the audit log")
 	}
 }

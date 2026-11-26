@@ -118,10 +118,11 @@ func TestResumedCreateDoesNotInsertASecondInstance(t *testing.T) {
 	}
 }
 
-// When the machine of an unfinished create is gone and the list names no
-// deletion of it (the service kept none, as after its 24 hours), the resumed
-// create makes it again.
-func TestResumedCreateInsertsAgainWhenItsInstanceIsGone(t *testing.T) {
+// When the machine of an unfinished create that was accepted is gone and
+// the list names no deletion of it (the service kept none, as after its 24
+// hours), the machine was made and deleted: the record is dropped and the
+// create is never sent again (createGone).
+func TestResumedAcceptedCreateWhoseMachineIsGoneIsDropped(t *testing.T) {
 	h := &hookProvider{}
 	e := newEnv(t, manual(), hooked(h))
 	const name = "again"
@@ -145,11 +146,15 @@ func TestResumedCreateInsertsAgainWhenItsInstanceIsGone(t *testing.T) {
 	}
 	e.b = e.open()
 	e.auto()
-	if got := e.settled(name); got.Status != config.StatusRunning || got.ID != id {
-		t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
+	e.idle()
+	if _, err := e.b.GetShed(context.Background(), name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("GetShed = %v, want the record dropped", err)
 	}
-	if n := e.prov.Count(fake.OpCreate); n != 2 {
-		t.Fatalf("%d create calls, want 2", n)
+	if n := e.prov.Count(fake.OpCreate); n != 1 {
+		t.Fatalf("%d create calls, want the first only", n)
+	}
+	if !strings.Contains(strings.Join(e.logLines(), "\n"), "has no machine any more; dropping its record (seen by its create)") {
+		t.Errorf("no log line says why:\n%s", strings.Join(e.logLines(), "\n"))
 	}
 }
 

@@ -118,6 +118,12 @@ type Options struct {
 	// Bridge is the plugin bridge message channels register with. May be
 	// nil.
 	Bridge *plugin.Bridge
+	// AuditLog is the server's audit log, where a shed whose machine the
+	// account service deleted (its lease ended, a delete at the service)
+	// is recorded. Nil records nothing. It is given here, not later, so
+	// that the start-up pass (Reconcile), which drops such sheds too, has
+	// it from its first line.
+	AuditLog *audit.Log
 	// FastFailWindow, BootTimeout, AuthGrace and ProbeInterval override the
 	// defaults; tests shorten them.
 	FastFailWindow time.Duration
@@ -189,10 +195,11 @@ type Backend struct {
 	// saveMarker is the store's SaveMarker for the write of a delete
 	// marker's request id (tests fail it).
 	saveMarker func(*state.Marker) error
-	// flushedIDs are the delete markers' request ids this process has
+	// flushedIDs are the request ids, of delete markers and of records
+	// (a create's, a start's, a stop's, a label write's), this process has
 	// written with a save whose flush succeeded: only those are sent. An
-	// id read back from disk is saved again, durably, before it is sent.
-	// Guarded by mu.
+	// id read back from disk is saved again, durably, before it is sent
+	// (markerRequestID, confirmFlushed). Guarded by mu.
 	flushedIDs map[string]bool
 
 	// deliverySvc asks a shed user's source for its credentials (nil: no
@@ -211,8 +218,8 @@ type Backend struct {
 	halting lockmap.Flags
 	// extending holds one extend per shed (by shed id) at a time, so an
 	// extend's stored request id (Record.Extend) is read and written by one
-	// call only.
-	extending lockmap.NamedMutexMap
+	// call only. Its wait ends with the caller's context (extendSlots).
+	extending extendSlots
 	// usage keeps GET /api/cloud/usage's answers for usageTTL, by the user
 	// asked about ("" for the organization only).
 	usageMu sync.Mutex
@@ -232,8 +239,9 @@ type Backend struct {
 	failedOnce sync.Once
 	startErr   error
 
-	// auditLog, when set, is where a machine the service deleted (its
-	// lease ended, a page delete) is recorded as a shed.delete event.
+	// auditLog, when set (Options.AuditLog, at New), is where a machine
+	// the service deleted (its lease ended, a page delete) is recorded as
+	// a shed.delete event.
 	auditLog *audit.Log
 
 	// busApplyMu serializes every application of a shed's reported user to
@@ -385,6 +393,7 @@ func New(opts Options) (*Backend, error) {
 	b.saveRecord = b.store.SaveRecord
 	b.saveMarker = b.store.SaveMarker
 	b.flushedIDs = map[string]bool{}
+	b.auditLog = opts.AuditLog
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
 	}
@@ -455,14 +464,6 @@ func (b *Backend) checkReady() error {
 // could not be asked, or the backend is degraded.
 func computeUnavailable(err error) error {
 	return &config.ComputeRefusal{Status: http.StatusServiceUnavailable, Code: config.ErrComputeUnavailable, Err: err}
-}
-
-// SetAuditLog attaches the server's audit log: a shed whose machine the
-// service deleted is recorded there.
-func (b *Backend) SetAuditLog(l *audit.Log) {
-	b.mu.Lock()
-	b.auditLog = l
-	b.mu.Unlock()
 }
 
 // Catalog returns the provider's last catalog, ok false before the first
@@ -781,6 +782,15 @@ func (b *Backend) inPlace(err error) error {
 
 // dropLocked removes a record from memory and disk.
 func (b *Backend) dropLocked(name string) {
+	if r := b.records[name]; r != nil {
+		// Its request ids are never sent again.
+		if r.Mutation != nil {
+			delete(b.flushedIDs, r.Mutation.RequestID)
+		}
+		if r.Spec != nil {
+			delete(b.flushedIDs, r.Spec.RequestID)
+		}
+	}
 	delete(b.records, name)
 	if err := b.store.DeleteRecord(name); err != nil {
 		b.logf("remote: removing the record of shed %s: %v", name, err)

@@ -75,7 +75,10 @@ type sweepCheck struct {
 //     it, so a machine that costs money is never shown as stopped;
 //   - gives a shed left "stopping" by a failed call a new stop job;
 //   - runs again the create or start of a shed kept "starting" because the
-//     provider could not be read when its job looked (Backend.keep);
+//     provider could not be read when its job looked (Backend.keep), but
+//     drops, once an exact read confirms it, the record of an unfinished
+//     create whose machine the list names as deleted: it is never sent
+//     again (see the rule above refuseCreate);
 //   - brings each listed shed's owner into line with its machine's
 //     (reconcileUserLocked).
 //
@@ -162,6 +165,14 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			// here: one read of its instance, and on from what that shows.
 			// A probe is not: a start call or the next server start
 			// retries it.
+			if r.Job == state.JobCreate && !r.Ready && !listed && deleted[r.Shed.ID] != "" {
+				// The list names its machine's deletion (its lease
+				// ended, a delete at the service): the create made a
+				// machine and the service deleted it. It is never sent
+				// again: the record is dropped once a read confirms it.
+				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: deleted[r.Shed.ID]})
+				break
+			}
 			if (r.Job == state.JobCreate && !r.Ready) || r.Job == state.JobStart {
 				if j := b.healLocked(r); j != nil {
 					launch = append(launch, j)
@@ -230,7 +241,7 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	dropped, stopped := false, false
 	b.mu.Lock()
 	r := b.currentLocked(c.name, c.id)
-	if r == nil || b.closed || b.jobs[c.name] != nil || r.Shed.Status != c.status || r.Ref != c.ref {
+	if r == nil || b.closed || b.jobs[c.name] != nil || r.Shed.Status != c.status || machineRef(r) != c.ref {
 		b.mu.Unlock()
 		return // a request got there first
 	}
@@ -284,6 +295,16 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	if launch != nil {
 		b.launch(launch)
 	}
+}
+
+// machineRef is the ref of a shed's machine: the one the provider gave it,
+// or, for a create whose answer never came, its shed id (provider.Ref is
+// the shed id).
+func machineRef(r *state.Record) provider.Ref {
+	if r.Ref != "" {
+		return r.Ref
+	}
+	return provider.Ref(r.Shed.ID)
 }
 
 // recordStoppedLocked records a shed whose machine stopped without this

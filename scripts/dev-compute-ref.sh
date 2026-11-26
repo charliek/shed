@@ -60,7 +60,8 @@ case "${1:-}" in
     echo "Reference service: $URL (pid $(cat "$PIDFILE"), log $LOG)"
     echo "  Enrolment code for $SERVER: $code"
     echo "  In the dev env file: SHED_REMOTE_DIRECTORY_URL=$URL and SHED_REMOTE_TRANSPORT=local"
-    echo "  Then: make dev-server-up-remote; bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --code $code --name $SERVER; make dev-compute-ref-grant"
+    echo "  Then: make dev-server-up-remote; awk '{print \$2}' $CONTROL/codes | bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --name $SERVER; make dev-compute-ref-grant"
+    echo "  (shed-server directory enroll reads the code from standard input; there is no --code flag)"
     ;;
   grant)
     running || { echo "ERROR: the reference service does not run; 'make dev-compute-ref-up' first."; exit 1; }

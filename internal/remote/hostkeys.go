@@ -169,10 +169,11 @@ func (h *hostKeys) refresh(ctx context.Context, rec *state.Record) (*state.Recor
 	h.mu.Unlock()
 
 	inst, err := h.b.prov.Get(ctx, rec.Ref)
-	if errors.Is(err, provider.ErrNotDelivered) {
-		// Only this read never reached the service: it says nothing about
-		// the machine, and must not pass for a create or start that was
-		// never delivered once it is the error of a dial.
+	if errors.Is(err, provider.ErrNotActed) {
+		// Only this read never reached the service, or was not acted on
+		// (a 429, a second 401): it says nothing about the machine, and
+		// must not pass for a create or start the service did not act on
+		// once it is the error of a dial.
 		err = &provider.Error{Kind: provider.ErrUnavailable, Op: "get", Detail: "the service could not be reached to read the machine's access"}
 	}
 	h.mu.Lock()

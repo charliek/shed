@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
@@ -36,7 +37,15 @@ type usageEntry struct {
 // COMPUTE_UNAVAILABLE), and a lost reply is sent again with it. A refusal is
 // the service's, mapped by its code: 403 EXTEND_NOT_ALLOWED, 409
 // LEASE_AT_CAP, 409 LEASE_ENDED, 403 PERSON_INACTIVE, 409 COMPUTE_DELETING,
-// 503 COMPUTE_UNAVAILABLE.
+// 503 COMPUTE_UNAVAILABLE. The whole call (the wait for another extend of
+// the shed, the sends, any wait a 429's Retry-After asks for, and the read
+// after) is bounded by the fast-fail window (Options.FastFailWindow).
+//
+// A request id the record still holds from an earlier call (its outcome
+// unknown: every reply was lost) keeps that unknown outcome when this call
+// is refused before the service judged it (not acted on, refused at the
+// scope): the extend may have landed, so the answer is 503 with the id kept
+// for the caller to send again, never a refusal that clears it.
 func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, requestID string) (*config.Shed, error) {
 	if err := b.checkReady(); err != nil {
 		return nil, err
@@ -47,6 +56,12 @@ func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, reques
 	if requestID != "" && !config.ValidUUID(requestID) {
 		return nil, fmt.Errorf("%w: request id %q is not a UUID", config.ErrInvalidShedRequestSentinel, requestID)
 	}
+	// The budget starts here, before the wait for another extend of the
+	// shed: a Retry-After that would run past it is not waited for, and
+	// the extend, which the service did not act on, is answered 503
+	// COMPUTE_UNAVAILABLE at once.
+	cctx, cancel := context.WithTimeout(ctx, b.opts.FastFailWindow)
+	defer cancel()
 	b.mu.Lock()
 	r, err := b.lookupLocked(ctx, name)
 	if err != nil {
@@ -61,7 +76,14 @@ func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, reques
 		return nil, fmt.Errorf("%w: shed %s has no machine yet; try again once it is starting", config.ErrProvisionBusySentinel, name)
 	}
 
-	defer b.extending.Acquire(id)()
+	release, err := b.extending.acquire(cctx, id)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, computeUnavailable(fmt.Errorf("another extend of shed %s is still waiting for the account service; try again", name))
+	}
+	defer release()
 	rid := strings.ToLower(requestID)
 	if rid == "" {
 		rid = provider.NewRequestID()
@@ -83,10 +105,13 @@ func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, reques
 		return nil, err
 	}
 
+	// The record held this id from an earlier call whose outcome is
+	// unknown (the id is cleared otherwise).
+	priorUnknown := prev != nil && prev.RequestID == rid && prev.Ref == ref
 	var inst provider.Instance
-	err = b.retryUnknown(ctx, rid, func(rid string) error {
+	err = b.retryUnknown(cctx, rid, func(rid string) error {
 		var cerr error
-		inst, cerr = b.prov.Extend(ctx, ref, rid, time.Duration(hours)*time.Hour)
+		inst, cerr = b.prov.Extend(cctx, ref, rid, time.Duration(hours)*time.Hour)
 		return cerr
 	})
 	// The answer to a repeated request id is the first send's, as it was
@@ -94,9 +119,16 @@ func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, reques
 	// a lease older than the machine's. So the machine is read afresh, and
 	// only a view no older than the record's is kept (notOlder).
 	if err == nil {
-		if fresh, gerr := b.prov.Get(ctx, ref); gerr == nil {
+		if fresh, gerr := b.prov.Get(cctx, ref); gerr == nil {
 			inst = fresh
 		}
+	}
+	if err != nil && priorUnknown && notSent(err) {
+		// Refused before the service judged it, which says nothing about
+		// the earlier send of this id: its outcome stays unknown, as
+		// retryUnknown keeps it across the attempts of one call.
+		err = &provider.Error{Kind: provider.ErrUnavailable, Op: "extend",
+			Detail: "an earlier send of this request id may have been acted on, and this one was refused before the service judged it (" + err.Error() + "); the outcome is unknown: send it again with the same request id"}
 	}
 	// The id stays on the record while its outcome is unknown (a lost
 	// reply): the caller who sent its own id sends it again.
@@ -110,6 +142,8 @@ func (b *Backend) ExtendShed(ctx context.Context, name string, hours int, reques
 			changed = true
 		}
 		if err == nil && inst.Ref == ref && notOlder(inst, cur.Machine) {
+			// noteMachineLocked holds to notOlder too; asked here so the
+			// record is saved only when it took the view.
 			b.noteMachineLocked(cur, inst)
 			changed = true
 		}
@@ -204,4 +238,33 @@ func lastTransition(m provider.Instance) time.Time {
 		return m.StoppedAt
 	}
 	return m.StartedAt
+}
+
+// extendSlots holds one extend per shed (by shed id) at a time. Unlike a
+// mutex, a caller waits for its turn only while its context allows: the
+// wait is part of the extend's budget. The zero value is ready to use.
+type extendSlots struct {
+	mu    sync.Mutex
+	slots map[string]chan struct{}
+}
+
+// acquire takes the shed's slot, or returns ctx's error when ctx ends
+// first. The caller calls the returned release once done.
+func (s *extendSlots) acquire(ctx context.Context, id string) (release func(), err error) {
+	s.mu.Lock()
+	if s.slots == nil {
+		s.slots = make(map[string]chan struct{})
+	}
+	slot := s.slots[id]
+	if slot == nil {
+		slot = make(chan struct{}, 1)
+		s.slots[id] = slot
+	}
+	s.mu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

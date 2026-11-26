@@ -27,7 +27,6 @@ import (
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
-	"github.com/charliek/shed/internal/remote"
 	"github.com/charliek/shed/internal/remote/provider/service"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/source"
@@ -291,8 +290,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// degraded and the start-up steps that need the list run when it
 	// arrives.
 	var waitBackendReady func(context.Context) error
-	// remoteBackend is the remote backend, for the audit log.
-	var remoteBackend *remote.Backend
+	// auditLog is the server's audit log (openAuditLog; nil when audit is
+	// off), and auditOpened says it has been opened. The remote backend's
+	// is opened before the backend is built: its start-up pass drops the
+	// sheds whose machines the account service deleted while the server
+	// was stopped, and records each one there. Every other backend's is
+	// opened below, before the front doors.
+	var auditLog *audit.Log
+	auditOpened := false
 	// releaseResumes lets the creates the start-up pass resumed run their
 	// delivery steps, once the origin migration has run (remote only; a
 	// no-op otherwise).
@@ -340,22 +345,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if dirRuntime != nil {
 			session = dirRuntime
 		}
-		rb, err := newRemoteBackend(cfg, pluginBridge, session)
+		// Egress control is refused on remote at load, so these two are
+		// never used; they are set so nothing below sees an empty path.
+		egressSocketDir = cfg.Remote.StateDirPath(serverStateDir(cfg))
+		egressStateDir = egressSocketDir
+		l, err := openRemoteAuditLog(cfg, egressStateDir, log.Printf)
+		if err != nil {
+			return err
+		}
+		if l != nil {
+			// Closed after the backend (deferred before be.Close).
+			defer func() { _ = l.Close() }()
+		}
+		auditLog, auditOpened = l, true
+		rb, err := newRemoteBackend(cfg, pluginBridge, session, auditLog)
 		if err != nil {
 			return err
 		}
 		log.Printf("Initialized remote backend (provider=%s, transport=%s)", cfg.Remote.Provider, cfg.Remote.Transport)
-		remoteBackend = rb
 		rb.SetDelivery(deliveryService)
 		// Creates resumed by the start-up pass wait for the origin
 		// migration below (stampUserOrigins).
 		rb.HoldResumes()
 		releaseResumes = rb.ReleaseResumes
 		be = rb
-		// Egress control is refused on remote at load, so these two are
-		// never used; they are set so nothing below sees an empty path.
-		egressSocketDir = cfg.Remote.StateDirPath(serverStateDir(cfg))
-		egressStateDir = egressSocketDir
 		// The start-up pass lists the cloud, repairs the record cache and
 		// resumes the jobs and message channels a previous server left.
 		resumeChannels = rb.Reconcile
@@ -639,16 +652,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// directory (openAuditLog). Once serving, runFrontDoors closes it, after
 	// every server has drained; this close (a no-op then) is for a return
 	// before that.
-	auditLog, err := openAuditLog(cfg, egressStateDir, log.Printf)
-	if err != nil {
-		return err
-	}
-	if auditLog != nil {
-		defer func() { _ = auditLog.Close() }()
-	}
-	if remoteBackend != nil && auditLog != nil {
-		// A shed whose machine the account service deleted is recorded.
-		remoteBackend.SetAuditLog(auditLog)
+	if !auditOpened {
+		auditLog, err = openAuditLog(cfg, egressStateDir, log.Printf)
+		if err != nil {
+			return err
+		}
+		if auditLog != nil {
+			defer func() { _ = auditLog.Close() }()
+		}
 	}
 
 	// Initialize HTTP API server
@@ -1277,6 +1288,19 @@ func openAuditLog(cfg *config.ServerConfig, dir string, logf func(format string,
 	}
 	logf("Audit log: %s", path)
 	return l, nil
+}
+
+// openRemoteAuditLog is openAuditLog for the remote backend, which opens it
+// before the backend is built (so the start-up pass records the sheds it
+// drops): the backend's state directory, which the backend's store would
+// create, is created first, owner-only as the store makes it.
+func openRemoteAuditLog(cfg *config.ServerConfig, dir string, logf func(format string, args ...any)) (*audit.Log, error) {
+	if cfg.AuditEnabled() {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("remote backend: state directory %s: %w", dir, err)
+		}
+	}
+	return openAuditLog(cfg, dir, logf)
 }
 
 // attachAuditLog hands the one audit log to both front doors: the API server

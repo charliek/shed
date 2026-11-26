@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote"
@@ -30,8 +31,11 @@ const backendReadyTimeout = 2 * time.Minute
 // process environment: the provider (the account service's compute, over
 // the directory runtime's session, or the in-memory fake), the link factory
 // (ssh with the server's client key, or the local test link) and the record
-// cache. It makes no call to the service; the caller runs Reconcile.
-func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge, session service.Session) (*remote.Backend, error) {
+// cache. auditLog (nil: audit off) is the server's audit log, given at
+// construction so that the start-up pass records the sheds it drops whose
+// machines the service deleted. It makes no call to the service; the caller
+// runs Reconcile.
+func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge, session service.Session, auditLog *audit.Log) (*remote.Backend, error) {
 	rcfg := cfg.Remote
 	if rcfg == nil {
 		return nil, fmt.Errorf("remote backend enabled but the remote config block is missing")
@@ -102,5 +106,6 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge, session s
 		AuthorizedKeys:  authorizedKeys,
 		FirewallSources: firewallSources,
 		Bridge:          bridge,
+		AuditLog:        auditLog,
 	})
 }

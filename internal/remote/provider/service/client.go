@@ -143,19 +143,26 @@ func (c *Client) do(ctx context.Context, k call) (any, error) {
 		case ResultReauth:
 			c.cfg.Session.ForgetComputeToken(acc.Bearer)
 			if reauthed {
-				return nil, c.fail(k, provider.ErrUnavailable, "", "a second 401")
+				// Both attempts were refused at the token, before any
+				// judgement: the service did not act on the call.
+				return nil, &provider.Error{Kind: provider.ErrUnavailable, Op: string(k.kind), Detail: "a second 401", Err: provider.ErrNotActed}
 			}
 			reauthed = true
 			continue
 		case ResultRetry:
+			// A 429 is a refusal before any judgement: past the deadline
+			// the call is unavailable and was not acted on, and its
+			// Retry-After goes with it for the caller to honour.
+			limited := &provider.Error{Kind: provider.ErrUnavailable, Op: string(k.kind), Code: "RATE_LIMITED",
+				Detail: "rate limited past the call's deadline", Err: provider.ErrNotActed, RetryAfter: o.RetryAfter}
 			deadline, _ := ctx.Deadline()
 			if time.Until(deadline) <= o.RetryAfter {
-				return nil, c.fail(k, provider.ErrUnavailable, "RATE_LIMITED", "rate limited past the call's deadline")
+				return nil, limited
 			}
 			select {
 			case <-time.After(o.RetryAfter):
 			case <-ctx.Done():
-				return nil, c.fail(k, provider.ErrUnavailable, "RATE_LIMITED", "rate limited past the call's deadline")
+				return nil, limited
 			}
 			continue
 		case ResultRefused:
@@ -370,13 +377,14 @@ func (c *Client) Destroy(ctx context.Context, ref provider.Ref, requestID string
 // fails as unavailable is tried again, up to maxPollFailures in a row.
 func (c *Client) Wait(ctx context.Context, p provider.Pending) (inst provider.Instance, err error) {
 	defer func() {
-		// The work was accepted: a poll that never reached the service, or
-		// whose read the service refused at the token or scope (403), says
+		// The work was accepted: a poll that never reached the service or
+		// that it did not act on (a 429, a second 401), or whose read the
+		// service refused at the token or scope (403), says
 		// nothing about it. Its outcome is unknown, not undelivered and not
 		// an operation that failed.
 		switch {
-		case errors.Is(err, provider.ErrNotDelivered):
-			err = &provider.Error{Kind: provider.ErrUnavailable, Op: "wait", Detail: "the service could not be reached to follow the work"}
+		case errors.Is(err, provider.ErrNotActed):
+			err = &provider.Error{Kind: provider.ErrUnavailable, Op: "wait", Detail: "the service could not be reached, or did not act on the read, to follow the work"}
 		case errors.Is(err, provider.ErrDenied):
 			err = &provider.Error{Kind: provider.ErrUnavailable, Op: "wait", Detail: "the service refused the read that follows the work (" + provider.CodeOf(err) + ")"}
 		}

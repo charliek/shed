@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Error kinds. Test for them with errors.Is; providers return them wrapped in
@@ -97,20 +98,33 @@ var (
 	// answers 503 COMPUTE_UNAVAILABLE.
 	ErrUnavailable = errors.New("compute service unavailable")
 
+	// ErrNotActed: the service provably did not act on the request: it was
+	// never delivered (ErrNotDelivered, which matches this too), or every
+	// attempt was answered with a refusal made before any judgement of
+	// the call (a 429 whose Retry-After runs past the call's deadline, a
+	// second 401). It comes with ErrUnavailable (503 COMPUTE_UNAVAILABLE),
+	// and unlike a lost reply it changed nothing: a create not acted on
+	// made no machine, and a start or stop not acted on changed none. A
+	// 429's wait is the Error's RetryAfter.
+	ErrNotActed = errors.New("the service did not act on the request")
+
 	// ErrNotDelivered: the request provably never reached the service: the
 	// connection was never made (refused, no such host, a TLS handshake
 	// that failed), no token could be had for it, or the request was never
-	// written. It comes with ErrUnavailable (503 COMPUTE_UNAVAILABLE), and
-	// unlike a lost reply it changed nothing: a create that was never
-	// delivered made no machine, and a start or stop never sent changed
-	// none.
-	ErrNotDelivered = errors.New("the request was never delivered")
+	// written. It is one case of ErrNotActed (errors.Is matches both).
+	ErrNotDelivered error = notActed("the request was never delivered")
 
 	// ErrInvalidReply: the service answered 2xx with a body the contract
 	// refuses (too large, not the call's shape, a machine object that
 	// breaks a rule, or one that echoes the bearer token).
 	ErrInvalidReply = errors.New("compute service sent an invalid reply")
 )
+
+// notActed is a kind of ErrNotActed with words of its own.
+type notActed string
+
+func (e notActed) Error() string        { return string(e) }
+func (e notActed) Is(target error) bool { return target == ErrNotActed }
 
 // Status reasons for a refusal, as they appear in a shed's status_reason.
 const (
@@ -137,6 +151,10 @@ type Error struct {
 	Detail string
 	// Err is the underlying error, if any.
 	Err error
+	// RetryAfter is how long the service asked the caller to wait before
+	// sending the call again (a 429's Retry-After), zero when it asked
+	// nothing.
+	RetryAfter time.Duration
 }
 
 // Errorf builds an *Error of the given kind for a provider call.
@@ -208,4 +226,14 @@ func CodeOf(err error) string {
 		return e.Code
 	}
 	return ""
+}
+
+// RetryAfterOf returns the wait the service asked for before the call is
+// sent again (Error.RetryAfter), or zero.
+func RetryAfterOf(err error) time.Duration {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.RetryAfter
+	}
+	return 0
 }

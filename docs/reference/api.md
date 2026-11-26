@@ -813,7 +813,7 @@ what each means to an operator.
 | 403 | `PERSON_INACTIVE` | | The shed's person is no longer active at the service. |
 | 503 | `CLOUD_QUOTA_EXCEEDED` | | The cloud's own quota refused the machine. |
 | 503 | `ZONE_CAPACITY_UNAVAILABLE` | | The cloud has no room for the machine. |
-| 503 | `FIREWALL_CHECK_FAILED` | | The server's [ingress check](remote-backend.md#ingress-and-the-firewall-modes) is failing. |
+| 503 | `FIREWALL_CHECK_FAILED` | | The server's [ingress check](remote-backend.md#ingress-and-the-firewall-modes) found the ingress wrong (one that could not read it is `COMPUTE_UNAVAILABLE`). |
 
 ### POST /api/sheds/{name}/reset
 

@@ -921,7 +921,7 @@ dev-server-restart-fc: check-no-dev-auth-mode check-dev-users check-dev-config-f
 #
 #   make dev-compute-ref-up          # (optional) the reference service, on loopback
 #   make dev-server-up-remote        # render the config, build, start
-#   bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --code <code> --name remote-dev   # once
+#   awk '{print $2}' ~/.shed/dev-remote/ref/control/codes | bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --name remote-dev   # once; the code on stdin
 #   make dev-compute-ref-grant       # (reference service) allow compute, register nocturn
 #   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev   # once
 #   make build && make dev-server-restart-remote   # pick up a rebuild

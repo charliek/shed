@@ -73,3 +73,32 @@ func TestOpenAuditLog(t *testing.T) {
 		})
 	}
 }
+
+// TestOpenRemoteAuditLogOnAFreshServer: the remote backend's audit log is
+// opened before the backend is built (its start-up pass records the sheds
+// it drops), when the backend's state directory may not exist yet. It is
+// created, owner-only, and the log opens in it; audit off creates nothing.
+func TestOpenRemoteAuditLogOnAFreshServer(t *testing.T) {
+	mtls := &config.AuthConfig{Mode: config.AuthModeMTLS}
+	dir := filepath.Join(t.TempDir(), "state", "remote")
+	l, err := openRemoteAuditLog(&config.ServerConfig{Auth: mtls}, dir, func(string, ...any) {})
+	if err != nil || l == nil {
+		t.Fatalf("openRemoteAuditLog = %v, %v; want a log", l, err)
+	}
+	_ = l.Close()
+	fi, err := os.Stat(dir)
+	if err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("state directory: %v, %v; want 0700", fi, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, audit.FileName)); err != nil {
+		t.Fatal(err)
+	}
+
+	off := filepath.Join(t.TempDir(), "remote")
+	if l, err := openRemoteAuditLog(&config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeOpen}}, off, func(string, ...any) {}); l != nil || err != nil {
+		t.Fatalf("audit off: %v, %v", l, err)
+	}
+	if _, err := os.Stat(off); !os.IsNotExist(err) {
+		t.Fatalf("audit off created %s: %v", off, err)
+	}
+}

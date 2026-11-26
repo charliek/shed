@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -115,9 +116,11 @@ func TestFirewallGateWaitEndsWithTheRequest(t *testing.T) {
 }
 
 // The gate's budget covers the wait for a check in progress, not only the
-// check the caller runs itself. A caller whose turn does not come in time is
-// refused with the firewall error, and the check in progress is left to
-// finish: its result serves the next caller.
+// check the caller runs itself. A caller whose turn does not come in time,
+// while that check waits on the service's ingress read, is refused 503
+// COMPUTE_UNAVAILABLE (the service is hanging; no firewall was found
+// wrong), and the check in progress is left to finish: its result serves
+// the next caller.
 func TestFirewallGateBudgetIncludesTheWait(t *testing.T) {
 	s := &stuckRule{}
 	clock := newTestClock()
@@ -127,8 +130,9 @@ func TestFirewallGateBudgetIncludesTheWait(t *testing.T) {
 
 	start := time.Now()
 	err := e.b.firewallGate(ctxT(t), config.NetworkProfileOpen)
-	if !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
-		t.Fatalf("firewallGate behind a check that does not finish = %v, want the firewall error", err)
+	computeRefusal(t, err, http.StatusServiceUnavailable, config.ErrComputeUnavailable, "")
+	if errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
+		t.Fatalf("firewallGate behind a hanging ingress read = %v, also the firewall error", err)
 	}
 	if waited := time.Since(start); waited > 2*time.Second {
 		t.Fatalf("firewallGate waited %s with a budget of %s", waited, e.b.fw.gateTimeout)
@@ -139,9 +143,8 @@ func TestFirewallGateBudgetIncludesTheWait(t *testing.T) {
 	default:
 	}
 	// No VM is made on the strength of a check that did not finish.
-	if _, err := e.create("refused"); !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
-		t.Fatalf("create behind a check that does not finish = %v, want the firewall error", err)
-	}
+	_, err = e.create("refused")
+	computeRefusal(t, err, http.StatusServiceUnavailable, config.ErrComputeUnavailable, "")
 	if e.instances() != 0 {
 		t.Fatal("an instance was made while no check had passed")
 	}

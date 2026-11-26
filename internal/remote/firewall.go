@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
@@ -141,6 +142,10 @@ type firewallState struct {
 	run chan struct{}
 	// gateTimeout is firewallGateTimeout; tests shorten it.
 	gateTimeout time.Duration
+	// readingIngress is true while a check waits on the service's answer
+	// to its ingress read: a caller that gives up waiting for that check
+	// was kept waiting by the service, not by a firewall found wrong.
+	readingIngress atomic.Bool
 	// The fields below are written with run held.
 	believed  netip.Addr // the address the echo services last agreed on
 	agreedAt  time.Time  // when they last agreed
@@ -269,7 +274,11 @@ func describeExpected(mode string, expected []string) string {
 // ago than FirewallMaxAge (and, for an isolated shed, found the ingress
 // exclusive), running the check first when the last result is older, and
 // otherwise an error that is config.ErrFirewallCheckFailedSentinel (503
-// FIREWALL_CHECK_FAILED) and carries the *FirewallFailure. Never call it
+// FIREWALL_CHECK_FAILED) and carries the *FirewallFailure, except when the
+// check failed because the service's ingress could not be read
+// (FirewallUnreadable), or the wait for a check in progress ran out while
+// that check still waited on the service's ingress read: that is 503
+// COMPUTE_UNAVAILABLE. Never call it
 // with b.mu held: it may read the service.
 //
 // The caller waits firewallGateTimeout at most, counted from here: a check
@@ -285,6 +294,12 @@ func (b *Backend) firewallGate(ctx context.Context, network string) error {
 		err := b.fw.acquire(ctx, budget.C)
 		budget.Stop()
 		switch {
+		case errors.Is(err, errCheckBusy) && b.fw.readingIngress.Load():
+			// The check in progress is waiting on the service's answer to
+			// its ingress read: the service is slow or hanging, which is
+			// the service being unavailable, as an unreadable ingress is.
+			return computeUnavailable(fmt.Errorf("a firewall check in progress is still waiting for the account service to answer its ingress read after %s; creates and starts are refused until it answers",
+				b.fw.gateTimeout))
 		case errors.Is(err, errCheckBusy):
 			return fmt.Errorf("%w: a firewall check in progress did not finish within %s; creates and starts are refused until the check passes",
 				config.ErrFirewallCheckFailedSentinel, b.fw.gateTimeout)
@@ -313,6 +328,13 @@ func (b *Backend) firewallGate(ctx context.Context, network string) error {
 	}
 	if status.Failure == nil {
 		return fmt.Errorf("%w: the check has not run yet", config.ErrFirewallCheckFailedSentinel)
+	}
+	if status.Failure.Reason == FirewallUnreadable {
+		// The service did not answer the ingress read (unreachable,
+		// hanging, failing): that is the service being unavailable, not a
+		// firewall found wrong. 503 COMPUTE_UNAVAILABLE, so a client waits
+		// for the service rather than looks at the firewall.
+		return computeUnavailable(fmt.Errorf("the account service could not be asked for the machines' ingress, which the firewall check reads before a create or start: %w; creates and starts are refused until it answers", status.Failure))
 	}
 	return fmt.Errorf("%w: %w; creates and starts are refused until the check passes", config.ErrFirewallCheckFailedSentinel, status.Failure)
 }
@@ -360,7 +382,9 @@ func (b *Backend) runFirewallCheck(ctx context.Context) (*FirewallFailure, []net
 		expected = []netip.Prefix{netip.PrefixFrom(fw.believed, 32)}
 	}
 
+	fw.readingIngress.Store(true)
 	ing, err := b.prov.Ingress(ctx)
+	fw.readingIngress.Store(false)
 	if err != nil {
 		return unreadable("the machines' ingress", err), expected
 	}
