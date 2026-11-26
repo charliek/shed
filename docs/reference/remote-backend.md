@@ -8,6 +8,8 @@ A remote server differs from a Firecracker or VZ server in three ways:
 - **Some features do not exist.** There are no host directories, server mounts, snapshots, reset, image store or egress profiles. Requests for them are refused before anything is created.
 - **Isolation is by network topology.** The `isolated` network profile is accepted because the network gives a shed no route to another shed and no private route to the server host. Outbound traffic is not filtered: a shed has a public address and reaches any public address, including a port the server host exposes to the internet.
 
+What a cloud shed's VM must run for the server to drive it (the link user, the agent, the host key, the shed's name and id) is the [guest contract](guest-contract.md).
+
 ## Statuses
 
 A shed's `status` is one of five values. `status_reason` explains a status where the table lists reasons; it is empty otherwise.

@@ -1,0 +1,25 @@
+{
+  "name": "retry-after-zero",
+  "description": "429 with Retry-After '0': wait 0 s.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 429,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "Retry-After": "0"
+      },
+      "body": {
+        "error": {
+          "code": "RATE_LIMITED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "retry",
+    "retry_after_s": 0
+  }
+}

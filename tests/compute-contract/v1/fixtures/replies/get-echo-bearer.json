@@ -1,0 +1,19 @@
+{
+  "name": "get-echo-bearer",
+  "description": "A machine whose spec is the bearer token presented (generated): refused before it is read.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "echo_bearer"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

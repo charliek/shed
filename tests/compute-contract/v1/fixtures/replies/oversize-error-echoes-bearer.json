@@ -1,0 +1,19 @@
+{
+  "name": "oversize-error-echoes-bearer",
+  "description": "A 409 to a create whose message holds the bearer in its first bytes, padded past 4 KiB (generated): the bytes read are checked before the body is set aside; refused, and the create's outcome is unknown.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "oversize_error_echo_bearer"
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrInvalidReply"
+  }
+}

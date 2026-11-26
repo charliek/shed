@@ -1,0 +1,25 @@
+{
+  "name": "code-lease-ended",
+  "description": "LEASE_ENDED at 409: a refusal of kind ErrLease.",
+  "call": "start",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "LEASE_ENDED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "LEASE_ENDED",
+    "kind": "ErrLease"
+  }
+}

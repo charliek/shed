@@ -1,0 +1,25 @@
+{
+  "name": "code-lowercase",
+  "description": "A code in lower case is not the code: the status's default.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "quota_person",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

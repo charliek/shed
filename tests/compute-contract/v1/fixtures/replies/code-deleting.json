@@ -1,0 +1,25 @@
+{
+  "name": "code-deleting",
+  "description": "DELETING at 409: a refusal of kind ErrDeleting.",
+  "call": "stop",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "DELETING",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "DELETING",
+    "kind": "ErrDeleting"
+  }
+}

@@ -1,0 +1,246 @@
+{
+  "name": "list-deleted-external",
+  "description": "A machine gone from the cloud without the service: it answers 404, its work in progress ends with error DELETING, and the list names its deletion with cause external.",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=compute%3Amanage"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{compute_token}}",
+      "expires_in": 600,
+      "scope": "compute:manage",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/v1/compute/machines/q6c3g4ymb5m2dkxwe7kyz5hhzu",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "request_id": "00000000-0000-4000-8000-000000000001",
+          "name": "widgets",
+          "user": "ada",
+          "size": "standard",
+          "image": "default",
+          "labels": {},
+          "authorized_keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL9jM32vCKELuuzbFDA+wh9kao37z7pApfvNTWB0bsX5"
+          ],
+          "spec": "spec-v1 layout=1 repo=example/widgets",
+          "access_kinds": [
+            "ssh"
+          ]
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "machine": {
+            "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+            "name": "widgets",
+            "server": "srv-a",
+            "user": "ada",
+            "client": null,
+            "state": "creating",
+            "size": {
+              "name": "standard",
+              "cpus": 2,
+              "memory_mb": 8192,
+              "arch": "amd64"
+            },
+            "disk_gb": 50,
+            "image": {
+              "requested": "default",
+              "resolved": "shed-remote-full-v1-0-0-20261101-000000"
+            },
+            "provider": "ref",
+            "created_at": "2026-11-16T06:00:00Z",
+            "started_at": null,
+            "stopped_at": null,
+            "lease": {
+              "expires_at": "2026-11-17T06:00:00Z",
+              "max_expires_at": "2026-11-21T06:00:00Z",
+              "extendable": true,
+              "presets_h": [
+                6,
+                12,
+                24,
+                48
+              ]
+            },
+            "access": [],
+            "labels": {},
+            "spec": "spec-v1 layout=1 repo=example/widgets"
+          },
+          "operation": "{{operation_1}}"
+        }
+      }
+    },
+    {
+      "before": [
+        {
+          "cloud.settle": [
+            "srv-a",
+            "q6c3g4ymb5m2dkxwe7kyz5hhzu"
+          ]
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/v1/compute/machines/q6c3g4ymb5m2dkxwe7kyz5hhzu/stop",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "request_id": "00000000-0000-4000-8000-000000000002"
+        }
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "operation": "{{operation_2}}"
+        }
+      }
+    },
+    {
+      "before": [
+        {
+          "machine.delete": [
+            "srv-a",
+            "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+            "external"
+          ]
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/machines/q6c3g4ymb5m2dkxwe7kyz5hhzu",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "error": {
+            "code": "NOT_FOUND",
+            "message": "{{message}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/operations/{{operation_2}}",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "done": true,
+          "error": {
+            "code": "DELETING"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/machines",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "machines": [],
+          "deleted": [
+            {
+              "shed_id": "q6c3g4ymb5m2dkxwe7kyz5hhzu",
+              "at": "2026-11-16T06:00:00Z",
+              "cause": "external"
+            }
+          ],
+          "complete": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "name": "ingress-not-exclusive-shared-network",
+  "description": "exclusive is true while every clause holds; once the machines share a network with something else that admits inbound traffic (clause 3), a read and a write answer exclusive: false.",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    }
+  ],
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=compute%3Amanage"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{compute_token}}",
+      "expires_in": 600,
+      "scope": "compute:manage",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/v1/compute/ingress",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "request_id": "00000000-0000-4000-8000-000000000001",
+          "sources": [
+            "203.0.113.0/24",
+            "2001:db8:5::/48"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "sources": [
+            "203.0.113.0/24",
+            "2001:db8:5::/48"
+          ],
+          "exclusive": true,
+          "applied_at": "2026-11-16T06:00:00Z"
+        }
+      }
+    },
+    {
+      "before": [
+        {
+          "ingress.break": "shared_network"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/v1/compute/ingress",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "sources": [
+            "203.0.113.0/24",
+            "2001:db8:5::/48"
+          ],
+          "exclusive": false,
+          "applied_at": "2026-11-16T06:00:00Z"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/v1/compute/ingress",
+        "headers": {
+          "Authorization": "Bearer {{compute_token}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "request_id": "00000000-0000-4000-8000-000000000002",
+          "sources": [
+            "203.0.113.0/24",
+            "2001:db8:5::/48"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "sources": [
+            "203.0.113.0/24",
+            "2001:db8:5::/48"
+          ],
+          "exclusive": false,
+          "applied_at": "2026-11-16T06:00:00Z"
+        }
+      }
+    }
+  ]
+}

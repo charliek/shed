@@ -1,0 +1,26 @@
+{
+  "name": "ingress-duplicate-source",
+  "description": "An ingress that names a source twice: invalid.",
+  "call": "ingress_get",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "sources": [
+          "203.0.113.0/24",
+          "203.0.113.0/24"
+        ],
+        "exclusive": true,
+        "applied_at": "2026-11-16T06:00:00Z"
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

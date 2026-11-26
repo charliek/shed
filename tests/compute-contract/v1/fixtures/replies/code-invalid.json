@@ -1,0 +1,25 @@
+{
+  "name": "code-invalid",
+  "description": "INVALID at 422: a refusal of kind ErrInvalid.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "INVALID",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

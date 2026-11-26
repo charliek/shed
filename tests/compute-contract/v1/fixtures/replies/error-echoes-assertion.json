@@ -1,0 +1,24 @@
+{
+  "name": "error-echoes-assertion",
+  "description": "A 422 to a create whose message holds the client assertion: refused whole; the create's outcome is unknown.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "SIZE_UNKNOWN",
+          "message": "{{assertion}}"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrInvalidReply"
+  }
+}

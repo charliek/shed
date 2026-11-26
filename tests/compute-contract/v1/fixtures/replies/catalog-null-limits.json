@@ -1,0 +1,60 @@
+{
+  "name": "catalog-null-limits",
+  "description": "A catalog whose limits are null: invalid (null is not a value there).",
+  "call": "catalog",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "sizes": [
+          {
+            "name": "standard",
+            "cpus": 2,
+            "memory_mb": 8192,
+            "arch": "amd64",
+            "disk_gb_default": 50
+          }
+        ],
+        "default_size": "standard",
+        "images": {
+          "default": "shed-remote-full-v1-0-0-20261101-000000",
+          "aliases": [
+            "cloud"
+          ]
+        },
+        "access_kinds": [
+          "ssh"
+        ],
+        "policy": {
+          "person": {
+            "initial_lease_s": 86400,
+            "max_age_s": 432000,
+            "extend_allowed": true,
+            "presets_h": [
+              6,
+              12,
+              24,
+              48
+            ]
+          },
+          "client": {
+            "max_lease_s": 432000
+          },
+          "warn_s": 7200
+        },
+        "limits": null,
+        "ingress": {
+          "writable": true
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

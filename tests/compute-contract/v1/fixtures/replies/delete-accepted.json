@@ -1,0 +1,20 @@
+{
+  "name": "delete-accepted",
+  "description": "202 with the operation.",
+  "call": "delete",
+  "replies": [
+    {
+      "status": 202,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "operation": "op-3"
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok"
+  }
+}

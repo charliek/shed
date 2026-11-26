@@ -1,0 +1,14 @@
+{
+  "name": "get-silent",
+  "description": "Nothing within the server's 12 s deadline: a read fails.",
+  "call": "get",
+  "replies": [
+    {
+      "silent": true
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

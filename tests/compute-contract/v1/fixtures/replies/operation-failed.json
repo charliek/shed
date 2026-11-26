@@ -1,0 +1,25 @@
+{
+  "name": "operation-failed",
+  "description": "Done with an error code the list has: the operation failed with that code's kind.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "done": true,
+        "error": {
+          "code": "CLOUD_QUOTA"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "operation": "CLOUD_QUOTA",
+    "kind": "ErrQuota"
+  }
+}

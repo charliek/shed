@@ -1,0 +1,18 @@
+{
+  "name": "get-bad-gateway",
+  "description": "502 to a read: unavailable.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 502,
+      "headers": {
+        "Content-Type": "text/plain"
+      },
+      "text": "bad gateway"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "code-unavailable",
+  "description": "UNAVAILABLE at 503: a read fails; the server's provider error is ErrUnavailable.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 503,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "UNAVAILABLE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

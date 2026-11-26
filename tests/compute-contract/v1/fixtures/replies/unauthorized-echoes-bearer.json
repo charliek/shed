@@ -1,0 +1,24 @@
+{
+  "name": "unauthorized-echoes-bearer",
+  "description": "A 401 whose message holds the bearer of that attempt: refused as an echo, before any retry.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 401,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "invalid_token",
+          "message": "{{bearer}}"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

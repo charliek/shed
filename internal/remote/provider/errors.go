@@ -58,6 +58,57 @@ var (
 	ErrUnexpectedState = errors.New("instance settled in an unexpected state")
 )
 
+// Error kinds of a compute service (tests/compute-contract/v1): what each
+// of the contract's codes and failures means to the backend. The
+// contract's fixtures/mapping.json names, for each code, one of these or
+// one of the kinds above.
+var (
+	// ErrSpecMismatch: a create named a shed_id the service holds under a
+	// different create body. Nothing was changed.
+	ErrSpecMismatch = errors.New("the machine was created with another body")
+
+	// ErrComputeLimit: the service's limit on machines per person or per
+	// organization is reached (any state counts). A client may retry once
+	// a machine is deleted. The API answers 503 COMPUTE_LIMIT_REACHED.
+	ErrComputeLimit = errors.New("compute limit reached")
+
+	// ErrPolicy: the service's policy refused the create (a size, an
+	// image, a lease, an access kind, the person or the client). Nothing
+	// was sent to the cloud, and retrying will not help. The API answers
+	// 422 COMPUTE_POLICY_REFUSED.
+	ErrPolicy = errors.New("refused by the compute service's policy")
+
+	// ErrLease: the machine's lease or owner does not allow the start or
+	// extend (the lease ended or is at its cap, extends are not allowed,
+	// or the machine's person is not active). Nothing was changed.
+	ErrLease = errors.New("refused by the machine's lease")
+
+	// ErrDeleting: the machine is being deleted; nothing but the delete
+	// will finish.
+	ErrDeleting = errors.New("the machine is being deleted")
+
+	// ErrIngress: the service will not apply the ingress sources (it does
+	// not let servers write ingress, or a source is wider than it allows).
+	ErrIngress = errors.New("ingress refused")
+
+	// ErrDenied: the service does not let this server manage compute (the
+	// grant is off, the server is disabled, or compute is refused by
+	// policy). The API answers 403 COMPUTE_DENIED.
+	ErrDenied = errors.New("compute denied for this server")
+
+	// ErrUnavailable: the service could not be reached or did not answer
+	// in time, or answered 5xx, 429 past the deadline, or 401 twice. For
+	// a call that changes something, the outcome is unknown: the caller
+	// retries with the same request_id or reads the machine. The API
+	// answers 503 COMPUTE_UNAVAILABLE.
+	ErrUnavailable = errors.New("compute service unavailable")
+
+	// ErrInvalidReply: the service answered 2xx with a body the contract
+	// refuses (too large, not the call's shape, a machine object that
+	// breaks a rule, or one that echoes the bearer token).
+	ErrInvalidReply = errors.New("compute service sent an invalid reply")
+)
+
 // Status reasons for a refusal, as they appear in a shed's status_reason.
 const (
 	ReasonQuota    = "quota"
@@ -118,21 +169,23 @@ func (e *Error) Unwrap() []error {
 }
 
 // Reason returns the status_reason for a refusal: ReasonQuota, ReasonCapacity
-// or ReasonLimit. It returns "" for every other error.
+// or ReasonLimit (for the server's limit and the compute service's). It
+// returns "" for every other error.
 func Reason(err error) string {
 	switch {
 	case errors.Is(err, ErrQuota):
 		return ReasonQuota
 	case errors.Is(err, ErrCapacity):
 		return ReasonCapacity
-	case errors.Is(err, ErrLimit):
+	case errors.Is(err, ErrLimit), errors.Is(err, ErrComputeLimit):
 		return ReasonLimit
 	}
 	return ""
 }
 
-// IsRefusal reports whether err is one of the three refusals a client may
-// retry later: quota, zone capacity or the server limit.
+// IsRefusal reports whether err is one of the refusals a client may retry
+// later: quota, zone capacity, the server limit or the compute service's
+// limit.
 func IsRefusal(err error) bool {
 	return Reason(err) != ""
 }

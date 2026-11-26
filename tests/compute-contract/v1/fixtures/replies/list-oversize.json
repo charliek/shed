@@ -1,0 +1,19 @@
+{
+  "name": "list-oversize",
+  "description": "A list of 4 MiB and one byte (generated): invalid.",
+  "call": "list",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "oversize_list"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

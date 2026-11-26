@@ -1,0 +1,31 @@
+{
+  "name": "usage-ok",
+  "description": "Usage with a person and the organization.",
+  "call": "usage",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "person": {
+          "machines": 2,
+          "running": 1,
+          "stopped": 1,
+          "max": 4
+        },
+        "org": {
+          "machines": 3,
+          "running": 2,
+          "stopped": 1,
+          "max": 10
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok"
+  }
+}

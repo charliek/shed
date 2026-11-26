@@ -1,0 +1,32 @@
+{
+  "name": "compute-no-bearer",
+  "description": "A compute call with no Authorization header: 401 invalid_token, as the directory answers.",
+  "before": [
+    {
+      "compute.allow": "srv-a"
+    }
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/v1/compute/catalog",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

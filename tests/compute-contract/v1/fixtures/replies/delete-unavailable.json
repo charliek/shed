@@ -1,0 +1,24 @@
+{
+  "name": "delete-unavailable",
+  "description": "503 to a delete: the outcome is unknown.",
+  "call": "delete",
+  "replies": [
+    {
+      "status": 503,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "UNAVAILABLE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "unknown",
+    "kind": "ErrUnavailable"
+  }
+}

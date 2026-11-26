@@ -1,0 +1,25 @@
+{
+  "name": "code-person-inactive",
+  "description": "PERSON_INACTIVE at 403: a refusal of kind ErrLease.",
+  "call": "start",
+  "replies": [
+    {
+      "status": 403,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "PERSON_INACTIVE",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "PERSON_INACTIVE",
+    "kind": "ErrLease"
+  }
+}

@@ -67,6 +67,7 @@ var ErrOutage = errors.New("the control directory holds an outage file: every lo
 const (
 	maxUsersFile      = 8 << 20
 	maxDeliveriesFile = 16 << 20
+	maxComputeFile    = 1 << 20
 	maxControlLines   = 1 << 20
 )
 
@@ -78,6 +79,7 @@ const (
 //	disabled        one client id per line
 //	no-deliveries   one client id per line: servers that may not ask for deliveries (every other may)
 //	deliveries.json each person's source: {"<user>": "NO_SOURCE" | Delivery}; a person not in it has none
+//	compute.json    the compute service's set-up steps, forced replies and settings (compute_control.go's computeFile)
 //	outage          present: every lookup fails, as in a storage outage
 //
 // The directory and each file must not be writable by group or others, and
@@ -340,4 +342,11 @@ func (c *ControlDir) Delivery(user string) (Delivery, bool, error) {
 		return Delivery{}, false, fmt.Errorf("deliveries.json: %s: %w", user, err)
 	}
 	return d, found, nil
+}
+
+// ComputeControl reads compute.json: the compute service's set-up steps
+// (each applied once, by its id), forced replies and settings. Missing, it
+// holds nothing.
+func (c *ControlDir) ComputeControl() ([]byte, bool, error) {
+	return c.read("compute.json", maxComputeFile)
 }

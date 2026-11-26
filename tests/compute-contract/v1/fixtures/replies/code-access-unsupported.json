@@ -1,0 +1,25 @@
+{
+  "name": "code-access-unsupported",
+  "description": "ACCESS_UNSUPPORTED at 422: a refusal of kind ErrPolicy.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "ACCESS_UNSUPPORTED",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "ACCESS_UNSUPPORTED",
+    "kind": "ErrPolicy"
+  }
+}

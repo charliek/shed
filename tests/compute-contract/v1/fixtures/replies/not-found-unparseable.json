@@ -1,0 +1,19 @@
+{
+  "name": "not-found-unparseable",
+  "description": "404 whose body is not JSON: NOT_FOUND by its status.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "text/plain"
+      },
+      "text": "not found"
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "NOT_FOUND",
+    "kind": "ErrNotFound"
+  }
+}

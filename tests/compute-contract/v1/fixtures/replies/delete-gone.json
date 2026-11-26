@@ -1,0 +1,16 @@
+{
+  "name": "delete-gone",
+  "description": "204: there is no machine.",
+  "call": "delete",
+  "replies": [
+    {
+      "status": 204,
+      "headers": {
+        "Cache-Control": "no-store"
+      }
+    }
+  ],
+  "expect": {
+    "result": "ok"
+  }
+}

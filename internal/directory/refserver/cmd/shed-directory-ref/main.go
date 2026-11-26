@@ -3,6 +3,11 @@
 // with all of its state in memory and its users, codes and disabled
 // servers read from a control directory (see refserver.ControlDir).
 //
+// It is also the compute contract's reference compute service, whose
+// in-memory cloud is steered by compute.json in the control directory; the
+// command applies that file, settles due operations and sweeps ended leases
+// every second.
+//
 // It is built by `make directory-ref` into bin/test/ and is part of no
 // release.
 //
@@ -40,11 +45,13 @@ const usage = `usage: shed-directory-ref --control <dir> [--listen 127.0.0.1:0] 
                           [--signing-key <PKCS#8 PEM> --key-id <id>]
 
 Serves the directory contract over plain HTTP on a loopback address, for
-tests. All state (enrolled servers, spent codes, the replay ledger) is in
-memory; users, codes, disabled servers, the servers that may not ask for
-deliveries (no-deliveries), each person's delivery source (deliveries.json:
-the provision contract's hosted source, POST /v1/deliveries) and an outage
-are read from the control directory on each request. After the clock moves back, an assertion
+tests. All state (enrolled servers, spent codes, the replay ledger, the
+compute service's machines) is in memory; users, codes, disabled servers,
+the servers that may not ask for deliveries (no-deliveries), each person's
+delivery source (deliveries.json: the provision contract's hosted source,
+POST /v1/deliveries), the compute service's steps, faults and settings
+(compute.json: the compute contract, /v1/compute/*) and an outage are read
+from the control directory on each request. After the clock moves back, an assertion
 whose acceptance window ended before the latest time the server has seen is
 refused until the clock catches up.
 
@@ -67,7 +74,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fs.PrintDefaults()
 	}
 	listen := fs.String("listen", "127.0.0.1:0", "the loopback address and port to listen on")
-	control := fs.String("control", "", "the control directory (users.json, codes, disabled, no-deliveries, deliveries.json, outage)")
+	control := fs.String("control", "", "the control directory (users.json, codes, disabled, no-deliveries, deliveries.json, compute.json, outage)")
 	org := fs.String("organization", "example", "the organization's slug")
 	keyFile := fs.String("signing-key", "", "a PKCS#8 PEM RSA key to sign access tokens with (default: a new key)")
 	keyID := fs.String("key-id", "", "the signing key's key id (with --signing-key)")
@@ -142,6 +149,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	say("listening on %s", srv.Issuer())
 	done := make(chan error, 1)
 	go func() { done <- hs.Serve(ln) }()
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := srv.ComputeTick(); err != nil {
+					logger.Printf("compute: %v", err)
+				}
+			}
+		}
+	}()
 	select {
 	case err := <-done:
 		fmt.Fprintln(stderr, err)

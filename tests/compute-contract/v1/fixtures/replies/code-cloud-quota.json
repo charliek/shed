@@ -1,0 +1,25 @@
+{
+  "name": "code-cloud-quota",
+  "description": "CLOUD_QUOTA at 409: a refusal of kind ErrQuota.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "CLOUD_QUOTA",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "CLOUD_QUOTA",
+    "kind": "ErrQuota"
+  }
+}

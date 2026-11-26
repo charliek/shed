@@ -1,0 +1,19 @@
+{
+  "name": "get-oversize",
+  "description": "A machine reply of 64 KiB and one byte (generated): invalid.",
+  "call": "get",
+  "replies": [
+    {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "oversize"
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrInvalidReply"
+  }
+}

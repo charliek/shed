@@ -1,0 +1,25 @@
+{
+  "name": "code-at-wrong-status",
+  "description": "A listed code at a status the list does not give it (QUOTA_PERSON at 422): the status's default.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 422,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "QUOTA_PERSON",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

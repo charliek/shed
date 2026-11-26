@@ -1,0 +1,20 @@
+{
+  "name": "error-body-oversize",
+  "description": "A 409 whose body is over 4 KiB (generated, naming BUSY): read as its status alone.",
+  "call": "start",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "generate": "oversize_error"
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

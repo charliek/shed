@@ -1,0 +1,25 @@
+{
+  "name": "code-lease-at-cap",
+  "description": "LEASE_AT_CAP at 409: a refusal of kind ErrLease.",
+  "call": "extend",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "LEASE_AT_CAP",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "LEASE_AT_CAP",
+    "kind": "ErrLease"
+  }
+}

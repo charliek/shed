@@ -1,0 +1,25 @@
+{
+  "name": "code-cloud-capacity",
+  "description": "CLOUD_CAPACITY at 409: a refusal of kind ErrCapacity.",
+  "call": "start",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "CLOUD_CAPACITY",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "CLOUD_CAPACITY",
+    "kind": "ErrCapacity"
+  }
+}

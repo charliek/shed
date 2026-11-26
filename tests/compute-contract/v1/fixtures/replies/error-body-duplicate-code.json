@@ -1,0 +1,20 @@
+{
+  "name": "error-body-duplicate-code",
+  "description": "An error object naming code twice: no code is read; the status's default.",
+  "call": "start",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "text": "{\"error\":{\"code\":\"BUSY\",\"code\":\"LEASE_ENDED\"}}"
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "INVALID",
+    "kind": "ErrInvalid"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "operation-not-found",
+  "description": "404 for an operation: unknown or expired; the server reads the machine.",
+  "call": "operation",
+  "replies": [
+    {
+      "status": 404,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "NOT_FOUND",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "NOT_FOUND",
+    "kind": "ErrNotFound"
+  }
+}

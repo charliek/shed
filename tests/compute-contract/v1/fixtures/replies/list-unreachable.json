@@ -1,0 +1,14 @@
+{
+  "name": "list-unreachable",
+  "description": "The connection is refused, for the list: a read fails, and nothing is dropped.",
+  "call": "list",
+  "replies": [
+    {
+      "unreachable": true
+    }
+  ],
+  "expect": {
+    "result": "failed",
+    "kind": "ErrUnavailable"
+  }
+}

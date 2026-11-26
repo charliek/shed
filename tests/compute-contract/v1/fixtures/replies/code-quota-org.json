@@ -1,0 +1,25 @@
+{
+  "name": "code-quota-org",
+  "description": "QUOTA_ORG at 409: a refusal of kind ErrComputeLimit.",
+  "call": "create",
+  "replies": [
+    {
+      "status": 409,
+      "headers": {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store"
+      },
+      "body": {
+        "error": {
+          "code": "QUOTA_ORG",
+          "message": "words for people, never read"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "result": "refused",
+    "code": "QUOTA_ORG",
+    "kind": "ErrComputeLimit"
+  }
+}
