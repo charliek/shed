@@ -1613,7 +1613,8 @@ const EGRESS_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 /// An extend's answer ([`Client::extend_with_request_id`]), and whether its outcome
 /// is unknown (`unresolved`): every send ended with no answer or a 5xx, or a send
 /// after such a one was refused without the request id being judged (a 401, any
-/// refusal before the server looked it up). A 2xx, the account service's refusal
+/// refusal before the server looked it up), or a 2xx came back whose shed could not be
+/// read (the lease moved; the answer is lost). A readable 2xx, the account service's refusal
 /// ([`EXTEND_JUDGEMENTS`]), a first send's 4xx and an error before anything was
 /// sent are definite.
 #[derive(Debug, Clone, PartialEq)]
@@ -1763,7 +1764,9 @@ impl Client {
         loop {
             // By status first: a 4xx is final even when its body broke off (its code
             // is then unknown), a 5xx is sent again whatever its body.
-            let (result, again) = match self
+            // `unread`: the server answered 2xx (the lease moved) but its shed could not
+            // be read (too large, or not a shed): not sent again, and not definite.
+            let (result, again, unread) = match self
                 .request_answer(
                     reqwest::Method::POST,
                     &url,
@@ -1777,13 +1780,19 @@ impl Client {
                 Err(e) => (
                     Err(ApiFailure::from_shed(&e)),
                     matches!(e, ShedError::Transport(_)),
+                    // `request_answer` decodes nothing: its only `Decode` is a 2xx
+                    // answer past the size limit.
+                    matches!(e, ShedError::Decode(_)),
                 ),
                 Ok(a) if (200..300).contains(&a.status) => {
-                    (self.answered_shed(a.status, &a.body), false)
+                    let result = self.answered_shed(a.status, &a.body);
+                    let unread = result.is_err();
+                    (result, false, unread)
                 }
                 Ok(a) => (
                     Err(ApiFailure::from_body(a.status, &a.body)),
                     a.status >= 500,
+                    false,
                 ),
             };
             if !again || attempt >= EXTEND_ATTEMPTS {
@@ -1792,7 +1801,7 @@ impl Client {
                 // such a send, an answer that did not judge this request (a 401, any
                 // refusal made before the server looked the id up) says nothing about
                 // it either: still unknown. A first send's refusal is final.
-                let unresolved = again || (earlier_unknown && !judged(&result));
+                let unresolved = again || unread || (earlier_unknown && !judged(&result));
                 return ExtendOutcome { result, unresolved };
             }
             earlier_unknown = true;
@@ -4412,6 +4421,13 @@ mod tests {
             (
                 vec![None, answer("409 Conflict", "", EXTEND_AT_CAP.trim_end())],
                 false,
+                false,
+            ),
+            // A 2xx whose shed cannot be read: applied, its answer lost; not resent.
+            (vec![answer("200 OK", "", "{\"name\":")], true, false),
+            (
+                vec![answer("200 OK", "", &"x".repeat(MAX_DOCUMENT_BYTES + 1))],
+                true,
                 false,
             ),
         ] {
