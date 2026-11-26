@@ -1484,18 +1484,23 @@ impl Client {
     /// A create stream's `error` event as the create's error ([`decode_error`]).
     /// Whether it is a cloud create is asked of the server only when the event does
     /// not say (an account-service code says): `/api/info`'s `backend` is `remote`.
-    /// A server that cannot say is taken as remote, so a cloud create's server text
-    /// is never shown.
+    /// A server that cannot say gets a fixed line that names no backend
+    /// ([`crate::models::unknown_refusal_words`]), so neither a cloud create's server
+    /// text nor a false "cloud" is ever shown.
     async fn refused_create(&self, data: &str) -> ShedError {
         let parts = api_error_parts(data.as_bytes());
         let said = crate::models::refusal_words(&parts.code, &parts.reason).is_some()
             || parts.code.starts_with(crate::models::COMPUTE_CODE_PREFIX);
-        let cloud = said
-            || self
-                .info()
-                .await
-                .map_or(true, |i| i.backend.as_deref() == Some(BACKEND_REMOTE));
-        ShedError::Create(decode_error(data, cloud))
+        if said {
+            return ShedError::Create(decode_error(data, true));
+        }
+        match self.info().await {
+            Ok(i) => ShedError::Create(decode_error(
+                data,
+                i.backend.as_deref() == Some(BACKEND_REMOTE),
+            )),
+            Err(_) => ShedError::Create(crate::models::unknown_refusal_words(&parts.code)),
+        }
     }
 }
 
@@ -1606,8 +1611,11 @@ const MAX_EGRESS_EVENT_BYTES: usize = 64 << 10;
 /// How long a refusal's body on the egress stream may take to arrive.
 const EGRESS_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 /// An extend's answer ([`Client::extend_with_request_id`]), and whether its outcome
-/// is unknown (`unresolved`): every send ended with no answer or a 5xx. A 2xx, a 4xx
-/// and an error before anything was sent are definite.
+/// is unknown (`unresolved`): every send ended with no answer or a 5xx, or a send
+/// after such a one was refused without the request id being judged (a 401, any
+/// refusal before the server looked it up). A 2xx, the account service's refusal
+/// ([`EXTEND_JUDGEMENTS`]), a first send's 4xx and an error before anything was
+/// sent are definite.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtendOutcome {
     pub result: Result<Shed, ApiFailure>,
@@ -1749,6 +1757,9 @@ impl Client {
         };
         let body = serde_json::json!({ "hours": hours, "request_id": request_id });
         let mut attempt = 1;
+        // Whether an earlier send's outcome was unknown: that send may have moved
+        // the lease, and only an answer that judged this request id says whether.
+        let mut earlier_unknown = false;
         loop {
             // By status first: a 4xx is final even when its body broke off (its code
             // is then unknown), a 5xx is sent again whatever its body.
@@ -1777,12 +1788,14 @@ impl Client {
             };
             if !again || attempt >= EXTEND_ATTEMPTS {
                 // `again` on the last send: it, and every one before it, ended with
-                // no answer or a 5xx, so whether the lease moved is not known.
-                return ExtendOutcome {
-                    result,
-                    unresolved: again,
-                };
+                // no answer or a 5xx, so whether the lease moved is not known. After
+                // such a send, an answer that did not judge this request (a 401, any
+                // refusal made before the server looked the id up) says nothing about
+                // it either: still unknown. A first send's refusal is final.
+                let unresolved = again || (earlier_unknown && !judged(&result));
+                return ExtendOutcome { result, unresolved };
             }
+            earlier_unknown = true;
             attempt += 1;
             tokio::time::sleep(pause).await;
         }
@@ -2037,6 +2050,27 @@ fn decode_progress(data: &str) -> Option<String> {
 
 /// The `backend` a remote server's `/api/info` names (cloud sheds, plan 041).
 const BACKEND_REMOTE: &str = "remote";
+
+/// The extend refusals that are the account service's judgement of the request id
+/// (it answers a repeated id with its first answer): with a 2xx, the only answers
+/// that settle an extend an earlier send of which may have moved the lease.
+/// shed-server's own refusals made before it looks the id up (a 401, `FORBIDDEN`,
+/// `SHED_NOT_FOUND`, `INVALID_REQUEST`, …) and any unknown code do not.
+const EXTEND_JUDGEMENTS: &[&str] = &[
+    "EXTEND_NOT_ALLOWED",
+    "LEASE_AT_CAP",
+    "LEASE_ENDED",
+    "PERSON_INACTIVE",
+    "COMPUTE_DELETING",
+];
+
+/// Whether an extend's answer judged its request id ([`EXTEND_JUDGEMENTS`]).
+fn judged(result: &Result<Shed, ApiFailure>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => EXTEND_JUDGEMENTS.contains(&e.code.as_str()),
+    }
+}
 
 /// A create stream's `error` event as one line. A code and reason with fixed words
 /// ([`crate::models::refusal_words`], the words an extend's refusal shows) show them,
@@ -4169,7 +4203,8 @@ mod tests {
     }
 
     /// A refused create's server text: shown by a server that is not remote, never by
-    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read.
+    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read, which
+    /// gets a line that calls it no cloud refusal either.
     #[tokio::test]
     async fn a_cloud_create_never_shows_the_server_text() {
         for (info, want) in [
@@ -4181,9 +4216,10 @@ mod tests {
                 Some(r#"{"name":"m","version":"1","backend":"remote"}"#),
                 "create failed: the cloud create was refused (SERVER_LIMIT_REACHED)",
             ),
+            // The backend cannot be told: a fixed line that names none.
             (
                 None,
-                "create failed: the cloud create was refused (SERVER_LIMIT_REACHED)",
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
             ),
         ] {
             let server = MockServer::start_async().await;
@@ -4400,6 +4436,57 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&new_request_id()).is_ok());
     }
 
+    /// After a send whose outcome was unknown, a refusal that did not judge the request
+    /// id (a 401, shed-server's own refusals before it looks the id up, an unknown
+    /// code) keeps the outcome unknown: the earlier send may have moved the lease. The
+    /// same refusal of a first send is final, as is the service's own judgement.
+    #[tokio::test]
+    async fn a_refusal_after_an_unknown_send_keeps_it_unknown_unless_it_judged_it() {
+        let refusal = |status: &str, code: &str| {
+            answer(
+                status,
+                "",
+                &format!(r#"{{"error":{{"code":"{code}","message":"no"}}}}"#),
+            )
+        };
+        let rid = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+        for (status, code) in [
+            ("401 Unauthorized", "UNAUTHORIZED"),
+            ("403 Forbidden", "FORBIDDEN"),
+            ("404 Not Found", "SHED_NOT_FOUND"),
+            ("400 Bad Request", "INVALID_REQUEST"),
+            ("409 Conflict", "SOMETHING_NEW"),
+        ] {
+            let (base, bodies) = recording_server(vec![None, refusal(status, code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(out.unresolved, "{code} after a lost reply: {out:?}");
+            assert_eq!(out.result.unwrap_err().code, code);
+            assert_eq!(bodies.lock().unwrap().len(), 2, "not sent again");
+            // The same refusal of a first send is final.
+            let (base, _) = recording_server(vec![refusal(status, code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(!out.unresolved, "{code} first: {out:?}");
+        }
+        // The service's judgement of the id settles it, after a 5xx too.
+        for code in EXTEND_JUDGEMENTS {
+            let unavailable = answer(
+                "503 Service Unavailable",
+                "",
+                r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"down"}}"#,
+            );
+            let (base, _) =
+                recording_server(vec![unavailable, refusal("409 Conflict", code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(!out.unresolved, "{code}: {out:?}");
+        }
+    }
+
     /// A refusal is final, with its status, code, message and reason.
     #[tokio::test]
     async fn an_extend_refusal_is_final_with_its_code_and_reason() {
@@ -4528,6 +4615,16 @@ mod tests {
             (e.status, e.code.as_str()),
             (Some(501), "FEATURE_UNSUPPORTED")
         );
+        // An answer with an invalid scope is a failed read, never counts.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/cloud/usage");
+                t.status(200).body(r#"{"person":"me","org":null}"#);
+            })
+            .await;
+        let e = client(&server).cloud_usage().await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(200), ""));
     }
 }
 

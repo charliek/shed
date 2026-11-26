@@ -38,7 +38,7 @@ import { DeliveryBadge, ShedDeliveryDetail, provisionRunOf, useShedDelivery, typ
 import { readDelivery } from "@/lib/delivery";
 import { ShedEgressDetail } from "@/components/ShedEgress";
 import {
-  CloudDeleteConfirm, CloudUsageLine, ShedCloudDetail, shedIncarnation, useCloudExtends, useCloudUsage,
+  CloudDeleteConfirm, CloudUsageLine, deleteFailureWords, ShedCloudDetail, shedIncarnation, useCloudExtends, useCloudUsage,
   useReportCloudUsage, type CloudExtends,
 } from "@/components/ShedCloud";
 import { leaseTone, readCloudRow, type CloudRow } from "@/lib/cloud";
@@ -54,7 +54,7 @@ import {
   type RoostPreview, type RoostToast, type RoostDumpRow,
 } from "@/lib/roost";
 import {
-  useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
+  useUiBridge, shedAction, deleteShedStrict, fetchSystemDf, fetchHostRows, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
   fetchEgressProfiles, reportEgress, reportCreateSheet, inTauri, listServerActivity, reportActivity, reportScrolled,
   openPreferences, setAppearanceState,
@@ -297,6 +297,36 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   useEffect(() => {
     if (confirmDelete && !confirmShed) setConfirmDelete(null);
   }, [confirmDelete, confirmShed]);
+  // The question's delete: running (`busy`), or failed with its words, which the
+  // question shows (it stays open). Its number is the question's, so a delete that
+  // answers after its question closed, or another opened, changes nothing there.
+  const [deleteRun, setDeleteRun] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
+  const deleteAsk = useRef(0);
+  const askDelete = (q: { host: string; name: string; incarnation: string } | null) => {
+    deleteAsk.current += 1;
+    setDeleteRun({ busy: false, error: null });
+    setConfirmDelete(q);
+  };
+  useEffect(() => {
+    if (!confirmDelete) {
+      deleteAsk.current += 1;
+      setDeleteRun({ busy: false, error: null });
+    }
+  }, [confirmDelete]);
+  const confirmedDelete = (s: Shed) => {
+    const ask = deleteAsk.current;
+    setDeleteRun({ busy: true, error: null });
+    deleteShedStrict(s.name, s.host).then(
+      () => {
+        if (deleteAsk.current === ask) setConfirmDelete(null);
+        refresh();
+      },
+      (e: unknown) => {
+        if (deleteAsk.current === ask) setDeleteRun({ busy: false, error: deleteFailureWords(e) });
+        refresh();
+      },
+    );
+  };
   // The usage line of each server whose rows are cloud sheds, and its report.
   const cloudUsage = useCloudUsage(sheds);
   useReportCloudUsage(cloudUsage);
@@ -392,7 +422,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
         groupByHost(sheds).map(([host, rows]) => (
           <div key={host} className="mb-[22px] last:mb-0" data-scroll-anchor={`host:${host}`}>
             <HostLabel host={host} />
-            {cloudUsage[host] && <CloudUsageLine host={host} words={cloudUsage[host]} />}
+            {cloudUsage.get(host) && <CloudUsageLine host={host} words={cloudUsage.get(host) ?? ""} />}
             <div className="flex flex-col gap-3">
               {rows.map((s) => {
                 const cloud = readCloudRow(s.cloud_row);
@@ -474,7 +504,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                             {running && <ActBtn icon={Terminal} tone="neutral" title="Open in Terminal" onClick={() => void openTerminal(s.name, s.host)} />}
                             {cloud.actions.start && <ActBtn icon={Play} tone="ok" title="Start" onClick={() => act("start", s)} />}
                             {cloud.actions.stop && <ActBtn icon={Square} tone="danger" title="Stop" onClick={() => act("stop", s)} />}
-                            {cloud.actions.delete && <ActBtn icon={Trash2} tone="danger" title="Delete" onClick={() => setConfirmDelete({ host: s.host, name: s.name, incarnation: shedIncarnation(s) })} />}
+                            {cloud.actions.delete && <ActBtn icon={Trash2} tone="danger" title="Delete" onClick={() => askDelete({ host: s.host, name: s.name, incarnation: shedIncarnation(s) })} />}
                           </>
                         )
                       ) : running ? (
@@ -529,11 +559,11 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
       {confirmShed && (
         <CloudDeleteConfirm
           shed={confirmShed}
-          onCancel={() => setConfirmDelete(null)}
+          busy={deleteRun.busy}
+          error={deleteRun.error}
+          onCancel={() => askDelete(null)}
           onConfirm={() => {
-            const s = confirmShed;
-            setConfirmDelete(null);
-            act("delete", s);
+            if (!deleteRun.busy) confirmedDelete(confirmShed);
           }}
         />
       )}
@@ -1239,11 +1269,13 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
   const creating = createId !== null;
   const state = progress?.state;
 
-  // The configured hosts a create can target (even ones with no sheds yet).
+  // The configured hosts a create can target (even ones with no sheds yet). The
+  // first is the default only while no host is chosen: a host set before the list
+  // arrives (the harness's fill door) is never overwritten.
   useEffect(() => {
     void fetchHosts().then((hs) => {
       setHosts(hs);
-      setHost(hs[0] ?? "");
+      setHost((h) => h || (hs[0] ?? ""));
     });
   }, []);
 

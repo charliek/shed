@@ -199,7 +199,7 @@ pub const EXTEND_UNKNOWN: &str = "extend_unknown";
 
 /// [`EXTEND_UNKNOWN`]'s words.
 pub const EXTEND_UNKNOWN_WORDS: &str =
-    "not known whether it was applied; it settles within a few minutes";
+    "not known whether it was applied; Extend stays unavailable until that is known";
 
 /// The code of an extend refused here, unsent, while an earlier extend of that shed
 /// is in flight or has an unknown outcome: sending it could move the lease twice.
@@ -207,7 +207,7 @@ pub const EXTEND_PENDING: &str = "extend_pending";
 
 /// [`EXTEND_PENDING`]'s words.
 pub const EXTEND_PENDING_WORDS: &str =
-    "an earlier extend's outcome is not known yet; it settles within a few minutes";
+    "an earlier extend's outcome is not known yet; Extend stays unavailable until it is";
 
 /// The line a cloud row shows while an extend of `hours` has an unknown outcome.
 pub fn unresolved_extend_words(hours: i64) -> String {

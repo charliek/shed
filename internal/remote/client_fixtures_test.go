@@ -2,6 +2,9 @@ package remote
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,10 +15,14 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/provider/service/servicetest"
+	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // The client fixtures of plan 041 (crates/fixtures/cloud/): what shed-server's
@@ -78,16 +85,11 @@ func TestCloudClientFixtures(t *testing.T) {
 	files["extend-at-cap.json"] = want("extend past the cap", code, http.StatusConflict, body)
 	code, body = call(http.MethodGet, "/api/cloud/usage", "")
 	files["usage-org.json"] = want("GET /api/cloud/usage", code, http.StatusOK, body)
-	// A person's usage: the handler writes the backend's answer as it is.
-	u, err := e.b.CloudUsage(ctxT(t), "linus")
-	if err != nil {
-		t.Fatal(err)
-	}
-	person, err := json.Marshal(u)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files["usage-person.json"] = append(person, '\n')
+	// A person's usage, through the handler for an authenticated person (an
+	// mtls server whose user list has linus): the open server's caller above
+	// is a local admin, whose answer is the organization's alone.
+	code, body = personUsage(t, e)
+	files["usage-person.json"] = want("GET /api/cloud/usage (a person)", code, http.StatusOK, body)
 	// The open server's caller is a local admin, whom the account service
 	// makes no machine for: the create stream's error event carries the
 	// reason.
@@ -134,9 +136,46 @@ func TestCloudClientFixtures(t *testing.T) {
 	}
 }
 
+// personUsage is GET /api/cloud/usage as linus, a person of the account
+// service, sends it: over an mtls server whose user list holds linus, with a
+// control certificate for linus's key. Its status and body.
+func personUsage(t *testing.T, e *env) (int, []byte) {
+	t.Helper()
+	const fp = "SHA256:linus-fixture-key"
+	lookup := userstest.New()
+	lookup.AddUser(users.User{Name: "linus"})
+	lookup.AddKey("linus", users.Key{Fingerprint: fp, Source: users.SourceInline})
+	cfg := &config.ServerConfig{
+		Name:           servicetest.DefaultServer,
+		DefaultBackend: config.BackendRemote,
+		Auth:           &config.AuthConfig{Mode: config.AuthModeMTLS},
+	}
+	s := api.NewServer(e.b, cfg, "", nil, nil)
+	s.SetUserLookup(lookup)
+	now := time.Now()
+	leaf := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName:         fp,
+			OrganizationalUnit: []string{"control"},
+			Names:              []pkix.AttributeTypeAndValue{{Type: servertls.ClientUserOID, Value: "linus"}},
+		},
+		NotBefore: now.Add(-time.Minute),
+		NotAfter:  now.Add(time.Hour),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/cloud/usage", nil)
+	req.TLS = &tls.ConnectionState{HandshakeComplete: true, PeerCertificates: []*x509.Certificate{leaf}}
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	var u config.CloudUsage
+	if rec.Code == http.StatusOK && (json.Unmarshal(rec.Body.Bytes(), &u) != nil || u.Person == nil) {
+		t.Fatalf("linus's usage has no person: %s", rec.Body.Bytes())
+	}
+	return rec.Code, rec.Body.Bytes()
+}
+
 // fixtureShape is a JSON document's (or an SSE stream's events') shape: each
 // object as its keys' shapes, each array as its elements' shapes, and each
-// leaf as its JSON type.
+// leaf as its JSON type, a number as an integer or not.
 func fixtureShape(data []byte) (any, error) {
 	if bytes.HasPrefix(data, []byte("event: ")) {
 		var events []any
@@ -153,8 +192,12 @@ func fixtureShape(data []byte) (any, error) {
 		}
 		return events, nil
 	}
+	// Numbers as written, so an integer and a fractional number differ (the
+	// Rust clients decode counts as integers).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	var doc any
-	if err := json.Unmarshal(data, &doc); err != nil {
+	if err := dec.Decode(&doc); err != nil {
 		return nil, err
 	}
 	return shapeOf(doc), nil
@@ -176,7 +219,34 @@ func shapeOf(v any) any {
 		return out
 	case nil:
 		return "null"
+	case json.Number:
+		if _, err := v.Int64(); err == nil {
+			return "integer"
+		}
+		return "number"
 	default:
 		return fmt.Sprintf("%T", v)
+	}
+}
+
+// The shape tells an integer from a fractional number (a count the clients
+// decode as an integer), and not one integer from another.
+func TestFixtureShapeNumbers(t *testing.T) {
+	shape := func(doc string) any {
+		t.Helper()
+		v, err := fixtureShape([]byte(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if !reflect.DeepEqual(shape(`{"org":{"max":100}}`), shape(`{"org":{"max":101}}`)) {
+		t.Error("100 and 101 have different shapes")
+	}
+	if reflect.DeepEqual(shape(`{"org":{"max":100}}`), shape(`{"org":{"max":100.5}}`)) {
+		t.Error("100 and 100.5 have the same shape")
+	}
+	if reflect.DeepEqual(shape(`[1]`), shape(`["1"]`)) {
+		t.Error("a number and a string have the same shape")
 	}
 }

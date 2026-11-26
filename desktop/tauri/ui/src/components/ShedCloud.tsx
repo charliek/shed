@@ -306,38 +306,46 @@ export function ShedCloudDetail({ shed, row, run, onExtend }: {
  *  stop) and once more [`USAGE_FOLLOW_UP_MS`] later, since shed-server caches usage
  *  [`USAGE_KEEP_MS`] and the first read may be its cached count; otherwise at most
  *  every [`USAGE_KEEP_MS`] as its rows are listed again. A server whose usage cannot
- *  be read has no line. */
-export function useCloudUsage(sheds: Shed[]): Record<string, string> {
-  const [usage, setUsage] = useState<Record<string, string>>({});
+ *  be read has no line. Every host-keyed table here is a `Map`: a server named like
+ *  an Object property (`constructor`, `__proto__`) is a key like any other. */
+export function useCloudUsage(sheds: Shed[]): ReadonlyMap<string, string> {
+  const [usage, setUsage] = useState<ReadonlyMap<string, string>>(() => new Map());
   // host -> its cloud rows when its usage was last asked for, when, and that ask's
   // number. Numbers come from one counter that never repeats, so an ask made before a
   // server's rows went away and came back can never pass for a later one.
-  const asked = useRef<Record<string, UsageAsk>>({});
+  const asked = useRef(new Map<string, UsageAsk>());
   const asks = useRef(0);
   // host -> its pending follow-up read.
-  const followUps = useRef<Record<string, number>>({});
+  const followUps = useRef(new Map<string, number>());
   const drop = useCallback(
     (host: string) =>
-      setUsage((u) => (host in u ? Object.fromEntries(Object.entries(u).filter(([h]) => h !== host)) : u)),
+      setUsage((u) => {
+        if (!u.has(host)) return u;
+        const next = new Map(u);
+        next.delete(host);
+        return next;
+      }),
     [],
   );
   const cancelFollowUp = useCallback((host: string) => {
-    const t = followUps.current[host];
+    const t = followUps.current.get(host);
     if (t !== undefined) {
       window.clearTimeout(t);
-      delete followUps.current[host];
+      followUps.current.delete(host);
     }
   }, []);
   const ask = useCallback(
     (host: string, key: string) => {
       const gen = ++asks.current;
-      asked.current[host] = { key, at: Date.now(), gen };
-      const current = () => asked.current[host]?.gen === gen;
+      asked.current.set(host, { key, at: Date.now(), gen });
+      const current = () => asked.current.get(host)?.gen === gen;
       void fetchCloudUsage(host).then(
         (a) => {
           if (!current()) return;
-          if (typeof a?.words === "string" && a.words) setUsage((u) => ({ ...u, [host]: a.words }));
-          else drop(host);
+          if (typeof a?.words === "string" && a.words) {
+            const words = a.words;
+            setUsage((u) => new Map(u).set(host, words));
+          } else drop(host);
         },
         () => {
           if (current()) drop(host);
@@ -347,36 +355,42 @@ export function useCloudUsage(sheds: Shed[]): Record<string, string> {
     [drop],
   );
   useEffect(() => {
-    const byHost: Record<string, string[]> = {};
+    const byHost = new Map<string, string[]>();
     for (const s of sheds) {
-      if (readCloudRow(s.cloud_row)) (byHost[s.host] ??= []).push(`${s.name}:${s.status}`);
+      if (!readCloudRow(s.cloud_row)) continue;
+      const rows = byHost.get(s.host);
+      if (rows) rows.push(`${s.name}:${s.status}`);
+      else byHost.set(s.host, [`${s.name}:${s.status}`]);
     }
-    for (const host of Object.keys(asked.current)) {
-      if (!(host in byHost)) {
-        delete asked.current[host];
+    for (const host of [...asked.current.keys()]) {
+      if (!byHost.has(host)) {
+        asked.current.delete(host);
         cancelFollowUp(host);
         drop(host);
       }
     }
     const now = Date.now();
-    for (const [host, rows] of Object.entries(byHost)) {
+    for (const [host, rows] of byHost) {
       const key = JSON.stringify(rows);
-      const step = usageStep(asked.current[host], key, now);
+      const step = usageStep(asked.current.get(host), key, now);
       if (!step.ask) continue;
       ask(host, key);
       if (!step.followUp) continue;
       cancelFollowUp(host);
-      followUps.current[host] = window.setTimeout(() => {
-        delete followUps.current[host];
-        // Rows changed again since: that change has its own reads.
-        if (asked.current[host]?.key === key) ask(host, key);
-      }, USAGE_FOLLOW_UP_MS);
+      followUps.current.set(
+        host,
+        window.setTimeout(() => {
+          followUps.current.delete(host);
+          // Rows changed again since: that change has its own reads.
+          if (asked.current.get(host)?.key === key) ask(host, key);
+        }, USAGE_FOLLOW_UP_MS),
+      );
     }
   }, [sheds, ask, drop, cancelFollowUp]);
   useEffect(
     () => () => {
-      for (const t of Object.values(followUps.current)) window.clearTimeout(t);
-      followUps.current = {};
+      for (const t of followUps.current.values()) window.clearTimeout(t);
+      followUps.current.clear();
     },
     [],
   );
@@ -394,8 +408,8 @@ export function CloudUsageLine({ host, words }: { host: string; words: string })
 
 /** Report the usage lines the pane rendered (`{server, words}` in order), read back
  *  off their nodes after the commit; null once the pane is gone. */
-export function useReportCloudUsage(usage: Record<string, string>) {
-  const key = JSON.stringify(usage);
+export function useReportCloudUsage(usage: ReadonlyMap<string, string>) {
+  const key = JSON.stringify([...usage]);
   useEffect(() => {
     reportShedCloud(
       "cloud_usage",
@@ -412,7 +426,19 @@ export function useReportCloudUsage(usage: Record<string, string>) {
 export const CLOUD_DELETE_WORDS = "Deletes the machine and its disk.";
 
 /** The confirmation Delete asks for on a cloud row. */
-export function CloudDeleteConfirm({ shed, onCancel, onConfirm }: { shed: Shed; onCancel: () => void; onConfirm: () => void }) {
+/** The words a failed Delete shows in its question: the error's own text (the
+ *  app's, such as `shed-server returned HTTP 503`; never a cloud server's message). */
+export function deleteFailureWords(e: unknown): string {
+  const why = typeof e === "string" && e ? e : e instanceof Error && e.message ? e.message : "no answer";
+  return `The delete failed: ${why}`;
+}
+
+/** A cloud row's Delete question. `busy` while its delete runs (Delete is then
+ *  disabled); `error`, a failed delete's words, shown under the question, which
+ *  stays open so the failure is seen. */
+export function CloudDeleteConfirm({ shed, busy, error, onCancel, onConfirm }: {
+  shed: Shed; busy: boolean; error: string | null; onCancel: () => void; onConfirm: () => void;
+}) {
   const root = useRef<HTMLDivElement>(null);
   useEscClose(onCancel);
   useEffect(() => {
@@ -440,19 +466,27 @@ export function CloudDeleteConfirm({ shed, onCancel, onConfirm }: { shed: Shed; 
       title: el?.querySelector("[data-dialog-title]")?.textContent ?? null,
       words: el?.querySelector("[data-delete-words]")?.textContent ?? null,
       buttons: Array.from(el?.querySelectorAll("button") ?? []).map((b) => (b.textContent ?? "").trim()).filter((t) => t !== ""),
+      busy,
+      error: el?.querySelector("[data-delete-error]")?.textContent ?? null,
     });
-    return () => reportShedCloud("cloud_delete", null);
-  }, [shed.host, shed.name]);
+  }, [shed.host, shed.name, busy, error]);
+  useEffect(() => () => reportShedCloud("cloud_delete", null), []);
   return (
     <Scrim onClose={onCancel} mark="cloud-delete">
       <div ref={root}>
         <DialogShell icon={Trash2} title={`Delete ${shed.name}?`} onClose={onCancel} width={440}>
           <p className="text-[14px] leading-snug text-shed-text-secondary" data-delete-words>{CLOUD_DELETE_WORDS}</p>
+          {error && (
+            <p className="text-[13px] leading-snug" style={{ color: "var(--shed-err-fg)" }} role="alert" data-delete-error>
+              {error}
+            </p>
+          )}
           <div className="flex items-center justify-between pt-1">
             <button onClick={onCancel} className={dialogBtnSecondary} data-delete-cancel>Cancel</button>
             <button
               onClick={onConfirm}
-              className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
+              disabled={busy}
+              className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold disabled:opacity-60"
               style={{ background: "var(--shed-err-fg)", color: "var(--shed-surface)", border: "none" }}
               data-delete-confirm
             >

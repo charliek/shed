@@ -51,7 +51,7 @@ PLAIN_SHEDS = [
      "memory_mb": 4096, "created_at": "2026-11-20T12:00:00Z"},
 ]
 
-#: How long after an unknown extend a lease short of its old end plus the hours
+#: How long after an unknown extend a lease whose end is still exactly its old end
 #: settles it as not applied, in this module's app (`SHED_TAURI_EXTEND_SETTLE_S`; 150 s by default).
 SETTLE_S = 10
 
@@ -422,8 +422,8 @@ def test_a_refusal_shows_its_words(r: Rig, code: str, reason: str, words: str):
 
 #: The words of an extend whose outcome is not known, of one refused because of it,
 #: and of the row meanwhile (`shed_app::cloud`).
-UNKNOWN_WORDS = "not known whether it was applied; it settles within a few minutes"
-PENDING_WORDS = "an earlier extend's outcome is not known yet; it settles within a few minutes"
+UNKNOWN_WORDS = "not known whether it was applied; Extend stays unavailable until that is known"
+PENDING_WORDS = "an earlier extend's outcome is not known yet; Extend stays unavailable until it is"
 #: How many times one extend is sent before its outcome is called unknown
 #: (`shed_core::http::EXTEND_ATTEMPTS`).
 EXTEND_ATTEMPTS = 3
@@ -549,7 +549,8 @@ def test_delete_on_a_cloud_row_asks_first(r: Rig):
                    what="the delete confirmation")
     ask = r.cloud()["delete_confirm"]
     assert ask == {"server": "mock", "shed": "cloud-stopped", "title": "Delete cloud-stopped?",
-                   "words": "Deletes the machine and its disk.", "buttons": ["Cancel", "Delete"]}, ask
+                   "words": "Deletes the machine and its disk.", "buttons": ["Cancel", "Delete"],
+                   "busy": False, "error": None}, ask
     _shot(r.c, "cloud-delete-confirm.png", anchor="host:mock")
     assert r.mock.shed("cloud-stopped") is not None, "nothing is deleted before the answer"
     # Cancel keeps the shed.
@@ -564,6 +565,26 @@ def test_delete_on_a_cloud_row_asks_first(r: Rig):
     r.c.wait_until(lambda: ("mock", "cloud-stopped") not in r.rows(), timeout=10,
                    what="its row gone")
     assert r.cloud()["delete_confirm"] is None
+
+
+def test_a_failed_delete_is_shown_in_its_question(r: Rig):
+    """A delete the server refuses keeps the question open and says so, with the app's
+    words, never the server's text; Delete again then deletes."""
+    _wait_rows(r)
+    r.mock.refuse_deletes(1, 503)
+    _ask_delete(r, "cloud-stopped")
+    r.c.call("ui.press_delete_confirm", {"button": "delete"})
+    r.c.wait_until(lambda: (r.cloud()["delete_confirm"] or {}).get("error"), timeout=10,
+                   what="the failure in the question")
+    ask = r.cloud()["delete_confirm"]
+    assert ask["shed"] == "cloud-stopped" and ask["busy"] is False, ask
+    assert ask["error"] == "The delete failed: shed-server returned HTTP 503", ask
+    assert "SERVER TEXT" not in ask["error"]
+    assert r.mock.shed("cloud-stopped") is not None, "nothing was deleted"
+    r.c.call("ui.press_delete_confirm", {"button": "delete"})
+    r.c.wait_until(lambda: r.mock.shed("cloud-stopped") is None, timeout=10, what="deleted")
+    r.c.wait_until(lambda: r.cloud()["delete_confirm"] is None, timeout=10,
+                   what="the question closed")
 
 
 def _ask_delete(r: Rig, name: str) -> None:

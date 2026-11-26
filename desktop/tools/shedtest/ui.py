@@ -302,8 +302,8 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #  * SOURCE_RECHECK_MS — how often a delivery stream settled on the account
     #    service (`409 SOURCE_IS_SERVICE`) is checked again (plan 040 §3.9), so a
     #    cell need not wait out five minutes; cleared otherwise.
-    #  * EXTEND_SETTLE_S — how long after an extend's unknown outcome a lease short
-    #    of its old end plus the hours settles it as not applied (plan 041), so a cell need not wait
+    #  * EXTEND_SETTLE_S — how long after an extend's unknown outcome a lease whose
+    #    end is still exactly its old end settles it as not applied (plan 041), so a cell need not wait
     #    out 150 s; cleared otherwise.
     #  * LOG_FILE — cleared unconditionally, like SOCKET (#414): an inherited
     #    one would send a hermetic run's log into the developer's file (or

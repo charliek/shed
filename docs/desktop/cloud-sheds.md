@@ -59,18 +59,18 @@ A refusal from the account service shows fixed words, never the server's own tex
 
 ### When the outcome is not known
 
-The app sends an extend up to three times, two seconds apart, with one request id, while no server answers or the server answers `5xx` (`COMPUTE_UNAVAILABLE` among them). When every try ends that way, the lease may or may not have moved, and the panel says *not known whether it was applied; it settles within a few minutes*. The app never sends that extend again; it settles it by what the shed's listings show next:
+The app sends an extend up to three times, two seconds apart, with one request id, while no server answers or the server answers `5xx` (`COMPUTE_UNAVAILABLE` among them). When every try ends that way, the lease may or may not have moved, and the panel says *not known whether it was applied; Extend stays unavailable until that is known*. The app never sends that extend again; it settles it by what the shed's listings show next:
 
 - **Applied:** the lease ends at least that many hours later than it did before the extend.
-- **Not applied:** 150 seconds after the outcome became unknown (two of the server's passes and a margin), the lease still ends where it did before. A lease moved by fewer hours (another, smaller extend) says nothing about this one, so the note stays until the shed is gone or 24 hours pass; restarting the app also clears it.
+- **Not applied:** the lease's end is unchanged, exactly where it was before the extend, in a listing at least 150 seconds after the outcome became unknown (two of the server's passes and a margin). The time passing settles nothing by itself: a lease moved by fewer hours (another, smaller extend) says nothing about this one, so the note stays until the shed is gone or 24 hours pass; restarting the app also clears it.
 - The shed is gone, or a shed created again under its name is listed: the record belonged to the old shed.
 - After 24 hours, whatever the listing says.
 
-A listing that fails (no answer, a refused sign-in) settles nothing. Until it settles, the row keeps a line saying so (`An extend by 6 h: not known whether it was applied; it settles within a few minutes`), its Extend controls are disabled, and any extend of that shed (from the IPC too) is refused in the app, unsent, with *an earlier extend's outcome is not known yet; it settles within a few minutes*. The app keeps this in memory only; after a restart the shed's next extend is sent.
+A listing that fails (no answer, a refused sign-in) settles nothing, and neither does one the app sent before the outcome became unknown. Until it settles, the row keeps a line saying so (`An extend by 6 h: not known whether it was applied; Extend stays unavailable until that is known`), its Extend controls are disabled, and any extend of that shed (from the IPC too) is refused in the app, unsent, with *an earlier extend's outcome is not known yet; Extend stays unavailable until it is*. The app keeps this in memory only; after a restart the shed's next extend is sent.
 
 ## When a create is refused
 
-A cloud create that is refused shows fixed words in the New shed sheet, after `create failed:`, never the server's own text: for example *the account service makes cloud machines only for its own people and for service clients; a local admin can list, stop, delete and extend cloud sheds but not create them* for a local admin (`COMPUTE_POLICY_REFUSED`, reason `person`). The words for `COMPUTE_LIMIT_REACHED`, `COMPUTE_POLICY_REFUSED` (by reason), `COMPUTE_DENIED`, `COMPUTE_UNAVAILABLE` and `COMPUTE_DELETING` are the CLI's; `CLOUD_QUOTA_EXCEEDED` shows *the cloud's quota does not allow another machine now; try again later* and `ZONE_CAPACITY_UNAVAILABLE` *the cloud has no room for this machine now; try again later*. Any other code from a remote server (whose `/api/info` says `backend: remote`, or that cannot say) shows *the cloud create was refused (CODE)*. A create refused by a server that is not remote shows the server's message, as before.
+A cloud create that is refused shows fixed words in the New shed sheet, after `create failed:`, never the server's own text: for example *the account service makes cloud machines only for its own people and for service clients; a local admin can list, stop, delete and extend cloud sheds but not create them* for a local admin (`COMPUTE_POLICY_REFUSED`, reason `person`). The words for `COMPUTE_LIMIT_REACHED`, `COMPUTE_POLICY_REFUSED` (by reason), `COMPUTE_DENIED`, `COMPUTE_UNAVAILABLE` and `COMPUTE_DELETING` are the CLI's; `CLOUD_QUOTA_EXCEEDED` shows *the cloud's quota does not allow another machine now; try again later* and `ZONE_CAPACITY_UNAVAILABLE` *the cloud has no room for this machine now; try again later*. Any other code from a remote server (whose `/api/info` says `backend: remote`) shows *the cloud create was refused (CODE)*. A create refused by a server that is not remote shows the server's message, as before. When the app cannot tell (its `/api/info` read fails), the sheet shows *the create was refused (CODE)*, never the server's message.
 
 ## The usage line
 
@@ -84,7 +84,7 @@ The first part counts the machines you hold against your limit; the second count
 
 ## Deleting a cloud shed
 
-**Delete** on a cloud row asks first, with **Delete *name*?** and the words *Deletes the machine and its disk.* Choose **Delete** to go on or **Cancel** (or Esc) to keep it. Delete is offered on a shed that is not running or changing state; stop a running shed first. The question stands only while the shed's current row still offers Delete: if the shed is started elsewhere, or goes, the question closes and nothing is deleted. A local shed deletes at once, as before.
+**Delete** on a cloud row asks first, with **Delete *name*?** and the words *Deletes the machine and its disk.* Choose **Delete** to go on or **Cancel** (or Esc) to keep it. Delete is offered on a shed that is not running or changing state; stop a running shed first. The question stands only while the shed's current row still offers Delete: if the shed is started elsewhere, or goes, the question closes and nothing is deleted. A delete that fails keeps the question open and says so under it (*The delete failed: shed-server returned HTTP 503*, never the server's own text); **Delete** tries again. A local shed deletes at once, as before.
 
 ## See also
 

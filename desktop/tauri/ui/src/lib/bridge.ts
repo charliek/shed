@@ -482,6 +482,13 @@ export async function shedAction(action: string, name: string, host: string): Pr
   await invoke("shed_action", { action, name, host });
 }
 
+/** Delete a shed, rejecting with the error's words when it fails (a cloud row's
+ *  confirmed Delete, which shows the failure in its question). */
+export function deleteShedStrict(name: string, host: string): Promise<void> {
+  if (!inTauri()) return Promise.resolve();
+  return invokeStrict("shed_action", { action: "delete", name, host });
+}
+
 /** Move a cloud shed's lease `hours` later (plan 041): `{shed, cloud_row}`. Rejects
  *  with the refusal (`shed_app::CloudFailure`, `{code, reason, status, words}`). */
 export function extendShed(host: string, name: string, hours: number): Promise<{ shed: Shed; cloud_row: unknown }> {

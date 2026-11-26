@@ -127,6 +127,15 @@ fn sheds_payload_at(r: &Reachability, now: i64) -> Value {
     json!({ "sheds": sheds, "host_errors": r.host_errors })
 }
 
+/// `shed.extend`'s `{host?, name, hours}`, typed before anything is sent: a `host`
+/// that is present but not a string is `bad_request`, never read as the default
+/// host (an extend adds billed hours, so a wrong target costs).
+fn extend_params(params: &Value) -> Result<(Option<&str>, &str, i64), (String, String)> {
+    let host = opt_str(params, "host")?;
+    let name = req_str(params, "name")?;
+    Ok((host, name, extend_hours(params)?))
+}
+
 /// An extend's `hours` as a whole number. Its range (1 to 720) is checked by
 /// [`Backend::extend`], the one check the Tauri command shares, before anything is
 /// sent.
@@ -1598,9 +1607,7 @@ impl Handler {
     /// 041): `{shed, cloud_row}`, or the refusal as `(code, words)` (an
     /// account-service refusal's code with its fixed words).
     async fn shed_extend(&self, params: &Value) -> Result<Value, (String, String)> {
-        let name = req_str(params, "name")?;
-        let host = params.get("host").and_then(Value::as_str);
-        let hours = extend_hours(params)?;
+        let (host, name, hours) = extend_params(params)?;
         self.backend
             .extend(host, name, hours)
             .await
@@ -2796,7 +2803,7 @@ mod tests {
         assert_eq!(row["extend_unresolved_h"], 6);
         assert_eq!(
             row["extend_unresolved_words"],
-            "An extend by 6 h: not known whether it was applied; it settles within a few minutes"
+            "An extend by 6 h: not known whether it was applied; Extend stays unavailable until that is known"
         );
     }
 
@@ -2978,6 +2985,31 @@ mod tests {
         );
         assert_eq!(extend_hours(&json!({})).unwrap_err().0, "bad_request");
         assert_eq!(extend_hours(&json!({"hours": 720})).unwrap(), 720);
+    }
+
+    /// A `host` that is not a string is refused, never read as the default host.
+    #[test]
+    fn extend_params_refuse_a_host_that_is_not_a_string() {
+        for host in [json!(17), json!(true), json!(["mock"]), json!({})] {
+            let params = json!({"host": host, "name": "widgets", "hours": 6});
+            assert_eq!(
+                extend_params(&params).unwrap_err().0,
+                "bad_request",
+                "{params}"
+            );
+        }
+        assert_eq!(
+            extend_params(&json!({"name": "widgets", "hours": 6})).unwrap(),
+            (None, "widgets", 6)
+        );
+        assert_eq!(
+            extend_params(&json!({"host": null, "name": "widgets", "hours": 6})).unwrap(),
+            (None, "widgets", 6)
+        );
+        assert_eq!(
+            extend_params(&json!({"host": "cloud-a", "name": "widgets", "hours": 6})).unwrap(),
+            (Some("cloud-a"), "widgets", 6)
+        );
     }
 
     /// Hours out of range are refused by the one check the IPC op and the Tauri

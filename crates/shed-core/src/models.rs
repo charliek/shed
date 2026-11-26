@@ -226,6 +226,17 @@ pub fn unknown_cloud_refusal_words(code: &str) -> String {
     }
 }
 
+/// The words for a create refused by a server whose backend could not be told (its
+/// `/api/info` read failed) with a code [`refusal_words`] has no words for: fixed,
+/// naming the code, never the server's message, and not calling it a cloud refusal.
+pub fn unknown_refusal_words(code: &str) -> String {
+    if code.is_empty() {
+        "the create was refused".to_string()
+    } else {
+        format!("the create was refused ({code})")
+    }
+}
+
 /// The prefix of the account service's refusal codes (`COMPUTE_LIMIT_REACHED`,
 /// `COMPUTE_POLICY_REFUSED`, …).
 pub const COMPUTE_CODE_PREFIX: &str = "COMPUTE_";
@@ -304,13 +315,49 @@ pub struct CloudCounts {
 
 /// `GET /api/cloud/usage`: the caller's machines against the account service's
 /// limit (`None` for a caller who is not a person of the service: a local admin,
-/// a service client) and the organization's.
+/// a service client; the server sends `null`) and the organization's.
+///
+/// Decoded strictly: a `person` that is neither `null` nor a count object, and an
+/// `org` that is missing or not one (a member of the wrong type, a fractional
+/// number), fail the whole answer, so an invalid scope is shown as no usage at
+/// all, never as a count or as a caller who is not a person. A count object's
+/// missing members are 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CloudUsage {
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "usage_person")]
     pub person: Option<CloudCounts>,
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(deserialize_with = "usage_org")]
     pub org: CloudCounts,
+}
+
+/// One scope of [`CloudUsage`]: a JSON object whose members are integers (an array,
+/// which serde would read positionally, is refused too).
+fn usage_scope<E: serde::de::Error>(v: Value) -> Result<CloudCounts, E> {
+    match v {
+        Value::Object(_) => serde_json::from_value(v).map_err(E::custom),
+        other => Err(E::custom(format!(
+            "a usage scope is an object of counts, not {other}"
+        ))),
+    }
+}
+
+/// [`CloudUsage::person`]: `null` (or absent) is a caller who is not a person.
+fn usage_person<'de, D>(d: D) -> Result<Option<CloudCounts>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        v => usage_scope(v).map(Some),
+    }
+}
+
+/// [`CloudUsage::org`]: always a scope.
+fn usage_org<'de, D>(d: D) -> Result<CloudCounts, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    usage_scope(Value::deserialize(d)?)
 }
 
 /// The `{"sheds": [...] | null}` wrapper for `GET /api/sheds`. `null` and an
@@ -1408,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_usage_tolerates_a_missing_person_and_odd_members() {
+    fn cloud_usage_reads_a_missing_person_and_refuses_an_invalid_scope() {
         let u: CloudUsage = serde_json::from_str(r#"{"org":{"machines":3,"max":10}}"#).unwrap();
         assert_eq!(u.person, None);
         assert_eq!(
@@ -1420,8 +1467,23 @@ mod tests {
                 max: 10
             }
         );
-        let u: CloudUsage = serde_json::from_str(r#"{"person":"me","org":null}"#).unwrap();
-        assert_eq!(u, CloudUsage::default());
+        let u: CloudUsage =
+            serde_json::from_str(r#"{"person":null,"org":{"machines":3,"max":10}}"#).unwrap();
+        assert_eq!(u.person, None, "null: a caller who is not a person");
+        // An invalid scope fails the answer: never a count, never the non-person
+        // state.
+        for raw in [
+            r#"{"person":"me","org":{"machines":3,"max":10}}"#,
+            r#"{"person":{"machines":"2"},"org":{"machines":3,"max":10}}"#,
+            r#"{"person":{"machines":1,"max":2},"org":null}"#,
+            r#"{"person":{"machines":1,"max":2}}"#,
+            r#"{"org":{"machines":3,"max":100.5}}"#,
+            r#"{"org":[]}"#,
+            r#"{"org":[3,1,2,10]}"#,
+            r#"{"person":[1,1,0,2],"org":{"machines":3,"max":10}}"#,
+        ] {
+            assert!(serde_json::from_str::<CloudUsage>(raw).is_err(), "{raw}");
+        }
     }
 
     #[test]

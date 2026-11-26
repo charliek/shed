@@ -18,7 +18,14 @@
 //! * the shed is gone from its server's listing, or is another incarnation;
 //! * [`EXTEND_UNKNOWN_MAX_S`] after the unknown outcome, whatever the listing says.
 //!
-//! A listing that fails (authentication, transport, any error) settles nothing.
+//! A listing that fails (authentication, transport, any error) settles nothing, and
+//! a listing settles only the outcomes recorded before it was sent
+//! ([`ExtendBook::listing_mark`]): one sent earlier may not list a shed newer than
+//! it, which would look gone.
+//!
+//! An extend takes its shed's turn ([`ExtendBook::reserve`]) before it reads the
+//! lease's end it is measured from, so no other extend of the shed can move the
+//! lease between that read and the send.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,9 +34,9 @@ use shed_core::models::Shed;
 
 use crate::cloud::secs;
 
-/// How long after an unknown outcome a lease short of its old end plus the hours
+/// How long after an unknown outcome a lease whose end is still exactly its old end
 /// means the extend was not applied: two of the server's sweeps (60 s each) and a
-/// margin.
+/// margin. The time passing settles nothing by itself.
 pub const EXTEND_SETTLE_S: i64 = 150;
 
 /// The longest an unknown outcome is kept: the account service keeps an extend's
@@ -102,16 +109,39 @@ pub fn settled(u: &UnknownExtend, observed: Option<&Shed>, now: i64, settle_s: i
     applied || not_applied
 }
 
+/// An unknown outcome as the book keeps it: the record and its place in the order
+/// outcomes were recorded in, which a listing's mark ([`ExtendBook::listing_mark`])
+/// is compared with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Recorded {
+    u: UnknownExtend,
+    seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Slot {
-    /// An extend is being sent (its own retries run under one request id).
-    InFlight,
-    Unknown(UnknownExtend),
+    /// An extend's turn is taken: the shed is being read, or the extend sent (its
+    /// own retries run under one request id). `held` is an earlier extend's unknown
+    /// outcome, kept while the read that may settle it is made. `reread`: a listing
+    /// settled `held` while the read was out, so that read may predate the lease
+    /// moving and is no baseline ([`ExtendBook::admit`] asks for another).
+    InFlight {
+        held: Option<Recorded>,
+        reread: bool,
+    },
+    Unknown(Recorded),
+}
+
+#[derive(Default)]
+struct Slots {
+    by_shed: HashMap<(String, String), Slot>,
+    /// How many unknown outcomes have been recorded: the last one's `seq`.
+    recorded: u64,
 }
 
 /// Each shed's extend in flight or with an unknown outcome, by (server, shed name).
 pub struct ExtendBook {
-    slots: Mutex<HashMap<(String, String), Slot>>,
+    slots: Mutex<Slots>,
     clock: Clock,
     settle_s: i64,
 }
@@ -122,10 +152,26 @@ impl Default for ExtendBook {
     }
 }
 
-/// Why [`ExtendBook::begin`] refused: an earlier extend of the shed is in flight or
-/// has an unknown outcome.
+/// Why [`ExtendBook::reserve`] or [`ExtendBook::admit`] refused: an earlier extend
+/// of the shed is in flight or has an unknown outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy;
+
+/// Why [`ExtendBook::admit`] did not let an extend through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAdmitted {
+    /// An earlier extend's outcome is still unknown (put back), or the turn is not
+    /// this extend's: nothing may be sent.
+    Busy,
+    /// A listing settled the earlier extend while the shed was being read: that read
+    /// may predate the lease moving. The turn is kept; read the shed again and admit
+    /// that read instead.
+    Reread,
+}
+
+/// What a listing is compared with ([`ExtendBook::listing_mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListingMark(u64);
 
 impl ExtendBook {
     pub fn with_clock(clock: Clock) -> Self {
@@ -146,72 +192,166 @@ impl ExtendBook {
         (self.clock)()
     }
 
-    /// Whether an extend of `name` on `host` is in flight (the cheap check before
-    /// the shed is read).
+    /// Whether an extend of `name` on `host` has its turn (being read or sent).
     pub fn in_flight(&self, host: &str, name: &str) -> bool {
         matches!(
-            self.slots.lock().unwrap().get(&key(host, name)),
-            Some(Slot::InFlight)
+            self.slots.lock().unwrap().by_shed.get(&key(host, name)),
+            Some(Slot::InFlight { .. })
         )
     }
 
-    /// Whether `name` on `host` has an unknown outcome (in flight or not).
+    /// Whether `name` on `host` has an unknown outcome (held by a read or not).
     pub fn has_unknown(&self, host: &str, name: &str) -> bool {
-        matches!(
-            self.slots.lock().unwrap().get(&key(host, name)),
-            Some(Slot::Unknown(_))
-        )
+        self.recorded(host, name).is_some()
     }
 
-    /// Start an extend of `observed` (the shed as just read) on `host`: an earlier
-    /// unknown outcome is first settled by `observed` if it can be; one still
-    /// unsettled, or an extend in flight, refuses ([`Busy`]). On `Ok` the slot is in
-    /// flight until [`Self::finish`].
-    pub fn begin(&self, host: &str, observed: &Shed) -> Result<(), Busy> {
-        let now = self.now();
+    /// Take the turn of an extend of `name` on `host`, before the shed is read: an
+    /// extend in flight refuses ([`Busy`]); an earlier unknown outcome is held, to
+    /// be settled by that read ([`Self::admit`]) or put back ([`Self::release`]).
+    /// Taken before the read, so no other extend can move the lease between the
+    /// read and the send and leave this one's baseline stale.
+    pub fn reserve(&self, host: &str, name: &str) -> Result<(), Busy> {
         let mut slots = self.slots.lock().unwrap();
-        let k = key(host, &observed.name);
-        match slots.get(&k) {
-            Some(Slot::InFlight) => return Err(Busy),
-            Some(Slot::Unknown(u)) if !settled(u, Some(observed), now, self.settle_s) => {
-                return Err(Busy)
+        let k = key(host, name);
+        let held = match slots.by_shed.remove(&k) {
+            Some(s @ Slot::InFlight { .. }) => {
+                slots.by_shed.insert(k, s);
+                return Err(Busy);
             }
-            _ => {}
-        }
-        slots.insert(k, Slot::InFlight);
+            Some(Slot::Unknown(r)) => Some(r),
+            None => None,
+        };
+        slots.by_shed.insert(
+            k,
+            Slot::InFlight {
+                held,
+                reread: false,
+            },
+        );
         Ok(())
     }
 
-    /// End the extend [`Self::begin`] started: `unknown` records its unknown
-    /// outcome (stamped now); `None` (an answer, or nothing sent) frees the slot.
+    /// Let the reserved extend of `name` on `host` be sent, `observed` being the
+    /// shed as read after [`Self::reserve`]: an earlier unknown outcome it held is
+    /// first settled by `observed` if it can be; one still unsettled is put back and
+    /// refuses ([`NotAdmitted::Busy`]). A read during which a listing settled the
+    /// held outcome is no baseline ([`NotAdmitted::Reread`], the turn kept). On `Ok`
+    /// the turn is the extend's until [`Self::finish`].
+    pub fn admit(&self, host: &str, name: &str, observed: &Shed) -> Result<(), NotAdmitted> {
+        let now = self.now();
+        let mut slots = self.slots.lock().unwrap();
+        let k = key(host, name);
+        let admitted = Slot::InFlight {
+            held: None,
+            reread: false,
+        };
+        match slots.by_shed.remove(&k) {
+            Some(Slot::InFlight { held: None, reread }) => {
+                slots.by_shed.insert(k, admitted);
+                if reread {
+                    return Err(NotAdmitted::Reread);
+                }
+            }
+            Some(Slot::InFlight { held: Some(r), .. }) => {
+                if !settled(&r.u, Some(observed), now, self.settle_s) {
+                    slots.by_shed.insert(k, Slot::Unknown(r));
+                    return Err(NotAdmitted::Busy);
+                }
+                slots.by_shed.insert(k, admitted);
+            }
+            other => {
+                if let Some(s) = other {
+                    slots.by_shed.insert(k, s);
+                }
+                return Err(NotAdmitted::Busy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Give back a turn [`Self::reserve`] took when nothing was sent (the read
+    /// failed): an unknown outcome it held is put back, unsettled (`true`).
+    pub fn release(&self, host: &str, name: &str) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let k = key(host, name);
+        match slots.by_shed.remove(&k) {
+            Some(Slot::InFlight { held: Some(r), .. }) => {
+                slots.by_shed.insert(k, Slot::Unknown(r));
+                true
+            }
+            Some(Slot::InFlight { held: None, .. }) => false,
+            Some(s) => {
+                slots.by_shed.insert(k, s);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// End the extend [`Self::admit`] let through: `unknown` records its unknown
+    /// outcome (stamped now, and after every listing mark taken so far); `None` (an
+    /// answer) frees the slot.
     pub fn finish(&self, host: &str, name: &str, unknown: Option<UnknownExtend>) {
         let mut slots = self.slots.lock().unwrap();
         let k = key(host, name);
-        if slots.get(&k) != Some(&Slot::InFlight) {
+        if !matches!(
+            slots.by_shed.get(&k),
+            Some(Slot::InFlight { held: None, .. })
+        ) {
             return;
         }
         match unknown {
             Some(u) => {
                 let at = self.now();
-                slots.insert(k, Slot::Unknown(UnknownExtend { at, ..u }));
+                slots.recorded += 1;
+                let seq = slots.recorded;
+                slots.by_shed.insert(
+                    k,
+                    Slot::Unknown(Recorded {
+                        u: UnknownExtend { at, ..u },
+                        seq,
+                    }),
+                );
             }
             None => {
-                slots.remove(&k);
+                slots.by_shed.remove(&k);
             }
         }
     }
 
-    /// Settle what `host`'s listing (`rows`, every shed it listed) shows. Called only
-    /// for a listing that succeeded: a failed one settles nothing.
-    pub fn observe(&self, host: &str, rows: &[Shed]) {
+    /// The mark to take before a listing is sent and hand to [`Self::observe`] with
+    /// what it showed: a listing settles only the outcomes recorded before it was
+    /// sent, since one sent earlier may predate the extend (a shed not yet listed
+    /// would look gone).
+    pub fn listing_mark(&self) -> ListingMark {
+        ListingMark(self.slots.lock().unwrap().recorded)
+    }
+
+    /// Settle what `host`'s listing (`rows`, every shed it listed), sent after
+    /// `mark` was taken, shows. Called only for a listing that succeeded: a failed
+    /// one settles nothing.
+    pub fn observe(&self, host: &str, rows: &[Shed], mark: ListingMark) {
         let now = self.now();
+        let settle_s = self.settle_s;
+        let settles = |name: &str, r: &Recorded| {
+            r.seq <= mark.0 && settled(&r.u, rows.iter().find(|s| s.name == name), now, settle_s)
+        };
         let mut slots = self.slots.lock().unwrap();
-        slots.retain(|(h, name), slot| match slot {
-            Slot::Unknown(u) if h == host => {
-                let shed = rows.iter().find(|s| &s.name == name);
-                !settled(u, shed, now, self.settle_s)
+        slots.by_shed.retain(|(h, name), slot| {
+            if h != host {
+                return true;
             }
-            _ => true,
+            match slot {
+                Slot::Unknown(r) => !settles(name, r),
+                Slot::InFlight { held, reread } => {
+                    if held.as_ref().is_some_and(|r| settles(name, r)) {
+                        // The read out now may predate what settled it.
+                        *held = None;
+                        *reread = true;
+                    }
+                    true
+                }
+            }
         });
     }
 
@@ -220,20 +360,34 @@ impl ExtendBook {
         self.slots
             .lock()
             .unwrap()
+            .by_shed
             .iter()
-            .filter_map(|(k, s)| match s {
-                Slot::Unknown(u) => Some((k.clone(), (u.incarnation.clone(), u.hours))),
-                Slot::InFlight => None,
+            .filter_map(|(k, s)| {
+                unknown_of(s).map(|r| (k.clone(), (r.u.incarnation.clone(), r.u.hours)))
             })
             .collect()
     }
 
     /// The hours of `name`'s extend on `host` whose outcome is not known, if any.
     pub fn unknown_hours(&self, host: &str, name: &str) -> Option<u32> {
-        match self.slots.lock().unwrap().get(&key(host, name)) {
-            Some(Slot::Unknown(u)) => Some(u.hours),
-            _ => None,
-        }
+        self.recorded(host, name).map(|u| u.hours)
+    }
+
+    fn recorded(&self, host: &str, name: &str) -> Option<UnknownExtend> {
+        self.slots
+            .lock()
+            .unwrap()
+            .by_shed
+            .get(&key(host, name))
+            .and_then(unknown_of)
+            .map(|r| r.u.clone())
+    }
+}
+
+fn unknown_of(s: &Slot) -> Option<&Recorded> {
+    match s {
+        Slot::Unknown(r) | Slot::InFlight { held: Some(r), .. } => Some(r),
+        Slot::InFlight { held: None, .. } => None,
     }
 }
 
@@ -361,6 +515,12 @@ mod tests {
         ));
     }
 
+    /// Reserve and admit at once (the shed read in between is `observed`).
+    fn begin(b: &ExtendBook, host: &str, observed: &Shed) -> Result<(), Busy> {
+        b.reserve(host, &observed.name)?;
+        b.admit(host, &observed.name, observed).map_err(|_| Busy)
+    }
+
     fn book() -> (ExtendBook, Arc<AtomicI64>) {
         let t = Arc::new(AtomicI64::new(T0));
         let c = t.clone();
@@ -374,8 +534,8 @@ mod tests {
     fn the_book_refuses_while_unknown_and_settles_by_listing() {
         let (b, t) = book();
         let w = shed("w", "c1", Some(BEFORE));
-        b.begin("cloud-a", &w).unwrap();
-        assert_eq!(b.begin("cloud-a", &w), Err(Busy), "in flight");
+        begin(&b, "cloud-a", &w).unwrap();
+        assert_eq!(begin(&b, "cloud-a", &w), Err(Busy), "in flight");
         assert!(b.in_flight("cloud-a", "w"));
         b.finish("cloud-a", "w", Some(unknown(6, 0)));
         assert_eq!(b.unknown_hours("cloud-a", "w"), Some(6));
@@ -384,15 +544,15 @@ mod tests {
             ("c1".to_string(), 6)
         );
         // Still at its old end, too soon: refused, kept.
-        assert_eq!(b.begin("cloud-a", &w), Err(Busy));
-        b.observe("cloud-a", std::slice::from_ref(&w));
+        assert_eq!(begin(&b, "cloud-a", &w), Err(Busy));
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(b.has_unknown("cloud-a", "w"));
         // Another server's listing settles nothing here.
-        b.observe("other", &[]);
+        b.observe("other", &[], b.listing_mark());
         assert!(b.has_unknown("cloud-a", "w"));
         // After the settle time the same end: not applied, settled.
         t.store(T0 + EXTEND_SETTLE_S, Ordering::SeqCst);
-        b.observe("cloud-a", std::slice::from_ref(&w));
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(!b.has_unknown("cloud-a", "w"));
         assert!(b.snapshot().is_empty());
     }
@@ -401,10 +561,10 @@ mod tests {
     fn a_begin_settles_an_applied_one_by_the_shed_it_read() {
         let (b, _) = book();
         let w = shed("w", "c1", Some(BEFORE));
-        b.begin("cloud-a", &w).unwrap();
+        begin(&b, "cloud-a", &w).unwrap();
         b.finish("cloud-a", "w", Some(unknown(6, 0)));
         let moved = shed("w", "c1", Some(BEFORE + 6 * 3600));
-        b.begin("cloud-a", &moved).unwrap();
+        begin(&b, "cloud-a", &moved).unwrap();
         assert!(b.in_flight("cloud-a", "w"));
         b.finish("cloud-a", "w", None);
         assert!(b.snapshot().is_empty());
@@ -415,22 +575,22 @@ mod tests {
         let (b, _) = book();
         let w = shed("w", "c1", Some(BEFORE));
         for observed in [vec![], vec![shed("w", "c2", Some(BEFORE))]] {
-            b.begin("cloud-a", &w).unwrap();
+            begin(&b, "cloud-a", &w).unwrap();
             b.finish("cloud-a", "w", Some(unknown(6, 0)));
-            b.observe("cloud-a", &observed);
+            b.observe("cloud-a", &observed, b.listing_mark());
             assert!(!b.has_unknown("cloud-a", "w"), "{observed:?}");
         }
         // A begin for another incarnation is not refused.
-        b.begin("cloud-a", &w).unwrap();
+        begin(&b, "cloud-a", &w).unwrap();
         b.finish("cloud-a", "w", Some(unknown(6, 0)));
-        b.begin("cloud-a", &shed("w", "c2", Some(BEFORE))).unwrap();
+        begin(&b, "cloud-a", &shed("w", "c2", Some(BEFORE))).unwrap();
     }
 
     #[test]
     fn the_age_limit_clears_it() {
         let (b, t) = book();
         let w = shed("w", "c1", None);
-        b.begin("cloud-a", &w).unwrap();
+        begin(&b, "cloud-a", &w).unwrap();
         b.finish(
             "cloud-a",
             "w",
@@ -440,11 +600,106 @@ mod tests {
             }),
         );
         t.store(T0 + EXTEND_UNKNOWN_MAX_S - 1, Ordering::SeqCst);
-        b.observe("cloud-a", std::slice::from_ref(&w));
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(b.has_unknown("cloud-a", "w"));
         t.store(T0 + EXTEND_UNKNOWN_MAX_S, Ordering::SeqCst);
-        b.observe("cloud-a", std::slice::from_ref(&w));
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(!b.has_unknown("cloud-a", "w"));
+    }
+
+    /// A listing sent before an unknown outcome was recorded settles nothing of it
+    /// (the shed it does not list may simply be newer than the listing); one sent
+    /// after does.
+    #[test]
+    fn a_listing_sent_before_the_outcome_was_recorded_settles_nothing() {
+        let (b, _) = book();
+        let w = shed("w", "c1", Some(BEFORE));
+        let early = b.listing_mark();
+        begin(&b, "cloud-a", &w).unwrap();
+        b.finish("cloud-a", "w", Some(unknown(6, 0)));
+        b.observe("cloud-a", &[], early);
+        assert!(
+            b.has_unknown("cloud-a", "w"),
+            "an earlier listing settles nothing"
+        );
+        b.observe("cloud-a", &[], b.listing_mark());
+        assert!(!b.has_unknown("cloud-a", "w"), "a later one shows it gone");
+    }
+
+    /// The turn is taken before the shed is read: a second extend is refused from
+    /// then on; a read that fails gives the turn back, an unknown outcome it held
+    /// put back unsettled; a listing during the read can settle a held one.
+    #[test]
+    fn the_turn_is_taken_before_the_read() {
+        let (b, t) = book();
+        let w = shed("w", "c1", Some(BEFORE));
+        b.reserve("cloud-a", "w").unwrap();
+        assert_eq!(b.reserve("cloud-a", "w"), Err(Busy), "reading");
+        assert!(!b.release("cloud-a", "w"), "nothing held");
+        assert!(!b.in_flight("cloud-a", "w"));
+
+        begin(&b, "cloud-a", &w).unwrap();
+        b.finish("cloud-a", "w", Some(unknown(6, 0)));
+        b.reserve("cloud-a", "w").unwrap();
+        assert_eq!(
+            b.unknown_hours("cloud-a", "w"),
+            Some(6),
+            "held, still shown"
+        );
+        assert_eq!(b.reserve("cloud-a", "w"), Err(Busy));
+        assert!(b.release("cloud-a", "w"), "the read failed: put back");
+        assert_eq!(b.unknown_hours("cloud-a", "w"), Some(6));
+        assert!(!b.in_flight("cloud-a", "w"));
+        // Read, still at its old end, too soon: refused and put back.
+        b.reserve("cloud-a", "w").unwrap();
+        assert_eq!(b.admit("cloud-a", "w", &w), Err(NotAdmitted::Busy));
+        assert!(b.has_unknown("cloud-a", "w") && !b.in_flight("cloud-a", "w"));
+        // A listing during the read settles the held one; that read is no
+        // baseline, so the shed is read again (the turn kept) and that read admits.
+        b.reserve("cloud-a", "w").unwrap();
+        t.store(T0 + EXTEND_SETTLE_S, Ordering::SeqCst);
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
+        assert!(!b.has_unknown("cloud-a", "w") && b.in_flight("cloud-a", "w"));
+        assert_eq!(b.admit("cloud-a", "w", &w), Err(NotAdmitted::Reread));
+        assert!(
+            b.in_flight("cloud-a", "w"),
+            "the turn is kept for the reread"
+        );
+        b.admit("cloud-a", "w", &w).unwrap();
+        b.finish("cloud-a", "w", None);
+        assert!(!b.in_flight("cloud-a", "w"));
+    }
+
+    /// Extend A's outcome is unknown at end E; extend B takes the turn (holding A)
+    /// and its read comes back at E, but a listing showing A applied (E + 6 h)
+    /// settled A while B's read was out. B's read is stale: it is never admitted as
+    /// B's baseline (else B, unknown in turn, would be settled as applied by A's
+    /// move at once). B reads again and is measured from the fresh end.
+    #[test]
+    fn a_read_out_while_a_listing_settled_the_held_one_is_read_again() {
+        let (b, _) = book();
+        let at_e = shed("w", "c1", Some(BEFORE));
+        let applied = shed("w", "c1", Some(BEFORE + 6 * 3600));
+        begin(&b, "cloud-a", &at_e).unwrap();
+        b.finish("cloud-a", "w", Some(unknown(6, 0))); // A
+        b.reserve("cloud-a", "w").unwrap(); // B's turn; its read goes out
+        b.observe("cloud-a", std::slice::from_ref(&applied), b.listing_mark());
+        assert!(!b.has_unknown("cloud-a", "w"), "A settled as applied");
+        // B's read, sent before that listing, comes back at E.
+        assert_eq!(b.admit("cloud-a", "w", &at_e), Err(NotAdmitted::Reread));
+        // B reads again: E + 6 h, its baseline.
+        b.admit("cloud-a", "w", &applied).unwrap();
+        b.finish(
+            "cloud-a",
+            "w",
+            Some(UnknownExtend {
+                before: lease_end(&applied),
+                ..unknown(6, 0)
+            }),
+        );
+        // A listing still at A's E + 6 h does not settle B as applied.
+        b.observe("cloud-a", std::slice::from_ref(&applied), b.listing_mark());
+        assert_eq!(b.unknown_hours("cloud-a", "w"), Some(6));
     }
 
     #[test]

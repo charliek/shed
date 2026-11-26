@@ -123,7 +123,7 @@ def test_an_extend_refusal_has_its_code_and_fixed_words(client, mock, code):
     assert e.value.message and EXTEND_REFUSAL_MESSAGE not in e.value.message, e.value.message
     assert len(mock.extend_requests()) == (3 if unknown else 1)
     if unknown:
-        assert e.value.message == "not known whether it was applied; it settles within a few minutes"
+        assert e.value.message == "not known whether it was applied; Extend stays unavailable until that is known"
         # Until a listing settles it, every extend of the shed is refused here, unsent.
         with pytest.raises(ShedError) as e:
             client.call("shed.extend", {"name": "cloud-ok", "hours": 6})

@@ -428,6 +428,8 @@ class MockShedServer:
         self._extend_dropped = 0
         # Set: the next create streams this `error` event data (`refuse_create`).
         self.create_error_data: str | None = None
+        # The next deletes refused with this status, nothing deleted (`refuse_deletes`).
+        self._delete_refusals: list[int] = []
         # Holds (`hold_extend` / `hold_usage`): the next request of each waits for its
         # gate before it is answered; the counters say how many arrived and were answered.
         self._extend_hold: threading.Event | None = None
@@ -589,6 +591,7 @@ class MockShedServer:
             self._extend_lost = 0
             self._extend_dropped = 0
             self.create_error_data = None
+            self._delete_refusals = []
             holds, self._holds = self._holds, []
             self._extend_hold = self._usage_hold = None
             self._extend_arrived = self._usage_arrived = self._usage_answered = 0
@@ -744,6 +747,16 @@ class MockShedServer:
             end = _parse_utc(lease["expires_at"])
             assert end is not None, lease
             lease["expires_at"] = _utc(end + timedelta(hours=hours))
+
+    def refuse_deletes(self, n: int, status: int = 503) -> None:
+        """The next `n` deletes are answered `status` with an API error and delete
+        nothing."""
+        with self._lock:
+            self._delete_refusals.extend([status] * n)
+
+    def _delete_refusal(self) -> int | None:
+        with self._lock:
+            return self._delete_refusals.pop(0) if self._delete_refusals else None
 
     def refuse_create(self, data: str = CREATE_REFUSED_DATA) -> None:
         """Every create streams one `error` event with `data` (by default the recorded
@@ -1826,6 +1839,10 @@ class MockShedServer:
                     return
                 parts = self.path.strip("/").split("/")
                 if len(parts) == 3 and parts[:2] == ["api", "sheds"]:
+                    refused = state._delete_refusal()
+                    if refused is not None:
+                        self._send(refused, _api_error("COMPUTE_UNAVAILABLE", "SERVER TEXT"))
+                        return
                     self._send(200 if state._delete(parts[2]) else 404, {"ok": True})
                 else:
                     self._send(404, {"error": "not found"})
