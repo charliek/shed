@@ -49,7 +49,8 @@ shedctl (no internal deps)
   `feed: "activity", watch: false` for an opencode tab. `RELEASE_PIN` lives in
   `src/bootstrap/source.rs`. Android-clean.
 - **`shed-app`** — toolkit-free shed client core: `Backend`, `AuthModeRegistry`,
-  `timefmt`. No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
+  `timefmt`, `extend`, `cloud` (plan 041: a cloud shed's `CloudRow` from its `cloud`, the
+  server's features and an injected now, so every shell only draws it; its refusal words are shed-core's `models::refusal_words`, which the create stream's error uses too). `extend` (an extend with an unknown outcome, every send unanswered or `5xx`, kept per shed incarnation and settled by observation of the listings sent after it was recorded: applied (the end at least the old end plus the hours), not applied (the end still exactly the old end, 150 s or more on; elapsed time alone settles nothing, and an end moved by fewer hours waits for the 24 h limit), gone or replaced, 24 h; until then Extend stays unavailable and the shed's extends are refused unsent; an extend takes its shed's turn before it reads the old end; `Backend::extend` and `refresh` drive it). No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
   `saphyr-parser`.**
 - **`shed-desktop-core`** — toolkit-free **shed-only** runtime the Tauri shell
   (and a future iced UI) hosts: `ShedId` (`roost:<server>/<shed>`),
@@ -373,7 +374,10 @@ shedctl (no internal deps)
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that the Rust decoders assert against — keep them
-byte-real, not hand-trimmed.
+byte-real, not hand-trimmed. `fixtures/cloud/` is written by shed-server's own handlers
+over the reference compute service (`UPDATE_CLIENT_FIXTURES=1 go test ./internal/remote/
+-run TestCloudClientFixtures`; without the variable the test fails when a file's shape
+no longer matches the server's).
 `fixtures/roost-vectors/` is a **vendored copy** of roost's own golden IPC vectors at the
 pinned rev (see below); its README carries the source sha and roost's never-semantically-edit
 rule.

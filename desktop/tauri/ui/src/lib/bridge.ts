@@ -38,6 +38,10 @@ export type Shed = {
   /** When this incarnation of the shed was created, verbatim: what names it to the
    *  egress feed (`egress.recent`). */
   created_at?: string | null;
+  /** What a cloud shed's row shows and offers (plan 041), decided in the core
+   *  (`shed_app::CloudRow`); null for any other shed. Read with `readCloudRow`
+   *  (`lib/cloud`). */
+  cloud_row?: unknown;
 };
 
 /** Why a host couldn't be listed. `other` is the open set (rendered generically). */
@@ -180,6 +184,15 @@ export type ShedRowRendered = {
   controls: { spinner: boolean; buttons: string[] } | null;
   /** The delivery badge's text (plan 039 A7), or null when the row shows none. */
   delivery_badge: string | null;
+  /** The runtime tag's text (`vz`, `firecracker`, `Cloud`), or null when none. */
+  tag: string | null;
+  /** The tag's tint: `vz`, `fc` (every other runtime) or `cloud`; null with no tag. */
+  tag_tint: string | null;
+  /** The meta line's whole text (`2 vCPU · 8 GB · running · deleted in 5h 10m`). */
+  meta: string | null;
+  /** A cloud row's lease words as drawn (plan 041): `{text, state, amber}`, or
+   *  null on any other row. */
+  lease: { text: string | null; state: string | null; amber: boolean } | null;
 };
 
 /** The reported shed rows: each row with its [ShedRowRendered]. A card is found
@@ -201,6 +214,15 @@ function withRenderedRows(sheds: Shed[]): (Shed & ShedRowRendered)[] {
       ...s,
       status_text: card?.querySelector("[data-shed-status]")?.textContent ?? null,
       delivery_badge: card?.querySelector("[data-shed-delivery-badge]")?.textContent ?? null,
+      tag: card?.querySelector("[data-shed-tag]")?.textContent ?? null,
+      tag_tint: card?.querySelector<HTMLElement>("[data-shed-tag]")?.dataset.shedTag ?? null,
+      meta: card?.querySelector("[data-shed-meta]")?.textContent ?? null,
+      lease: (() => {
+        const el = card?.querySelector<HTMLElement>("[data-shed-lease]");
+        return el
+          ? { text: el.textContent, state: el.dataset.shedLease ?? null, amber: el.dataset.leaseTone === "amber" }
+          : null;
+      })(),
       controls: controls
         ? {
             spinner: !!controls.querySelector(".animate-spin"),
@@ -458,6 +480,43 @@ export function useUiBridge(
 export async function shedAction(action: string, name: string, host: string): Promise<void> {
   if (!inTauri()) return;
   await invoke("shed_action", { action, name, host });
+}
+
+/** Delete a shed, rejecting with the error's words when it fails (a cloud row's
+ *  confirmed Delete, which shows the failure in its question). */
+export function deleteShedStrict(name: string, host: string): Promise<void> {
+  if (!inTauri()) return Promise.resolve();
+  return invokeStrict("shed_action", { action: "delete", name, host });
+}
+
+/** Move a cloud shed's lease `hours` later (plan 041): `{shed, cloud_row}`. Rejects
+ *  with the refusal (`shed_app::CloudFailure`, `{code, reason, status, words}`). */
+export function extendShed(host: string, name: string, hours: number): Promise<{ shed: Shed; cloud_row: unknown }> {
+  return invokeStrict("extend_shed", { host, name, hours });
+}
+
+/** A remote server's cloud usage line (plan 041): `{host, usage, words}`. Rejects with
+ *  the refusal (`FEATURE_UNSUPPORTED` on a server without compute). */
+export function fetchCloudUsage(host: string): Promise<{ host: string; words: string }> {
+  return invokeStrict("cloud_usage", { host });
+}
+
+/** What the Sheds pane's cloud parts rendered (plan 041 B2), each under its own key:
+ *  `shed_cloud` (the open cloud detail), `cloud_usage` (the usage lines) and
+ *  `cloud_delete` (the delete confirmation); null when not shown. `dashboard.dump`
+ *  relays them as its `cloud`. */
+export function reportShedCloud(key: "shed_cloud" | "cloud_usage" | "cloud_delete", value: unknown): void {
+  if (!inTauri()) return;
+  void invoke("ui_report", { snapshot: { [key]: value } });
+}
+
+/** What the New-shed sheet rendered (`{phase, name, host, state, error, doors}`: `form`
+ *  or `progress`, its Name and Host, the create's state, the error line it shows, and
+ *  whether its doors' listeners are attached), or null once it closes.
+ *  `create_sheet.dump` relays it. */
+export function reportCreateSheet(value: unknown): void {
+  if (!inTauri()) return;
+  void invoke("ui_report", { snapshot: { create_sheet: value } });
 }
 
 /** Disk-usage shapes (shed-core's df models, serialized). */

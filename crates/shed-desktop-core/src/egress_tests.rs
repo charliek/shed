@@ -389,6 +389,8 @@ async fn a_listing_drops_deleted_and_replaced_incarnations() {
             &shed_core::http::ShedError::Transport("refused".into()),
         )],
         delivery: HashMap::new(),
+        features: HashMap::new(),
+        extend_unresolved: HashMap::new(),
     };
     // `web` was deleted and created again (by someone else) between two listings.
     feed.observe(&listing(vec![

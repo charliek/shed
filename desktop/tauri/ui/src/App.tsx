@@ -37,6 +37,11 @@ import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstra
 import { DeliveryBadge, ShedDeliveryDetail, provisionRunOf, useShedDelivery, type ShedDeliveryState } from "@/components/ShedDelivery";
 import { readDelivery } from "@/lib/delivery";
 import { ShedEgressDetail } from "@/components/ShedEgress";
+import {
+  CloudDeleteConfirm, CloudUsageLine, deleteFailureWords, ShedCloudDetail, shedIncarnation, useCloudExtends, useCloudUsage,
+  useReportCloudUsage, type CloudExtends,
+} from "@/components/ShedCloud";
+import { leaseTone, readCloudRow, type CloudRow } from "@/lib/cloud";
 import { CredentialsView, useCredentialSources } from "@/components/CredentialsView";
 import {
   EMPTY_FEED, actorText, appendPage, deliveryText, errorText, outcomeTone, readPage,
@@ -49,9 +54,9 @@ import {
   type RoostPreview, type RoostToast, type RoostDumpRow,
 } from "@/lib/roost";
 import {
-  useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
+  useUiBridge, shedAction, deleteShedStrict, fetchSystemDf, fetchHostRows, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
-  fetchEgressProfiles, reportEgress, inTauri, listServerActivity, reportActivity, reportScrolled,
+  fetchEgressProfiles, reportEgress, reportCreateSheet, inTauri, listServerActivity, reportActivity, reportScrolled,
   openPreferences, setAppearanceState,
   sessionKey, reportAgents, useRcSessions,
   crazeCreate, crazeOpenTerminal, crazeReopen, crazeSaved, laneFailure,
@@ -104,14 +109,40 @@ const sessionOrigin = (s: RcSession): string => `${s.host}/${s.shed}`;
  *  `2 vCPU · 4 GB · stopped (capacity)`; just the status when specs are absent).
  *  The status part is its own node, so the dashboard report reads it back off
  *  the row (`data-shed-status`). */
-function MetaLine({ s }: { s: Shed }) {
+function MetaLine({ s, cloud }: { s: Shed; cloud: CloudRow | null }) {
+  if (cloud) return <CloudMetaLine s={s} cloud={cloud} />;
   const specs: string[] = [];
   if (s.cpus) specs.push(`${s.cpus} vCPU`);
   if (s.memory_mb) specs.push(`${Math.round(s.memory_mb / 1024)} GB`);
   return (
-    <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted">
+    <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted" data-shed-meta>
       {specs.map((b) => `${b} · `).join("")}
       <span data-shed-status>{statusText(s)}</span>
+    </div>
+  );
+}
+
+/** A cloud row's meta line (plan 041): its size and its lease from the core's row,
+ *  around the status — `2 vCPU · 8 GB · running · deleted in 5h 10m`, the lease amber
+ *  within its warning time. */
+function CloudMetaLine({ s, cloud }: { s: Shed; cloud: CloudRow }) {
+  const tone = leaseTone(cloud.lease_state);
+  const color = tone === "amber" ? "var(--shed-attention)" : tone === "danger" ? "var(--shed-danger)" : undefined;
+  return (
+    <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted" data-shed-meta>
+      {cloud.size_words && `${cloud.size_words} · `}
+      <span data-shed-status>{statusText(s)}</span>
+      {cloud.lease_words && " · "}
+      {cloud.lease_words && (
+        <span
+          className={tone === "muted" ? undefined : "font-semibold"}
+          style={color ? { color } : undefined}
+          data-shed-lease={cloud.lease_state}
+          data-lease-tone={tone}
+        >
+          {cloud.lease_words}
+        </span>
+      )}
     </div>
   );
 }
@@ -236,8 +267,10 @@ export function needsYou(s: RcSession): boolean {
   return s.activity === "needs_input" || s.activity === "needs_approval";
 }
 
-function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, hosts, shedCraze, onCrazeCreate, delivery: dlv }: {
+function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy, hosts, shedCraze, onCrazeCreate, delivery: dlv, cloudExtends }: {
   sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void;
+  /** Every cloud shed's extend, held by the shell (plan 041). */
+  cloudExtends: CloudExtends;
   /** The open delivery detail and every shed's Deliver again run (plan 039 A7). */
   delivery: ShedDeliveryState;
   roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
@@ -247,6 +280,87 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   onCrazeCreate: (machine: string) => void;
 }) {
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
+  // A cloud row's Delete asks first (plan 041): the shed it asks about (its server,
+  // name and incarnation), or null. The question stands only while that shed is still
+  // listed and its current row still offers Delete; otherwise it closes, and its
+  // Delete sends nothing.
+  const [confirmDelete, setConfirmDelete] = useState<{ host: string; name: string; incarnation: string } | null>(null);
+  const confirmShed = confirmDelete
+    ? sheds.find(
+        (s) =>
+          s.host === confirmDelete.host &&
+          s.name === confirmDelete.name &&
+          shedIncarnation(s) === confirmDelete.incarnation &&
+          readCloudRow(s.cloud_row)?.actions.delete === true,
+      ) ?? null
+    : null;
+  useEffect(() => {
+    if (confirmDelete && !confirmShed) setConfirmDelete(null);
+  }, [confirmDelete, confirmShed]);
+  // The question's delete: running (`busy`), or failed with its words, which the
+  // question shows (it stays open). Its number is the question's, so a delete that
+  // answers after its question closed, or another opened, changes nothing there.
+  const [deleteRun, setDeleteRun] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
+  const deleteAsk = useRef(0);
+  const askDelete = (q: { host: string; name: string; incarnation: string } | null) => {
+    deleteAsk.current += 1;
+    setDeleteRun({ busy: false, error: null });
+    setConfirmDelete(q);
+  };
+  useEffect(() => {
+    if (!confirmDelete) {
+      deleteAsk.current += 1;
+      setDeleteRun({ busy: false, error: null });
+    }
+  }, [confirmDelete]);
+  const confirmedDelete = (s: Shed) => {
+    const ask = deleteAsk.current;
+    setDeleteRun({ busy: true, error: null });
+    deleteShedStrict(s.name, s.host).then(
+      () => {
+        if (deleteAsk.current === ask) setConfirmDelete(null);
+        refresh();
+      },
+      (e: unknown) => {
+        if (deleteAsk.current === ask) setDeleteRun({ busy: false, error: deleteFailureWords(e) });
+        refresh();
+      },
+    );
+  };
+  // The usage line of each server whose rows are cloud sheds, and its report.
+  const cloudUsage = useCloudUsage(sheds);
+  useReportCloudUsage(cloudUsage);
+  const paneRoot = useRef<HTMLDivElement>(null);
+  // The harness's doors onto a row (test mode only): its details toggle and its
+  // Delete, pressed as a pointer would. A card is found by its own host and name
+  // attributes, never by a selector built from them.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    const uns: Array<() => void> = [];
+    const card = (p: { server?: unknown; shed?: unknown } | undefined) =>
+      Array.from(paneRoot.current?.querySelectorAll<HTMLElement>("[data-shed-row]") ?? []).find(
+        (el) => el.dataset.shedHost === p?.server && el.dataset.shedName === p?.shed,
+      );
+    const click = (el: Element | null | undefined) => {
+      if (el instanceof HTMLButtonElement && !el.disabled) el.click();
+    };
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      uns.push(await listen<{ server?: unknown; shed?: unknown }>("press-shed-details", (e) => {
+        click(card(e.payload)?.querySelector("button[data-shed-detail-toggle], button[data-shed-delivery-badge]"));
+      }));
+      uns.push(await listen<{ server?: unknown; shed?: unknown }>("press-shed-delete", (e) => {
+        click(Array.from(card(e.payload)?.querySelectorAll<HTMLButtonElement>("[data-shed-controls] button") ?? [])
+          .find((b) => b.title === "Delete"));
+      }));
+      if (cancelled) uns.forEach((u) => u());
+    })();
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
   // The empty state defers to a host failure when there is one — same helper the
   // bridge reports as UI truth, so the pane and `dashboard.dump.empty` agree.
   const empty = shedsEmptyState(sheds, hostErrors);
@@ -288,7 +402,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   }, [reportedRoostKey]);
   useEffect(() => () => reportShedRoost(null), []);
   return (
-    <div>
+    <div ref={paneRoot}>
       <PageHead
         title="Sheds"
         right={
@@ -306,10 +420,12 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
         <Empty icon={Boxes} title={empty.title} body={empty.body} />
       ) : (
         groupByHost(sheds).map(([host, rows]) => (
-          <div key={host} className="mb-[22px] last:mb-0">
+          <div key={host} className="mb-[22px] last:mb-0" data-scroll-anchor={`host:${host}`}>
             <HostLabel host={host} />
+            {cloudUsage.get(host) && <CloudUsageLine host={host} words={cloudUsage.get(host) ?? ""} />}
             <div className="flex flex-col gap-3">
               {rows.map((s) => {
+                const cloud = readCloudRow(s.cloud_row);
                 const running = s.status === "running";
                 const busy = isBusy(s);
                 const dotColor = running ? "var(--shed-ok)" : busy ? "var(--shed-attention)" : "var(--shed-text-muted)";
@@ -326,7 +442,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                     <div className="min-w-0 flex-1">
                       <div className="mb-1.5 flex flex-wrap items-center gap-2.5">
                         <span className="text-[16px] font-semibold text-shed-text">{s.name}</span>
-                        {s.backend && <Tag kind={s.backend} />}
+                        {cloud ? <Tag kind={cloud.badge} cloud /> : s.backend && <Tag kind={s.backend} />}
                         {s.image && <ImageChip>{s.image}</ImageChip>}
                         {delivery ? (
                           <DeliveryBadge rec={delivery} open={detailShown} onToggle={toggleDetail} />
@@ -344,7 +460,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                           </button>
                         )}
                       </div>
-                      <MetaLine s={s} />
+                      <MetaLine s={s} cloud={cloud} />
                       {running && (() => {
                         const target = `roost:${s.host}/${s.name}`;
                         const craze = crazeOf(target);
@@ -378,7 +494,20 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                       })()}
                     </div>
                     <div className="flex gap-2" data-shed-controls>
-                      {running ? (
+                      {cloud ? (
+                        // A cloud row offers what its core row says (plan 041):
+                        // never Restart, and its Delete asks first.
+                        busy ? (
+                          <ActBtn icon={RotateCw} tone="attention" spin disabled />
+                        ) : (
+                          <>
+                            {running && <ActBtn icon={Terminal} tone="neutral" title="Open in Terminal" onClick={() => void openTerminal(s.name, s.host)} />}
+                            {cloud.actions.start && <ActBtn icon={Play} tone="ok" title="Start" onClick={() => act("start", s)} />}
+                            {cloud.actions.stop && <ActBtn icon={Square} tone="danger" title="Stop" onClick={() => act("stop", s)} />}
+                            {cloud.actions.delete && <ActBtn icon={Trash2} tone="danger" title="Delete" onClick={() => askDelete({ host: s.host, name: s.name, incarnation: shedIncarnation(s) })} />}
+                          </>
+                        )
+                      ) : running ? (
                         <>
                           <ActBtn icon={Terminal} tone="neutral" title="Open in Terminal" onClick={() => void openTerminal(s.name, s.host)} />
                           <ActBtn icon={RotateCw} tone="attention" title="Restart" onClick={() => act("reset", s)} />
@@ -398,7 +527,18 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                       table below it can be long. Keyed by the incarnation: a shed
                       created again under its name is another shed, and starts with
                       none of the old one's blocks. */}
-                  {detailShown && (
+                  {/* A cloud row's detail leads with its machine and Extend; it has no
+                      egress section (a remote server has no egress control). */}
+                  {detailShown && cloud && (
+                    <ShedCloudDetail
+                      key={`${s.host}/${s.name}/${s.created_at ?? ""}`}
+                      shed={s}
+                      row={cloud}
+                      run={cloudExtends.runOf(s)}
+                      onExtend={(hours) => cloudExtends.extend(s, hours, refresh)}
+                    />
+                  )}
+                  {detailShown && !cloud && (
                     <ShedEgressDetail key={`${s.host}/${s.name}/${s.created_at ?? ""}`} shed={s} />
                   )}
                   {detailShown && delivery && (
@@ -415,6 +555,17 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
             </div>
           </div>
         ))
+      )}
+      {confirmShed && (
+        <CloudDeleteConfirm
+          shed={confirmShed}
+          busy={deleteRun.busy}
+          error={deleteRun.error}
+          onCancel={() => askDelete(null)}
+          onConfirm={() => {
+            if (!deleteRun.busy) confirmedDelete(confirmShed);
+          }}
+        />
       )}
     </div>
   );
@@ -1118,11 +1269,13 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
   const creating = createId !== null;
   const state = progress?.state;
 
-  // The configured hosts a create can target (even ones with no sheds yet).
+  // The configured hosts a create can target (even ones with no sheds yet). The
+  // first is the default only while no host is chosen: a host set before the list
+  // arrives (the harness's fill door) is never overwritten.
   useEffect(() => {
     void fetchHosts().then((hs) => {
       setHosts(hs);
-      setHost(hs[0] ?? "");
+      setHost((h) => h || (hs[0] ?? ""));
     });
   }, []);
 
@@ -1154,6 +1307,23 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 
   useEscClose(onClose, !creating);
 
+  // What this sheet rendered, for the harness (`create_sheet.dump`), read off its
+  // own nodes after the commit; `doors` once its doors' listeners are attached.
+  const sheetRoot = useRef<HTMLDivElement>(null);
+  const [doors, setDoors] = useState(false);
+  useEffect(() => {
+    const el = sheetRoot.current;
+    reportCreateSheet({
+      phase: creating ? "progress" : "form",
+      name,
+      host,
+      state: state ?? null,
+      error: el?.querySelector("[data-create-error]")?.textContent ?? null,
+      doors,
+    });
+  }, [creating, state, error, name, host, doors]);
+  useEffect(() => () => reportCreateSheet(null), []);
+
   const submit = async () => {
     if (!name.trim() || submitting) return;
     setSubmitting(true);
@@ -1180,6 +1350,35 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
     if (createId && state !== "complete") void createCancel(createId);
     onClose();
   };
+
+  // The harness's doors (test mode only): the sheet's own Name and Host fields, and
+  // its Create shed, which takes nothing once a create is under way, as a pointer.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  const creatingRef = useRef(creating);
+  creatingRef.current = creating;
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    const uns: Array<() => void> = [];
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      uns.push(await listen<{ name?: unknown; host?: unknown }>("fill-create", (e) => {
+        if (creatingRef.current) return;
+        if (typeof e.payload?.name === "string") setName(e.payload.name);
+        if (typeof e.payload?.host === "string") setHost(e.payload.host);
+      }));
+      uns.push(await listen("press-create", () => {
+        if (!creatingRef.current) void submitRef.current();
+      }));
+      if (cancelled) uns.forEach((u) => u());
+      else setDoors(true);
+    })();
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
 
   const hostOpts = hosts.length ? hosts.map((h) => ({ value: h, label: h })) : [{ value: "", label: "(default)" }];
   const canCreate = name.trim().length > 0 && !submitting;
@@ -1210,6 +1409,7 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 
   return (
     <Scrim onClose={() => { if (!creating) onClose(); }} mark="create">
+      <div ref={sheetRoot} className="contents">
       <DialogShell icon={Plus} title="New shed" sub="Spin up a dev environment on a host." onClose={cancel} width={540} footer={footer}>
         {!creating ? (
           <>
@@ -1239,7 +1439,7 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
               <input id={`${fid}-repo`} value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="owner/repo" className={cn(dialogInput, "font-mono")} />
             </Field>
             {error && (
-              <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
+              <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }} data-create-error>{error}</div>
             )}
           </>
         ) : (
@@ -1259,12 +1459,13 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
               {(progress?.messages ?? []).map((m, i) => (
                 <div key={i}>{m}</div>
               ))}
-              {error && <div style={{ color: "var(--shed-danger)" }}>{error}</div>}
+              {error && <div style={{ color: "var(--shed-danger)" }} data-create-error>{error}</div>}
               {(progress?.messages ?? []).length === 0 && !error && <div className="text-shed-text-muted">Starting…</div>}
             </div>
           </>
         )}
       </DialogShell>
+      </div>
     </Scrim>
   );
 }
@@ -1284,6 +1485,7 @@ export default function App() {
   // The open shed delivery detail, its `ui.show_shed_delivery` doors, and every
   // shed's Deliver again run (plan 039 A7).
   const shedDelivery = useShedDelivery(setPane);
+  const cloudExtends = useCloudExtends();
   const [mode, setMode] = useState<"light" | "dark">("light");
   // The open modal — and its LIVE value (`modalNow`), written synchronously by
   // the one setter, which is what a craze create that resolves later decides
@@ -1635,6 +1837,9 @@ export default function App() {
   const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, {
     servers: hostRows.map((h) => ({ name: h.host, reachable: h.usage != null })),
   });
+  // Each listing forgets the finished extends of sheds no longer listed (plan 041).
+  const pruneExtends = cloudExtends.prune;
+  useEffect(() => pruneExtends(sheds), [sheds, pruneExtends]);
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
   // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
@@ -1657,6 +1862,7 @@ export default function App() {
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-create", () => setModal("create")));
+      uns.push(await listen("close-create", () => setModal((m) => (m === "create" ? null : m))));
       // The craze create sheet's door (`ui.show_craze_create {machine}`),
       // the same pattern: it opens from a machine's "New craze session" — a
       // click the harness has none of.
@@ -1723,7 +1929,9 @@ export default function App() {
           requestAnimationFrame(() =>
             reportScrolled({
               anchor, token: e.payload?.token ?? null, found: !!el,
-              animations: document.getAnimations().length,
+              // Transient ones only: a busy row's spinner never finishes.
+              animations: document.getAnimations()
+                .filter((a) => a.effect?.getTiming().iterations !== Infinity).length,
             }),
           );
         }),
@@ -1837,6 +2045,7 @@ export default function App() {
                 shedCraze={rcShedCraze}
                 onCrazeCreate={openCrazeSheet}
                 delivery={shedDelivery}
+                cloudExtends={cloudExtends}
               />
             )}
             {pane === "agents" && (

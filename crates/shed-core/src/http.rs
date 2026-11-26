@@ -26,8 +26,8 @@ use futures_util::StreamExt;
 use thiserror::Error;
 
 use crate::models::{
-    CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo, SessionsResponse, Shed,
-    ShedImage, ShedList, SourceDocument, SourceUnbound, SystemDiskUsage,
+    CloudUsage, CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo,
+    SessionsResponse, Shed, ShedImage, ShedList, SourceDocument, SourceUnbound, SystemDiskUsage,
 };
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
@@ -151,6 +151,7 @@ fn source_answer<T: serde::de::DeserializeOwned>(answer: SourceAnswer) -> Result
         status,
         retry_after,
         body,
+        ..
     } = answer;
     if (200..300).contains(&status) {
         // Bounded: serde's message quotes the input it choked on, and a 200 whose body
@@ -183,6 +184,19 @@ struct SourceAnswer {
     /// `Retry-After`, whole seconds, capped ([`source_retry_after`]).
     retry_after: Option<Duration>,
     body: Vec<u8>,
+    /// Why a non-2xx body is not whole (it broke off mid-read), else `None`. Only
+    /// [`Client::request_answer`] hands such an answer out.
+    broken: Option<ShedError>,
+}
+
+impl SourceAnswer {
+    /// The answer, or the transport failure its body broke off with.
+    fn whole(self) -> Result<SourceAnswer, ShedError> {
+        match self.broken {
+            Some(e) => Err(e),
+            None => Ok(self),
+        }
+    }
 }
 
 const GET_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1013,8 +1027,28 @@ impl Client {
     /// READING: a non-2xx body is read to at most `max_error_body` bytes (the rest is
     /// left unread), and a 2xx body past `max_body` is refused (a decode error) as soon
     /// as it is known to be, from its `Content-Length` or from the bytes read so far.
-    /// The same re-auth path and the same bound.
+    /// The same re-auth path and the same bound. A body that breaks off (the connection
+    /// closed or timed out mid-body) is a transport failure, whatever the status: a
+    /// caller never reads a cut-off error body as an answer.
     async fn request_with_status(
+        &self,
+        method: reqwest::Method,
+        url: &reqwest::Url,
+        timeout: Duration,
+        body: Option<&serde_json::Value>,
+        max_body: usize,
+        max_error_body: usize,
+    ) -> Result<SourceAnswer, ShedError> {
+        self.request_answer(method, url, timeout, body, max_body, max_error_body)
+            .await?
+            .whole()
+    }
+
+    /// [`Self::request_with_status`] keeping a non-2xx answer whose body broke off: its
+    /// status was received, so a caller that judges by status alone (an extend: a 4xx
+    /// is final) can, with [`SourceAnswer::broken`] saying the body is not whole. A 2xx
+    /// whose body breaks off is a transport failure here too.
+    async fn request_answer(
         &self,
         method: reqwest::Method,
         url: &reqwest::Url,
@@ -1043,7 +1077,19 @@ impl Client {
             return Err(too_large());
         }
         let mut out = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(flatten)? {
+        let mut broken = None;
+        loop {
+            let chunk = match resp.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                // A non-2xx whose body breaks off: its status is known, its body is not
+                // whole. Kept, marked; `whole` makes it the transport failure it was.
+                Err(e) if !success => {
+                    broken = Some(flatten(e));
+                    break;
+                }
+                Err(e) => return Err(flatten(e)),
+            };
             let room = cap - out.len();
             if chunk.len() > room {
                 if success {
@@ -1058,6 +1104,7 @@ impl Client {
             status,
             retry_after,
             body: out,
+            broken,
         })
     }
 
@@ -1385,13 +1432,19 @@ impl Client {
                     let chunk =
                         chunk.map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?;
                     for ev in parser.feed(&chunk) {
-                        self.handle_create_event(&ev, sink, &mut saw_complete)?;
+                        if let Some(data) =
+                            self.handle_create_event(&ev, sink, &mut saw_complete)?
+                        {
+                            return Err(self.refused_create(&data).await);
+                        }
                     }
                 }
             }
         }
         for ev in parser.finish() {
-            self.handle_create_event(&ev, sink, &mut saw_complete)?;
+            if let Some(data) = self.handle_create_event(&ev, sink, &mut saw_complete)? {
+                return Err(self.refused_create(&data).await);
+            }
         }
         if !saw_complete {
             return Err(ShedError::Create(
@@ -1401,12 +1454,14 @@ impl Client {
         Ok(())
     }
 
+    /// One create stream event; an `error` event's data comes back (`Some`) for
+    /// [`Self::refused_create`] to word.
     fn handle_create_event(
         &self,
         ev: &crate::sse::SseEvent,
         sink: &dyn CreateSink,
         saw_complete: &mut bool,
-    ) -> Result<(), ShedError> {
+    ) -> Result<Option<String>, ShedError> {
         match ev.event.as_str() {
             "progress" => {
                 if let Some(msg) = decode_progress(&ev.data) {
@@ -1420,54 +1475,95 @@ impl Client {
                 *saw_complete = true;
                 sink.on_complete(shed);
             }
-            "error" => return Err(ShedError::Create(decode_error(&ev.data))),
+            "error" => return Ok(Some(ev.data.clone())),
             _ => {}
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// A create stream's `error` event as the create's error ([`decode_error`]).
+    /// Whether it is a cloud create is asked of the server only when the event does
+    /// not say (an account-service code says): `/api/info`'s `backend` is `remote`.
+    /// A server that cannot say (no answer, or no `backend` in it) gets a fixed line that names no backend
+    /// ([`crate::models::unknown_refusal_words`]), so neither a cloud create's server
+    /// text nor a false "cloud" is ever shown.
+    async fn refused_create(&self, data: &str) -> ShedError {
+        let parts = api_error_parts(data.as_bytes());
+        let said = crate::models::refusal_words(&parts.code, &parts.reason).is_some()
+            || parts.code.starts_with(crate::models::COMPUTE_CODE_PREFIX);
+        if said {
+            return ShedError::Create(decode_error(data, true));
+        }
+        // A server that answers with no `backend` cannot say either.
+        match self.info().await.ok().and_then(|i| i.backend) {
+            Some(b) => ShedError::Create(decode_error(data, b == BACKEND_REMOTE)),
+            None => ShedError::Create(crate::models::unknown_refusal_words(&parts.code)),
+        }
     }
 }
 
 /// A refusal from one of the delivery-era routes (plan 039: the shed document, the
-/// provision route, the activity feed): the status when there was one, the API error's
-/// `code` and its `message`, cleaned for display. Its own type, so no existing match over
+/// provision route, the activity feed) and the cloud routes (plan 041: extend, usage):
+/// the status when there was one, the API error's `code`, its `message` and its
+/// `reason` (a compute refusal's, such as `person` for `COMPUTE_POLICY_REFUSED`; ""
+/// for none), cleaned for display. Its own type, so no existing match over
 /// [`ShedError`] learns a case.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ApiFailure {
     pub status: Option<u16>,
     pub code: String,
     pub message: String,
+    pub reason: String,
 }
 
 impl ApiFailure {
-    fn from_shed(e: &ShedError) -> Self {
+    /// A failure with no answer from the server (a transport, decode or config
+    /// error): no code, no reason, the error's text.
+    pub fn from_shed(e: &ShedError) -> Self {
+        let status = match *e {
+            ShedError::BadStatus(s) => Some(s),
+            _ => None,
+        };
+        ApiFailure::local(status, e.to_string())
+    }
+
+    /// A failure this client decided (no API error body): no code, no reason.
+    fn local(status: Option<u16>, message: impl Into<String>) -> Self {
         ApiFailure {
-            status: match *e {
-                ShedError::BadStatus(s) => Some(s),
-                _ => None,
-            },
+            status,
             code: String::new(),
-            message: e.to_string(),
+            message: message.into(),
+            reason: String::new(),
         }
     }
 
-    /// A non-2xx answer: its API error body's code and message when it has one.
+    /// A non-2xx answer: its API error body's code, message and reason when it has
+    /// one.
     fn from_body(status: u16, body: &[u8]) -> Self {
-        let (code, message) = api_error_parts(body);
+        let parts = api_error_parts(body);
         ApiFailure {
             status: Some(status),
-            message: if message.is_empty() {
+            message: if parts.message.is_empty() {
                 format!("shed-server returned HTTP {status}")
             } else {
-                message
+                parts.message
             },
-            code,
+            code: parts.code,
+            reason: parts.reason,
         }
     }
 }
 
-/// An API error body's (`{"error":{"code","message"}}`, or a bare `{"code","message"}`)
-/// code and message, both cleaned for display; empty when it has none.
-fn api_error_parts(body: &[u8]) -> (String, String) {
+/// An API error body's parts, each cleaned for display and empty when absent.
+struct ApiErrorParts {
+    code: String,
+    message: String,
+    reason: String,
+}
+
+/// Read an API error body: the server's `{"error":{"code","message","reason"}}`, or a
+/// bare `{"code","message","reason"}`.
+fn api_error_parts(body: &[u8]) -> ApiErrorParts {
     let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
     let detail = v.get("error").filter(|e| e.is_object()).unwrap_or(&v);
     let text = |k: &str, max: usize| {
@@ -1477,7 +1573,11 @@ fn api_error_parts(body: &[u8]) -> (String, String) {
             .map(|s| crate::models::display_source_text(s, max))
             .unwrap_or_default()
     };
-    (text("code", 64), text("message", 1024))
+    ApiErrorParts {
+        code: text("code", 64),
+        message: text("message", 1024),
+        reason: text("reason", 64),
+    }
 }
 
 /// One progress line of a provision (`shed provision`'s stream).
@@ -1508,14 +1608,36 @@ const EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_EGRESS_EVENT_BYTES: usize = 64 << 10;
 /// How long a refusal's body on the egress stream may take to arrive.
 const EGRESS_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+/// An extend's answer ([`Client::extend_with_request_id`]), and whether its outcome
+/// is unknown (`unresolved`): every send ended with no answer or a 5xx, or a send
+/// after such a one was refused without the request id being judged (a 401, any
+/// refusal before the server looked it up), or a 2xx came back whose shed could not be
+/// read (the lease moved; the answer is lost). A readable 2xx, the account service's refusal
+/// ([`EXTEND_JUDGEMENTS`]), a first send's 4xx and an error before anything was
+/// sent are definite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtendOutcome {
+    pub result: Result<Shed, ApiFailure>,
+    pub unresolved: bool,
+}
+
+/// A fresh extend `request_id` (a UUID).
+pub fn new_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// How many times [`Client::extend`] sends one extend at most (the CLI's number).
+pub const EXTEND_ATTEMPTS: usize = 3;
+/// The pause before [`Client::extend`] sends its extend again.
+const EXTEND_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
 impl Client {
     /// GET a JSON document, bounded, with its refusal's API error.
-    async fn get_document(
+    async fn get_document<T: serde::de::DeserializeOwned>(
         &self,
         segments: &[&str],
         query: &[(&str, String)],
-    ) -> Result<serde_json::Value, ApiFailure> {
+    ) -> Result<T, ApiFailure> {
         let url = self
             .build_url(segments, query)
             .map_err(|e| ApiFailure::from_shed(&e))?;
@@ -1533,11 +1655,8 @@ impl Client {
         if !(200..300).contains(&answer.status) {
             return Err(ApiFailure::from_body(answer.status, &answer.body));
         }
-        serde_json::from_slice(&answer.body).map_err(|e| ApiFailure {
-            status: Some(answer.status),
-            code: String::new(),
-            message: format!("decode error: {e}"),
-        })
+        serde_json::from_slice(&answer.body)
+            .map_err(|e| ApiFailure::local(Some(answer.status), format!("decode error: {e}")))
     }
 
     /// `GET /api/sheds/{name}`: the shed document as the server wrote it (its delivery
@@ -1586,6 +1705,122 @@ impl Client {
         let mut progress = Vec::new();
         let result = self.provision_stream(name, &mut progress).await;
         ProvisionOutcome { progress, result }
+    }
+
+    /// `POST /api/sheds/{name}/extend` (plan 041): move a cloud shed's lease `hours`
+    /// later (1 to 720) and return the shed as the server answered it, host stamped.
+    ///
+    /// Each call makes one fresh `request_id` (a UUID) and sends it again, the same,
+    /// when no answer came (a transport failure) or the server could not decide (a
+    /// 5xx): up to [`EXTEND_ATTEMPTS`] sends, two seconds apart. The server and the
+    /// account service answer a repeat with the first answer, so the lease moves once.
+    /// A refusal (4xx: `EXTEND_NOT_ALLOWED`, `LEASE_AT_CAP`, `LEASE_ENDED`,
+    /// `PERSON_INACTIVE`, `COMPUTE_DELETING`, …) is final, with its code and reason.
+    pub async fn extend(&self, name: &str, hours: u32) -> Result<Shed, ApiFailure> {
+        self.extend_with_request_id(name, hours, &new_request_id())
+            .await
+            .result
+    }
+
+    /// As [`Self::extend`], under the caller's `request_id` (a UUID,
+    /// [`new_request_id`]), and saying whether its outcome is still unknown: every send
+    /// failed with no answer or a 5xx, so the lease may or may not have moved. A
+    /// caller that keeps the id and sends the same extend again under it (the same
+    /// `hours`) gets the first answer, never a second move; a new id is a new extend.
+    pub async fn extend_with_request_id(
+        &self,
+        name: &str,
+        hours: u32,
+        request_id: &str,
+    ) -> ExtendOutcome {
+        self.extend_with(name, hours, request_id, EXTEND_RETRY_PAUSE)
+            .await
+    }
+
+    async fn extend_with(
+        &self,
+        name: &str,
+        hours: u32,
+        request_id: &str,
+        pause: Duration,
+    ) -> ExtendOutcome {
+        let url = match self.build_url(&["api", "sheds", name, "extend"], &[]) {
+            Ok(url) => url,
+            // Nothing was sent: a definite outcome.
+            Err(e) => {
+                return ExtendOutcome {
+                    result: Err(ApiFailure::from_shed(&e)),
+                    unresolved: false,
+                }
+            }
+        };
+        let body = serde_json::json!({ "hours": hours, "request_id": request_id });
+        let mut attempt = 1;
+        // Whether an earlier send's outcome was unknown: that send may have moved
+        // the lease, and only an answer that judged this request id says whether.
+        let mut earlier_unknown = false;
+        loop {
+            // By status first: a 4xx is final even when its body broke off (its code
+            // is then unknown), a 5xx is sent again whatever its body.
+            // `unread`: the server answered 2xx (the lease moved) but its shed could not
+            // be read (too large, or not a shed): not sent again, and not definite.
+            let (result, again, unread) = match self
+                .request_answer(
+                    reqwest::Method::POST,
+                    &url,
+                    WRITE_TIMEOUT,
+                    Some(&body),
+                    MAX_DOCUMENT_BYTES,
+                    MAX_ERROR_BODY_BYTES,
+                )
+                .await
+            {
+                Err(e) => (
+                    Err(ApiFailure::from_shed(&e)),
+                    matches!(e, ShedError::Transport(_)),
+                    // `request_answer` decodes nothing: its only `Decode` is a 2xx
+                    // answer past the size limit.
+                    matches!(e, ShedError::Decode(_)),
+                ),
+                Ok(a) if (200..300).contains(&a.status) => {
+                    let result = self.answered_shed(a.status, &a.body);
+                    let unread = result.is_err();
+                    (result, false, unread)
+                }
+                Ok(a) => (
+                    Err(ApiFailure::from_body(a.status, &a.body)),
+                    a.status >= 500,
+                    false,
+                ),
+            };
+            if !again || attempt >= EXTEND_ATTEMPTS {
+                // `again` on the last send: it, and every one before it, ended with
+                // no answer or a 5xx, so whether the lease moved is not known. After
+                // such a send, an answer that did not judge this request (a 401, any
+                // refusal made before the server looked the id up) says nothing about
+                // it either: still unknown. A first send's refusal is final.
+                let unresolved = again || unread || (earlier_unknown && !judged(&result));
+                return ExtendOutcome { result, unresolved };
+            }
+            earlier_unknown = true;
+            attempt += 1;
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// A shed document the server answered, decoded and stamped with this host.
+    fn answered_shed(&self, status: u16, body: &[u8]) -> Result<Shed, ApiFailure> {
+        let mut shed: Shed = serde_json::from_slice(body)
+            .map_err(|e| ApiFailure::local(Some(status), format!("decode error: {e}")))?;
+        shed.host = self.server_name.clone();
+        Ok(shed)
+    }
+
+    /// `GET /api/cloud/usage` (plan 041): the caller's cloud machines against the
+    /// account service's limit (`person`, `None` for a caller who is not a person of
+    /// the service) and the organization's. A server without compute answers `501`.
+    pub async fn cloud_usage(&self) -> Result<CloudUsage, ApiFailure> {
+        self.get_document(&["api", "cloud", "usage"], &[]).await
     }
 
     /// `GET /api/egress/stream` (control scope): calls `on_open` once the server has
@@ -1731,22 +1966,21 @@ impl Client {
                         }
                     }
                     "complete" => {
-                        *done = Some(serde_json::from_str(&ev.data).map_err(|e| ApiFailure {
-                            status: Some(status),
-                            code: String::new(),
-                            message: format!("decode error: {e}"),
+                        *done = Some(serde_json::from_str(&ev.data).map_err(|e| {
+                            ApiFailure::local(Some(status), format!("decode error: {e}"))
                         }));
                     }
                     "error" => {
-                        let (code, message) = api_error_parts(ev.data.as_bytes());
+                        let parts = api_error_parts(ev.data.as_bytes());
                         *done = Some(Err(ApiFailure {
                             status: None,
-                            code,
-                            message: if message.is_empty() {
+                            code: parts.code,
+                            message: if parts.message.is_empty() {
                                 "provision failed".into()
                             } else {
-                                message
+                                parts.message
                             },
+                            reason: parts.reason,
                         }));
                     }
                     _ => {}
@@ -1774,11 +2008,10 @@ impl Client {
             handle(ev, progress, &mut done);
         }
         done.unwrap_or_else(|| {
-            Err(ApiFailure {
-                status: Some(status),
-                code: String::new(),
-                message: "the provision stream ended before a complete event".into(),
-            })
+            Err(ApiFailure::local(
+                Some(status),
+                "the provision stream ended before a complete event",
+            ))
         })
     }
 }
@@ -1822,17 +2055,58 @@ fn decode_progress(data: &str) -> Option<String> {
     }
 }
 
-/// An error event's `message ?? code ?? raw`.
-fn decode_error(data: &str) -> String {
-    #[derive(serde::Deserialize)]
-    struct ApiError {
-        code: Option<String>,
-        message: Option<String>,
+/// The `backend` a remote server's `/api/info` names (cloud sheds, plan 041).
+const BACKEND_REMOTE: &str = "remote";
+
+/// The extend refusals that are the account service's judgement of the request id
+/// (it answers a repeated id with its first answer): with a 2xx, the only answers
+/// that settle an extend an earlier send of which may have moved the lease.
+/// shed-server's own refusals made before it looks the id up (a 401, `FORBIDDEN`,
+/// `SHED_NOT_FOUND`, `INVALID_REQUEST`, …) and any unknown code do not.
+const EXTEND_JUDGEMENTS: &[&str] = &[
+    "EXTEND_NOT_ALLOWED",
+    "LEASE_AT_CAP",
+    "LEASE_ENDED",
+    "PERSON_INACTIVE",
+    "COMPUTE_DELETING",
+];
+
+/// Whether an extend's answer judged its request id ([`EXTEND_JUDGEMENTS`]).
+fn judged(result: &Result<Shed, ApiFailure>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => EXTEND_JUDGEMENTS.contains(&e.code.as_str()),
     }
-    if let Ok(e) = serde_json::from_str::<ApiError>(data) {
-        return e.message.or(e.code).unwrap_or_else(|| data.to_string());
+}
+
+/// A create stream's `error` event as one line. A code and reason with fixed words
+/// ([`crate::models::refusal_words`], the words an extend's refusal shows) show them,
+/// never the server's message. On a `cloud` create (or with an account-service code,
+/// `COMPUTE_…`) any other code shows a fixed line naming it
+/// ([`crate::models::unknown_cloud_refusal_words`]): a cloud create never shows the
+/// server's text. Anything else is the server's API error
+/// (`{"error":{"code","message","reason"}}`, or a bare `{"code","message","reason"}`)
+/// as its `message`, else its `code`, else the raw data, with a `reason` the message
+/// does not already name in parentheses added as ` (reason: <reason>)`.
+fn decode_error(data: &str, cloud: bool) -> String {
+    let parts = api_error_parts(data.as_bytes());
+    if let Some(words) = crate::models::refusal_words(&parts.code, &parts.reason) {
+        return words.to_string();
     }
-    data.to_string()
+    if cloud || parts.code.starts_with(crate::models::COMPUTE_CODE_PREFIX) {
+        return crate::models::unknown_cloud_refusal_words(&parts.code);
+    }
+    let mut text = if !parts.message.is_empty() {
+        parts.message
+    } else if !parts.code.is_empty() {
+        parts.code
+    } else {
+        return data.to_string();
+    };
+    if !parts.reason.is_empty() && !text.contains(&format!("({})", parts.reason)) {
+        text.push_str(&format!(" (reason: {})", parts.reason));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -2096,7 +2370,7 @@ mod tests {
     async fn scripted_server(
         script: Vec<Option<Vec<u8>>>,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2105,14 +2379,7 @@ mod tests {
             let mut script = script.into_iter();
             while let Ok((mut sock, _)) = listener.accept().await {
                 seen.fetch_add(1, Ordering::SeqCst);
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    if sock.read(&mut byte).await.unwrap_or(0) == 0 {
-                        break;
-                    }
-                    head.push(byte[0]);
-                }
+                read_head(&mut sock).await;
                 match script.next() {
                     Some(Some(answer)) => {
                         let _ = sock.write_all(&answer).await;
@@ -2135,6 +2402,20 @@ mod tests {
         (base, count)
     }
 
+    /// Read a request's head, byte by byte, up to its blank line (or the socket's end).
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if sock.read(&mut byte).await.unwrap_or(0) == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        head
+    }
+
     fn answer(status: &str, headers: &str, body: &str) -> Option<Vec<u8>> {
         Some(
             format!(
@@ -2151,6 +2432,24 @@ mod tests {
     }
 
     const BUSY_BODY: &str = r#"{"error":{"code":"SOURCE_BUSY","message":"being saved"}}"#;
+
+    /// A source refusal whose body breaks off is a transport failure, as it always was:
+    /// never `Unsupported` (a cut-off 404 is not a plain 404 from an older server) and
+    /// never a refusal read from half a body.
+    #[tokio::test]
+    async fn a_cut_off_source_refusal_is_a_transport_failure() {
+        for status in ["404 Not Found", "409 Conflict", "503 Service Unavailable"] {
+            let cut = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: 1000\r\nconnection: close\r\n\r\n{{\"error\":{{\"code\""
+            );
+            let (base, _) = scripted_server(vec![Some(cut.into_bytes())]).await;
+            match client_at(base).source_status().await.unwrap_err() {
+                SourceError::Shed(ShedError::Transport(_)) => {}
+                e => panic!("{status}: want a transport failure, got {e:?}"),
+            }
+        }
+    }
 
     /// A 200 that never ends is refused once it passes the cap, while reading — not
     /// buffered whole, and not left to the request timeout.
@@ -3461,6 +3760,14 @@ mod tests {
     #[tokio::test]
     async fn create_error_event_reports_error() {
         let server = MockServer::start_async().await;
+        // A local server (not remote): its message is shown.
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200)
+                    .body(r#"{"name":"m","version":"1","backend":"vz"}"#);
+            })
+            .await;
         server
             .mock_async(|w, t| {
                 w.method(POST).path("/api/sheds");
@@ -3767,6 +4074,579 @@ mod tests {
             ShedError::Transport(msg) => assert!(msg.contains("credential"), "got: {msg}"),
             other => panic!("expected Transport credential timeout, got {other:?}"),
         }
+    }
+
+    // ---- cloud sheds (plan 041): the create error's reason, extend, usage ----
+
+    /// The recorded create stream's `error` event (`crates/fixtures/cloud/`, written by
+    /// shed-server's own handlers) carries the server's API error envelope.
+    const CREATE_REFUSED_SSE: &str = include_str!("../../fixtures/cloud/create-refused.sse");
+
+    /// The account service's refusals show fixed words, the words an extend's refusal
+    /// shows, never the server's message; anything else keeps the server's API error.
+    #[test]
+    fn decode_error_gives_a_compute_refusal_its_fixed_words() {
+        let data = CREATE_REFUSED_SSE
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap();
+        // The recorded refusal: COMPUTE_POLICY_REFUSED (person).
+        assert_eq!(
+            decode_error(data, false),
+            crate::models::refusal_words("COMPUTE_POLICY_REFUSED", "person").unwrap()
+        );
+        assert!(!decode_error(data, false).contains("compute policy refused"));
+        // By reason, and by code alone when the reason has no words of its own.
+        assert_eq!(
+            decode_error(r#"{"error":{"code":"COMPUTE_LIMIT_REACHED","message":"SERVER TEXT","reason":"organization"}}"#, false),
+            "the organization holds as many cloud machines as the account service allows; try again once one is deleted"
+        );
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"COMPUTE_POLICY_REFUSED","message":"SERVER TEXT","reason":"other"}}"#,
+                false
+            ),
+            "the account service's policy refused this"
+        );
+        assert_eq!(
+            decode_error(r#"{"error":{"code":"COMPUTE_DENIED"}}"#, false),
+            "the account service does not let this server make cloud machines"
+        );
+        // An account-service code with no words here: a fixed line naming it.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"COMPUTE_NEW_THING","message":"SERVER TEXT"}}"#,
+                false
+            ),
+            "the cloud create was refused (COMPUTE_NEW_THING)"
+        );
+        // shed-server's own errors keep their message; a reason it does not name is
+        // added.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"SERVER_LIMIT_REACHED","message":"no room","reason":"sheds"}}"#,
+                false
+            ),
+            "no room (reason: sheds)"
+        );
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"x","message":"refused (y)","reason":"y"}}"#,
+                false
+            ),
+            "refused (y)"
+        );
+        // The bare shape is still read; with no message the code stands in.
+        assert_eq!(
+            decode_error(
+                r#"{"code":"create_failed","message":"could not create x"}"#,
+                false
+            ),
+            "could not create x"
+        );
+        assert_eq!(
+            decode_error(r#"{"error":{"code":"SHED_EXISTS"}}"#, false),
+            "SHED_EXISTS"
+        );
+        // The cloud's own refusals have fixed words too.
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"ZONE_CAPACITY_UNAVAILABLE","message":"SERVER TEXT"}}"#,
+                true
+            ),
+            "the cloud has no room for this machine now; try again later"
+        );
+        assert_eq!(
+            decode_error(
+                r#"{"error":{"code":"CLOUD_QUOTA_EXCEEDED","message":"SERVER TEXT"}}"#,
+                false
+            ),
+            "the cloud's quota does not allow another machine now; try again later"
+        );
+        // A cloud create never shows the server's text: any other code is a fixed
+        // line naming it, and no code at all a fixed line.
+        for (data, want) in [
+            (
+                r#"{"error":{"code":"SERVER_LIMIT_REACHED","message":"SERVER TEXT"}}"#,
+                "the cloud create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                r#"{"code":"create_failed","message":"SERVER TEXT"}"#,
+                "the cloud create was refused (create_failed)",
+            ),
+            ("SERVER TEXT", "the cloud create was refused"),
+        ] {
+            assert_eq!(decode_error(data, true), want);
+        }
+        // Anything else is the raw data.
+        assert_eq!(decode_error("boom", false), "boom");
+        assert_eq!(decode_error(r#"{"other":1}"#, false), r#"{"other":1}"#);
+    }
+
+    #[tokio::test]
+    async fn a_refused_create_reaches_the_sink_with_its_reason() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(CREATE_REFUSED_SSE);
+            })
+            .await;
+        let sink = Arc::new(RecordingSink::default());
+        let req = CreateShedRequest {
+            name: "refused".into(),
+            ..Default::default()
+        };
+        client(&server).create_shed(&req, sink.as_ref()).await;
+        let error = sink.snapshot().error.expect("an error");
+        let words = crate::models::refusal_words("COMPUTE_POLICY_REFUSED", "person").unwrap();
+        assert_eq!(error, format!("create failed: {words}"));
+        assert!(
+            !error.contains("compute policy refused"),
+            "the server's text: {error}"
+        );
+    }
+
+    /// A refused create's server text: shown by a server that is not remote, never by
+    /// a remote one (its `/api/info` `backend`) or one whose info cannot be read or
+    /// names no backend, which gets a line that calls it no cloud refusal either.
+    #[tokio::test]
+    async fn a_cloud_create_never_shows_the_server_text() {
+        for (info, want) in [
+            (
+                Some(r#"{"name":"m","version":"1","backend":"vz"}"#),
+                "create failed: no room on this host",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1","backend":"remote"}"#),
+                "create failed: the cloud create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            // The backend cannot be told: a fixed line that names none.
+            (
+                None,
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1"}"#),
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
+            ),
+            (
+                Some(r#"{"name":"m","version":"1","backend":null}"#),
+                "create failed: the create was refused (SERVER_LIMIT_REACHED)",
+            ),
+        ] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(POST).path("/api/sheds");
+                    t.status(200)
+                        .header("content-type", "text/event-stream")
+                        .body("event: error\ndata: {\"error\":{\"code\":\"SERVER_LIMIT_REACHED\",\"message\":\"no room on this host\"}}\n\n");
+                })
+                .await;
+            let info_mock = server
+                .mock_async(|w, t| {
+                    w.method(GET).path("/api/info");
+                    match info {
+                        Some(body) => t.status(200).body(body),
+                        None => t.status(503),
+                    };
+                })
+                .await;
+            let sink = Arc::new(RecordingSink::default());
+            let req = CreateShedRequest {
+                name: "x".into(),
+                ..Default::default()
+            };
+            client(&server).create_shed(&req, sink.as_ref()).await;
+            assert_eq!(sink.snapshot().error.as_deref(), Some(want), "{info:?}");
+            assert_eq!(info_mock.hits_async().await, 1);
+        }
+        // A refusal with fixed words does not ask.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(CREATE_REFUSED_SSE);
+            })
+            .await;
+        let info_mock = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(200).body(r#"{"name":"m","version":"1"}"#);
+            })
+            .await;
+        let sink = Arc::new(RecordingSink::default());
+        client(&server)
+            .create_shed(&CreateShedRequest::default(), sink.as_ref())
+            .await;
+        assert!(sink.snapshot().error.is_some());
+        assert_eq!(info_mock.hits_async().await, 0);
+    }
+
+    /// A scripted server that records each request's body: each entry answers one
+    /// connection with its bytes, or (`None`) drops it unanswered (a lost reply).
+    async fn recording_server(
+        script: Vec<Option<Vec<u8>>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            for answer in script {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let head = read_head(&mut sock).await;
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                let _ = sock.read_exact(&mut body).await;
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                if let Some(answer) = answer {
+                    let _ = sock.write_all(&answer).await;
+                    let _ = sock.shutdown().await;
+                }
+            }
+        });
+        (base, bodies)
+    }
+
+    const EXTEND_ANSWER: &str = include_str!("../../fixtures/cloud/extend.json");
+    const EXTEND_AT_CAP: &str = include_str!("../../fixtures/cloud/extend-at-cap.json");
+
+    fn extend_body(raw: &str) -> (u64, String) {
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        (
+            v["hours"].as_u64().unwrap(),
+            v["request_id"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn extend_returns_the_shed_the_server_answered() {
+        let (base, bodies) =
+            recording_server(vec![answer("200 OK", "", EXTEND_ANSWER.trim_end())]).await;
+        let shed = client_at(base).extend("widgets", 6).await.unwrap();
+        assert_eq!(shed.name, "widgets");
+        assert_eq!(shed.host, "mini2", "stamped with this host");
+        let lease = shed
+            .cloud
+            .and_then(|c| c.lease)
+            .expect("the answer's lease");
+        assert!(lease.extendable);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let (hours, rid) = extend_body(&bodies[0]);
+        assert_eq!(hours, 6);
+        assert!(uuid::Uuid::parse_str(&rid).is_ok(), "{rid}");
+    }
+
+    /// A lost reply and a 5xx are sent again with the same request id; each call has
+    /// its own.
+    #[tokio::test]
+    async fn extend_sends_a_lost_or_undecided_reply_again_with_its_id() {
+        let unavailable = answer(
+            "503 Service Unavailable",
+            "",
+            r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"down"}}"#,
+        );
+        let (base, bodies) = recording_server(vec![
+            None,
+            unavailable,
+            answer("200 OK", "", EXTEND_ANSWER.trim_end()),
+            answer("200 OK", "", EXTEND_ANSWER.trim_end()),
+        ])
+        .await;
+        let c = client_at(base);
+        let rid = uuid::Uuid::new_v4().to_string();
+        let shed = c
+            .extend_with("widgets", 6, &rid, Duration::ZERO)
+            .await
+            .result
+            .unwrap();
+        assert_eq!(shed.name, "widgets");
+        c.extend("widgets", 6).await.unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        let ids: Vec<String> = bodies.iter().map(|b| extend_body(b).1).collect();
+        assert_eq!(ids[..3], [rid.clone(), rid.clone(), rid.clone()]);
+        assert_ne!(ids[3], rid, "a new call has a new id");
+    }
+
+    /// At most [`EXTEND_ATTEMPTS`] sends: the last answer is the error.
+    #[tokio::test]
+    async fn extend_gives_up_after_its_attempts() {
+        let (base, bodies) = recording_server(vec![None; EXTEND_ATTEMPTS + 2]).await;
+        let e = client_at(base)
+            .extend_with(
+                "widgets",
+                6,
+                "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+                Duration::ZERO,
+            )
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(e.status, None);
+        assert_eq!(bodies.lock().unwrap().len(), EXTEND_ATTEMPTS);
+    }
+
+    /// Whether an extend's outcome is unknown: only when every send ended with no
+    /// answer or a 5xx. An answer (2xx or 4xx) settles it, even after lost ones.
+    #[tokio::test]
+    async fn an_extend_is_unresolved_only_when_no_send_was_answered() {
+        let unavailable = || {
+            answer(
+                "503 Service Unavailable",
+                "",
+                r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"down"}}"#,
+            )
+        };
+        let rid = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+        for (script, unresolved, ok) in [
+            (vec![None; EXTEND_ATTEMPTS], true, false),
+            (vec![None, unavailable(), unavailable()], true, false),
+            (
+                vec![None, None, answer("200 OK", "", EXTEND_ANSWER.trim_end())],
+                false,
+                true,
+            ),
+            (
+                vec![None, answer("409 Conflict", "", EXTEND_AT_CAP.trim_end())],
+                false,
+                false,
+            ),
+            // A 2xx whose shed cannot be read: applied, its answer lost; not resent.
+            (vec![answer("200 OK", "", "{\"name\":")], true, false),
+            (
+                vec![answer("200 OK", "", &"x".repeat(MAX_DOCUMENT_BYTES + 1))],
+                true,
+                false,
+            ),
+        ] {
+            let (base, _) = recording_server(script).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert_eq!(
+                (out.unresolved, out.result.is_ok()),
+                (unresolved, ok),
+                "{out:?}"
+            );
+        }
+        // A public entry point that takes the caller's id sends that id.
+        let (base, bodies) =
+            recording_server(vec![answer("200 OK", "", EXTEND_ANSWER.trim_end())]).await;
+        let out = client_at(base)
+            .extend_with_request_id("widgets", 6, rid)
+            .await;
+        assert!(out.result.is_ok() && !out.unresolved);
+        assert_eq!(extend_body(&bodies.lock().unwrap()[0]).1, rid);
+        assert!(uuid::Uuid::parse_str(&new_request_id()).is_ok());
+    }
+
+    /// After a send whose outcome was unknown, a refusal that did not judge the request
+    /// id (a 401, shed-server's own refusals before it looks the id up, an unknown
+    /// code) keeps the outcome unknown: the earlier send may have moved the lease. The
+    /// same refusal of a first send is final, as is the service's own judgement.
+    #[tokio::test]
+    async fn a_refusal_after_an_unknown_send_keeps_it_unknown_unless_it_judged_it() {
+        let refusal = |status: &str, code: &str| {
+            answer(
+                status,
+                "",
+                &format!(r#"{{"error":{{"code":"{code}","message":"no"}}}}"#),
+            )
+        };
+        let rid = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+        for (status, code) in [
+            ("401 Unauthorized", "UNAUTHORIZED"),
+            ("403 Forbidden", "FORBIDDEN"),
+            ("404 Not Found", "SHED_NOT_FOUND"),
+            ("400 Bad Request", "INVALID_REQUEST"),
+            ("409 Conflict", "SOMETHING_NEW"),
+        ] {
+            let (base, bodies) = recording_server(vec![None, refusal(status, code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(out.unresolved, "{code} after a lost reply: {out:?}");
+            assert_eq!(out.result.unwrap_err().code, code);
+            assert_eq!(bodies.lock().unwrap().len(), 2, "not sent again");
+            // The same refusal of a first send is final.
+            let (base, _) = recording_server(vec![refusal(status, code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(!out.unresolved, "{code} first: {out:?}");
+        }
+        // The service's judgement of the id settles it, after a 5xx too.
+        for code in EXTEND_JUDGEMENTS {
+            let unavailable = answer(
+                "503 Service Unavailable",
+                "",
+                r#"{"error":{"code":"COMPUTE_UNAVAILABLE","message":"down"}}"#,
+            );
+            let (base, _) =
+                recording_server(vec![unavailable, refusal("409 Conflict", code)]).await;
+            let out = client_at(base)
+                .extend_with("widgets", 6, rid, Duration::ZERO)
+                .await;
+            assert!(!out.unresolved, "{code}: {out:?}");
+        }
+    }
+
+    /// A refusal is final, with its status, code, message and reason.
+    #[tokio::test]
+    async fn an_extend_refusal_is_final_with_its_code_and_reason() {
+        let (base, bodies) = recording_server(vec![
+            answer("409 Conflict", "", EXTEND_AT_CAP.trim_end()),
+            answer(
+                "403 Forbidden",
+                "",
+                r#"{"error":{"code":"PERSON_INACTIVE","message":"gone","reason":"person"}}"#,
+            ),
+            answer("200 OK", "", EXTEND_ANSWER.trim_end()),
+        ])
+        .await;
+        let c = client_at(base);
+        let e = c
+            .extend_with(
+                "widgets",
+                720,
+                "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+                Duration::ZERO,
+            )
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(e.status, Some(409));
+        assert_eq!(e.code, "LEASE_AT_CAP");
+        assert!(e.message.starts_with("lease at cap"), "{}", e.message);
+        assert_eq!(e.reason, "");
+        let e = c
+            .extend_with(
+                "widgets",
+                6,
+                "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+                Duration::ZERO,
+            )
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str(), e.reason.as_str()),
+            (Some(403), "PERSON_INACTIVE", "person")
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 2, "no refusal was sent again");
+    }
+
+    /// A refusal whose body breaks off is still final: its status was received, so it
+    /// is classified by status (code unknown) and never sent again. A 2xx whose body
+    /// breaks off is not known to have landed, and is sent again with its id.
+    #[tokio::test]
+    async fn a_refusal_whose_body_breaks_off_is_still_final() {
+        let cut = |status: &str| {
+            Some(
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: 1000\r\nconnection: close\r\n\r\n{{\"error\":{{\"code\""
+                )
+                .into_bytes(),
+            )
+        };
+        let (base, bodies) = recording_server(vec![cut("409 Conflict"), cut("409 Conflict")]).await;
+        let e = client_at(base)
+            .extend_with(
+                "widgets",
+                6,
+                "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+                Duration::ZERO,
+            )
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(e.status, Some(409), "{e:?}");
+        assert_eq!(bodies.lock().unwrap().len(), 1, "a 4xx is never sent again");
+
+        let (base, bodies) = recording_server(vec![
+            cut("200 OK"),
+            answer("200 OK", "", EXTEND_ANSWER.trim_end()),
+        ])
+        .await;
+        let shed = client_at(base)
+            .extend_with(
+                "widgets",
+                6,
+                "6f9619ff-8b86-4d01-b42d-00cf4fc964ff",
+                Duration::ZERO,
+            )
+            .await
+            .result
+            .unwrap();
+        assert_eq!(shed.name, "widgets");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(extend_body(&bodies[0]).1, extend_body(&bodies[1]).1);
+    }
+
+    #[tokio::test]
+    async fn cloud_usage_decodes_the_recorded_answers() {
+        for (raw, person) in [
+            (include_str!("../../fixtures/cloud/usage-org.json"), false),
+            (include_str!("../../fixtures/cloud/usage-person.json"), true),
+        ] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(GET).path("/api/cloud/usage");
+                    t.status(200).body(raw);
+                })
+                .await;
+            let u = client(&server).cloud_usage().await.unwrap();
+            assert_eq!(u.person.is_some(), person, "{raw}");
+            assert!(
+                u.org.max > 0 && u.org.machines == u.org.running + u.org.stopped,
+                "{u:?}"
+            );
+        }
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/cloud/usage");
+                t.status(501).body(
+                    r#"{"error":{"code":"FEATURE_UNSUPPORTED","message":"cloud usage is not supported"}}"#,
+                );
+            })
+            .await;
+        let e = client(&server).cloud_usage().await.unwrap_err();
+        assert_eq!(
+            (e.status, e.code.as_str()),
+            (Some(501), "FEATURE_UNSUPPORTED")
+        );
+        // An answer with an invalid scope is a failed read, never counts.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/cloud/usage");
+                t.status(200).body(r#"{"person":"me","org":null}"#);
+            })
+            .await;
+        let e = client(&server).cloud_usage().await.unwrap_err();
+        assert_eq!((e.status, e.code.as_str()), (Some(200), ""));
     }
 }
 

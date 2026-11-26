@@ -28,6 +28,7 @@ import (
 	"github.com/charliek/shed/internal/remote/transport/conformance"
 	"github.com/charliek/shed/internal/remote/transport/locallink"
 	"github.com/charliek/shed/internal/vmutil"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -449,11 +450,25 @@ func (e *env) put(name, status string) {
 
 func markerCount(t *testing.T, dir string) int {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "deleting"))
+	return len(stateFiles(t, filepath.Join(dir, "deleting")))
+}
+
+// stateFiles lists the state files in dir, leaving out the ".tmp-*" file a
+// write in flight puts beside its target (state.writeJSON): a marker or
+// record re-saved by a background operation would otherwise count twice.
+func stateFiles(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("read markers: %v", err)
+		t.Fatalf("read %s: %v", dir, err)
 	}
-	return len(entries)
+	files := entries[:0]
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".tmp-") {
+			files = append(files, e)
+		}
+	}
+	return files
 }
 
 // --- the call table ---
@@ -594,7 +609,7 @@ func TestCreateFastFailLeavesNoRecord(t *testing.T) {
 			if sheds, _ := e.b.ListSheds(context.Background()); len(sheds) != 0 {
 				t.Fatalf("a refused create left %d records", len(sheds))
 			}
-			if entries, _ := os.ReadDir(filepath.Join(e.dir, "sheds")); len(entries) != 0 {
+			if entries := stateFiles(t, filepath.Join(e.dir, "sheds")); len(entries) != 0 {
 				t.Fatalf("a refused create left %d record files", len(entries))
 			}
 			e.idle()
@@ -1020,6 +1035,12 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	if pin := e.storedRecord("keys").HostKeyPin; pin != testHostKey {
 		t.Fatalf("pin in the record = %q, want the attested key sshd presented", pin)
 	}
+	// One line says so: the shed's name and the key's fingerprint, never
+	// the key itself.
+	wantLine := "remote: shed keys: host key " + hostKeyFingerprint(testHostKey) + " pinned at first contact"
+	if pinned := linesContaining(e.logLines(), "pinned at first contact"); len(pinned) != 1 || pinned[0] != wantLine {
+		t.Fatalf("pin log lines = %q, want [%q]", pinned, wantLine)
+	}
 	inst, _ := e.prov.Get(context.Background(), ref)
 	if inst.ShedState() != provider.ShedStateReady || inst.Layout() != guest.Layout {
 		t.Fatalf("labels after create: state %q layout %d", inst.ShedState(), inst.Layout())
@@ -1040,6 +1061,34 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	got := e.settled("keys")
 	if got.Status != config.StatusStopped || got.StatusReason != config.StatusReasonHostKey {
 		t.Fatalf("start with a changed host key settled %q (%q), want stopped (host_key)", got.Status, got.StatusReason)
+	}
+	if pinned := linesContaining(e.logLines(), "pinned at first contact"); len(pinned) != 1 {
+		t.Fatalf("a pinned shed logged another pin: %q", pinned)
+	}
+}
+
+func linesContaining(lines []string, sub string) []string {
+	var out []string
+	for _, l := range lines {
+		if strings.Contains(l, sub) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestHostKeyFingerprintIsSSHs(t *testing.T) {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(localAuthorizedKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hostKeyFingerprint(localAuthorizedKey), ssh.FingerprintSHA256(pub); got != want {
+		t.Fatalf("hostKeyFingerprint = %q, want %q", got, want)
+	}
+	for _, bad := range []string{"", "ssh-ed25519", "ssh-ed25519 !!notbase64"} {
+		if got := hostKeyFingerprint(bad); strings.HasPrefix(got, "SHA256:") {
+			t.Errorf("hostKeyFingerprint(%q) = %q", bad, got)
+		}
 	}
 }
 

@@ -92,7 +92,7 @@ export function DialogShell({
           <Icon size={20} style={{ color: "var(--shed-accent)" }} />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-[18px] font-bold leading-tight text-shed-text">{title}</div>
+          <div className="text-[18px] font-bold leading-tight text-shed-text" data-dialog-title>{title}</div>
           {sub && <div className="mt-1 text-[13px] leading-snug text-shed-text-muted">{sub}</div>}
         </div>
         <button

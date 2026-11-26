@@ -20,6 +20,7 @@ import select
 import socket
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -207,6 +208,117 @@ DEFAULT_SHEDS = [
 
 
 # ---------------------------------------------------------------------------
+# Cloud sheds (plan 041): a remote server whose sheds are machines of an account
+# service, each with a lease (`serve_cloud`). The rows are the record shed-server's
+# own handlers answered (`crates/fixtures/cloud/sheds.json`, recorded over the
+# reference compute service by `internal/remote/client_fixtures_test.go`), renamed and
+# with their `cloud` set relative to now:
+#   * `POST /api/sheds/{name}/extend {"hours", "request_id"?}` -> 200 the shed with its
+#     lease moved, or a refusal `{"error": {"code", "message", "reason"?}}` by the
+#     server's codes (`refuse_extend` scripts the next ones); a repeated `request_id`
+#     answers its first answer again and moves nothing (a 5xx is not kept: it decided
+#     nothing); `lose_extend_replies` decides the next ones as usual and loses each
+#     reply (a 502 in its place), as a gateway that drops the answer would, and
+#     `drop_extends` answers the next ones 502 deciding nothing (`move_lease` then
+#     moves a lease as an extend applied late would);
+#   * `GET /api/cloud/usage` -> `{person, org}`; `501 FEATURE_UNSUPPORTED` on a server
+#     without compute (the default).
+_CLOUD_SHAPES = Path(__file__).resolve().parents[3] / "crates" / "fixtures" / "cloud"
+_CLOUD_RECORD = next(s for s in json.loads((_CLOUD_SHAPES / "sheds.json").read_text())["sheds"]
+                     if s["name"] == "widgets")
+#: `GET /api/cloud/usage` as recorded for a person.
+CLOUD_USAGE = json.loads((_CLOUD_SHAPES / "usage-person.json").read_text())
+_EXTEND_RE = re.compile(r"^/api/sheds/([^/]+)/extend$")
+# The server's `config.ValidUUID`: 8-4-4-4-12 hex digits, either case (`fullmatch`).
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_CLOUD_USAGE_PATH = "/api/cloud/usage"
+#: The `data:` of the recorded create stream's refusal (`create-refused.sse`): a local
+#: admin's create, COMPUTE_POLICY_REFUSED (person), as shed-server's handlers wrote it.
+CREATE_REFUSED_DATA = next(
+    line[len("data: "):] for line in (_CLOUD_SHAPES / "create-refused.sse").read_text().splitlines()
+    if line.startswith("data: "))
+#: `/api/info` of a remote server with leases.
+CLOUD_INFO = {**DEFAULT_INFO, "backend": "remote",
+              "features": ["overview", "async_lifecycle", "delivery", "lease"]}
+#: The extend refusals and their statuses (`internal/config/types.go`).
+EXTEND_REFUSALS = {
+    "EXTEND_NOT_ALLOWED": 403,
+    "LEASE_AT_CAP": 409,
+    "LEASE_ENDED": 409,
+    "PERSON_INACTIVE": 403,
+    "COMPUTE_DELETING": 409,
+    "COMPUTE_UNAVAILABLE": 503,
+}
+#: The message every mock refusal carries: what a client must NOT show for a code
+#: that has fixed words.
+EXTEND_REFUSAL_MESSAGE = "MOCK SERVER TEXT"
+_H = 3600
+
+
+def _utc(at: datetime) -> str:
+    return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc(raw: str) -> datetime | None:
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def cloud_shed(name: str, status: str, *, left_s: int | None, cap_s: int = 5 * 24 * _H,
+               size: tuple[str, int, int] = ("standard", 2, 8192), extendable: bool = True,
+               presets: list[int] | None = None, warn_s: int | None = 7200,
+               owner: str | None = None, ran_s: int = 3 * _H + 120) -> dict:
+    """A cloud shed's record: the recorded remote row, renamed, its `cloud` set from
+    now: the lease ends `left_s` from now (None: the lease is not known yet) with its
+    cap `cap_s` from now; `warn_s` None leaves it absent (2 h)."""
+    now = datetime.now(timezone.utc)
+    rec = json.loads(json.dumps(_CLOUD_RECORD))
+    rec.pop("delivery", None)
+    name_, cpus, mem = size
+    # Each row its own shed: a fresh 26-character id, as the server's are.
+    rec.update({"name": name, "id": secrets.token_hex(13), "status": status, "cpus": cpus,
+                "memory_mb": mem})
+    if owner:
+        rec["owner"] = owner
+    cloud = rec["cloud"]
+    cloud["size"] = {"name": name_, "cpus": cpus, "memory_mb": mem}
+    cloud["created_at"] = _utc(now - timedelta(seconds=ran_s + 600))
+    cloud["started_at"] = _utc(now - timedelta(seconds=ran_s))
+    cloud.pop("stopped_at", None)
+    if status == "stopped":
+        cloud["stopped_at"] = _utc(now - timedelta(seconds=60))
+    if left_s is None:
+        cloud.pop("lease", None)
+        cloud.pop("provider", None)
+    else:
+        lease = {"expires_at": _utc(now + timedelta(seconds=left_s)),
+                 "max_expires_at": _utc(now + timedelta(seconds=cap_s)),
+                 "extendable": extendable,
+                 "presets_h": [6, 12, 24, 48] if presets is None else presets}
+        if warn_s is not None:
+            lease["warn_s"] = warn_s
+        cloud["lease"] = lease
+    return rec
+
+
+def cloud_sheds() -> list[dict]:
+    """The remote fixture: a lease well within (ok), one under its warning time
+    (soon), one ended, one not known yet, a stopped one, and a service client's machine
+    (not extendable), on two sizes."""
+    return [
+        cloud_shed("cloud-ok", "running", left_s=5 * _H + 600),
+        cloud_shed("cloud-soon", "running", left_s=_H + 20 * 60, size=("large", 8, 32768)),
+        cloud_shed("cloud-ended", "stopped", left_s=-600),
+        cloud_shed("cloud-unknown", "starting", left_s=None),
+        cloud_shed("cloud-stopped", "stopped", left_s=30 * _H),
+        cloud_shed("nocturn-cloud", "running", left_s=20 * _H, cap_s=30 * _H,
+                   extendable=False, presets=[], owner="nocturn"),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # The egress decision stream (`GET /api/egress/stream`): `501` (egress control not
 # enabled) unless the mock was built with `egress_events`, when it is a `200` SSE
 # stream of `data: {json}` decisions (`shed_core::models::EgressDecision`), each written
@@ -304,6 +416,28 @@ class MockShedServer:
         # `sheds` may be a list or None (the real server returns
         # `{"sheds": null}` when empty — a decoding path we must exercise).
         self.sheds: list | None = [dict(s) for s in DEFAULT_SHEDS]
+        # ---- cloud sheds (plan 041): see `serve_cloud` ----
+        self.cloud_usage: dict | None = None  # None: 501, a server without compute
+        self._extend_refusals: list[tuple[str, str]] = []
+        # (caller, shed incarnation, lowercased request id) -> the answer kept for it.
+        self._extend_answers: dict[tuple[str, str, str], tuple[int, dict]] = {}
+        self._extend_requests: list[dict] = []
+        # The next extends whose reply is lost (`lose_extend_replies`), and those
+        # answered 502 with nothing decided (`drop_extends`).
+        self._extend_lost = 0
+        self._extend_dropped = 0
+        # Set: the next create streams this `error` event data (`refuse_create`).
+        self.create_error_data: str | None = None
+        # The next deletes refused with this status, nothing deleted (`refuse_deletes`).
+        self._delete_refusals: list[int] = []
+        # Holds (`hold_extend` / `hold_usage`): the next request of each waits for its
+        # gate before it is answered; the counters say how many arrived and were answered.
+        self._extend_hold: threading.Event | None = None
+        self._usage_hold: threading.Event | None = None
+        self._extend_arrived = 0
+        self._usage_arrived = 0
+        self._usage_answered = 0
+        self._holds: list[threading.Event] = []  # every hold made, set again by `reset`
         # Create-stream controls.
         self.create_should_fail = False
         self.create_progress = ["resolving image", "starting VM", "provisioning workspace"]
@@ -450,7 +584,20 @@ class MockShedServer:
             self.shed_doc_refusal = None
             self.egress_enabled = True
             self.egress_default = []
+            self.cloud_usage = None
+            self._extend_refusals = []
+            self._extend_answers = {}
+            self._extend_requests = []
+            self._extend_lost = 0
+            self._extend_dropped = 0
+            self.create_error_data = None
+            self._delete_refusals = []
+            holds, self._holds = self._holds, []
+            self._extend_hold = self._usage_hold = None
+            self._extend_arrived = self._usage_arrived = self._usage_answered = 0
             gate, self._provision_gate = self._provision_gate, None
+        for h in holds:
+            h.set()
         if gate is not None:
             gate.set()
         with self._lock:
@@ -559,6 +706,192 @@ class MockShedServer:
                 if s["name"] == name:
                     return dict(s)
         return None
+
+    # -- cloud sheds (plan 041) ---------------------------------------------
+    def serve_cloud(self, sheds: list[dict] | None = None,
+                    usage: dict | None = CLOUD_USAGE) -> None:
+        """Become a remote server with leases: `CLOUD_INFO`, the cloud fixture's rows
+        (`cloud_sheds()`, or `sheds`), and `usage` for `GET /api/cloud/usage` (None:
+        501)."""
+        with self._lock:
+            self.info = dict(CLOUD_INFO)
+            self.sheds = cloud_sheds() if sheds is None else sheds
+            self.cloud_usage = None if usage is None else json.loads(json.dumps(usage))
+
+    def refuse_extend(self, code: str, reason: str = "") -> None:
+        """The next extend is refused with `code` (one of `EXTEND_REFUSALS`), at its
+        status, with `reason` when given. Several calls queue in order."""
+        assert code in EXTEND_REFUSALS, code
+        with self._lock:
+            self._extend_refusals.append((code, reason))
+
+    def lose_extend_replies(self, n: int) -> None:
+        """The next `n` extends are decided as usual (applied, refused or answered
+        again for a repeated request id) and each reply is lost: a 502 with no API
+        error goes back instead, as from a gateway that dropped the answer."""
+        with self._lock:
+            self._extend_lost = n
+
+    def drop_extends(self, n: int) -> None:
+        """The next `n` extends are answered 502 with nothing decided (no lease moves,
+        no answer kept)."""
+        with self._lock:
+            self._extend_dropped = n
+
+    def move_lease(self, name: str, hours: int) -> None:
+        """Move `name`'s lease end `hours` later, as an extend the service applied
+        late would."""
+        with self._lock:
+            shed = next(s for s in (self.sheds or []) if s["name"] == name)
+            lease = shed["cloud"]["lease"]
+            end = _parse_utc(lease["expires_at"])
+            assert end is not None, lease
+            lease["expires_at"] = _utc(end + timedelta(hours=hours))
+
+    def refuse_deletes(self, n: int, status: int = 503) -> None:
+        """The next `n` deletes are answered `status` with an API error and delete
+        nothing."""
+        with self._lock:
+            self._delete_refusals.extend([status] * n)
+
+    def _delete_refusal(self) -> int | None:
+        with self._lock:
+            return self._delete_refusals.pop(0) if self._delete_refusals else None
+
+    def refuse_create(self, data: str = CREATE_REFUSED_DATA) -> None:
+        """Every create streams one `error` event with `data` (by default the recorded
+        refusal, `create-refused.sse`) and no shed, until `reset`."""
+        with self._lock:
+            self.create_error_data = data
+
+    def hold_extend(self) -> threading.Event:
+        """The next extend that arrives waits, before anything is decided, until the
+        returned event is set (`reset` sets it too)."""
+        gate = threading.Event()
+        with self._lock:
+            self._extend_hold = gate
+            self._holds.append(gate)
+        return gate
+
+    def hold_usage(self) -> threading.Event:
+        """The next usage read takes its answer when it arrives, then waits to send it
+        until the returned event is set (`reset` sets it too)."""
+        gate = threading.Event()
+        with self._lock:
+            self._usage_hold = gate
+            self._holds.append(gate)
+        return gate
+
+    def cloud_counts(self) -> dict:
+        """`{extend_arrived, usage_arrived, usage_answered}`: the extends that reached
+        the mock (held ones included) and the usage reads that arrived and were sent."""
+        with self._lock:
+            return {"extend_arrived": self._extend_arrived, "usage_arrived": self._usage_arrived,
+                    "usage_answered": self._usage_answered}
+
+    def _arrive_extend(self) -> None:
+        with self._lock:
+            self._extend_arrived += 1
+            gate, self._extend_hold = self._extend_hold, None
+        if gate is not None:
+            gate.wait(30)
+
+    def _note_usage_answered(self) -> None:
+        with self._lock:
+            self._usage_answered += 1
+
+    def extend_requests(self) -> list[dict]:
+        """Every extend body received, with the shed's name under `name`."""
+        with self._lock:
+            return [dict(r) for r in self._extend_requests]
+
+    def _extend(self, name: str, body: object, caller: str = "") -> tuple[int, dict]:
+        """`POST /api/sheds/{name}/extend` as the server answers it (`handleExtendShed`):
+        the body's shape, `hours` and a `request_id` that is a UUID when given are
+        checked first (400 `INVALID_REQUEST`, nothing recorded). An answer is kept for
+        its caller, shed and request id together, as the server derives the service's
+        id from all three: the same id from another caller or for another shed is a
+        new extend, and so is the same id for a shed created again under the name."""
+        if not isinstance(body, dict) or set(body) - {"hours", "request_id"}:
+            return 400, _api_error("INVALID_REQUEST", 'the body must be {"hours": N}')
+        hours = body.get("hours")
+        if not isinstance(hours, int) or isinstance(hours, bool) or not 1 <= hours <= 720:
+            return 400, _api_error("INVALID_REQUEST", "hours must be 1 to 720")
+        rid = body.get("request_id")
+        if rid is None:  # JSON null decodes to the empty id, as in Go
+            rid = ""
+        if not isinstance(rid, str):
+            return 400, _api_error("INVALID_REQUEST", 'the body must be {"hours": N}')
+        if rid and not _UUID_RE.fullmatch(rid):
+            return 400, _api_error("INVALID_REQUEST", "request_id must be a UUID")
+        with self._lock:
+            self._extend_requests.append({"name": name, **body})
+            if "lease" not in self.info.get("features", []):
+                return 501, _api_error("FEATURE_UNSUPPORTED", "extend is not supported")
+            # The shed is resolved first, and the answer kept for this incarnation of
+            # it (its id, else its name and creation time, as the server's
+            # `ExtendRequestID` falls back): a shed created again under its name is
+            # another shed. The id is a UUID in either case, compared lowercased.
+            shed = next((s for s in (self.sheds or []) if s["name"] == name), None)
+            if shed is None:
+                return 404, _api_error("SHED_NOT_FOUND", f"shed {name!r} not found")
+            incarnation = shed.get("id") or f"{name}@{shed.get('created_at', '')}"
+            key = (caller, incarnation, rid.lower())
+            if self._extend_dropped > 0:
+                self._extend_dropped -= 1
+                return 502, {}
+            if rid and key in self._extend_answers:
+                answer = self._extend_answers[key]
+            else:
+                answer = self._extend_locked(name, hours)
+                # An answer is kept, as the account service keeps it; a 5xx (the
+                # service not reached) decided nothing, so a retry is a new try.
+                if rid and answer[0] < 500:
+                    self._extend_answers[key] = answer
+            if self._extend_lost > 0:
+                self._extend_lost -= 1
+                return 502, {}
+            return answer
+
+    def _extend_locked(self, name: str, hours: int) -> tuple[int, dict]:
+        def refusal(code: str, reason: str = "") -> tuple[int, dict]:
+            err = {"code": code, "message": EXTEND_REFUSAL_MESSAGE}
+            if reason:
+                err["reason"] = reason
+            return EXTEND_REFUSALS[code], {"error": err}
+
+        if self._extend_refusals:
+            return refusal(*self._extend_refusals.pop(0))
+        shed = next((s for s in (self.sheds or []) if s["name"] == name), None)
+        if shed is None:
+            return 404, _api_error("SHED_NOT_FOUND", f"shed {name!r} not found")
+        lease = (shed.get("cloud") or {}).get("lease")
+        if lease is None:
+            return refusal("COMPUTE_UNAVAILABLE")
+        end, cap = _parse_utc(lease["expires_at"]), _parse_utc(lease["max_expires_at"])
+        now = datetime.now(timezone.utc)
+        if end is None or cap is None or end <= now:
+            return refusal("LEASE_ENDED")
+        if not lease.get("extendable"):
+            return refusal("EXTEND_NOT_ALLOWED")
+        new_end = end + timedelta(hours=hours)
+        if new_end > cap:
+            return refusal("LEASE_AT_CAP")
+        lease["expires_at"] = _utc(new_end)
+        lease["extendable"] = new_end + timedelta(hours=1) <= cap
+        return 200, json.loads(json.dumps(shed))
+
+    def _usage(self) -> tuple[int, dict]:
+        with self._lock:
+            self._usage_arrived += 1
+            gate, self._usage_hold = self._usage_hold, None
+            if self.cloud_usage is None:
+                answer = 501, _api_error("FEATURE_UNSUPPORTED", "cloud usage is not supported")
+            else:
+                answer = 200, json.loads(json.dumps(self.cloud_usage))
+        if gate is not None:
+            gate.wait(30)
+        return answer
 
     # -- mutations the request handlers call (under lock) -----------------
     def _set_status(self, name: str, status: str) -> bool:
@@ -1230,6 +1563,10 @@ class MockShedServer:
                     else:
                         self._send(200, doc)
                     return
+                if path == _CLOUD_USAGE_PATH:
+                    self._send(*state._usage())
+                    state._note_usage_answered()
+                    return
                 m = _EGRESS_SHOW_RE.match(path)
                 if m and m.group(1) not in ("stream", "profiles"):
                     status = state.egress_status(unquote(m.group(1)))
@@ -1451,6 +1788,17 @@ class MockShedServer:
                 if m:
                     self._serve_provision(unquote(m.group(1)))
                     return
+                m = _EXTEND_RE.match(path)
+                if m:
+                    try:
+                        body = self._body()
+                    except ValueError:
+                        body = None
+                    # The mock's only notion of who asks: the credential presented.
+                    caller = self.headers.get("Authorization") or ""
+                    state._arrive_extend()
+                    self._send(*state._extend(unquote(m.group(1)), body, caller))
+                    return
                 if path == _SOURCES_USE_PATH:
                     try:
                         body = self._body()
@@ -1491,6 +1839,10 @@ class MockShedServer:
                     return
                 parts = self.path.strip("/").split("/")
                 if len(parts) == 3 and parts[:2] == ["api", "sheds"]:
+                    refused = state._delete_refusal()
+                    if refused is not None:
+                        self._send(refused, _api_error("COMPUTE_UNAVAILABLE", "SERVER TEXT"))
+                        return
                     self._send(200 if state._delete(parts[2]) else 404, {"ok": True})
                 else:
                     self._send(404, {"error": "not found"})
@@ -1512,6 +1864,10 @@ class MockShedServer:
                 for msg in state.create_progress:
                     frame("progress", {"message": msg})
                     time.sleep(0.02)
+                if state.create_error_data is not None:
+                    self.wfile.write(f"event: error\ndata: {state.create_error_data}\n\n".encode())
+                    self.wfile.flush()
+                    return
                 if state.create_should_fail:
                     frame("error", {"code": "create_failed", "message": f"could not create {name}"})
                     return

@@ -184,6 +184,10 @@ different scope and a different tradeoff (see the credential-ownership table in
 - Don't expose any shed-server further; a reachable server is trusted by the network, not the
   app.
 
+## Cloud rows
+
+A shed of a server whose machines come from the account service carries `cloud` (plan 041). Every decision about it (the words, the lease state `ok`/`soon`/`ended`/`unknown`, which actions it offers, the extend presets clipped to the cap, the fixed refusal words, the usage line) is made once in `crates/shed-app/src/cloud.rs`; `sheds.list` attaches the result as `cloud_row`, and the UI (`tauri/ui/src/components/ShedCloud.tsx`, `lib/cloud.ts`) only draws it, so keep new decisions out of the frontend. The IPC doors are `shed.extend`, `cloud.usage` and the test-mode `ui.press_*` / `ui.fill_extend_hours` ones (`docs/desktop/ipc.md`); the cells are `tools/shedtest/test_tauri_cloud.py` and `test_tauri_cloud_view.py`. User docs: `docs/desktop/cloud-sheds.md`.
+
 ## Skills + docs
 
 The end-to-end validation loops are documented as skills (update them when you hit a new

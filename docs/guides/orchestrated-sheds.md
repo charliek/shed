@@ -432,7 +432,7 @@ Statuses](../reference/remote-backend.md#statuses)):
 | `stopped` (`capacity`, `quota`, `limit` or `firewall`) | A start was refused, by the cloud, the server's `max_running` or the ingress check. Start it again later, or delete it. |
 | `stopped` (`unreachable`) | The VM came up but its agent did not answer, so the server stopped it again. Start it again; if it happens again, ask an admin to read the server log. |
 | `stopped` (`host_key` or `layout`) | The VM presented a host key other than the pinned one, or its agent is one this server cannot drive. Starting again is not expected to help: delete it, and tell an admin. |
-| `error` (`capacity`, `quota`, `create_failed`, `host_key`, `layout` or `firewall`) | The create failed. Only a delete leaves this state, and until then the shed counts against `max_sheds`. Delete it; after `capacity`, `quota` or `firewall`, create again later. |
+| `error` (`capacity`, `quota`, `create_failed`, `host_key`, `access`, `layout` or `firewall`) | The create failed. A delete leaves this state; so does the machine going (its lease ends, or the account service deletes it) when the create had made one, and the shed is then no longer listed. Until then the shed counts against `max_sheds`. Delete it; after `capacity`, `quota` or `firewall`, create again later. |
 
 A create or start that the account service's limits, the cloud, the server's
 limits or the ingress check refuses at once answers `503`, never `409`:

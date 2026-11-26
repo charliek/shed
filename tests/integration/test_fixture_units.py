@@ -6296,3 +6296,62 @@ def test_ref_control_reads_the_services_inventory(tmp_path):
     # The dev script starts the service with the file.
     script = (dc.REPO_ROOT / "scripts" / "dev-compute-ref.sh").read_text()
     assert '--inventory "$DIR/inventory.json"' in script
+
+
+# A shared shed's name is recorded only once its create succeeded: a refused
+# create must not leave later cases polling a shed that does not exist.
+
+
+def _shared_env():
+    import test_remote_compute as trc
+
+    return trc.Env(where="hermetic", service="ref", alice=None, bob=None, admin=None, client=None,
+                   client_name="c", client_policy={"name_prefix": "c-", "max_age_s": 0, "images": [],
+                                                   "network": ""},
+                   control=None, server_log=lambda: "", restart=None, image=None,
+                   cleanup=lambda name: None, shared=trc.Shared())
+
+
+def test_client_shed_records_its_name_only_after_the_create_succeeds(monkeypatch):
+    import test_remote_compute as trc
+
+    answers = [(409, {"error": {"code": "CONFLICT"}}), (201, {"id": "id-1"})]
+    monkeypatch.setattr(trc, "client_create", lambda env, name, lease=None: answers.pop(0))
+    waited = []
+    monkeypatch.setattr(trc, "client_wait_running",
+                        lambda env, name: waited.append(name) or {"name": name, "status": "running"})
+    env = _shared_env()
+    with pytest.raises(AssertionError, match="the client's create of c-cc-shared-.*: 409"):
+        env.client_shed()
+    assert env.shared.client is None and waited == [], "a refused create shares nothing and waits on nothing"
+    assert len(env.made) == 1 and env.shared.created == 0, "the failing case's clean-up owns the name"
+    env.made.clear()
+    shed = env.client_shed()
+    assert env.shared.client == shed["name"] == waited[0] and env.made == []
+    assert env.shared.created == 1 and env.shared.ids == {shed["name"]: "id-1"}
+    # A later case reuses it without another create.
+    assert env.client_shed()["name"] == shed["name"] and answers == []
+
+
+def test_person_shed_records_its_name_only_after_the_create_succeeds(monkeypatch):
+    import test_remote_compute as trc
+
+    codes = [1, 0]
+    monkeypatch.setattr(trc, "create",
+                        lambda env, who, name: subprocess.CompletedProcess([], codes.pop(0), "", "refused"))
+    waited = []
+    monkeypatch.setattr(trc, "wait_status",
+                        lambda who, name, status: waited.append(name) or {"name": name, "id": "id-p"})
+
+    class Alice:
+        user = "alice"
+
+    env = _shared_env()
+    env.alice = Alice()
+    with pytest.raises(AssertionError, match="alice: shed create itest-cc-shared-.*: exit 1"):
+        env.person_shed()
+    assert env.shared.person is None and waited == [] and len(env.made) == 1
+    env.made.clear()
+    shed = env.person_shed()
+    assert env.shared.person == shed["name"] and env.made == []
+    assert env.shared.created == 1 and env.shared.ids == {shed["name"]: "id-p"}

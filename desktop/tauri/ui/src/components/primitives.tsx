@@ -46,17 +46,19 @@ export function StatusChip({ tone, label }: { tone: Tone; label: string }) {
   );
 }
 
-/** A runtime tag (vz / firecracker), mono pill in the runtime's brand tint. */
-export function Tag({ kind }: { kind: string }) {
-  const vz = kind === "vz";
+/** A runtime tag (vz / firecracker), mono pill in the runtime's brand tint; a cloud
+ *  shed's tag (plan 041) wears its own tint, apart from either runtime's. */
+export function Tag({ kind, cloud }: { kind: string; cloud?: boolean }) {
+  const tint = cloud ? "cloud" : kind === "vz" ? "vz" : "fc";
   return (
     <span
       className="flex-none rounded-md px-2 py-[3px] font-mono text-[10px] font-bold leading-none"
       style={{
-        background: vz ? "var(--shed-tag-vz-bg)" : "var(--shed-tag-fc-bg)",
-        color: vz ? "var(--shed-tag-vz-text)" : "var(--shed-tag-fc-text)",
+        background: `var(--shed-tag-${tint}-bg)`,
+        color: `var(--shed-tag-${tint}-text)`,
         letterSpacing: ".03em",
       }}
+      data-shed-tag={tint}
     >
       {kind}
     </span>
