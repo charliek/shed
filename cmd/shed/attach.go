@@ -114,12 +114,19 @@ func attachPlain(name, serverName string, entry *config.ServerEntry, shed *confi
 // (see TestAttachPlainTmuxArgvGolden). Never swapped outside tests.
 var execSSH = syscall.Exec
 
+// stderrIsTerminal is isStderrTTY, the question the plain attach's banner
+// opt-out asks; a test that pins the attach argv answers it.
+var stderrIsTerminal = isStderrTTY
+
 // execSSHTmux replaces this process with `ssh -t … <tmuxCmd>` (the plain
 // attach path). Interactive, so it intentionally omits BatchMode/ConnectTimeout
 // (an interactive session may legitimately prompt); the rest is shared via
 // baseSSHArgs.
+//
+// Under --json, or with a stderr that is not a terminal, it asks the server
+// for no lease banner (bannerOptOut); the session keeps its terminal.
 func execSSHTmux(serverName, name string, entry *config.ServerEntry, tmuxCmd string) error {
-	base, err := baseSSHArgs(serverName, name, entry)
+	base, err := baseSSHArgs(serverName, name, entry, bannerOptOut(stderrIsTerminal(), jsonFlag)...)
 	if err != nil {
 		return err
 	}

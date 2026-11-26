@@ -164,6 +164,13 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = id
 
+	// A create's lease is a service client's, on a server with leases
+	// only, and is checked before anything else is asked of the backend.
+	caller := callerFrom(r.Context())
+	if !s.createLeaseRefusal(w, caller, &req) {
+		return
+	}
+
 	// A remote server offers its compute service's named sizes: the
 	// request's cpus and memory pick one, and the record carries that size's
 	// numbers. This runs before the client cap check so the caps apply to
@@ -190,7 +197,6 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	// touches the host (local_dir existence would otherwise be an oracle for
 	// the server's filesystem), and before the SSE branch, so a refusal is
 	// always a plain 403.
-	caller := callerFrom(r.Context())
 	if caller.IsClient() {
 		if rule := s.clientCreateRefusal(caller, &req); rule != "" {
 			writePolicyViolation(w, caller, rule)

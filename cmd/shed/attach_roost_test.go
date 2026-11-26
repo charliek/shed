@@ -285,12 +285,14 @@ func TestAttachGateFallsBackToTmux(t *testing.T) {
 func resetAttachState(t *testing.T) {
 	t.Helper()
 	session, forceNew, tmux := attachSessionFlag, attachNewFlag, attachTmuxFlag
-	exec, cfg, newRoost := execSSH, clientConfig, newRoostAttach
+	exec, cfg, newRoost, tty, js := execSSH, clientConfig, newRoostAttach, stderrIsTerminal, jsonFlag
 	t.Cleanup(func() {
 		attachSessionFlag, attachNewFlag, attachTmuxFlag = session, forceNew, tmux
-		execSSH, clientConfig, newRoostAttach = exec, cfg, newRoost
+		execSSH, clientConfig, newRoostAttach, stderrIsTerminal, jsonFlag = exec, cfg, newRoost, tty, js
 	})
 	attachSessionFlag, attachNewFlag, attachTmuxFlag = config.DefaultSessionName, false, false
+	// A person at a terminal: the attach argv as it always was.
+	stderrIsTerminal, jsonFlag = func() bool { return true }, false
 	t.Setenv("SHED_ATTACH", "")
 }
 

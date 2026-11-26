@@ -183,6 +183,14 @@ type Backend struct {
 	// saveRecord is the store's SaveRecord for a delivery step's write
 	// (tests fail it).
 	saveRecord func(*state.Record) error
+	// saveMarker is the store's SaveMarker for the write of a delete
+	// marker's request id (tests fail it).
+	saveMarker func(*state.Marker) error
+	// flushedIDs are the delete markers' request ids this process has
+	// written with a save whose flush succeeded: only those are sent. An
+	// id read back from disk is saved again, durably, before it is sent.
+	// Guarded by mu.
+	flushedIDs map[string]bool
 
 	// deliverySvc asks a shed user's source for its credentials (nil: no
 	// delivery). stepLocks holds a provision's step in hand against a stop
@@ -198,6 +206,14 @@ type Backend struct {
 	// halting is raised by a stop or a delete of the shed while it waits
 	// for the step lock: a provision's next step gives way to it.
 	halting lockmap.Flags
+	// extending holds one extend per shed (by shed id) at a time, so an
+	// extend's stored request id (Record.Extend) is read and written by one
+	// call only.
+	extending lockmap.NamedMutexMap
+	// usage keeps GET /api/cloud/usage's answers for usageTTL, by the user
+	// asked about ("" for the organization only).
+	usageMu sync.Mutex
+	usage   map[string]usageEntry
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -364,6 +380,8 @@ func New(opts Options) (*Backend, error) {
 	}
 	b.rmPartial = b.removePartialClone
 	b.saveRecord = b.store.SaveRecord
+	b.saveMarker = b.store.SaveMarker
+	b.flushedIDs = map[string]bool{}
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
 	}
@@ -610,6 +628,12 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	// on the copy only; the stored record carries none.
 	shed.Mounts = config.SelectedMounts(nil)
 	shed.Delivery = config.NewShedDelivery(r.Delivery, b.now())
+	var warn *time.Duration
+	if b.haveCatalog {
+		w := b.catalog.Policy.Warn
+		warn = &w
+	}
+	shed.Cloud = cloudOf(r, warn)
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen
@@ -619,6 +643,61 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 		}
 	}
 	return &shed
+}
+
+// cloudOf is a shed's cloud facts. From the machine the service last
+// answered: its size, disk, image, times and lease, with the catalog's
+// warning time (warn; nil when the catalog has not been read, which the
+// record then leaves out). Before the first answer, what the server asked
+// for: the size, the disk, the image name and the shed's creation time, with
+// no lease (unknown). Every remote record carries it. Nothing of it names a
+// project, a zone or an address.
+func cloudOf(r *state.Record, warn *time.Duration) *config.ShedCloud {
+	m := r.Machine
+	if m == nil || m.Ref == "" {
+		c := &config.ShedCloud{
+			Size:      config.CloudSize{CPUs: r.Shed.CPUs, MemoryMB: r.Shed.MemoryMB},
+			Image:     r.Shed.Image,
+			CreatedAt: r.Shed.CreatedAt,
+		}
+		if sp := r.Spec; sp != nil {
+			c.Size.Name, c.DiskGB = sp.Size, sp.DiskGB
+			if c.Image == "" {
+				c.Image = sp.Image
+			}
+		}
+		return c
+	}
+	lease := &config.CloudLease{
+		ExpiresAt:    m.Lease.ExpiresAt,
+		MaxExpiresAt: m.Lease.MaxExpiresAt,
+		Extendable:   m.Lease.Extendable,
+		PresetsH:     slices.Clone(m.Lease.PresetsH),
+	}
+	if warn != nil {
+		s := int64(*warn / time.Second)
+		lease.WarnS = &s
+	}
+	c := &config.ShedCloud{
+		Provider:  m.Provider,
+		Size:      config.CloudSize{Name: m.Size.Name, CPUs: m.Size.CPUs, MemoryMB: m.Size.MemoryMB},
+		DiskGB:    m.DiskGB,
+		Image:     m.ImageResolved,
+		CreatedAt: m.CreatedAt,
+		Lease:     lease,
+	}
+	if c.Image == "" {
+		c.Image = m.Image
+	}
+	if !m.StartedAt.IsZero() {
+		t := m.StartedAt
+		c.StartedAt = &t
+	}
+	if !m.StoppedAt.IsZero() {
+		t := m.StoppedAt
+		c.StoppedAt = &t
+	}
+	return c
 }
 
 // ownership returns the service client and user a record is reported with.

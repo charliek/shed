@@ -38,6 +38,8 @@ var clientAllowedList = []string{
 	// The activity feed: a client sees its own sheds' events (plan 039
 	// §3.9; TestActivityVisibility).
 	"GET /api/activity",
+	// The organization's cloud usage (plan 041 §3.4).
+	"GET /api/cloud/usage",
 }
 
 // clientForbiddenList is every other registered route, listed by hand. A
@@ -84,6 +86,8 @@ var clientForbiddenList = []string{
 	// Nobody provisions a service client's shed (plan 039 §3.2).
 	"POST /api/sheds/{name}/provision",
 	"POST /api/sheds/{name}/assign",
+	// A service client cannot extend a lease (plan 041 §0.1 item 6).
+	"POST /api/sheds/{name}/extend",
 	"GET /api/sheds/{name}/sessions",
 	"DELETE /api/sheds/{name}/sessions/{session}",
 	"GET /api/sheds/{name}/connect/{port}",

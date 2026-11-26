@@ -347,6 +347,10 @@ type Shed struct {
 	// adoption; a record written before it existed has none and reports
 	// none); for Firecracker and VZ the report step sets the host's.
 	Arch string `json:"arch,omitempty" yaml:"arch,omitempty"`
+	// Cloud is a cloud shed's machine as the account service reported it
+	// (the remote backend only; FeatureLease): its size, image, times and
+	// lease. Set when a record is reported, never stored as part of a Shed.
+	Cloud *ShedCloud `json:"cloud,omitempty" yaml:"-"`
 }
 
 // HostResources names what the shed, as its backend reports it, reaches that
@@ -1358,6 +1362,16 @@ type CreateShedRequest struct {
 	// when the catalog no longer offers it with those numbers; it never
 	// resolves the numbers again. Never from the wire.
 	SizeName string `json:"-"`
+	// Lease is a service client's lease for its cloud shed, a Go duration
+	// ("30h"): the account service deletes the machine that long after it
+	// is made. Only a service client may send it, and only to a server that
+	// advertises FeatureLease (422 FEATURE_UNSUPPORTED otherwise); above
+	// the client's policy.max_age it is refused POLICY_VIOLATION. Absent:
+	// the client's policy.max_age.
+	Lease string `json:"lease,omitempty"`
+	// ClientLease is Lease as the API parsed and checked it, for the
+	// backend. Never from the wire.
+	ClientLease time.Duration `json:"-"`
 }
 
 // ServerEnvWithheld reports whether the server's env_file variables are kept
@@ -1641,6 +1655,21 @@ const (
 	// ErrComputeDeleting (409): the service is deleting the machine (its
 	// lease ended, or it was deleted at the service).
 	ErrComputeDeleting = "COMPUTE_DELETING"
+	// The refusals of an extend (POST /api/sheds/{name}/extend), each a
+	// ComputeRefusal with the account service's own code:
+	//
+	// ErrExtendNotAllowed (403): the lease cannot be extended (a service
+	// client's machine, or the service's policy lets no person extend).
+	ErrExtendNotAllowed = "EXTEND_NOT_ALLOWED"
+	// ErrLeaseAtCap (409): the extend would take the lease past its cap;
+	// nothing changed.
+	ErrLeaseAtCap = "LEASE_AT_CAP"
+	// ErrLeaseEnded (409): the lease has ended; the machine is being
+	// deleted.
+	ErrLeaseEnded = "LEASE_ENDED"
+	// ErrPersonInactive (403): the machine's person is no longer a live
+	// person of the account service for this server.
+	ErrPersonInactive = "PERSON_INACTIVE"
 	// ErrSizeUnavailable (422): no size of the service's catalog provides
 	// the cpus and memory a create asked for.
 	ErrSizeUnavailable = "SIZE_UNAVAILABLE"

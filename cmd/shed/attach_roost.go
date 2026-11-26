@@ -286,7 +286,13 @@ func attachShed(name, serverName string, entry *config.ServerEntry, shed *config
 	if !roost.ctl.Available(ctx) {
 		return attachPlain(name, serverName, entry, shed)
 	}
-	return roost.attach(ctx, name, serverName, entry, shed, attachSessionFlag, attachNewFlag)
+	if err := roost.attach(ctx, name, serverName, entry, shed, attachSessionFlag, attachNewFlag); err != nil {
+		return err
+	}
+	// The roost tab's session has no terminal on the server, which so
+	// prints no lease banner: the CLI does, once.
+	roostBanner(os.Stderr, shed, time.Now(), isStderrTTY(), jsonFlag)
+	return nil
 }
 
 // attach runs §3.3 steps 3-8 against an already-running shed.

@@ -33,6 +33,8 @@ type recBackend struct {
 	// getErr, when set, is what GetShed and GetSnapshot answer: a record
 	// that cannot be read.
 	getErr error
+	// extendIDs are the request ids extends reached the backend with.
+	extendIDs []string
 }
 
 func newRecBackend() *recBackend {

@@ -1666,12 +1666,18 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 			// Server text, escaped as parseError escapes it (SafeText):
 			// printable text is unchanged, a control character never reaches
 			// the terminal raw.
+			// The server sends the API's error envelope,
+			// {"error":{"code","message","reason"}}; a bare
+			// {"code","message"} is read too.
 			var apiErr config.APIError
-			if uerr := json.Unmarshal([]byte(data), &apiErr); uerr != nil {
-				return true, nil, fmt.Errorf("server error: %s", sdkbootstrap.SafeText(data))
+			if uerr := json.Unmarshal([]byte(data), &apiErr); uerr == nil && apiErr.Error.Code != "" {
+				return true, nil, errors.New(apiErrorText(apiErr.Error))
 			}
-			return true, nil, fmt.Errorf("%s: %s",
-				sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))
+			var bare config.APIErrorDetail
+			if uerr := json.Unmarshal([]byte(data), &bare); uerr == nil && bare.Code != "" {
+				return true, nil, errors.New(apiErrorText(bare))
+			}
+			return true, nil, fmt.Errorf("server error: %s", sdkbootstrap.SafeText(data))
 		}
 		return false, nil, nil
 	}
@@ -1936,6 +1942,26 @@ func (c *APIClient) StartShed(name string) (*config.Shed, error) {
 		return nil, err
 	}
 	return &shed, nil
+}
+
+// ExtendShed moves a cloud shed's lease later by req.Hours, with the
+// caller's request id (req.RequestID) when it has one.
+func (c *APIClient) ExtendShed(name string, req config.ExtendShedRequest) (*config.Shed, error) {
+	var shed config.Shed
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/sheds/"+name+"/extend", req, &shed, c.createTimeout); err != nil {
+		return nil, err
+	}
+	return &shed, nil
+}
+
+// CloudUsage reads the machines held against the account service's limits
+// (the caller's and the organization's).
+func (c *APIClient) CloudUsage() (*config.CloudUsage, error) {
+	var u config.CloudUsage
+	if err := c.doRequest(http.MethodGet, "/api/cloud/usage", nil, &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 // StopShed stops a running shed.
@@ -2345,7 +2371,9 @@ func (c *APIClient) Status() (string, error) {
 // HTTP status; the text is what parseError has always returned.
 type apiStatusError struct {
 	Status int
-	text   string
+	// Code is the structured error's code, "" when the body had none.
+	Code string
+	text string
 }
 
 func (e *apiStatusError) Error() string { return e.text }
@@ -2370,6 +2398,5 @@ func (c *APIClient) parseError(resp *http.Response) error {
 			resp.StatusCode, sdkbootstrap.SafeText(strings.TrimRight(string(body), "\r\n")))}
 	}
 
-	return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("%s: %s",
-		sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))}
+	return &apiStatusError{Status: resp.StatusCode, Code: apiErr.Error.Code, text: apiErrorText(apiErr.Error)}
 }

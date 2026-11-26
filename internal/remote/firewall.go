@@ -24,7 +24,9 @@ import (
 // exclusive). So the server reads the ingress and refuses to create or start
 // a machine while its sources are not the ones the firewall mode expects,
 // and an isolated shed while the service cannot say it is exclusive. In auto
-// mode the server writes the sources itself (SetIngress).
+// and static mode the server writes the sources itself when they differ
+// (SetIngress, at most once every FirewallPatchInterval); a static server
+// whose service manages the ingress elsewhere only compares.
 //
 // The check runs at start-up, in every periodic pass, and before a create or
 // start whose last result is older than FirewallMaxAge. A failing check
@@ -36,7 +38,7 @@ const (
 	// on.
 	FirewallMaxAge = 60 * time.Second
 	// FirewallPatchInterval is the least time between two writes of the
-	// ingress in auto mode.
+	// ingress (auto and static mode).
 	FirewallPatchInterval = 5 * time.Minute
 	// PublicAddrMaxAge is how long auto mode keeps believing an address
 	// after the echo services last agreed on it.
@@ -367,17 +369,26 @@ func (b *Backend) runFirewallCheck(ctx context.Context) (*FirewallFailure, []net
 		return nil, nil
 	}
 	mismatch := checkSources(ing.Sources, expected)
-	if mismatch == nil || fw.mode != config.RemoteFirewallAuto {
-		return mismatch, expected
+	if mismatch == nil {
+		return nil, expected
 	}
 
-	// Auto mode, and the sources are not the server's address.
+	// The sources are not the mode's: the server writes them (plan 041
+	// R7), in auto mode its address, in static mode its configured
+	// ranges. A static server whose service manages the ingress elsewhere
+	// (the catalog says so, or a write answers INGRESS_NOT_WRITABLE) only
+	// compares, and the mismatch refuses creates and starts.
 	now := b.now()
+	static := fw.mode == config.RemoteFirewallStatic
+	cat, haveCat := b.Catalog()
 	switch {
-	case !agreedNow:
+	case static && haveCat && !cat.IngressWritable:
+		mismatch.Detail = "compared only: the account service's ingress is managed elsewhere; apply these sources there"
+		return mismatch, expected
+	case !static && !agreedNow:
 		mismatch.Detail = "not repaired: the echo services did not agree in this check"
 		return mismatch, expected
-	case !publicIPv4(fw.believed):
+	case !static && !publicIPv4(fw.believed):
 		mismatch.Detail = "not repaired: " + fw.believed.String() + " is not a public address"
 		return mismatch, expected
 	case !fw.lastPatch.IsZero() && now.Sub(fw.lastPatch) < FirewallPatchInterval:
@@ -392,6 +403,13 @@ func (b *Backend) runFirewallCheck(ctx context.Context) (*FirewallFailure, []net
 		written, werr = b.prov.SetIngress(ctx, rid, expected)
 		return werr
 	})
+	if errors.Is(err, provider.ErrIngress) && static {
+		// Static mode against an ingress it may not write: it compares
+		// only, as before, and the mismatch stands.
+		b.logf("remote: firewall: the account service will not apply the configured sources [%s] (%s); remote.firewall.mode: %s compares only", joinPrefixes(expected), provider.CodeOf(err), config.RemoteFirewallStatic)
+		mismatch.Detail = "compared only: the account service will not apply the sources (" + provider.CodeOf(err) + "); apply them there"
+		return mismatch, expected
+	}
 	if errors.Is(err, provider.ErrIngress) {
 		b.logf("remote: firewall: the account service will not apply the sources [%s] (%s); remote.firewall.mode: %s cannot keep the ingress", joinPrefixes(expected), provider.CodeOf(err), config.RemoteFirewallAuto)
 		return &FirewallFailure{

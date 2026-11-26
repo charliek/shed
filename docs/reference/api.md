@@ -124,6 +124,7 @@ the route's own `403`, `400` or `501` never appears.
 | POST | `/api/sheds/{name}/start` | Start a shed |
 | POST | `/api/sheds/{name}/stop` | Stop a shed |
 | POST | `/api/sheds/{name}/assign` | Give a shed with no user to a user (admin) |
+| POST | `/api/sheds/{name}/extend` | Move a cloud shed's lease later |
 | POST | `/api/sheds/{name}/reset` | Wipe and recreate the shed's writable upper layer |
 | POST | `/api/sheds/{name}/exec` | Run one command in a running shed, streamed as NDJSON |
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
@@ -656,6 +657,41 @@ On Firecracker and VZ the new user is written to disk before the answer, and a
 running shed's credential requests go to the new user's machine from then on.
 On the remote backend the user is also written to the instance's `shed_user`
 label; see [Remote backend › Users](remote-backend.md#users).
+
+### POST /api/sheds/{name}/extend
+
+Moves a cloud shed's lease later, so the account service deletes its
+machine later, never past the lease's cap. The shed's own user or an admin
+(a local admin included); never a service client or a script key. A server
+whose sheds have leases advertises the `lease` feature; any other answers
+501 `FEATURE_UNSUPPORTED`.
+
+**Request:**
+
+```json
+{"hours": 6, "request_id": "6f9619ff-8b86-4d01-b42d-00cf4fc964ff"}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hours` | integer | How much later the lease ends: 1 to 720 |
+| `request_id` | string | Optional. A UUID the caller makes for this extend and sends again when it retries the request (a reply it did not get): every request with the same `request_id` for the same shed, from the same caller, moves the lease once, for as long as the account service keeps its answer (24 hours). Without it every request is a new extend. `shed extend` makes one per invocation. |
+
+**Response (200 OK):** the shed, with its new `cloud.lease`.
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | `hours` outside 1 to 720, or a `request_id` that is not a UUID |
+| 403 | `FORBIDDEN` | A service client, a script key, or a user who is neither the shed's nor an admin |
+| 403 | `EXTEND_NOT_ALLOWED` | The lease cannot be extended (a service client's shed, or the account service's policy) |
+| 403 | `PERSON_INACTIVE` | The shed's person is no longer active at the account service |
+| 409 | `LEASE_AT_CAP` | The extend would take the lease past its cap; nothing changed |
+| 409 | `LEASE_ENDED` | The lease has ended |
+| 409 | `COMPUTE_DELETING` | The account service is deleting the machine |
+| 501 | `FEATURE_UNSUPPORTED` | The server's sheds have no lease |
+| 503 | `COMPUTE_UNAVAILABLE` | The account service could not be reached, or the answer is not known: send the request again with the same `request_id` |
 
 ### POST /api/sheds/{name}/reset
 

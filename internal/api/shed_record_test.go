@@ -32,6 +32,7 @@ var recordRoutes = []string{
 	"POST /api/sheds/{name}/start",
 	"POST /api/sheds/{name}/stop",
 	"POST /api/sheds/{name}/assign",
+	"POST /api/sheds/{name}/extend",
 	"POST /api/sheds/{name}/reset",
 	"POST /api/sheds/{name}/provision",
 	"POST /api/egress/{name}",
@@ -42,6 +43,7 @@ var recordRoutes = []string{
 // notRecordRoutes return no shed record.
 var notRecordRoutes = []string{
 	"GET /api/activity",
+	"GET /api/cloud/usage",
 	"GET /api/delivery/requests",
 	"POST /api/delivery/requests/{id}",
 	"GET /api/info",
@@ -257,6 +259,9 @@ func TestShedRecordRoutesCarryIsolation(t *testing.T) {
 		},
 		"POST /api/sheds/{name}/assign": func(t *testing.T) {
 			checkRecords(t, "assign", recordsOf(t, "assign", asRoot(http.MethodPost, "/api/sheds/legacy/assign", `{"user":"bob"}`)), runtime.GOARCH, stored)
+		},
+		"POST /api/sheds/{name}/extend": func(t *testing.T) {
+			checkRecords(t, "extend", recordsOf(t, "extend", asRoot(http.MethodPost, "/api/sheds/rbox/extend", `{"hours":6}`)), runtime.GOARCH, stored)
 		},
 		"POST /api/sheds/{name}/reset": func(t *testing.T) {
 			checkRecords(t, "reset", recordsOf(t, "reset", asRoot(http.MethodPost, "/api/sheds/rbox/reset", "")), runtime.GOARCH, stored)

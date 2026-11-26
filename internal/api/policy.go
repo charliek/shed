@@ -31,6 +31,10 @@ func (s *Server) clientCreateRefusal(c Caller, req *config.CreateShedRequest) st
 		return fmt.Sprintf("image %q is not allowed (allowed: %s)", req.Image, strings.Join(p.Images, ", "))
 	case !strings.HasPrefix(req.Name, p.NamePrefix):
 		return fmt.Sprintf("shed name %q must start with %q", req.Name, p.NamePrefix)
+	case req.ClientLease > 0 && p.MaxAge.Duration() > 0 && req.ClientLease > p.MaxAge.Duration():
+		// A cloud shed's lease (createLeaseRefusal parsed it) is bounded by
+		// the client's max_age, the age its operator lets its sheds reach.
+		return fmt.Sprintf("lease %s is over the client's max_age %s", req.ClientLease, p.MaxAge.Duration())
 	}
 	// A remote server's images are its compute service's (S0 ruling 3): a
 	// client's image must be one the catalog offers as well as one its

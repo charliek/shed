@@ -63,6 +63,18 @@ type Mutation struct {
 	RequestID string `json:"request_id"`
 }
 
+// ExtendRequest is an extend's request id, stored before it is sent.
+type ExtendRequest struct {
+	// Ref is the machine it is for.
+	Ref provider.Ref `json:"ref"`
+	// RequestID is the id sent.
+	RequestID string `json:"request_id"`
+	// Hours is how much later it moves the lease.
+	Hours int `json:"hours"`
+	// At is when it was first sent.
+	At time.Time `json:"at"`
+}
+
 // Record is everything the server keeps about one shed.
 type Record struct {
 	// Schema is Schema; SaveRecord writes it.
@@ -86,6 +98,12 @@ type Record struct {
 	// Mutation is the request id of the job's call in flight, kept from
 	// before the call is sent until the job's step ends.
 	Mutation *Mutation `json:"mutation,omitempty"`
+	// Extend is the request id of the extend in flight, written durably
+	// before it is sent, and kept while its outcome is not known (its
+	// reply was lost, every retry too). A known outcome clears it. Only the
+	// extend's own retries send it again: a caller who retries its request
+	// sends its own id (config.ExtendShedRequest.RequestID).
+	Extend *ExtendRequest `json:"extend,omitempty"`
 	// Spec is the create, request id included. It is kept so a create
 	// resumed after a restart sends the same request.
 	Spec *provider.Spec `json:"spec,omitempty"`
@@ -181,6 +199,10 @@ func (r *Record) Clone() *Record {
 	if r.Mutation != nil {
 		m := *r.Mutation
 		out.Mutation = &m
+	}
+	if r.Extend != nil {
+		x := *r.Extend
+		out.Extend = &x
 	}
 	out.Spec = r.Spec.Clone()
 	if r.Machine != nil {

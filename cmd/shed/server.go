@@ -192,6 +192,11 @@ func isStdoutTTY() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
+// isStderrTTY reports whether stderr is an interactive terminal.
+func isStderrTTY() bool {
+	return term.IsTerminal(int(os.Stderr.Fd()))
+}
+
 // confirmHostKey verifies or confirms the server's SSH host key before it is
 // pinned, closing the add-time MITM window. With an expected fingerprint it
 // verifies out-of-band (failing on mismatch). Otherwise: --trust-on-first-use

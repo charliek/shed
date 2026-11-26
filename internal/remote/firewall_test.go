@@ -50,6 +50,17 @@ func tune(fn func(*Options)) envOpt {
 	}
 }
 
+// readOnlyIngress gives the fake a catalog whose ingress is managed
+// elsewhere: static mode then compares only (plan 041 R7), which is what
+// the tests of a failing check exercise.
+func readOnlyIngress() envOpt {
+	return func(_ *env, o *fake.Options) {
+		c := fake.DefaultCatalog()
+		c.IngressWritable = false
+		o.Catalog = &c
+	}
+}
+
 func withClock(c *testClock) envOpt {
 	return tune(func(o *Options) { o.Now = c.Now })
 }
@@ -99,7 +110,7 @@ func TestFirewallCheckClauses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := newEnv(t, func(e *env, _ *fake.Options) {
+			e := newEnv(t, readOnlyIngress(), func(e *env, _ *fake.Options) {
 				if tt.mode != "" {
 					e.cfg.Firewall.Mode = tt.mode
 					e.cfg.Firewall.AcknowledgeAny = tt.mode == config.RemoteFirewallAny
@@ -227,7 +238,7 @@ func fixedSources(p *fake.Provider) {
 // nothing else changes; when it passes again they work.
 func TestFirewallGate(t *testing.T) {
 	clock := newTestClock()
-	e := newEnv(t, withClock(clock))
+	e := newEnv(t, readOnlyIngress(), withClock(clock))
 	ctx := ctxT(t)
 
 	for _, name := range []string{"runs", "rests"} {
@@ -391,7 +402,7 @@ func TestFirewallGate(t *testing.T) {
 // would start a VM later, so it is refused too and nothing is queued.
 func TestFirewallGateQueuedStart(t *testing.T) {
 	clock := newTestClock()
-	e := newEnv(t, manual(), withClock(clock))
+	e := newEnv(t, readOnlyIngress(), manual(), withClock(clock))
 	e.put("q", config.StatusStopping)
 	e.put("up", config.StatusStarting)
 	brokenSources(e.prov)
@@ -412,7 +423,7 @@ func TestFirewallGateQueuedStart(t *testing.T) {
 // TestFirewallFailingAtStartup: a failing check does not keep the server
 // from starting; existing sheds can be listed, stopped and deleted.
 func TestFirewallFailingAtStartup(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, readOnlyIngress())
 	if _, err := e.create("old"); err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +519,7 @@ func TestNetworkProfileWithAcknowledgedRanges(t *testing.T) {
 func TestFirewallGateInTheJob(t *testing.T) {
 	t.Run("a create resumed after a restart", func(t *testing.T) {
 		h := &hookProvider{}
-		e := newEnv(t, hooked(h))
+		e := newEnv(t, readOnlyIngress(), hooked(h))
 		const name = "resumed"
 		// The first server dies while the insert is on its way: the record
 		// holds the create and names no instance.
@@ -556,7 +567,7 @@ func TestFirewallGateInTheJob(t *testing.T) {
 
 	t.Run("a create resumed after a restart, the check passing", func(t *testing.T) {
 		h := &hookProvider{}
-		e := newEnv(t, hooked(h))
+		e := newEnv(t, readOnlyIngress(), hooked(h))
 		const name = "resumed"
 		entered := make(chan struct{})
 		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, provider.Instance, error) {
@@ -577,7 +588,7 @@ func TestFirewallGateInTheJob(t *testing.T) {
 
 	t.Run("a start queued behind a stop", func(t *testing.T) {
 		clock := newTestClock()
-		e := newEnv(t, manual(), withClock(clock))
+		e := newEnv(t, readOnlyIngress(), manual(), withClock(clock))
 		const name = "queued"
 		e.put(name, config.StatusStopping)
 		// Let in while the check passes, and queued behind the stop.
@@ -613,7 +624,7 @@ func TestFirewallGateInTheJob(t *testing.T) {
 	})
 
 	t.Run("a start resumed after a restart, the VM already up", func(t *testing.T) {
-		e := newEnv(t)
+		e := newEnv(t, readOnlyIngress())
 		const name = "up"
 		e.running(name)
 		id := e.settledID(name)

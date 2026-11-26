@@ -263,6 +263,11 @@ func (s *Server) Router() chi.Router {
 		// state of its list (admin only; control scope).
 		r.Get("/users/status", s.handleUsersStatus)
 
+		// Cloud sheds: the machines held against the account service's
+		// limits (any caller, for whom AuthorizeUsage lets them see; 501
+		// on a server without compute).
+		r.Get("/cloud/usage", s.handleCloudUsage)
+
 		// Activity: the audit log's lifecycle and delivery events, as the
 		// caller may see them (control scope; every caller, filtered).
 		r.Get("/activity", s.handleActivity)
@@ -307,6 +312,9 @@ func (s *Server) Router() chi.Router {
 				r.Post("/stop", s.handleStopShed)
 				// Give a shed with no user to a user (admin only).
 				r.Post("/assign", s.handleAssignShed)
+				// Move a cloud shed's lease later (its own user or an
+				// admin; 501 on a backend without leases).
+				r.Post("/extend", s.handleExtendShed)
 				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
 				// Deliver the shed's credentials afresh and finish its
 				// owed steps (control scope; the shed's own user only).

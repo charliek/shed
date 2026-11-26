@@ -450,9 +450,9 @@ func (b *Backend) mutateSeeing(ctx context.Context, ref provider.Ref, rid string
 // requestID is the request id a job's call sends: the one the record holds
 // for that call on its machine (a retry, or the job resumed after a
 // restart), or a new one, written durably to the record before the call is
-// sent. An error (errSuperseded when the shed is gone, or the write's)
-// means the call must not be sent: a send whose id is not on disk could be
-// sent again under another id after a restart.
+// sent. An error (errSuperseded when the shed is gone, or the write's,
+// state.ErrNotDurable included) means the call must not be sent: a send whose
+// id is not on disk could be sent again under another id after a restart.
 func (b *Backend) requestID(j *job, call string) (string, error) {
 	if rec := b.snapshot(j.name, j.id); rec == nil {
 		return "", errSuperseded
@@ -460,10 +460,18 @@ func (b *Backend) requestID(j *job, call string) (string, error) {
 		return m.RequestID, nil
 	}
 	rid := provider.NewRequestID()
+	var prev *state.Mutation
 	err := b.updateDurable(j.name, j.id, func(r *state.Record) {
+		prev = r.Mutation
 		r.Mutation = &state.Mutation{Call: call, Ref: r.Ref, RequestID: rid}
 	})
-	if err != nil && !errors.Is(err, state.ErrNotDurable) {
+	if errors.Is(err, state.ErrNotDurable) {
+		// In place but not flushed: a power cut could lose it, and the
+		// call be sent again under another id. Nothing is sent; the id is
+		// taken back, so the next run writes a new one.
+		b.update(j.name, j.id, func(r *state.Record) { r.Mutation = prev })
+	}
+	if err != nil {
 		return "", err
 	}
 	return rid, nil
@@ -527,7 +535,10 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			// facts, what was delivered to its guest and the link to it
 			// belong to another guest.
 			b.closeLink(j.id)
-			if err := b.updateDurable(j.name, j.id, resetForNewMachine); err != nil && !errors.Is(err, state.ErrNotDurable) {
+			// A new request id that is not flushed (state.ErrNotDurable)
+			// sends nothing either: the next run, finding the machine
+			// gone, makes another and writes it again.
+			if err := b.updateDurable(j.name, j.id, resetForNewMachine); err != nil {
 				if errors.Is(err, errSuperseded) {
 					return errSuperseded
 				}
@@ -608,13 +619,20 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		// earlier send made the machine. A note that cannot be written
 		// sends nothing.
 		if !sentBefore {
+			var prev *state.Mutation
 			err := b.updateDurable(j.name, j.id, func(r *state.Record) {
+				prev = r.Mutation
 				r.Mutation = &state.Mutation{Call: state.JobCreate, RequestID: r.Spec.RequestID}
 			})
+			if errors.Is(err, state.ErrNotDurable) {
+				// In place but not flushed: the note is taken back and
+				// nothing is sent.
+				b.update(j.name, j.id, func(r *state.Record) { r.Mutation = prev })
+			}
 			switch {
 			case errors.Is(err, errSuperseded):
 				return errSuperseded
-			case err != nil && !errors.Is(err, state.ErrNotDurable):
+			case err != nil:
 				if fresh {
 					return b.refuseCreate(j, fmt.Errorf("%w: recording the create before sending it: %w", errNotRecorded, err), config.StatusReasonCreateFailed)
 				}
@@ -1156,7 +1174,7 @@ func resetForNewMachine(r *state.Record) {
 	r.Machine = nil
 	r.HostKeyPin = ""
 	r.Layout = 0
-	r.Pending, r.Mutation = nil, nil
+	r.Pending, r.Mutation, r.Extend = nil, nil, nil
 	r.UserConflict = ""
 	r.Ready = false
 	r.Cloned, r.Provisioned = false, false
@@ -1715,6 +1733,10 @@ func (b *Backend) startDelete(marker *state.Marker, prior *job) {
 					b.logf("remote: removing the delete marker of shed %s: %v", j.name, err)
 				}
 				delete(b.pending, j.id)
+				if m := j.marker; m != nil {
+					delete(b.flushedIDs, m.LabelID)
+					delete(b.flushedIDs, m.DestroyID)
+				}
 			}
 			delete(b.deletes, j.id)
 			b.finishLocked()
@@ -1780,21 +1802,32 @@ func (b *Backend) runDelete(ctx context.Context, j *job) error {
 }
 
 // markerRequestID returns the request id in *field of a delete marker,
-// making one and writing the marker durably first when it has none, so a
-// retry or the delete resumed after a restart sends the same one. An error
-// means the id is not on disk and the call must not be sent.
+// making one when it has none, so a retry or the delete resumed after a
+// restart sends the same one. It is returned only once a save of the marker
+// holding it has been flushed in this process: a new id is saved first, and
+// so is one read back from disk (a save whose rename landed and whose flush
+// failed leaves it there, and a power cut could still take it away). An
+// error (state.ErrNotDurable included) means the id is not known to be on
+// disk and the call must not be sent; a new id is taken back, one from disk
+// is kept, and the next retry saves it again.
 func (b *Backend) markerRequestID(m *state.Marker, field *string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if *field != "" {
+	if *field != "" && b.flushedIDs[*field] {
 		return *field, nil
 	}
-	rid := provider.NewRequestID()
-	*field = rid
-	if err := b.inPlace(b.store.SaveMarker(m)); err != nil {
-		*field = ""
+	fresh := *field == ""
+	if fresh {
+		*field = provider.NewRequestID()
+	}
+	rid := *field
+	if err := b.saveMarker(m); err != nil {
+		if fresh {
+			*field = ""
+		}
 		return "", fmt.Errorf("recording a request id in the delete marker of %s: %w", m.Name, err)
 	}
+	b.flushedIDs[rid] = true
 	return rid, nil
 }
 

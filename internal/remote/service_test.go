@@ -54,6 +54,13 @@ func serviceEnvWith(t *testing.T, opts servicetest.Options, decorate func(provid
 	if _, err := w.Client().SetIngress(context.Background(), "", []netip.Prefix{netip.MustParsePrefix(fake.DefaultIngressSource)}); err != nil {
 		t.Fatalf("SetIngress: %v", err)
 	}
+	return serviceEnvOn(t, w, decorate, more...), w
+}
+
+// serviceEnvOn builds the backend of serviceEnvWith against a world the
+// caller set up (its ingress included).
+func serviceEnvOn(t *testing.T, w *servicetest.World, decorate func(provider.Provider) provider.Provider, more ...envOpt) *env {
+	t.Helper()
 	svc := delivery.NewService(deliverytest.NewSource(), 5*time.Second)
 	svc.SetOrigin(directoryOrigin)
 	base := func(e *env, _ *fake.Options) {
@@ -74,8 +81,7 @@ func serviceEnvWith(t *testing.T, opts servicetest.Options, decorate func(provid
 			b.SetDelivery(svc)
 		}
 	}
-	e := newEnv(t, append([]envOpt{base}, more...)...)
-	return e, w
+	return newEnv(t, append([]envOpt{base}, more...)...)
 }
 
 // machineOf reads a shed's machine at the service.
@@ -369,16 +375,69 @@ func TestServiceCreateOwnersAndRefusals(t *testing.T) {
 // The firewall check reads the service's ingress: sources that differ from
 // the mode's refuse creates.
 func TestServiceFirewallIngress(t *testing.T) {
-	clock := newTestClock()
-	e, w := serviceEnv(t, servicetest.Options{}, withClock(clock))
-	if _, err := w.Client().SetIngress(context.Background(), "", []netip.Prefix{netip.MustParsePrefix("198.51.100.9/32")}); err != nil {
-		t.Fatal(err)
+	ingressOf := func(t *testing.T, w *servicetest.World) string {
+		t.Helper()
+		ing, err := w.Client().Ingress(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return joinPrefixes(ing.Sources)
 	}
-	clock.Advance(FirewallMaxAge + time.Second)
-	_, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "refused", NoProvision: true, User: "ada"})
-	if !errors.Is(err, config.ErrFirewallCheckFailedSentinel) || !strings.Contains(err.Error(), "198.51.100.9/32") {
-		t.Fatalf("create with the ingress elsewhere = %v, want FIREWALL_CHECK_FAILED", err)
-	}
+
+	// Static mode writes its configured sources when the service's differ
+	// (plan 041 R7): against a fresh service, with no ingress yet, the
+	// start-up check writes them and creates pass; sources changed at the
+	// service are written back, at most once every patch interval.
+	t.Run("static mode writes its sources", func(t *testing.T) {
+		clock := newTestClock()
+		w := servicetest.Start(t, servicetest.Options{AutoSettle: 20 * time.Millisecond})
+		w.Step("policy.set", map[string]any{"person_max": 100, "org_max": 100})
+		if got := ingressOf(t, w); got != "" {
+			t.Fatalf("a fresh service's ingress: [%s]", got)
+		}
+		e := serviceEnvOn(t, w, nil, withClock(clock))
+		if got := ingressOf(t, w); got != fake.DefaultIngressSource {
+			t.Fatalf("after start-up the ingress is [%s], want the configured %s", got, fake.DefaultIngressSource)
+		}
+		if _, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "first", NoProvision: true, User: "ada"}); err != nil {
+			t.Fatalf("a create once the sources are written: %v", err)
+		}
+		e.settled("first")
+		if _, err := w.Client().SetIngress(context.Background(), "", []netip.Prefix{netip.MustParsePrefix("198.51.100.9/32")}); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(FirewallPatchInterval + time.Second)
+		if _, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "second", NoProvision: true, User: "ada"}); err != nil {
+			t.Fatalf("a create after the sources were changed at the service: %v", err)
+		}
+		if got := ingressOf(t, w); got != fake.DefaultIngressSource {
+			t.Fatalf("the ingress was not written back: [%s]", got)
+		}
+		if !strings.Contains(strings.Join(e.logLines(), "\n"), "remote: firewall: wrote the ingress") {
+			t.Fatal("no line says the ingress was written")
+		}
+	})
+
+	// Against an ingress managed elsewhere static mode compares only: the
+	// server starts, nothing is written, and a mismatch refuses creates.
+	t.Run("static mode against an ingress it may not write", func(t *testing.T) {
+		clock := newTestClock()
+		w := servicetest.Start(t, servicetest.Options{AutoSettle: 20 * time.Millisecond})
+		w.Step("policy.set", map[string]any{"person_max": 100, "org_max": 100})
+		if _, err := w.Client().SetIngress(context.Background(), "", []netip.Prefix{netip.MustParsePrefix("198.51.100.9/32")}); err != nil {
+			t.Fatal(err)
+		}
+		w.Step("policy.set", map[string]any{"ingress_writable": false})
+		e := serviceEnvOn(t, w, nil, withClock(clock))
+		clock.Advance(FirewallPatchInterval + time.Second)
+		_, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "refused", NoProvision: true, User: "ada"})
+		if !errors.Is(err, config.ErrFirewallCheckFailedSentinel) || !strings.Contains(err.Error(), "198.51.100.9/32") || !strings.Contains(err.Error(), "compared only") {
+			t.Fatalf("create with the ingress elsewhere = %v, want FIREWALL_CHECK_FAILED, compared only", err)
+		}
+		if got := ingressOf(t, w); got != "198.51.100.9/32" {
+			t.Fatalf("a read-only ingress was changed: [%s]", got)
+		}
+	})
 }
 
 // With the service down at start the server starts degraded: it lists and

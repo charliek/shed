@@ -15,12 +15,14 @@ import "context"
 
 // Event names of the lifecycle and delivery kinds.
 const (
-	EventShedCreate     = "shed.create"
-	EventShedStart      = "shed.start"
-	EventShedStop       = "shed.stop"
-	EventShedDelete     = "shed.delete"
-	EventShedReset      = "shed.reset"
-	EventShedAssign     = "shed.assign"
+	EventShedCreate = "shed.create"
+	EventShedStart  = "shed.start"
+	EventShedStop   = "shed.stop"
+	EventShedDelete = "shed.delete"
+	EventShedReset  = "shed.reset"
+	EventShedAssign = "shed.assign"
+	// EventShedExtend is a cloud shed's lease moved later (plan 041).
+	EventShedExtend     = "shed.extend"
 	EventProvisionStart = "shed.provision.start"
 	EventProvisionEnd   = "shed.provision.end"
 	EventDelivery       = "delivery"
@@ -29,7 +31,7 @@ const (
 // ShedEventKinds is every kind that names its shed's id and whose it was.
 var ShedEventKinds = []string{
 	EventShedCreate, EventShedStart, EventShedStop, EventShedDelete, EventShedReset,
-	EventShedAssign, EventProvisionStart, EventProvisionEnd, EventDelivery,
+	EventShedAssign, EventShedExtend, EventProvisionStart, EventProvisionEnd, EventDelivery,
 }
 
 // IsShedEventKind reports whether event is one of ShedEventKinds.

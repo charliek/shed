@@ -66,6 +66,9 @@ func (b *foldingBackend) StopShed(ctx context.Context, name string) (*config.She
 func (b *foldingBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
 	return b.userFakeBackend.AssignUser(ctx, b.fold("assign", name), req)
 }
+func (b *foldingBackend) ExtendShed(ctx context.Context, name string, hours int, rid string) (*config.Shed, error) {
+	return b.userFakeBackend.ExtendShed(ctx, b.fold("extend", name), hours, rid)
+}
 func (b *foldingBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.userFakeBackend.ResetShed(ctx, b.fold("reset", name))
 }
@@ -135,6 +138,7 @@ var pathParamRoutes = map[string]string{
 	"POST /api/sheds/{name}/start":                    "shed",
 	"POST /api/sheds/{name}/stop":                     "shed",
 	"POST /api/sheds/{name}/assign":                   "shed",
+	"POST /api/sheds/{name}/extend":                   "shed",
 	"POST /api/sheds/{name}/reset":                    "shed",
 	"POST /api/sheds/{name}/provision":                "shed",
 	"POST /api/sheds/{name}/exec":                     "shed",
@@ -203,8 +207,8 @@ func TestShedNameRouteWalk(t *testing.T) {
 			t.Errorf("classified route %s is not registered (stale list)", route)
 		}
 	}
-	if len(shedRoutes) != 14 {
-		t.Errorf("found %d shed routes, want 14: %v", len(shedRoutes), shedRoutes)
+	if len(shedRoutes) != 15 {
+		t.Errorf("found %d shed routes, want 15: %v", len(shedRoutes), shedRoutes)
 	}
 
 	for _, route := range shedRoutes {

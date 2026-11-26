@@ -160,6 +160,10 @@ const (
 	// ActionAdmin is for what belongs to the whole server: the image store,
 	// prune, host directories.
 	ActionAdmin
+	// ActionExtend moves a cloud shed's lease later: the shed's own user,
+	// or an admin (a local admin included). A service client and a script
+	// key never may (ErrForbiddenSentinel), even on their own shed.
+	ActionExtend
 )
 
 func (a Action) String() string {
@@ -172,6 +176,8 @@ func (a Action) String() string {
 		return "enter"
 	case ActionAdmin:
 		return "admin"
+	case ActionExtend:
+		return "extend"
 	}
 	return fmt.Sprintf("action(%d)", int(a))
 }
@@ -189,6 +195,9 @@ func (a Action) String() string {
 //     client's shed; an admin may not enter another user's shed, a shed with
 //     no user, or an unresolved one (ErrForbiddenSentinel).
 //   - ActionAdmin needs an admin.
+//   - ActionExtend is ActionManage for a person (their own shed, or any
+//     shed for an admin), and refused to a service client (even on its own
+//     shed) and to a script key: an extend is a person's choice.
 //
 // A caller who may not see the shed at all gets ErrShedNotFoundSentinel, so
 // nobody learns which names other callers use. The error wraps one of
@@ -205,7 +214,7 @@ func Authorize(p Principal, owner, user string, a Action) error {
 		if owner != p.Client {
 			return config.ErrShedNotFoundSentinel
 		}
-		if a == ActionAdmin {
+		if a == ActionAdmin || a == ActionExtend {
 			return config.ErrForbiddenSentinel
 		}
 		return nil
@@ -218,10 +227,16 @@ func Authorize(p Principal, owner, user string, a Action) error {
 		return config.ErrForbiddenSentinel
 	}
 	if owner == "" && user == p.User {
+		if a == ActionExtend && p.Script {
+			return config.ErrForbiddenSentinel
+		}
 		return nil
 	}
 	if !p.Admin {
 		return config.ErrShedNotFoundSentinel
+	}
+	if a == ActionExtend && p.Script {
+		return config.ErrForbiddenSentinel
 	}
 	if owner != "" {
 		// A service client's shed: an admin may do everything to it.
@@ -256,6 +271,8 @@ func AuthorizeShed(p Principal, shed *config.Shed, a Action) error {
 		return fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, shed.Name)
 	case errors.Is(err, config.ErrForbiddenSentinel) && a == ActionAdmin:
 		return fmt.Errorf("%w: only an admin can do this", config.ErrForbiddenSentinel)
+	case errors.Is(err, config.ErrForbiddenSentinel) && a == ActionExtend:
+		return fmt.Errorf("%w: %s", config.ErrForbiddenSentinel, extendRefusal(p))
 	case errors.Is(err, config.ErrForbiddenSentinel) && shed.Owner == "" && shed.User == "":
 		return fmt.Errorf("%w: %w: shed %s has no user; nobody can enter it until an admin gives it to a user with 'shed assign %s <user>'",
 			config.ErrForbiddenSentinel, ErrUnassigned, shed.Name, shed.Name)
@@ -344,4 +361,59 @@ func CheckSnapshot(ctx context.Context, name string, snap *config.Snapshot) erro
 		return fmt.Errorf("%w: %s (taken again since it was looked up)", config.ErrSnapshotNotFoundSentinel, name)
 	}
 	return nil
+}
+
+// extendRefusal says why p may not extend a lease: a service client's and a
+// script key's extend is refused whatever the shed.
+func extendRefusal(p Principal) string {
+	if p.Kind == PrincipalClient {
+		return "a service client cannot extend a lease"
+	}
+	if p.Script {
+		return "a script key cannot extend a lease; its user can, with a key of their own"
+	}
+	return "only the shed's user or an admin can extend its lease"
+}
+
+// AuthorizeExtend refuses, before any shed is looked up, a caller who may
+// never extend a lease: a service client and a script key (the access
+// rule refuses them again on the shed, ActionExtend).
+func AuthorizeExtend(p Principal) error {
+	if !p.valid() {
+		return ErrNoPrincipal
+	}
+	if p.Kind == PrincipalClient || (p.Kind == PrincipalUser && p.Script) {
+		return fmt.Errorf("%w: %s", config.ErrForbiddenSentinel, extendRefusal(p))
+	}
+	return nil
+}
+
+// AuthorizeUsage decides whose machines a GET /api/cloud/usage counts:
+// asked is the ?user= the caller named ("" for none), servicePerson whether
+// a name is a person of the account service. A person counts their own (and
+// may name themselves); only an admin who is a person of the service may
+// name another user. A local admin, the implicit user and a service client
+// get the organization's alone and may name nobody ("" back for a client;
+// the backend gives a local admin's own name no person counts). The server
+// itself counts whom it names.
+func AuthorizeUsage(p Principal, asked string, servicePerson func(string) bool) (string, error) {
+	if !p.valid() {
+		return "", ErrNoPrincipal
+	}
+	switch {
+	case p.Kind == PrincipalSystem:
+		return asked, nil
+	case p.Kind == PrincipalClient:
+		if asked != "" {
+			return "", fmt.Errorf("%w: a service client cannot name a user", config.ErrForbiddenSentinel)
+		}
+		return "", nil
+	case asked == "":
+		return p.User, nil
+	case p.Implicit || !servicePerson(p.User):
+		return "", fmt.Errorf("%w: only an admin of the account service can name a user for cloud usage", config.ErrForbiddenSentinel)
+	case asked == p.User || p.Admin:
+		return asked, nil
+	}
+	return "", fmt.Errorf("%w: only an admin can see another user's cloud usage", config.ErrForbiddenSentinel)
 }

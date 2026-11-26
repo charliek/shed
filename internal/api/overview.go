@@ -61,6 +61,11 @@ const (
 	// cursor, as the caller may see them. Advertised when the server's
 	// audit log is open (without it the route answers an empty page).
 	FeatureActivity = "activity"
+	// FeatureLease signals cloud sheds with a lease: "cloud" on every remote
+	// shed record, POST /api/sheds/{name}/extend, GET /api/cloud/usage and
+	// a service client's create "lease" (config.FeatureLease). Advertised
+	// by a server whose backend has leases (remote).
+	FeatureLease = config.FeatureLease
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -86,6 +91,9 @@ func (s *Server) serverFeatures() []string {
 	}
 	if s.audit != nil {
 		features = append(features, FeatureActivity)
+	}
+	if s.offersLease() {
+		features = append(features, FeatureLease)
 	}
 	return features
 }

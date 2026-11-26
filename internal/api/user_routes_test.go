@@ -133,6 +133,22 @@ func (b *userFakeBackend) DeleteShed(ctx context.Context, name string) error {
 	return b.act(ctx, "delete", name)
 }
 
+// ExtendShed and CloudUsage make the fake a backend with leases (the remote
+// backend's capabilities), so the walk reaches the extend and usage routes.
+func (b *userFakeBackend) ExtendShed(ctx context.Context, name string, _ int, _ string) (*config.Shed, error) {
+	if err := b.act(ctx, "extend", name); err != nil {
+		return nil, err
+	}
+	return b.GetShed(ctx, name)
+}
+
+func (b *userFakeBackend) CloudUsage(context.Context, string) (config.CloudUsage, error) {
+	return config.CloudUsage{Org: config.CloudCounts{Max: 10}}, nil
+}
+
+// ServicePerson: every user of the fake is the account service's.
+func (b *userFakeBackend) ServicePerson(string) bool { return true }
+
 func (b *userFakeBackend) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.act(ctx, "start", name); err != nil {
 		return nil, err
@@ -424,6 +440,8 @@ var userRouteClasses = map[string]string{
 	"POST /api/sheds/{name}/start":                    "shed:enter",
 	"POST /api/sheds/{name}/stop":                     "shed:manage",
 	"POST /api/sheds/{name}/assign":                   "admin",
+	"POST /api/sheds/{name}/extend":                   "shed:manage",
+	"GET /api/cloud/usage":                            "any",
 	"POST /api/sheds/{name}/reset":                    "shed:enter",
 	"POST /api/sheds/{name}/provision":                "shed:enter",
 	"POST /api/sheds/{name}/exec":                     "shed:enter",
@@ -456,6 +474,8 @@ func routeRequest(route string) (method, path, body string) {
 		body = `{"name":"fresh"}`
 	case "POST /api/sheds/{name}/assign":
 		body = `{"user":"bob"}`
+	case "POST /api/sheds/{name}/extend":
+		body = `{"hours":6}`
 	case "POST /api/images/tag":
 		body = `{"source":"a","target":"b"}`
 	case "POST /api/images/pull":
@@ -523,6 +543,8 @@ var userRouteAllowed = map[string]int{
 	// The admin passes the access rule and reaches the assignment rule:
 	// "box" is alice's already (TestAssignShedRoute assigns one with none).
 	"POST /api/sheds/{name}/assign":               http.StatusConflict,
+	"POST /api/sheds/{name}/extend":               http.StatusOK,
+	"GET /api/cloud/usage":                        http.StatusOK,
 	"POST /api/sheds/{name}/reset":                http.StatusOK,
 	"POST /api/sheds/{name}/provision":            http.StatusOK,
 	"POST /api/sheds/{name}/exec":                 http.StatusOK,

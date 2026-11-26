@@ -29,6 +29,10 @@ import (
 func (b *Backend) ownerFor(cat provider.Catalog, req config.CreateShedRequest, origin string) (provider.Owner, error) {
 	required := cat.OwnerRequired || b.cfg.Provider == config.RemoteProviderService
 	switch {
+	case req.Owner != "" && req.ClientLease > 0:
+		// The client's own lease, checked by the API against its
+		// policy.max_age.
+		return provider.Owner{Client: req.Owner, Lease: req.ClientLease}, nil
 	case req.Owner != "":
 		return provider.Owner{Client: req.Owner, Lease: b.clientLease(cat, req.Owner)}, nil
 	case !required:
@@ -40,10 +44,11 @@ func (b *Backend) ownerFor(cat provider.Catalog, req config.CreateShedRequest, o
 		Err: errors.New("only a person of the account service or a service client creates a cloud shed; a local admin can list, stop, delete and extend them")}
 }
 
-// clientLease is the lease a service client's machine gets: the client's
-// policy.max_age (with nothing configured, the service's longest client
-// lease). Plan 041 A3 adds the create request's own lease, refused
-// POLICY_VIOLATION above max_age; it replaces this choice there.
+// clientLease is the lease a service client's machine gets when its create
+// names none: the client's policy.max_age (with nothing configured, the
+// service's longest client lease). A create that names one
+// (CreateShedRequest.Lease) gets that, refused POLICY_VIOLATION by the API
+// above max_age.
 func (b *Backend) clientLease(cat provider.Catalog, client string) time.Duration {
 	if b.opts.Server != nil && b.opts.Server.Auth != nil {
 		if c, ok := b.opts.Server.Auth.Clients[client]; ok && c.Policy.MaxAge.Duration() > 0 {

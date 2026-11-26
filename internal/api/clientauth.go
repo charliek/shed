@@ -34,6 +34,10 @@ var clientAllowedRoutes = map[string]bool{
 	// The activity feed: the handler shows a client its own sheds' events
 	// only (plan 039 §3.9).
 	"GET /api/activity": true,
+	// The machines held against the account service's limits: a client
+	// sees the organization's only (plan 041 §3.4). Not extend: a client
+	// cannot extend a lease.
+	"GET /api/cloud/usage": true,
 }
 
 // normalizeRoutePattern drops a trailing "/" from a chi route pattern (but
