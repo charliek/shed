@@ -314,7 +314,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 			s.streamSSE(w, r, r.Context(), nil, nil, func(ctx context.Context) (any, error) {
 				shed, err := s.createAndWait(ctx, context.WithoutCancel(r.Context()), asyncBackend, req)
 				if err != nil {
-					log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, s.backend.Type(), err)
+					s.logCreateError(req.Name, err)
 				}
 				return shed, err
 			})

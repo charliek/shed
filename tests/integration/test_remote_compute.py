@@ -241,9 +241,10 @@ class Env:
         """Alice's shared shed, running (made on first use)."""
         if self.shared.person is None:
             name = f"itest-cc-shared-{uuid.uuid4().hex[:6]}"
-            self.shared.person = name
-            create_ok(self, self.alice, name)
-        return wait_status(self.alice, self.shared.person, "running")
+            self._share("person", name, lambda: create_started(self, self.alice, name))
+        shed = wait_status(self.alice, self.shared.person, "running")
+        self.shared.ids.setdefault(self.shared.person, shed.get("id", "?"))
+        return shed
 
     def stop_service(self) -> None:
         """Take the service down. Call it inside the `try` whose `finally`
@@ -261,12 +262,27 @@ class Env:
         `client_lease_h` asked for at its create (made on first use)."""
         if self.shared.client is None:
             name = f"{self.client_policy['name_prefix']}cc-shared-{uuid.uuid4().hex[:6]}"
-            self.shared.client = name
-            status, body = client_create(self, name, f"{client_lease_h(self.client_policy)}h")
-            assert status in (200, 201), f"the client's create of {name}: {status} {body}"
-            self.shared.created += 1
-            self.shared.ids[name] = (body or {}).get("id", "?")
+
+            def make() -> None:
+                status, body = client_create(self, name, f"{client_lease_h(self.client_policy)}h")
+                assert status in (200, 201), f"the client's create of {name}: {status} {body}"
+                self.shared.created += 1
+                self.shared.ids[name] = (body or {}).get("id", "?")
+
+            self._share("client", name, make)
         return client_wait_running(self, self.shared.client)
+
+    def _share(self, slot: str, name: str, make: Callable[[], None]) -> None:
+        """Make the shared shed `slot` ("person" or "client") with `make`,
+        recording its name only once the create succeeded. A refused create
+        leaves the slot empty: this case fails here, at once, and a later
+        case tries its own create instead of polling a shed that does not
+        exist until its timeout. Until then the name is this case's own, so
+        its clean-up deletes whatever a create that failed half-way left."""
+        self.made.append(name)
+        make()
+        self.made.remove(name)
+        setattr(self.shared, slot, name)
 
     def ask(self, fn: Callable, *args, **kwargs):
         """A control step; the case skips when this run cannot take it."""
@@ -501,10 +517,15 @@ def create(env: Env, who, name: str) -> subprocess.CompletedProcess:
     return who.cli(*args, timeout=CREATE_TIMEOUT)
 
 
-def create_ok(env: Env, who, name: str) -> dict:
+def create_started(env: Env, who, name: str) -> None:
+    """`shed create` as `who`, which must succeed; counts the machine."""
     r = create(env, who, name)
     assert r.returncode == 0, f"{who.user}: shed create {name}: exit {r.returncode}: {_out(r)[-1500:]}"
     env.shared.created += 1
+
+
+def create_ok(env: Env, who, name: str) -> dict:
+    create_started(env, who, name)
     shed = wait_status(who, name, "running")
     env.shared.ids[name] = shed.get("id", "?")
     return shed

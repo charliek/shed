@@ -28,6 +28,7 @@ import (
 	"github.com/charliek/shed/internal/remote/transport/conformance"
 	"github.com/charliek/shed/internal/remote/transport/locallink"
 	"github.com/charliek/shed/internal/vmutil"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -1020,6 +1021,12 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	if pin := e.storedRecord("keys").HostKeyPin; pin != testHostKey {
 		t.Fatalf("pin in the record = %q, want the attested key sshd presented", pin)
 	}
+	// One line says so: the shed's name and the key's fingerprint, never
+	// the key itself.
+	wantLine := "remote: shed keys: host key " + hostKeyFingerprint(testHostKey) + " pinned at first contact"
+	if pinned := linesContaining(e.logLines(), "pinned at first contact"); len(pinned) != 1 || pinned[0] != wantLine {
+		t.Fatalf("pin log lines = %q, want [%q]", pinned, wantLine)
+	}
 	inst, _ := e.prov.Get(context.Background(), ref)
 	if inst.ShedState() != provider.ShedStateReady || inst.Layout() != guest.Layout {
 		t.Fatalf("labels after create: state %q layout %d", inst.ShedState(), inst.Layout())
@@ -1040,6 +1047,34 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	got := e.settled("keys")
 	if got.Status != config.StatusStopped || got.StatusReason != config.StatusReasonHostKey {
 		t.Fatalf("start with a changed host key settled %q (%q), want stopped (host_key)", got.Status, got.StatusReason)
+	}
+	if pinned := linesContaining(e.logLines(), "pinned at first contact"); len(pinned) != 1 {
+		t.Fatalf("a pinned shed logged another pin: %q", pinned)
+	}
+}
+
+func linesContaining(lines []string, sub string) []string {
+	var out []string
+	for _, l := range lines {
+		if strings.Contains(l, sub) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestHostKeyFingerprintIsSSHs(t *testing.T) {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(localAuthorizedKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hostKeyFingerprint(localAuthorizedKey), ssh.FingerprintSHA256(pub); got != want {
+		t.Fatalf("hostKeyFingerprint = %q, want %q", got, want)
+	}
+	for _, bad := range []string{"", "ssh-ed25519", "ssh-ed25519 !!notbase64"} {
+		if got := hostKeyFingerprint(bad); strings.HasPrefix(got, "SHA256:") {
+			t.Errorf("hostKeyFingerprint(%q) = %q", bad, got)
+		}
 	}
 }
 

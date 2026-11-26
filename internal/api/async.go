@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/charliek/shed/internal/backend"
@@ -135,12 +136,34 @@ func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al b
 	}
 	shed, err := al.WaitSettled(ctx, req.Name)
 	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return nil, callerGoneError{err}
+		}
 		return nil, err
 	}
 	if err := settledError(shed); err != nil {
 		return nil, err
 	}
 	return shed, nil
+}
+
+// callerGoneError is createAndWait's error when the caller went away (its
+// request context ended) after the create was accepted: the create itself
+// runs on in the backend's job, so this is not a failed create. It wraps
+// the context's error.
+type callerGoneError struct{ err error }
+
+func (e callerGoneError) Error() string { return e.err.Error() }
+func (e callerGoneError) Unwrap() error { return e.err }
+
+// logCreateError logs an asynchronous create's error: a caller that went
+// away while the create continues is said as such, not as a failure.
+func (s *Server) logCreateError(name string, err error) {
+	if errors.As(err, new(callerGoneError)) {
+		log.Printf("CreateShed %q (backend=%s): the caller went away before the shed settled; the create continues", name, s.backend.Type())
+		return
+	}
+	log.Printf("CreateShed failed for %q (backend=%s): %v", name, s.backend.Type(), err)
 }
 
 // deleteAndWait is the SSE delete on an AsyncLifecycle backend: the delete

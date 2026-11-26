@@ -47,7 +47,7 @@ An extend moves the lease **later by that many hours** from its present end, not
 
 ### When an extend is refused
 
-A refusal from the account service shows fixed words, never the server's own text. The API codes are on the [API reference](../reference/api.md); the same words come from `shed extend` in the CLI.
+A refusal from the account service shows fixed words, never the server's own text. The API codes are on the [API reference](../reference/api.md); the same words come from [`shed extend`](../reference/cli.md#shed-extend) in the CLI.
 
 | Code | Words shown |
 |---|---|
@@ -78,4 +78,5 @@ The first part counts the machines you hold against your limit; the second count
 
 - [Remote backend](../reference/remote-backend.md): statuses, leases, the account service's part and error codes.
 - [API reference](../reference/api.md): the extend call and its `request_id`.
+- [CLI reference](../reference/cli.md#shed-extend): `shed extend`, the same extend from a terminal.
 - [IPC](ipc.md): `shed.extend`, `cloud.usage`, the `cloud_row` on `sheds.list` and the test doors for these controls.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -340,6 +341,10 @@ func TestAsyncCreateSSE(t *testing.T) {
 }
 
 func TestAsyncCreateSSEDisconnectLeavesJob(t *testing.T) {
+	logs := &syncBuffer{}
+	oldOut := log.Writer()
+	log.SetOutput(logs)
+	t.Cleanup(func() { log.SetOutput(oldOut) })
 	b := newAsyncFakeBackend()
 	h := remoteTestServer(t, b, remotePolicy())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -365,6 +370,18 @@ func TestAsyncCreateSSEDisconnectLeavesJob(t *testing.T) {
 	b.mu.Unlock()
 	if err := jobCtx.Err(); err != nil {
 		t.Errorf("job context cancelled by the disconnect: %v", err)
+	}
+	// The log says the caller went away and the create goes on, not that
+	// the create failed.
+	want := `CreateShed "a1" (backend=remote): the caller went away before the shed settled; the create continues`
+	for i := 0; !strings.Contains(logs.String(), want); i++ {
+		if i > 200 {
+			t.Fatalf("log = %q, want a line %q", logs.String(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if strings.Contains(logs.String(), "CreateShed failed") {
+		t.Errorf("a disconnect logged as a failed create: %q", logs.String())
 	}
 	close(b.release)
 	<-b.settled
@@ -765,5 +782,30 @@ func TestAsyncStreamedDeleteReportsAFailedDestroy(t *testing.T) {
 	names, last := sseEvents(t, resp.body)
 	if len(names) == 0 || names[len(names)-1] != "error" || !strings.Contains(last, errDestroyFailed.Error()) {
 		t.Fatalf("streamed delete with a failed destroy: events %v last %s, want an error naming it", names, last)
+	}
+}
+
+// TestLogCreateErrorSaysWhatHappened: a failed create is logged as one; a
+// caller gone while the create continues is not.
+func TestLogCreateErrorSaysWhatHappened(t *testing.T) {
+	logs := &syncBuffer{}
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(logs)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+	s := &Server{backend: newAsyncFakeBackend()}
+
+	s.logCreateError("a", callerGoneError{context.Canceled})
+	s.logCreateError("b", fmt.Errorf("refused: %w", context.Canceled))
+	s.logCreateError("c", errors.New("no capacity"))
+	want := `CreateShed "a" (backend=remote): the caller went away before the shed settled; the create continues
+CreateShed failed for "b" (backend=remote): refused: context canceled
+CreateShed failed for "c" (backend=remote): no capacity
+`
+	if got := logs.String(); got != want {
+		t.Fatalf("log =\n%s\nwant\n%s", got, want)
+	}
+	if !errors.Is(callerGoneError{context.Canceled}, context.Canceled) {
+		t.Error("callerGoneError does not unwrap to the context's error")
 	}
 }

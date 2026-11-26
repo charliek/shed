@@ -2,6 +2,8 @@ package remote
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -272,5 +274,21 @@ func (h *hostKeys) Learn(ctx context.Context, presented string) error {
 	if !h.b.update(h.name, h.id, func(r *state.Record) { r.HostKeyPin = pin }) {
 		return fmt.Errorf("shed %s no longer exists", h.name)
 	}
+	h.b.logf("remote: shed %s: host key %s pinned at first contact", h.name, hostKeyFingerprint(pin))
 	return nil
+}
+
+// hostKeyFingerprint is a key's SHA256 fingerprint, as ssh-keygen -l and
+// ssh.FingerprintSHA256 print it, from the key in authorized_keys form.
+func hostKeyFingerprint(key string) string {
+	f := strings.Fields(key)
+	if len(f) < 2 {
+		return "(no key)"
+	}
+	blob, err := base64.StdEncoding.DecodeString(f[1])
+	if err != nil {
+		return "(unreadable key)"
+	}
+	sum := sha256.Sum256(blob)
+	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
 }

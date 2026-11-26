@@ -1030,7 +1030,7 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	}
 	b.endCreateLocked(rec, reason)
 	b.mu.Unlock()
-	b.logf("remote: create of shed %s failed (%s); its machine, if any, stays until the shed is deleted: %v", j.name, reason, cause)
+	b.logf("remote: create of shed %s failed (%s); its machine, if one was made, stays until the shed is deleted, its lease ends or the account service deletes it, and the record goes with the machine; with none, the record stays until the shed is deleted: %v", j.name, reason, cause)
 	b.credMgr.StopListener(j.name)
 	b.closeLink(j.id)
 	return cause
