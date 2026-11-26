@@ -504,8 +504,8 @@ without an account service.
 [Revoking a client](#revoking-a-client) is unchanged: remove it from
 `auth.clients`, restart `serve`, and give a replacement client a new name.
 The reaper leaves a removed client's sheds alone. On a remote server a
-running one keeps running, and billed, until the cloud's run limit stops it
-or an admin stops or deletes it.
+running one keeps running, and billed, until its machine's lease ends at the
+account service or an admin stops or deletes it.
 
 ## What a leaked bundle gives
 

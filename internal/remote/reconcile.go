@@ -231,7 +231,16 @@ func (b *Backend) reconcile(ctx context.Context, listing provider.Listing) {
 			cause := deleted[r.Shed.ID]
 			switch {
 			case r.Shed.Status == config.StatusError:
-				// An error record outlives its machine.
+				// A shed in error whose create made a machine keeps its
+				// record while the machine stands; once the machine is gone
+				// (its lease ended, a delete at the service) it is dropped
+				// when a read confirms it, with the cause when the list
+				// names one. One refused before it made a machine stays
+				// (errorRecordGoes); one a delete marker names is the
+				// delete's to finish.
+				if errorRecordGoes(r) && marked[r.Shed.ID] == nil {
+					confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: cause})
+				}
 			case cause != "":
 				// The service deleted it: dropped once a read confirms. An
 				// unfinished create whose answer never came is one too

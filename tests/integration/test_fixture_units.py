@@ -2352,7 +2352,7 @@ def test_the_users_dir_is_one_argument_and_never_code(tmp_path, target):
 def test_the_test_targets_tell_the_suite_about_the_user_list():
     lines = _makefile_logical_lines()
     for target, backend in (("test-integration-dev", None), ("test-integration-dev-fc", "fc"),
-                            ("test-integration-remote", "remote")):
+                            ("test-integration-remote", None)):
         start = next(i for i, l in enumerate(lines) if l.startswith(f"{target}:"))
         recipe = []
         for l in lines[start + 1:]:
@@ -2362,7 +2362,9 @@ def test_the_test_targets_tell_the_suite_about_the_user_list():
         body = "\n".join(recipe)
         if backend is None:
             # The [vz] cases restart the Mac dev server with the list
-            # themselves: nothing to tell them.
+            # themselves, and the remote dev server takes its people from
+            # the account service (it refuses SHED_DEV_USERS=itest): nothing
+            # to tell them.
             assert "SHED_ITEST_USERS=" not in body, (target, body)
         else:
             assert f"SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),{backend},)" in body, (target, body)

@@ -421,8 +421,9 @@ def shed_server_dev(request):
 #            reconfigure it: it must have been STARTED with the user list,
 #            and `SHED_ITEST_USERS` must list `fc`; otherwise it skips saying
 #            what to set.
-#   [remote] the remote dev server (`SHED_REMOTE_SERVER`), likewise with
-#            `remote` in `SHED_ITEST_USERS`. Every shed there is a billed VM:
+#   [remote] the remote dev server (`SHED_REMOTE_SERVER`). Its people come
+#            from the account service it is enrolled with (the directory
+#            source), never a user list. Every shed there is a billed VM:
 #            a users case the remote backend need not run carries
 #            `@pytest.mark.local_vm_only(reason)` and skips on [remote]
 #            before any fixture runs (pytest_runtest_setup below).

@@ -555,7 +555,7 @@ func refuseLegacy(store *state.Store, records []*state.Record) error {
 	if len(found) == 0 {
 		return nil
 	}
-	return fmt.Errorf("remote: %w: %s. Run the previous shed-server release once more and `shed delete` each of these sheds; or, once their VMs are confirmed gone from the cloud, remove the state directory %s. Then start this server (see %s)",
+	return fmt.Errorf("remote: %w: %s. Run the previous shed-server release once more and `shed delete` each of these sheds; or, once their VMs are confirmed gone from the cloud, remove the directories sheds/ and deleting/ in %s (not the directory itself: it holds the audit log). Then start this server (see %s)",
 		ErrLegacyState, strings.Join(found, "; "), store.Dir(), config.RemoteUpgradePage)
 }
 

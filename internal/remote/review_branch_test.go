@@ -47,6 +47,12 @@ func withAudit(t *testing.T) (envOpt, string) {
 	}, path
 }
 
+// measuredWindow is the 250ms fast-fail window of a test that measures an
+// answer against it (the harness default is longer; see env.open).
+func measuredWindow() envOpt {
+	return tuned(func(o *Options) { o.FastFailWindow = 250 * time.Millisecond })
+}
+
 // auditHas reports whether the audit log at path holds a service-deletion
 // event with cause.
 func auditHas(t *testing.T, path, cause string) bool {
@@ -488,7 +494,7 @@ func TestUnreadableIngressIsComputeUnavailable(t *testing.T) {
 // window (lead ruling): the wait is not taken, the call answers 503
 // COMPUTE_UNAVAILABLE inside the window, and nothing was extended.
 func TestExtendRateLimitedPastTheWindow(t *testing.T) {
-	e, w := serviceEnv(t, servicetest.Options{})
+	e, w := serviceEnv(t, servicetest.Options{}, measuredWindow())
 	e.createFor("widgets", "linus")
 	m0, _ := machineOf(t, w, e, "widgets")
 	w.Ref.ComputeForceReply("extend", &refserver.ComputeReply{Status: http.StatusTooManyRequests, Headers: map[string]string{"Retry-After": "30"}})
@@ -577,7 +583,7 @@ func TestRetriedUnknownExtendStaysUnknown(t *testing.T) {
 // COMPUTE_UNAVAILABLE inside the window, and one whose caller leaves ends at
 // once.
 func TestExtendWaitIsInTheBudget(t *testing.T) {
-	e, _ := serviceEnv(t, servicetest.Options{})
+	e, _ := serviceEnv(t, servicetest.Options{}, measuredWindow())
 	e.createFor("widgets", "linus")
 	shed, err := e.b.GetShed(ctxT(t), "widgets")
 	if err != nil {
@@ -622,5 +628,148 @@ func TestExtendWaitIsInTheBudget(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("an extend whose caller left still waits")
+	}
+}
+
+// --- the follow-up review: an error record and a re-sent create ---
+
+// A create left in error (here a host key other than the attested one)
+// keeps its record while its machine stands: a pass drops nothing. When its
+// lease ends at the service, the next pass, or the next server start, drops
+// the record with the cause, in the log and the audit log.
+func TestErrorRecordIsDroppedWhenItsMachineIsGone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		next func(e *env)
+	}{
+		{"the next pass", func(e *env) { e.sweep() }},
+		{"the next server start", func(e *env) { e.restart() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auditOpt, path := withAudit(t)
+			e, w := serviceEnv(t, servicetest.Options{}, auditOpt)
+			e.fl.failAlways("broken", transport.ErrHostKeyMismatch)
+			if _, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "broken", NoProvision: true, User: "linus"}); err != nil {
+				t.Fatal(err)
+			}
+			e.idle()
+			if got, why := e.status("broken"), e.reason("broken"); got != config.StatusError || why != config.StatusReasonHostKey {
+				t.Fatalf("shed is %s (%s), want error (host_key)", got, why)
+			}
+			// Its machine stands: the record stays.
+			e.sweep()
+			e.idle()
+			if got := e.status("broken"); got != config.StatusError {
+				t.Fatalf("after a pass with its machine standing the shed is %s, want error", got)
+			}
+			if l, err := w.Client().List(ctxT(t)); err != nil || len(l.Instances) != 1 {
+				t.Fatalf("machines at the service: %+v (%v), want the one made", l.Instances, err)
+			}
+
+			w.Step("clock.advance", 86400+1)
+			tc.next(e)
+			e.idle()
+			if _, err := e.b.GetShed(ctxT(t), "broken"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				t.Fatalf("GetShed = %v, want the record dropped", err)
+			}
+			if log := strings.Join(e.logLines(), "\n"); !strings.Contains(log, "shed broken (") || !strings.Contains(log, "deleted its machine (cause lease_ended)") {
+				t.Fatalf("no line names the cause:\n%s", log)
+			}
+			if !auditHas(t, path, provider.CauseLeaseEnded) {
+				t.Fatal("no service-deletion event in the audit log")
+			}
+		})
+	}
+}
+
+// A create the service refused before it made a machine (here a resumed
+// create, past the fast-fail window, refused for quota) stays in error with
+// its reason, at every pass and server start, until a person deletes it:
+// only a record whose machine existed is dropped once it is gone.
+func TestErrorRecordThatNeverMadeAMachineStays(t *testing.T) {
+	h := &callHooks{}
+	e := newEnv(t, manual(), withHooks(h))
+	h.createNotMade.Store(true)
+	if _, err := e.create("refused"); err != nil {
+		t.Fatalf("create = %v; a lost reply is not a refusal", err)
+	}
+	e.idle()
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.createNotMade.Store(false)
+	e.prov.FailNext(fake.OpCreate, provider.Errorf(provider.ErrQuota, "create", "quota exhausted"))
+	e.auto()
+	e.b = e.open()
+	e.idle()
+	check := func(when string) {
+		t.Helper()
+		if got, why := e.status("refused"), e.reason("refused"); got != config.StatusError || why != config.StatusReasonQuota {
+			t.Fatalf("%s: shed is %s (%s), want error (quota)", when, got, why)
+		}
+	}
+	check("after the refusal")
+	if rec := e.storedRecord("refused"); rec.Ref != "" || rec.Machine != nil || rec.Pending != nil {
+		t.Fatalf("the refused create recorded a machine: ref %q machine %v pending %v", rec.Ref, rec.Machine != nil, rec.Pending != nil)
+	}
+	if n := e.instances(); n != 0 {
+		t.Fatalf("%d machines, want none", n)
+	}
+	e.sweep()
+	e.idle()
+	check("after a pass")
+	e.restart()
+	e.idle()
+	check("after a server start")
+	if err := e.b.DeleteShed(ctxT(t), "refused"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	e.idle()
+	if _, err := e.b.GetShed(ctxT(t), "refused"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("GetShed after the delete = %v, want gone", err)
+	}
+}
+
+// A create resumed with its machine never made is sent again under a new
+// request id. The durable "being sent" note is written for that id before
+// the send, so a run after a lost reply knows the send may have made the
+// machine.
+func TestResentCreateNotesItsNewRequestID(t *testing.T) {
+	h := &callHooks{}
+	e := newEnv(t, manual(), withHooks(h))
+	h.createNotMade.Store(true)
+	if _, err := e.create("again"); err != nil {
+		t.Fatalf("create = %v; a lost reply is not a refusal", err)
+	}
+	e.idle()
+	old := e.storedRecord("again")
+	if old.Ref != "" || old.Mutation == nil || old.Mutation.RequestID != old.Spec.RequestID {
+		t.Fatalf("after the first run: ref %q mutation %+v", old.Ref, old.Mutation)
+	}
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The next server resumes it: the machine is gone (never made), so the
+	// create is sent again under a new request id, and its reply is lost
+	// again.
+	e.auto()
+	e.b = e.open()
+	e.idle()
+	if got := e.status("again"); got != config.StatusStarting {
+		t.Fatalf("shed is %s, want starting (kept)", got)
+	}
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.storedRecord("again")
+	if rec.Spec.RequestID == old.Spec.RequestID {
+		t.Fatal("the create was sent again under its old request id")
+	}
+	sent := h.sent("create")
+	if len(sent) == 0 || sent[len(sent)-1] != rec.Spec.RequestID {
+		t.Fatalf("creates sent %v, want the last under %s", sent, rec.Spec.RequestID)
+	}
+	if rec.Mutation == nil || rec.Mutation.Call != state.JobCreate || rec.Mutation.RequestID != rec.Spec.RequestID {
+		t.Fatalf("the record's note %+v, want the create under its new request id %s", rec.Mutation, rec.Spec.RequestID)
 	}
 }

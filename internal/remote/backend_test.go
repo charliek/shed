@@ -249,13 +249,18 @@ func (e *env) open() *Backend {
 		prov = e.wrap(e.prov)
 	}
 	o := Options{
-		Config:              e.cfg,
-		Provider:            prov,
-		Links:               e.links,
-		StateDir:            e.dir,
-		AuthorizedKeys:      []string{testKey},
-		FirewallSources:     []string{fake.DefaultIngressSource},
-		FastFailWindow:      250 * time.Millisecond,
+		Config:          e.cfg,
+		Provider:        prov,
+		Links:           e.links,
+		StateDir:        e.dir,
+		AuthorizedKeys:  []string{testKey},
+		FirewallSources: []string{fake.DefaultIngressSource},
+		// A window a loaded machine meets: the create's durable writes
+		// (its record, its "being sent" note) are fsyncs, measured at up
+		// to hundreds of milliseconds while other packages run, and a
+		// 250ms window was spent by them alone, failing creates as never
+		// delivered. A test that measures the window sets its own.
+		FastFailWindow:      time.Second,
 		BootTimeout:         2 * time.Second,
 		AuthGrace:           300 * time.Millisecond,
 		ProbeInterval:       5 * time.Millisecond,

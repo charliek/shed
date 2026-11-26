@@ -763,9 +763,10 @@ def _env_backends(name: str) -> set[str]:
 
 
 def started_with_users(backend: str) -> bool:
-    """Whether `SHED_ITEST_USERS` (a comma list of `fc`, `remote`) says the dev
+    """Whether `SHED_ITEST_USERS` (a comma list of backends, `fc`) says the dev
     server of `backend` was started with the itest user list. (The Mac dev
-    server is always restarted with it by the suite itself.)"""
+    server is always restarted with it by the suite itself; a remote server
+    whose machines come from the account service takes its people from it.)"""
     return backend in _env_backends("SHED_ITEST_USERS")
 
 
@@ -775,7 +776,6 @@ def skip_unless_started_with_users(backend: str, server_name: str) -> None:
     how = {
         "fc": "SHED_DEV_USERS=itest make dev-server-restart-fc (or render a config with "
               "`scripts/render-dev-config.sh <base> <out> --users <keys dir>`)",
-        "remote": "SHED_DEV_USERS=itest make dev-server-restart-remote",
     }.get(backend, "scripts/render-dev-config.sh <base> <out> --users <keys dir>")
     pytest.skip(
         f"the users cases on [{backend}] need {server_name!r} STARTED with the itest user list "

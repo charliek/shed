@@ -571,6 +571,11 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 	// proves nothing was made.
 	sentBefore := rec.Mutation != nil && rec.Mutation.Call == state.JobCreate && rec.Mutation.RequestID == rec.Spec.RequestID
 	fresh := j.firstRun && !sentBefore && rec.Ref == ""
+	// everSent stays true once any send of this create may have been
+	// delivered, even after a reset for a new machine gives it a request id
+	// that sentBefore no longer covers: every later failure keeps the
+	// record (see the rule above refuseCreate).
+	everSent := sentBefore
 
 	// A create resumed after a restart, or by a later pass, first resolves
 	// what its earlier send did, before any admission check: the machine it
@@ -611,6 +616,9 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 				return errSuperseded
 			}
 			b.noteFlushed(rec.Spec.RequestID)
+			// The new request id has never been sent: the durable "being
+			// sent" note below is written for it before its first send.
+			sentBefore = false
 		case err != nil:
 			// The read failed, so nothing is known: the machine may be a
 			// create half done, or a shed the server that died had
@@ -670,7 +678,7 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			if ctx.Err() != nil {
 				return errSuperseded
 			}
-			if errors.Is(err, errNameDeleting) && !sentBefore {
+			if errors.Is(err, errNameDeleting) && !everSent {
 				return b.refuseCreate(j, err, config.StatusReasonCreateFailed)
 			}
 			return b.keep(j, state.JobCreate, err)
@@ -949,7 +957,13 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 // server may not use, a guest it cannot drive, an operation the service
 // failed) leaves it in error with the reason (failCreate). Neither writes a
 // marker: the machine stays until a person deletes the shed, and its lease
-// bounds the cost.
+// bounds the cost. A record in error whose create made a machine (a Ref,
+// facts or a Pending recorded) is dropped once that machine is confirmed
+// gone (the list omits it or names its deletion, and an exact read answers
+// not found), with the cause when the list names one, by the periodic and
+// start-up passes: a failed create's record clears when its machine's lease
+// ends at the service. A create refused before it made a machine stays in
+// error with its reason until a person deletes the shed.
 //
 // A create resumed by a later run whose machine a read finds gone is sent
 // again ONLY when no earlier send of it was accepted (no Ref, machine or
@@ -960,8 +974,9 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 
 // refuseCreate ends a create the service definitively refused (see the rule
 // above): inside the fast-fail window the refusal is the create's answer
-// and no record stays; after it the shed is left in error with the reason.
-// The refused create made no machine, so nothing is destroyed.
+// and no record stays; after it the shed is left in error with the reason,
+// until a person deletes it. The refused create made no machine, so nothing
+// is destroyed.
 func (b *Backend) refuseCreate(j *job, cause error, reason string) error {
 	if j.ctx.Err() != nil {
 		return errSuperseded
@@ -998,7 +1013,8 @@ func (b *Backend) keepCreate(j *job, cause error, reason string) error {
 
 // failCreate leaves a create that may have made a machine, and that no
 // retry will finish, in status error with the reason (see the rule above).
-// Nothing is cleaned up: the machine stays until a person deletes the shed.
+// Nothing is cleaned up: the machine stays until a person deletes the shed
+// or its lease ends, and the record until the machine is gone.
 func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	if j.ctx.Err() != nil {
 		return errSuperseded

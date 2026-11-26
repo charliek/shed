@@ -95,7 +95,7 @@ tests they would have run, not the whole session.
 | `SHED_ITEST_DIRECTORY_LOG` | _unset_                                        | The file that reference server's standard error goes to: `test_delivery_hosted.py` counts its `delivery call` and token-request lines. Unset, the writing hosted-delivery cases skip. |
 | `SHED_HOSTED_V011_SHED` | _unset_                                           | A shed `itest-alice` made on a v0.11 server binary before the server was upgraded to this build (same state): `test_delivery_hosted.py`'s case 8 lists it and delivers to it. Unset, that case skips. |
 | `SHED_VZ_DEV_AUDIT_LOG`, `SHED_VZ_DEV_STATE_DIRS`, `SHED_FC_DEV_AUDIT_LOG`, `SHED_FC_DEV_STATE_DIRS`, `SHED_REMOTE_AUDIT_LOG`, `SHED_REMOTE_STATE_DIRS`, `SHED_REMOTE_DEV_DIR` | the dev servers' own | Where `test_delivery.py`'s sentinel sweep reads each dev server's audit log and state directories (comma lists). Defaults: the Mac dev server's directory above `vz.instance_dir` and its `state_dir`; `/var/lib/shed-dev/firecracker/audit.jsonl`, its directory and the `state` directory beside it (on `SHED_FC_HOST`); `~/.shed/dev-remote/remote` and `state`. |
-| `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
+| `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself, and `[remote]` takes its people from the account service. `test-integration-dev-fc` sets it from `SHED_DEV_USERS`. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
 | `SHED_ITEST_SOURCE`    | `config`                                           | Where the users cases' server takes its users from: `config` (`auth.users`) or `directory` (an account service; the run started the server with `render-directory`'s auth block). See [Named users](#named-users-authusers). |
 | `SHED_DIRECTORY_ITEST` | _unset_                                            | `1` runs `test_directory.py` and the local cases of `test_delivery_hosted.py`; set, with `SHED_BIN_DIR` (the built `bin/`), by `make test-integration-directory` only. Unset, they skip. |
@@ -106,7 +106,7 @@ tests they would have run, not the whole session.
 | `SHED_COMPUTE_REF_DIR`, `SHED_COMPUTE_REF_SERVER` | `~/.shed/dev-remote/ref`, the config's `name` | The reference service's directory (its `control/` and `ref.log`, as `make dev-compute-ref-up` makes them) and the name the dev server is enrolled under. |
 | `SHED_COMPUTE_CLIENT`, `SHED_REMOTE_CONFIG`, `SHED_SERVER_BIN` | `nocturn`, `~/.shed/dev-remote/server.yaml`, `bin/shed-server` | The service client the compute cases act as, the rendered config its bundle is issued from, and the binary that issues it. |
 | `SHED_REMOTE_RESTART`  | _unset_                                            | A shell command that restarts the remote dev server (e.g. `make -C <repo> dev-server-restart-remote`), for the degraded-start case of `test_remote_compute.py`. Unset, that case skips. |
-| `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the itest user list and tells `test-integration-dev-fc`/`-remote` so; empty means no user list (one implicit user). |
+| `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the Mac and FC dev servers (`dev-server-up`, `-up-fc` and their restarts) with the itest user list and tells `test-integration-dev-fc` so; empty means no user list (one implicit user). The remote dev server refuses it: its people come from the account service. |
 
 ## Fixtures
 
@@ -570,8 +570,11 @@ scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-us
 
 # The dev targets do it with SHED_DEV_USERS=itest, and tell the suite:
 SHED_DEV_USERS=itest make dev-server-restart-fc && SHED_DEV_USERS=itest make test-integration-dev-fc
-SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make test-integration-remote PYTEST_ARGS=test_users.py
 ```
+
+The remote dev server takes no user list (it refuses `SHED_DEV_USERS=itest`):
+its people come from the account service it is enrolled with, so the itest
+people are listed there (see [Cloud sheds from the account service](#cloud-sheds-from-the-account-service-test_remote_computepy)).
 
 **Which server each backend uses** (`users_env` in `conftest.py`):
 
@@ -579,7 +582,7 @@ SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make
 |---|---|---|
 | `[vz]` | the Mac dev server | nothing: the module restarts it with the user list through `dev_config()` and restores the committed base afterwards (always: other modules' `dev_config()` calls restore the base too, so a list the server was started with would be gone by then). The developer's credential source bindings are kept aside for the detour and put back (see "Reconfiguring the Mac dev server" above) |
 | `[fc]` | `$SHED_FC_DEV_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=fc`; skips saying so otherwise |
-| `[remote]` | `$SHED_REMOTE_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=remote`; skips saying so otherwise |
+| `[remote]` | `$SHED_REMOTE_SERVER` | the itest people on its account service's list (its users come from `auth.directory`; no `SHED_ITEST_USERS`) |
 
 To run only the users cases against an FC dev server started by hand (for
 example from a config rendered with `--users`):

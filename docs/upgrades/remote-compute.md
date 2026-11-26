@@ -69,13 +69,13 @@ To rotate: keep the old key configured (`remote.ssh`) **until every machine made
 Old cloud sheds are **not migrated**. A record or delete marker the previous server wrote carries no schema number the new server accepts. At start the server stops and names each one:
 
 ```text
-remote: the remote state directory holds sheds of the in-tree cloud provider this server no longer has: shed ada-dev (it was written by an earlier server); an unfinished delete of shed ada-old (01HZ...). Run the previous shed-server release once more and `shed delete` each of these sheds; or, once their VMs are confirmed gone from the cloud, remove the state directory <dir>. Then start this server (see docs/upgrades/remote-compute.md)
+remote: the remote state directory holds sheds of the in-tree cloud provider this server no longer has: shed ada-dev (it was written by an earlier server); an unfinished delete of shed ada-old (01HZ...). Run the previous shed-server release once more and `shed delete` each of these sheds; or, once their VMs are confirmed gone from the cloud, remove the directories sheds/ and deleting/ in <dir> (not the directory itself: it holds the audit log). Then start this server (see docs/upgrades/remote-compute.md)
 ```
 
 Do one of the two:
 
 1. Run the previous shed-server release once more, `shed delete` each shed it names, wait for the machines to be gone, then start the new server. (This is step 2 above, done late.)
-2. Confirm in the cloud that the machines are gone, then remove the state directory the message names (`remote.state_dir`, by default `remote/` under the server's state directory), and start the new server.
+2. Confirm in the cloud that the machines are gone, then remove the `sheds/` (records) and `deleting/` (delete markers) directories in the directory the message names (`remote.state_dir`, by default `remote/` under the server's state directory), and start the new server. Keep the directory itself: it also holds the audit log, `audit.jsonl`.
 
 The message lists what it found; a machine still in the cloud that no record names is the cloud's to delete, not shed's.
 

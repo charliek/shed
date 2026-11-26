@@ -2156,9 +2156,11 @@ const (
 const (
 	// RemoteFirewallStatic (the default): the firewall rule's sources are
 	// fixed and must equal the configured set (firewall.source_ranges, or
-	// the variable firewall.source_ranges_env names). The server reads the
-	// rule and refuses creates and starts while it differs; it never changes
-	// it.
+	// the variable firewall.source_ranges_env names). When they differ the
+	// server writes the configured set to the account service's ingress,
+	// if that ingress is writable (the catalog says so and the write is not
+	// refused); otherwise it only compares, and refuses creates and starts
+	// while the sources differ.
 	RemoteFirewallStatic = "static"
 	// RemoteFirewallAuto: the server follows its own public address
 	// (firewall.echo_urls) and patches the rule's sources to that one /32.

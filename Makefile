@@ -258,13 +258,14 @@ SHED_DEV_STATE_DIR ?=
 # (auth.users: itest-admin, itest-alice, itest-bob, and the config's own
 # auth.ssh key sources moved under the admin user `dev`), so the users cases
 # (tests/integration/test_users.py) can run against it. Empty (the default):
-# no user list, one implicit user. `itest`: dev-server-up, -up-fc and
-# -up-remote (and their restarts) render the config with
+# no user list, one implicit user. `itest`: dev-server-up and -up-fc (and
+# their restarts) render the config with
 # `scripts/render-dev-config.sh --users $(SHED_ITEST_USERS_DIR)`, and
-# test-integration-dev-fc and -remote tell the suite so
-# (SHED_ITEST_USERS=<backend>). The suite's [vz] users cases restart the Mac
-# dev server with the list themselves (and restore the committed base), so
-# test-integration-dev needs neither. The keys are generated once, outside
+# test-integration-dev-fc tells the suite so (SHED_ITEST_USERS=fc). The
+# remote dev server refuses it: its people come from the account service
+# (auth.directory), where the itest people are listed instead. The suite's
+# [vz] users cases restart the Mac dev server with the list themselves (and
+# restore the committed base), so test-integration-dev needs neither. The keys are generated once, outside
 # the repo (`make dev-itest-users`). Needs uv.
 SHED_DEV_USERS ?=
 SHED_ITEST_USERS_DIR ?= $(HOME)/.shed/dev/itest-users
@@ -1195,7 +1196,6 @@ test-integration-remote: build-cli
 	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
 	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
 	  SHED_IMAGE_HAS_DELIVERY=remote \
-	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),remote,) \
 	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 

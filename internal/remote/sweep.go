@@ -70,7 +70,10 @@ type sweepCheck struct {
 //     "stopped", with the reason;
 //   - drops the record of a shed whose machine no longer exists, once an
 //     exact read confirms it, naming the cause when the list gives the
-//     machine's deletion (its lease ended, a delete at the service);
+//     machine's deletion (its lease ended, a delete at the service); a
+//     shed in error whose create made a machine is one too, so a failed
+//     create's record clears when its machine's lease ends at the service
+//     (one refused before it made a machine stays until it is deleted);
 //   - records a "stopped" shed whose machine runs as "starting" and probes
 //     it, so a machine that costs money is never shown as stopped;
 //   - gives a shed left "stopping" by a failed call a new stop job;
@@ -191,6 +194,15 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			if r.Ref != "" && (!listed || inst.State == provider.StateRunning || inst.State == provider.StateStarting) {
 				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed, cause: deleted[r.Shed.ID]})
 			}
+		case config.StatusError:
+			// A shed left in error by a create that made a machine keeps
+			// its record while the machine stands; once the machine is gone
+			// (its lease ended, a delete at the service) the record is
+			// dropped, as a settled shed's is (see errorRecordGoes). One a
+			// delete marker or job names is the delete's to finish.
+			if !listed && errorRecordGoes(r) && !marked[r.Shed.ID] && b.deletes[r.Shed.ID] == nil {
+				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: machineRef(r), status: r.Shed.Status, cause: deleted[r.Shed.ID]})
+			}
 		}
 		// A listed machine that needs no correction and no job (its state
 		// matches the record) is still a read of it: its facts are kept,
@@ -295,6 +307,15 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	if launch != nil {
 		b.launch(launch)
 	}
+}
+
+// errorRecordGoes reports whether a record in error is one the passes drop
+// once its machine is confirmed gone: one whose create made a machine (a
+// Ref, facts or a Pending recorded). A create refused before it made one
+// keeps its record, in error with its reason, until a person deletes the
+// shed.
+func errorRecordGoes(r *state.Record) bool {
+	return r.Ref != "" || r.Machine != nil || r.Pending != nil
 }
 
 // machineRef is the ref of a shed's machine: the one the provider gave it,
