@@ -1512,7 +1512,7 @@ const (
 	// ShedOriginUnknownMessage.
 	ErrShedOriginUnknown = "SHED_ORIGIN_UNKNOWN"
 	// ShedOriginUnknownMessage is ErrShedOriginUnknown's one fixed message.
-	ShedOriginUnknownMessage = "this shed has no record of where its user came from: no credentials are delivered to it and none can be added: recreate the shed (a shed made before this version is recorded at this version's first start; one made after that by an older shed-server stays unknown)"
+	ShedOriginUnknownMessage = "this shed has no record of where its user came from: no credentials are delivered to it and none can be added: recreate the shed (a shed made before this version is recorded by this version's first successful origin migration, at a start; a failed one stamps nothing and is retried at the next start; one made after that by an older shed-server stays unknown)"
 	// ShedOriginChangedMessage is ErrShedOriginChanged's one fixed message.
 	ShedOriginChangedMessage = "this shed's user was a different principal when it was created (the name moved between this server's local admins and the account service): no credentials are delivered to it; create a new shed"
 	// ErrExecLimit (429) means the shed already runs

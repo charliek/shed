@@ -468,10 +468,11 @@ pub async fn unbind(
         Some(m) => match still_bound(client, &m.id).await {
             Some(true) => {
                 // Another machine that took over meanwhile is never cleared: the
-                // server refuses SOURCE_MOVED, and nothing more is sent.
+                // server refuses SOURCE_MOVED, and nothing more is sent. The first
+                // unbind did clear this machine, so the refusal says so.
                 if let Err(e) = unbind_this_machine(client, &m.id).await {
                     if is_source_moved(&e) {
-                        return Err(refusal(host, &e, "unbind"));
+                        return Err(moved_after_unbind(host));
                     }
                 }
                 match still_bound(client, &m.id).await {
@@ -637,6 +638,19 @@ fn refusal_changed_nothing(e: &SourceError) -> bool {
         }
         _ => false,
     }
+}
+
+/// A stop whose first unbind cleared this machine, which a late admission then bound
+/// again, and whose second unbind was refused `SOURCE_MOVED`: another machine took
+/// over in between. Its own class, since (unlike `source_moved`) something was cleared.
+fn moved_after_unbind(host: &str) -> (String, String) {
+    err(
+        "moved_after_unbind",
+        format!(
+            "the unbind on {host} cleared this machine, then another machine took over as \
+             your credential source; this machine stays stopped there"
+        ),
+    )
 }
 
 /// The refusal for a user the account service answers for on `host` (`409
@@ -1096,6 +1110,23 @@ mod tests {
             refusal("mini", &api(418, "X", "ghp_SENTINEL"), "unbind").1,
             "mini refused the unbind"
         );
+    }
+
+    /// A SOURCE_MOVED on the re-check's unbind follows a clear that completed: its own
+    /// class and words, never `source_moved`'s "nothing was cleared".
+    #[test]
+    fn a_takeover_after_the_first_unbind_says_the_clear_completed() {
+        let (code, words) = moved_after_unbind("mini");
+        assert_eq!(code, "moved_after_unbind");
+        assert_eq!(
+            words,
+            "the unbind on mini cleared this machine, then another machine took over as your \
+             credential source; this machine stays stopped there"
+        );
+        // Negative control: the first unbind's refusal says nothing was cleared.
+        let first = refusal("mini", &api(409, SOURCE_MOVED, "x"), "unbind");
+        assert_eq!(first.0, "source_moved");
+        assert!(first.1.contains("nothing was cleared") && !words.contains("nothing"));
     }
 
     /// An unbind where the account service answers is refused before any pause: from

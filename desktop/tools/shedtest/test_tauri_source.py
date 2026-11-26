@@ -1353,7 +1353,11 @@ def test_a_stop_never_clears_a_machine_that_took_over_meanwhile():
         mock.move_before_unbind(OTHER_MACHINE, "desk", skip=1)
         with pytest.raises(ShedError) as e:
             client.source_unbind("mock")
-        assert e.value.code == "source_moved", e.value
+        # The first unbind cleared this machine: its own class, saying so.
+        assert (e.value.code, e.value.message) == (
+            "moved_after_unbind",
+            "the unbind on mock cleared this machine, then another machine took over as "
+            "your credential source; this machine stays stopped there"), e.value
         assert mock.source_unbind_requests() == [mine] * 3, "no unbind after SOURCE_MOVED"
         assert mock.source_bound() == OTHER_MACHINE
         assert _list_row(client, "mock")["paused"] is True
