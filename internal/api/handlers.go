@@ -59,13 +59,19 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if cat, ok, _ := backend.CatalogOf(s.backend); ok && info.DefaultImage == "" {
+		// A remote server's default image is its compute service's.
+		info.DefaultImage = cat.DefaultImage
+	}
+
 	writeJSON(w, http.StatusOK, info)
 }
 
 // guestArch is /api/info's guest_arch: the architecture every shed this
 // server can create runs, or "" when that is not one value. A local VM
 // backend's is the host's (its capabilities say); a remote backend's is the
-// one every configured size shares.
+// one every size of its compute service's catalog shares ("" before the
+// catalog is read).
 func (s *Server) guestArch() string {
 	if s.backend == nil {
 		return ""
@@ -73,8 +79,8 @@ func (s *Server) guestArch() string {
 	if arch := backend.CapabilitiesOf(s.backend).GuestArch; arch != "" {
 		return arch
 	}
-	if s.backend.Type() == backend.TypeRemote && s.cfg.Remote != nil {
-		return s.cfg.Remote.GuestArch()
+	if cat, ok, _ := backend.CatalogOf(s.backend); ok {
+		return cat.GuestArch
 	}
 	return ""
 }
@@ -158,17 +164,26 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = id
 
-	// A remote server offers named sizes: the request's cpus and memory pick
-	// one, and the record carries that size's numbers. This runs before the
-	// client cap check so the caps apply to what the shed will really get.
-	if s.cfg.DefaultBackend == config.BackendRemote && s.cfg.Remote != nil {
-		size, err := s.cfg.Remote.ResolveSize(req.CPUs, req.MemoryMB)
+	// A remote server offers its compute service's named sizes: the
+	// request's cpus and memory pick one, and the record carries that size's
+	// numbers. This runs before the client cap check so the caps apply to
+	// what the shed will really get. With no catalog yet (a degraded start)
+	// the backend refuses the create itself.
+	// The backend then creates that size and no other (SizeName): a
+	// catalog that changes before it runs is refused, never resolved again.
+	// A backend that offers a catalog and has none yet refuses here, before
+	// the caps are checked against numbers no size was picked for.
+	if cat, ok, offers := backend.CatalogOf(s.backend); ok {
+		size, err := cat.ResolveSize(req.CPUs, req.MemoryMB)
 		if err != nil {
-			code, errCode, msg := backendErrorFor(r.Context(), err)
-			writeError(w, code, errCode, msg)
+			writeBackendError(w, r.Context(), err)
 			return
 		}
-		req.CPUs, req.MemoryMB = size.CPUs, size.MemoryMB
+		req.CPUs, req.MemoryMB, req.SizeName = size.CPUs, size.MemoryMB, size.Name
+	} else if offers {
+		writeBackendError(w, r.Context(), &config.ComputeRefusal{Status: http.StatusServiceUnavailable, Code: config.ErrComputeUnavailable,
+			Err: errors.New("the account service's catalog has not been read yet")})
+		return
 	}
 
 	// A service client's create policy runs before any validation that
@@ -310,8 +325,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		shed, err := s.backend.CreateShed(context.WithoutCancel(r.Context()), req)
 		if err != nil {
 			log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, s.backend.Type(), err)
-			code, errCode, msg := backendErrorFor(r.Context(), err)
-			writeError(w, code, errCode, msg)
+			writeBackendError(w, r.Context(), err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, shed)
@@ -324,8 +338,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -459,8 +472,8 @@ drain:
 	}
 
 	if res.err != nil {
-		_, errCode, msg := backendErrorFor(r.Context(), res.err)
-		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
+		_, apiErr := backendAPIError(r.Context(), res.err)
+		writeSSEEvent(w, "error", apiErr)
 	} else {
 		writeSSEEvent(w, "complete", res.payload)
 	}
@@ -494,8 +507,7 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -509,8 +521,7 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -579,8 +590,7 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, shed)
@@ -667,8 +677,7 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := ec.ClearShedEgress(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, shed)
@@ -699,8 +708,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	// teardown and its timing.
 	if isAsync {
 		if err := s.backend.DeleteShed(context.WithoutCancel(r.Context()), name); err != nil {
-			code, errCode, msg := backendErrorFor(r.Context(), err)
-			writeError(w, code, errCode, msg)
+			writeBackendError(w, r.Context(), err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -715,8 +723,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	err := s.backend.DeleteShed(ctx, name)
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -763,8 +770,7 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := s.backend.StartShed(ctx, name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -787,8 +793,7 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	// create still runs (gracefully) after the client has given up.
 	shed, err := s.backend.StopShed(context.WithoutCancel(r.Context()), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -804,8 +809,7 @@ func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.ResetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -910,6 +914,32 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, apiErr)
 }
 
+// writeBackendError writes a backend error as its caller is answered
+// (backendAPIError).
+func writeBackendError(w http.ResponseWriter, ctx context.Context, err error) {
+	status, apiErr := backendAPIError(ctx, err)
+	writeJSON(w, status, apiErr)
+}
+
+// backendAPIError is a backend error as its caller is answered
+// (backendErrorFor), with the reason a compute service's refusal carries.
+func backendAPIError(ctx context.Context, err error) (int, config.APIError) {
+	status, code, msg := backendErrorFor(ctx, err)
+	apiErr := config.NewAPIError(code, msg)
+	apiErr.Error.Reason = errorReason(err)
+	return status, apiErr
+}
+
+// errorReason is the reason a backend error carries (a
+// *config.ComputeRefusal's), or "".
+func errorReason(err error) string {
+	var cr *config.ComputeRefusal
+	if errors.As(err, &cr) {
+		return cr.Reason
+	}
+	return ""
+}
+
 // firewallRefusalForClients is all a service client is told of a failing
 // firewall check. The full message is written for the operator who must fix
 // the cloud: it names the server's public address, the rule's source ranges,
@@ -947,6 +977,15 @@ func mapAccessError(err error) (status int, code, msg string, ok bool) {
 func mapBackendError(err error) (int, string, string) {
 	if status, code, msg, ok := mapAccessError(err); ok {
 		return status, code, msg
+	}
+	// A compute service's refusal, mapped by its code (the remote backend
+	// gives the status, the code and the reason): before the sentinels.
+	var cr *config.ComputeRefusal
+	if errors.As(err, &cr) && cr.Code != "" && cr.Status != 0 {
+		return cr.Status, cr.Code, err.Error()
+	}
+	if errors.Is(err, config.ErrSizeUnavailableSentinel) {
+		return http.StatusUnprocessableEntity, config.ErrSizeUnavailable, err.Error()
 	}
 	// Check sentinel errors
 	if errors.Is(err, config.ErrShedAssignedSentinel) {
@@ -1124,8 +1163,7 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.backend.DeleteImage(r.Context(), name); err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 
@@ -1147,8 +1185,7 @@ func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
 
 	deleted, err := s.backend.PruneImages(r.Context(), dryRun)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	if deleted == nil {
@@ -1168,8 +1205,7 @@ func (s *Server) handleInspectImage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.backend.InspectImage(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -1193,8 +1229,7 @@ func (s *Server) handleTagImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.TagImage(r.Context(), req.Source, req.Target); err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1223,8 +1258,7 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 	}
 	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform, req.WithLayers)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, config.ImagePullResponse{Tag: req.Tag, Digest: digest})
@@ -1262,8 +1296,7 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.PushImage(r.Context(), req.Source, req.Destination); err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, config.ImagePushResponse(req))

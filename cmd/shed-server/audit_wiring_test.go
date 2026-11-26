@@ -102,6 +102,8 @@ type rigOptions struct {
 	httpHandler   http.Handler
 	timeout       time.Duration
 	reaperRelease chan struct{}
+	// fatal is frontDoors.fatal.
+	fatal chan error
 }
 
 func startFrontDoors(t *testing.T, be backend.Backend) *frontDoorRig {
@@ -179,6 +181,7 @@ func startFrontDoorsWith(t *testing.T, be backend.Backend, opts rigOptions) *fro
 		doors:          doors,
 		beforeShutdown: func() { close(r.began) },
 		timeout:        timeout,
+		fatal:          opts.fatal,
 	}
 	if release := opts.reaperRelease; release != nil {
 		fd.startReaper = func() func() {
@@ -636,5 +639,23 @@ func TestFrontDoorsShutdownClosesEveryGateFirst(t *testing.T) {
 	}
 	if ev := r.events(t); ev[audit.EventSSH] != 1 {
 		t.Errorf("the log holds %v, want the one ssh line of the entry admitted before the shutdown", ev)
+	}
+}
+
+// TestFrontDoorsStopOnABackendFatal: a reason the server must not run that
+// the backend finds after a degraded start (the doors serve by then) ends
+// serve with that error, and every door is shut down, as after a door's
+// failure.
+func TestFrontDoorsStopOnABackendFatal(t *testing.T) {
+	fatal := make(chan error, 1)
+	r := startFrontDoorsWith(t, &ownedShedBackend{}, rigOptions{fatal: fatal})
+	_ = r.sshClient(t).Close()
+	want := errors.New("remote: the account service refuses to write the ingress")
+	fatal <- want
+	if err := r.wait(t); !errors.Is(err, want) {
+		t.Fatalf("runFrontDoors = %v, want the backend's fatal error", err)
+	}
+	if _, err := net.DialTimeout("tcp", r.sshAddr, time.Second); err == nil {
+		t.Error("the SSH listener still accepts after the fatal error")
 	}
 }

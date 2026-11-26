@@ -39,8 +39,7 @@ func (s *Server) handleProvisionShed(w http.ResponseWriter, r *http.Request) {
 	// status; the slot, once taken, is held until the run is done.
 	run, err := pv.BeginProvision(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	defer run.Release()
@@ -61,8 +60,7 @@ func (s *Server) handleProvisionShed(w http.ResponseWriter, r *http.Request) {
 	shed, err := work(backend.ContextWithProgress(base, timer.Track))
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, shed)

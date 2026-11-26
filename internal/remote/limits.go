@@ -2,13 +2,13 @@ package remote
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/provider"
 )
 
-// Limits are counted from the records under Backend.mu. A create or start
+// Limits are counted from the records under Backend.mu. Each is off at zero
+// (the default): the account service holds the quotas. A create or start
 // saves its record ("starting") inside the same critical section that checked
 // the limit, so the count always includes every job in flight and two calls
 // can never both take the last slot.
@@ -99,16 +99,4 @@ func (b *Backend) checkStartLocked() error {
 		return limitError("remote.limits.max_running", limit, b.stuckDeletesLocked())
 	}
 	return nil
-}
-
-// runLimit is the run limit a shed of this owner gets at each start: the
-// larger of remote.max_run_duration and the owning client's max_age.
-func (b *Backend) runLimit(owner string) time.Duration {
-	var maxAge time.Duration
-	if owner != "" && b.opts.Server != nil && b.opts.Server.Auth != nil {
-		if client, ok := b.opts.Server.Auth.Clients[owner]; ok {
-			maxAge = client.Policy.MaxAge.Duration()
-		}
-	}
-	return b.cfg.RunLimit(maxAge)
 }

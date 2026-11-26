@@ -21,7 +21,7 @@ type stuckRule struct {
 	entered chan struct{}
 }
 
-func (s *stuckRule) EnvFirewallRule(ctx context.Context) (provider.FirewallRule, error) {
+func (s *stuckRule) Ingress(ctx context.Context) (provider.Ingress, error) {
 	s.mu.Lock()
 	release, entered := s.release, s.entered
 	s.mu.Unlock()
@@ -33,10 +33,10 @@ func (s *stuckRule) EnvFirewallRule(ctx context.Context) (provider.FirewallRule,
 		select {
 		case <-release:
 		case <-ctx.Done():
-			return provider.FirewallRule{}, ctx.Err()
+			return provider.Ingress{}, ctx.Err()
 		}
 	}
-	return s.Provider.EnvFirewallRule(ctx)
+	return s.Provider.Ingress(ctx)
 }
 
 // stick makes rule reads hang until the returned function is called.
@@ -98,7 +98,7 @@ func TestFirewallGateWaitEndsWithTheRequest(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan error, 1)
-	go func() { got <- e.b.firewallGate(ctx) }()
+	go func() { got <- e.b.firewallGate(ctx, config.NetworkProfileOpen) }()
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 	select {
@@ -126,7 +126,7 @@ func TestFirewallGateBudgetIncludesTheWait(t *testing.T) {
 	release, done := slowCheck(t, e, s, clock)
 
 	start := time.Now()
-	err := e.b.firewallGate(ctxT(t))
+	err := e.b.firewallGate(ctxT(t), config.NetworkProfileOpen)
 	if !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
 		t.Fatalf("firewallGate behind a check that does not finish = %v, want the firewall error", err)
 	}
@@ -151,11 +151,11 @@ func TestFirewallGateBudgetIncludesTheWait(t *testing.T) {
 	if st := e.b.FirewallStatus(); !st.OK {
 		t.Fatalf("the check that was in progress ended %+v, want a pass", st.Failure)
 	}
-	reads := e.count(fake.OpEnvFirewallRule)
-	if err := e.b.firewallGate(ctxT(t)); err != nil {
+	reads := e.count(fake.OpIngress)
+	if err := e.b.firewallGate(ctxT(t), config.NetworkProfileOpen); err != nil {
 		t.Fatalf("firewallGate after the check passed: %v", err)
 	}
-	if n := e.count(fake.OpEnvFirewallRule) - reads; n != 0 {
+	if n := e.count(fake.OpIngress) - reads; n != 0 {
 		t.Fatalf("%d more rule reads, want none: the finished check's result is fresh", n)
 	}
 }
@@ -167,10 +167,10 @@ func TestFirewallGateUsesTheCheckItWaitedFor(t *testing.T) {
 	clock := newTestClock()
 	e := newEnv(t, stuck(s), withClock(clock))
 	release, done := slowCheck(t, e, s, clock)
-	reads := e.count(fake.OpEnvFirewallRule)
+	reads := e.count(fake.OpIngress)
 
 	got := make(chan error, 1)
-	go func() { got <- e.b.firewallGate(ctxT(t)) }()
+	go func() { got <- e.b.firewallGate(ctxT(t), config.NetworkProfileOpen) }()
 	time.Sleep(20 * time.Millisecond)
 	release()
 	<-done
@@ -182,7 +182,7 @@ func TestFirewallGateUsesTheCheckItWaitedFor(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("firewallGate did not return after the check in progress ended")
 	}
-	if n := e.count(fake.OpEnvFirewallRule) - reads; n != 1 {
+	if n := e.count(fake.OpIngress) - reads; n != 1 {
 		t.Fatalf("%d rule reads, want 1: the waiter must not run a second check", n)
 	}
 }

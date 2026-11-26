@@ -278,7 +278,7 @@ func newAutoEnv(t *testing.T, ruleSource string, bodies []string, more ...envOpt
 		withClock(clock),
 		func(e *env, o *fake.Options) {
 			e.cfg.Firewall = config.RemoteFirewallConfig{Mode: config.RemoteFirewallAuto, EchoURLs: urls}
-			o.FirewallSources = []string{ruleSource}
+			o.IngressSources = []string{ruleSource}
 		},
 		tune(func(o *Options) { o.EchoClient, o.FirewallSources = client, nil }),
 	}
@@ -299,12 +299,25 @@ func (a *autoEnv) downAll() {
 
 func (a *autoEnv) ruleSources() []string {
 	a.t.Helper()
-	rule, err := a.prov.EnvFirewallRule(context.Background())
-	if err != nil {
-		a.t.Fatalf("EnvFirewallRule: %v", err)
-	}
-	return rule.SourceRanges
+	return ingressSources(a.t, a.prov)
 }
+
+// ingressSources is the provider's ingress sources, as text.
+func ingressSources(t *testing.T, p *fake.Provider) []string {
+	t.Helper()
+	ing, err := p.Ingress(context.Background())
+	if err != nil {
+		t.Fatalf("Ingress: %v", err)
+	}
+	out := []string{}
+	for _, s := range ing.Sources {
+		out = append(out, s.String())
+	}
+	return out
+}
+
+// setSources has someone else write the ingress's sources.
+func setSources(p *fake.Provider, sources ...string) { p.SetIngressState(sources, true) }
 
 // check moves the clock and runs one check.
 func (a *autoEnv) check(after time.Duration) FirewallStatus {
@@ -320,15 +333,15 @@ func TestFirewallAutoPatchesOnAgreement(t *testing.T) {
 	if !s.OK || !slices.Equal(s.Expected, []string{addr + "/32"}) {
 		t.Fatalf("start-up status = %+v (%v)", s, s.Failure)
 	}
-	if got := a.prov.FirewallPatches(); len(got) != 1 || !slices.Equal(got[0], []string{addr + "/32"}) {
+	if got := a.prov.IngressWrites(); len(got) != 1 || !slices.Equal(got[0], []string{addr + "/32"}) {
 		t.Fatalf("patches = %v, want one to %s/32", got, addr)
 	}
 	if got := a.ruleSources(); !slices.Equal(got, []string{addr + "/32"}) {
 		t.Errorf("rule sources = %v", got)
 	}
 	log := strings.Join(a.logLines(), "\n")
-	if !strings.Contains(log, "patched rule shed-"+testEnv+"-ssh: sources were [192.0.2.1/32], are now ["+addr+"/32]") {
-		t.Errorf("the patch's old and new sources are not in the log:\n%s", log)
+	if !strings.Contains(log, "wrote the ingress: sources were [192.0.2.1/32], are now ["+addr+"/32]") {
+		t.Errorf("the write's old and new sources are not in the log:\n%s", log)
 	}
 	// With the rule right, later checks patch nothing.
 	for range 3 {
@@ -336,7 +349,7 @@ func TestFirewallAutoPatchesOnAgreement(t *testing.T) {
 			t.Fatalf("check failed: %v", s.Failure)
 		}
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 1 {
+	if n := a.count(fake.OpSetIngress); n != 1 {
 		t.Errorf("%d patches, want 1", n)
 	}
 	if _, err := a.create("works"); err != nil {
@@ -351,7 +364,7 @@ func TestFirewallAutoNoPatchWhenRuleIsRight(t *testing.T) {
 	if s := a.b.FirewallStatus(); !s.OK {
 		t.Fatalf("start-up check failed: %v", s.Failure)
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 0 {
+	if n := a.count(fake.OpSetIngress); n != 0 {
 		t.Errorf("%d patches of a rule that was already right", n)
 	}
 }
@@ -393,17 +406,16 @@ func TestFirewallAutoNeverPatchesWithoutAgreement(t *testing.T) {
 			if s.OK || s.Failure == nil || s.Failure.Reason != FirewallAddressUnknown {
 				t.Fatalf("status = %+v (%v), want reason %s", s, s.Failure, FirewallAddressUnknown)
 			}
-			for _, w := range []string{"public address is not known", "the firewall rule was not touched", tt.wantMsg} {
+			for _, w := range []string{"public address is not known", "the ingress was not touched", tt.wantMsg} {
 				if !strings.Contains(s.Failure.Error(), w) {
 					t.Errorf("message lacks %q: %v", w, s.Failure)
 				}
 			}
-			if n := e.count(fake.OpSetFirewallSources); n != 0 {
+			if n := e.count(fake.OpSetIngress); n != 0 {
 				t.Errorf("%d patches without agreement", n)
 			}
-			rule, err := e.prov.EnvFirewallRule(context.Background())
-			if err != nil || !slices.Equal(rule.SourceRanges, []string{fake.DefaultFirewallSource}) {
-				t.Errorf("the rule changed: %+v, %v", rule, err)
+			if got := ingressSources(t, e.prov); !slices.Equal(got, []string{fake.DefaultIngressSource}) {
+				t.Errorf("the ingress changed: %v", got)
 			}
 			if _, err := e.create("refused"); !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
 				t.Errorf("create = %v, want the firewall refusal", err)
@@ -415,7 +427,7 @@ func TestFirewallAutoNeverPatchesWithoutAgreement(t *testing.T) {
 func TestFirewallAutoRateLimit(t *testing.T) {
 	const first, second, third = "203.0.113.7", "203.0.113.8", "203.0.113.9"
 	a := newAutoEnv(t, "192.0.2.1/32", []string{first, first})
-	if n := a.count(fake.OpSetFirewallSources); n != 1 {
+	if n := a.count(fake.OpSetIngress); n != 1 {
 		t.Fatalf("%d patches at start-up, want 1", n)
 	}
 
@@ -423,10 +435,10 @@ func TestFirewallAutoRateLimit(t *testing.T) {
 	// yet, so the check fails and says when it will be repaired.
 	a.setAll(second)
 	s := a.check(time.Minute)
-	if s.OK || s.Failure.Reason != FirewallRuleSources {
+	if s.OK || s.Failure.Reason != FirewallSources {
 		t.Fatalf("status = %+v (%v)", s, s.Failure)
 	}
-	for _, w := range []string{"expected source ranges [" + second + "/32]", "found source ranges [" + first + "/32]", "not repaired yet", "at most once every 5m0s"} {
+	for _, w := range []string{"expected sources [" + second + "/32]", "found sources [" + first + "/32]", "not repaired yet", "at most once every 5m0s"} {
 		if !strings.Contains(s.Failure.Error(), w) {
 			t.Errorf("message lacks %q: %v", w, s.Failure)
 		}
@@ -438,7 +450,7 @@ func TestFirewallAutoRateLimit(t *testing.T) {
 	for range 3 {
 		a.check(time.Minute)
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 1 {
+	if n := a.count(fake.OpSetIngress); n != 1 {
 		t.Fatalf("%d patches inside the rate limit, want 1", n)
 	}
 	// Five minutes after the first patch it is repaired.
@@ -446,22 +458,22 @@ func TestFirewallAutoRateLimit(t *testing.T) {
 	if !s.OK {
 		t.Fatalf("check after the rate limit: %v", s.Failure)
 	}
-	if got := a.prov.FirewallPatches(); len(got) != 2 || !slices.Equal(got[1], []string{second + "/32"}) {
+	if got := a.prov.IngressWrites(); len(got) != 2 || !slices.Equal(got[1], []string{second + "/32"}) {
 		t.Fatalf("patches = %v", got)
 	}
 
 	// A patch that fails counts against the limit too: no hammering.
 	a.setAll(third)
-	a.prov.FailNext(fake.OpSetFirewallSources, provider.Errorf(nil, "set_firewall_sources", "HTTP 403: Required 'compute.firewalls.update' permission"))
+	a.prov.FailNext(fake.OpSetIngress, provider.Errorf(nil, "ingress_put", "HTTP 500"))
 	s = a.check(FirewallPatchInterval)
-	if s.OK || !strings.Contains(s.Failure.Error(), "compute.firewalls.update") {
+	if s.OK || !strings.Contains(s.Failure.Error(), "HTTP 500") {
 		t.Fatalf("status after a failed patch = %+v (%v)", s, s.Failure)
 	}
 	s = a.check(time.Minute)
 	if s.OK || !strings.Contains(s.Failure.Error(), "not repaired yet") {
 		t.Fatalf("status a minute after a failed patch = %+v (%v)", s, s.Failure)
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 3 {
+	if n := a.count(fake.OpSetIngress); n != 3 {
 		t.Errorf("%d patch attempts, want 3", n)
 	}
 	if got := a.ruleSources(); !slices.Equal(got, []string{second + "/32"}) {
@@ -489,19 +501,19 @@ func TestFirewallAutoFifteenMinuteRule(t *testing.T) {
 
 	// During that time a hand edit of the rule is reported and not undone:
 	// nothing is patched on an old belief.
-	a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} })
+	setSources(a.prov, "198.51.100.9/32")
 	s := a.check(30 * time.Second)
-	if s.OK || s.Failure.Reason != FirewallRuleSources || !strings.Contains(s.Failure.Error(), "did not agree in this check") {
+	if s.OK || s.Failure.Reason != FirewallSources || !strings.Contains(s.Failure.Error(), "did not agree in this check") {
 		t.Fatalf("hand-edited rule without agreement: %+v (%v)", s, s.Failure)
 	}
-	a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{addr + "/32"} })
+	setSources(a.prov, addr+"/32")
 
 	// At fifteen minutes the address is no longer believed.
 	s = a.check(30 * time.Second)
 	if s.OK || s.Failure.Reason != FirewallAddressUnknown {
 		t.Fatalf("15 minutes without agreement: %+v (%v)", s, s.Failure)
 	}
-	for _, w := range []string{"have not agreed on one for 15m0s", "last agreed on " + addr, "the firewall rule was not touched"} {
+	for _, w := range []string{"have not agreed on one for 15m0s", "last agreed on " + addr, "the ingress was not touched"} {
 		if !strings.Contains(s.Failure.Error(), w) {
 			t.Errorf("message lacks %q: %v", w, s.Failure)
 		}
@@ -509,7 +521,7 @@ func TestFirewallAutoFifteenMinuteRule(t *testing.T) {
 	if _, err := a.create("refused"); !errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
 		t.Errorf("create at 15 minutes = %v", err)
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 0 {
+	if n := a.count(fake.OpSetIngress); n != 0 {
 		t.Errorf("%d patches, want none", n)
 	}
 	if got := a.ruleSources(); !slices.Equal(got, []string{addr + "/32"}) {
@@ -531,70 +543,48 @@ func TestFirewallAutoFifteenMinuteRule(t *testing.T) {
 	a.settled("again")
 }
 
-// TestFirewallAutoNeverPatchesABrokenRule: the echo services agree and the
-// sources are wrong, but something else about the rule or the network is
-// wrong too. The rule is reported and never patched.
-func TestFirewallAutoNeverPatchesABrokenRule(t *testing.T) {
+// TestFirewallAutoNotWritable: a service whose ingress is managed elsewhere
+// answers INGRESS_NOT_WRITABLE to the write auto mode makes: the check fails
+// saying so, and nothing is written. A service whose catalog says so at
+// start-up refuses the start (TestAutoModeRefusedAgainstAReadOnlyIngress).
+func TestFirewallAutoNotWritable(t *testing.T) {
 	const addr = "203.0.113.7"
-	tag := provider.NetworkTag(testEnv)
-	edit := func(fn func(*provider.FirewallRule)) func(*fake.Provider) {
-		return func(p *fake.Provider) { p.EditEnvRule(fn) }
+	a := newAutoEnv(t, addr+"/32", []string{addr, addr})
+	if s := a.b.FirewallStatus(); !s.OK {
+		t.Fatalf("start-up: %v", s.Failure)
 	}
-	tests := []struct {
-		name    string
-		arrange func(p *fake.Provider)
-		want    FirewallReason
-	}{
-		{"rule missing", func(p *fake.Provider) { p.RemoveFirewallRule(provider.FirewallRuleName(testEnv)) }, FirewallRuleMissing},
-		{"rule on another network", edit(func(r *provider.FirewallRule) { r.Network = "elsewhere" }), FirewallRuleNetwork},
-		{"rule is egress", edit(func(r *provider.FirewallRule) { r.Direction = provider.DirectionEgress }), FirewallRuleDirection},
-		{"rule disabled", edit(func(r *provider.FirewallRule) { r.Disabled = true }), FirewallRuleDisabled},
-		{"rule allows more", edit(func(r *provider.FirewallRule) { r.Allowed[0].Ports = []string{"22", "8080"} }), FirewallRuleAllow},
-		{"rule has no target", edit(func(r *provider.FirewallRule) { r.TargetTags = nil }), FirewallRuleTarget},
-		{"rule targets a second tag", edit(func(r *provider.FirewallRule) { r.TargetTags = []string{tag, "web"} }), FirewallRuleTarget},
-		{"rule admits a source tag", edit(func(r *provider.FirewallRule) { r.SourceTags = []string{"bastion"} }), FirewallRuleSourceKind},
-		{"stray rule", func(p *fake.Provider) {
-			p.AddFirewallRule(provider.FirewallRule{Name: "allow-internal", SourceRanges: []string{"10.128.0.0/9"}, Allowed: []provider.FirewallPorts{{Protocol: "all"}}})
-		}, FirewallStrayRule},
-		{"default network", func(p *fake.Provider) { p.SetDefaultNetwork(true) }, FirewallDefaultNetwork},
-		{"the network's rules cannot be read", func(p *fake.Provider) { p.FailNext(fake.OpNetworkIngress, errors.New("timeout")) }, FirewallUnreadable},
+	a.prov.SetIngressWritable(false)
+	setSources(a.prov, "198.51.100.9/32")
+	s := a.check(FirewallPatchInterval + time.Second)
+	if s.OK || s.Failure.Reason != FirewallNotWritable || !strings.Contains(s.Failure.Error(), "INGRESS_NOT_WRITABLE") {
+		t.Fatalf("status = %+v (%v), want not_writable naming INGRESS_NOT_WRITABLE", s, s.Failure)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			a := newAutoEnv(t, addr+"/32", []string{addr, addr})
-			if s := a.b.FirewallStatus(); !s.OK || a.count(fake.OpSetFirewallSources) != 0 {
-				t.Fatalf("start-up: %+v (%v)", s, s.Failure)
-			}
-			// Wrong sources (which alone would be patched) and one more
-			// fault.
-			a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} })
-			tt.arrange(a.prov)
-			s := a.check(FirewallPatchInterval + time.Second)
-			if s.OK || s.Failure == nil || s.Failure.Reason != tt.want {
-				t.Fatalf("status = %+v (%v), want reason %s", s, s.Failure, tt.want)
-			}
-			if n := a.count(fake.OpSetFirewallSources); n != 0 {
-				t.Errorf("%d patches of a rule that fails the check for another reason", n)
-			}
-		})
+	if got := a.ruleSources(); !slices.Equal(got, []string{"198.51.100.9/32"}) {
+		t.Errorf("the ingress was written: %v", got)
 	}
 }
 
-// readOnly hides the fake's FirewallSourceSetter, as a provider that cannot
-// change rules would be.
-type readOnly struct{ provider.Provider }
-
-func TestFirewallAutoProviderCannotPatch(t *testing.T) {
-	const addr = "203.0.113.7"
-	a := newAutoEnv(t, "192.0.2.1/32", []string{addr, addr}, func(e *env, _ *fake.Options) {
-		e.wrap = func(p provider.Provider) provider.Provider { return readOnly{p} }
-	})
-	s := a.b.FirewallStatus()
-	if s.OK || s.Failure.Reason != FirewallRuleSources || !strings.Contains(s.Failure.Error(), "this provider cannot change the rule") {
-		t.Fatalf("status = %+v (%v)", s, s.Failure)
+// TestAutoModeRefusedAgainstAReadOnlyIngress: remote.firewall.mode: auto
+// against a service whose catalog says its ingress is not writable stops the
+// server at start-up, with a message saying what to use instead.
+func TestAutoModeRefusedAgainstAReadOnlyIngress(t *testing.T) {
+	servers, urls, client := echoes(t, "203.0.113.7", "203.0.113.7")
+	_ = servers
+	cat := fake.DefaultCatalog()
+	cat.IngressWritable = false
+	cfg := &config.RemoteConfig{Provider: config.RemoteProviderFake, AllowTestDrivers: true,
+		Firewall: config.RemoteFirewallConfig{Mode: config.RemoteFirewallAuto, EchoURLs: urls}}
+	b, err := New(Options{Config: cfg, Provider: fake.New(fake.Options{Catalog: &cat}), Links: newFakeLinks(), StateDir: t.TempDir(),
+		AuthorizedKeys: []string{testKey}, EchoClient: client, SweepInterval: -1, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := a.count(fake.OpSetFirewallSources); n != 0 {
-		t.Errorf("%d patches", n)
+	defer b.Close()
+	ctx := ctxT(t)
+	go b.Reconcile(ctx)
+	err = b.WaitReady(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not writable") || !strings.Contains(err.Error(), "mode: static") {
+		t.Fatalf("WaitReady = %v, want the start-up refusal", err)
 	}
 }
 
@@ -650,26 +640,26 @@ func TestFirewallFailureLoggedOncePerFailure(t *testing.T) {
 		want    int
 	}{
 		{name: "the same failure, the last patch one minute older", between: func(*autoEnv) {}, want: 1},
-		{name: "the rule's sources change again", between: func(a *autoEnv) {
-			a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.10/32"} })
+		{name: "the ingress's sources change again", between: func(a *autoEnv) {
+			setSources(a.prov, "198.51.100.10/32")
 		}, want: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// The start-up check patches the rule, so the interval is running.
 			a := newAutoEnv(t, "192.0.2.1/32", []string{addr, addr})
-			if n := a.count(fake.OpSetFirewallSources); n != 1 {
+			if n := a.count(fake.OpSetIngress); n != 1 {
 				t.Fatalf("%d patches at start-up, want 1", n)
 			}
-			a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} })
+			setSources(a.prov, "198.51.100.9/32")
 
 			first := a.check(time.Minute)
-			if first.OK || first.Failure.Reason != FirewallRuleSources || !strings.Contains(first.Failure.Error(), "not repaired yet") {
+			if first.OK || first.Failure.Reason != FirewallSources || !strings.Contains(first.Failure.Error(), "not repaired yet") {
 				t.Fatalf("first check = %+v (%v), want rule_sources, not repaired yet", first, first.Failure)
 			}
 			tt.between(a)
 			second := a.check(time.Minute)
-			if second.OK || second.Failure.Reason != FirewallRuleSources {
+			if second.OK || second.Failure.Reason != FirewallSources {
 				t.Fatalf("second check = %+v (%v), want rule_sources", second, second.Failure)
 			}
 			if first.Failure.Error() == second.Failure.Error() {
@@ -685,5 +675,63 @@ func TestFirewallFailureLoggedOncePerFailure(t *testing.T) {
 				t.Errorf("%d FAILED lines in the log, want %d:\n%s", got, tt.want, strings.Join(a.logLines(), "\n"))
 			}
 		})
+	}
+}
+
+// refusingIngress is a provider whose ingress write is refused with
+// INGRESS_NOT_WRITABLE, while its catalog says the ingress is writable.
+type refusingIngress struct{ provider.Provider }
+
+func (refusingIngress) SetIngress(context.Context, string, []netip.Prefix) (provider.Ingress, error) {
+	return provider.Ingress{}, &provider.Error{Kind: provider.ErrIngress, Op: "set ingress", Code: "INGRESS_NOT_WRITABLE"}
+}
+
+// TestAutoModeRefusedWhenTheIngressWriteIsRefused: auto mode whose first
+// ingress write the service refuses (INGRESS_NOT_WRITABLE) stops the start
+// with that reason, as the catalog's own word does; it is not a firewall
+// failure the server starts with. The wait's error is the refusal, never a
+// timeout, so serve tells it from a degraded start.
+func TestAutoModeRefusedWhenTheIngressWriteIsRefused(t *testing.T) {
+	_, urls, client := echoes(t, "203.0.113.7", "203.0.113.7")
+	cfg := &config.RemoteConfig{Provider: config.RemoteProviderFake, AllowTestDrivers: true,
+		Firewall: config.RemoteFirewallConfig{Mode: config.RemoteFirewallAuto, EchoURLs: urls}}
+	b, err := New(Options{Config: cfg, Provider: refusingIngress{fake.New(fake.Options{})}, Links: newFakeLinks(), StateDir: t.TempDir(),
+		AuthorizedKeys: []string{testKey}, EchoClient: client, SweepInterval: -1, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	go b.Reconcile(ctxT(t))
+	wctx, cancel := context.WithTimeout(ctxT(t), 5*time.Second)
+	defer cancel()
+	err = b.WaitReady(wctx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "refuses to") || !strings.Contains(err.Error(), "mode: static") {
+		t.Fatalf("WaitReady = %v, want the start-up refusal", err)
+	}
+	select {
+	case <-b.Ready():
+		t.Fatal("the backend became ready")
+	default:
+	}
+}
+
+// TestWaitReadyTimesOutDegraded: a backend whose service does not answer
+// reports the wait's own timeout (context.DeadlineExceeded), which serve
+// reads as a degraded start, never as a reason not to run.
+func TestWaitReadyTimesOutDegraded(t *testing.T) {
+	p := fake.New(fake.Options{})
+	p.FailNext(fake.OpCatalog, &provider.Error{Kind: provider.ErrUnavailable, Op: "catalog"})
+	cfg := &config.RemoteConfig{Provider: config.RemoteProviderFake, AllowTestDrivers: true}
+	b, err := New(Options{Config: cfg, Provider: p, Links: newFakeLinks(), StateDir: t.TempDir(), AuthorizedKeys: []string{testKey},
+		FirewallSources: []string{fake.DefaultIngressSource}, SweepInterval: -1, ListRetry: time.Hour, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	go b.Reconcile(ctxT(t))
+	wctx, cancel := context.WithTimeout(ctxT(t), 100*time.Millisecond)
+	defer cancel()
+	if err := b.WaitReady(wctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitReady = %v, want the wait's timeout", err)
 	}
 }

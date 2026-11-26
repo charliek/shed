@@ -15,6 +15,8 @@ package service
 import (
 	"net/netip"
 	"time"
+
+	"github.com/charliek/shed/internal/remote/provider"
 )
 
 // Call is one of the contract's calls, as its fixtures name them.
@@ -63,9 +65,9 @@ const (
 	// MaxListMachines is the most machines one list holds.
 	MaxListMachines = 500
 	// MaxLabels is the most labels a machine holds.
-	MaxLabels = 32
+	MaxLabels = provider.MaxLabels
 	// MaxSpec is the largest spec, in bytes.
-	MaxSpec = 4096
+	MaxSpec = provider.MaxSpec
 	// ServiceDeadline is how soon a service answers every call;
 	// CallDeadline is how long a server waits for one.
 	ServiceDeadline = 10 * time.Second

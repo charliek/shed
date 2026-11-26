@@ -8,11 +8,14 @@ import (
 	"io"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/charliek/shed/internal/remote/provider"
 )
 
 // The validation of the contract's section "Validation": a server refuses
@@ -67,25 +70,17 @@ func bad(rule, format string, args ...any) *InvalidError {
 	return &InvalidError{Rule: rule, Detail: fmt.Sprintf(format, args...)}
 }
 
-// The contract's grammar ("Names and values").
+// The contract's grammar ("Names and values"): what the provider package
+// does not already hold (the shed id, name, owner and label grammar, the
+// reserved labels).
 var (
 	wordRx      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
-	shedNameRx  = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
-	handleRx    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	shedIDRx    = regexp.MustCompile(`^[a-z2-7]{26}$`)
 	operationRx = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	labelKeyRx  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
-	labelValRx  = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
 	codeRx      = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 	requestIDRx = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
-// ReservedLabels are the labels whose facts are the machine's members:
-// never written, and refused in a reply.
-var ReservedLabels = []string{"shed_schema", "shed_env", "shed_id", "shed_name", "shed_owner", "shed_user", "shed_user_origin"}
-
-// ValidShedID, ValidOperation and ValidRequestID check an id's grammar.
-func ValidShedID(s string) bool    { return shedIDRx.MatchString(s) }
+// ValidOperation and ValidRequestID check an id's grammar.
 func ValidOperation(s string) bool { return operationRx.MatchString(s) }
 func ValidRequestID(s string) bool { return requestIDRx.MatchString(s) }
 
@@ -368,9 +363,9 @@ func (o object) word(name string) (string, error) {
 	return s, nil
 }
 
-// refusedClass names the class an access host is in that only test
+// RefusedClass names the class an access host is in that only test
 // drivers allow, or "".
-func refusedClass(a netip.Addr) string {
+func RefusedClass(a netip.Addr) string {
 	switch {
 	case a.IsLoopback():
 		return "loopback"
@@ -393,7 +388,7 @@ func ParseAccessHost(s string, testDrivers bool) (netip.Addr, error) {
 	if err != nil || a.Zone() != "" || a.Is4In6() || a.String() != s {
 		return netip.Addr{}, bad(RuleAccessHostInvalid, "the host is not an IP literal in its canonical form")
 	}
-	if c := refusedClass(a); c != "" && !testDrivers {
+	if c := RefusedClass(a); c != "" && !testDrivers {
 		return netip.Addr{}, bad(RuleAccessHostRefused, "the host is %s", c)
 	}
 	return a, nil
@@ -434,7 +429,7 @@ func machineValue(raw json.RawMessage, c Context) (*Machine, error) {
 	if m.ShedID, err = o.str("shed_id"); err != nil {
 		return nil, err
 	}
-	if !shedIDRx.MatchString(m.ShedID) {
+	if !provider.ValidShedID(m.ShedID) {
 		return nil, bad(RuleShedIDMismatch, "shed_id breaks the grammar")
 	}
 	if c.ShedID != "" && m.ShedID != c.ShedID {
@@ -443,7 +438,7 @@ func machineValue(raw json.RawMessage, c Context) (*Machine, error) {
 	if m.Name, err = o.str("name"); err != nil {
 		return nil, err
 	}
-	if !shedNameRx.MatchString(m.Name) {
+	if !provider.ValidShedName(m.Name) {
 		return nil, bad(RuleNameInvalid, "name breaks the grammar")
 	}
 	if m.Server, err = o.str("server"); err != nil {
@@ -463,7 +458,7 @@ func machineValue(raw json.RawMessage, c Context) (*Machine, error) {
 	switch {
 	case hasUser == hasClient:
 		return nil, bad(RuleOwnerInvalid, "exactly one of user and client is set")
-	case hasUser && !handleRx.MatchString(user), hasClient && !handleRx.MatchString(client):
+	case hasUser && !provider.ValidHandle(user), hasClient && !provider.ValidHandle(client):
 		return nil, bad(RuleOwnerInvalid, "the owner breaks the grammar")
 	}
 	m.User, m.Client = user, client
@@ -649,16 +644,14 @@ func labels(raw json.RawMessage) (map[string]string, error) {
 	}
 	out := map[string]string{}
 	for k := range lo {
-		for _, r := range ReservedLabels {
-			if k == r {
-				return nil, bad(RuleLabelsInvalid, "the reserved label %s", k)
-			}
+		if slices.Contains(provider.ReservedLabels, k) {
+			return nil, bad(RuleLabelsInvalid, "the reserved label %s", k)
 		}
 		v, err := lo.str(k)
 		if err != nil {
 			return nil, bad(RuleLabelsInvalid, "a label value is not a string")
 		}
-		if !labelKeyRx.MatchString(k) || !labelValRx.MatchString(v) {
+		if !provider.ValidLabelKey(k) || !provider.ValidLabelValue(v) {
 			return nil, bad(RuleLabelsInvalid, "a label breaks the grammar")
 		}
 		out[k] = v
@@ -777,7 +770,7 @@ func decodeList(b []byte, c Context) (*List, error) {
 		if d.ShedID, err = do.str("shed_id"); err != nil {
 			return nil, err
 		}
-		if !shedIDRx.MatchString(d.ShedID) {
+		if !provider.ValidShedID(d.ShedID) {
 			return nil, bad(RuleShedIDMismatch, "a deletion's shed_id breaks the grammar")
 		}
 		if d.At, err = do.time("at"); err != nil {

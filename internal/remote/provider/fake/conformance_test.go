@@ -1,37 +1,61 @@
 package fake
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/provider/providertest"
 )
 
+const testKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
+
+// clock is a settable clock.
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
 func TestConformance(t *testing.T) {
-	const env = "conform"
 	providertest.Run(t, providertest.Harness{
-		Env:    env,
-		Size:   provider.DefaultSizes()[0],
-		Image:  "shed-full-amd64-v1",
-		Family: provider.ImagePrefixFamily + "shed-full-amd64",
-		New: func(t *testing.T) (provider.Provider, providertest.Controls) {
-			p := New(Options{Env: env})
-			return p, providertest.Controls{
-				Seed: func(t *testing.T, name string, labels map[string]string) provider.Ref {
-					return p.Seed(provider.Instance{Name: name, State: provider.StateRunning, Labels: labels})
+		New: func(t *testing.T) *providertest.Target {
+			clk := &clock{t: time.Now().UTC().Truncate(time.Second)}
+			p := New(Options{Manual: true, Now: clk.Now, OwnerRequired: true})
+			return &providertest.Target{
+				Provider: p,
+				// The fake keeps its machines in memory; another process
+				// is the same memory.
+				Fresh:  func() provider.Provider { return p },
+				Settle: func(ref provider.Ref) { p.Complete(ref) },
+				LoseNextReply: func(call string) {
+					op := map[string]Op{"create": OpCreate, "start": OpStart, "stop": OpStop, "delete": OpDestroy, "labels": OpSetLabels, "extend": OpExtend}[call]
+					p.LoseNextReply(op)
 				},
-				PublishHostKey: func(t *testing.T, ref provider.Ref, key string) {
-					p.PublishHostKey(ref, key)
+				ExpireOperations: p.ForgetOperations,
+				DeleteOutside:    p.DeleteAs,
+				Advance: func(d time.Duration) {
+					clk.advance(d)
+					p.EndLeases()
 				},
-				RefuseNextCreate: func(t *testing.T, kind error) {
-					p.FailNext(OpCreate, provider.Errorf(kind, string(OpCreate), "injected"))
+				FailNextCreate: func() {
+					p.FailOperation(OpCreate, &provider.Error{Kind: provider.ErrQuota, Op: "wait", Code: "CLOUD_QUOTA"})
 				},
-				FailNextCreateOperation: func(t *testing.T, kind error) {
-					p.FailOperation(OpCreate, provider.Errorf(kind, string(OpWait), "injected"))
-				},
-				SetFirewall: func(t *testing.T, rules []provider.FirewallRule) {
-					p.SetFirewallRules(rules...)
-				},
+				User:   "ada",
+				Client: "nocturn",
+				Key:    testKey,
 			}
 		},
 	})

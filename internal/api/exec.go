@@ -178,8 +178,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	// requireShedName answers it as an unknown shed.
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := backendErrorFor(r.Context(), err)
-		writeError(w, code, errCode, msg)
+		writeBackendError(w, r.Context(), err)
 		return
 	}
 	if shed.Status != config.StatusRunning {
@@ -256,8 +255,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, config.ErrShedNotRunning, err.Error())
 				return
 			}
-			code, errCode, msg := backendErrorFor(r.Context(), err)
-			writeError(w, code, errCode, msg)
+			writeBackendError(w, r.Context(), err)
 			return
 		}
 		// Started, then lost: end the stream with no exit frame, which is how

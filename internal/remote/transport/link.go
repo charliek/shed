@@ -114,6 +114,10 @@ type Target struct {
 	// needs no address (locallink) does not call it, and it may be nil
 	// there.
 	Addr func(ctx context.Context) (string, error)
+	// Connected, when set, is called after each connection to the address
+	// Addr last gave has completed its handshake, so the target can tell
+	// an address that worked from one whose dial failed. May be nil.
+	Connected func()
 	// HostKeys decides which host key the link accepts. Required by
 	// sshlink; unused by locallink.
 	HostKeys HostKeyStore

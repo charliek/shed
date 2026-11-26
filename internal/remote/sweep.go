@@ -3,16 +3,14 @@ package remote
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 )
-
-// runLimitSlack is how close to its run limit an instance must have stopped
-// for the stop to be put down to the limit.
-const runLimitSlack = 2 * time.Minute
 
 // startSweeper starts the periodic pass, once, after the start-up pass.
 func (b *Backend) startSweeper() {
@@ -48,57 +46,64 @@ func (b *Backend) startSweeper() {
 	})
 }
 
-// sweepCheck is a shed whose record and the cloud's list disagree.
+// sweepCheck is a shed whose record and the provider's list disagree. cause
+// is why the list says the service deleted its machine ("" when it does not
+// say).
 type sweepCheck struct {
 	name, id string
 	ref      provider.Ref
 	status   string
 	listed   bool
+	cause    string
 }
 
-// Sweep is the periodic pass. It runs the firewall check, lists this
-// environment's instances once and then, for sheds with no job in flight:
+// Sweep is the periodic pass. It reads the catalog again, runs the firewall
+// check, lists this server's machines once and then, for sheds with no job
+// in flight:
 //
 //   - starts the delete job of every delete marker that has none (a destroy
 //     that failed is retried here, not only at the next server start);
-//   - writes a delete marker for an instance still labelled creating
-//     StaleCreateAge after the cloud made it, with no record: a create whose
-//     record was lost, which nothing else would ever remove;
-//   - records a "running" shed whose instance stopped (the run limit, or a
-//     stop from outside) as "stopped", with the reason;
-//   - drops the record of a shed whose instance no longer exists;
-//   - records a "stopped" shed whose instance runs as "starting" and probes
-//     it, so a VM that costs money is never shown as stopped;
-//   - gives a shed left "stopping" by a failed cloud call a new stop job;
+//   - writes a delete marker for a machine still labelled creating
+//     StaleCreateAge after the provider made it, with no record: a create
+//     whose record was lost, which nothing else would ever remove;
+//   - records a "running" shed whose machine stopped (from outside) as
+//     "stopped", with the reason;
+//   - drops the record of a shed whose machine no longer exists, once an
+//     exact read confirms it, naming the cause when the list gives the
+//     machine's deletion (its lease ended, a delete at the service);
+//   - records a "stopped" shed whose machine runs as "starting" and probes
+//     it, so a machine that costs money is never shown as stopped;
+//   - gives a shed left "stopping" by a failed call a new stop job;
 //   - runs again the create or start of a shed kept "starting" because the
-//     cloud could not be read when its job looked (Backend.keep);
-//   - brings each listed shed's user into line with its instance's
-//     shed_user label (reconcileUserLocked).
+//     provider could not be read when its job looked (Backend.keep);
+//   - brings each listed shed's owner into line with its machine's
+//     (reconcileUserLocked).
 //
-// It destroys nothing itself: only a delete job does, and a delete job exists
-// only for a delete marker. Each correction is confirmed with a fresh read of
-// the one instance and applied only if the shed is still as it was, so a
-// request that arrives during the pass wins.
+// A machine the service is deleting is never answered with a stop. The pass
+// destroys nothing itself: only a delete job does, and a delete job exists
+// only for a delete marker. Each correction is confirmed with a fresh read
+// of the one machine and applied only if the shed is still as it was, so a
+// request that arrives during the pass wins. A list that fails drops
+// nothing.
 func (b *Backend) Sweep(ctx context.Context) error {
 	if err := b.checkReady(); err != nil {
 		return err
 	}
+	if err := b.refreshCatalog(ctx); err != nil {
+		b.logf("remote: periodic pass: reading the catalog (the last one is kept): %v", err)
+	}
 	// Refresh the firewall check. Its result gates creates and starts only;
 	// nothing below depends on it, and nothing is stopped or deleted for it.
 	b.CheckFirewall(ctx)
-	insts, err := b.prov.List(ctx, provider.Selector{Env: b.cfg.Environment})
+	listing, err := b.prov.List(ctx)
 	if err != nil {
 		return err
 	}
-	byID := make(map[string]provider.Instance, len(insts))
-	for _, inst := range insts {
-		if inst.Labels[provider.LabelEnv] != b.cfg.Environment {
-			continue
-		}
-		if id := inst.Labels[provider.LabelID]; id != "" {
-			byID[id] = inst
-		}
+	byID := make(map[string]provider.Instance, len(listing.Instances))
+	for _, inst := range listing.Instances {
+		byID[string(inst.Ref)] = inst
 	}
+	deleted := deletionCauses(listing.Deleted)
 
 	b.mu.Lock()
 	if b.closed {
@@ -128,25 +133,18 @@ func (b *Backend) Sweep(ctx context.Context) error {
 	for _, m := range markers {
 		marked[m.ID] = true
 	}
-	carriers := make(map[string]int, len(insts))
-	for _, inst := range insts {
-		carriers[inst.Labels[provider.LabelID]]++
-	}
-	for _, inst := range insts {
-		id, err := inst.Identity()
-		if err != nil || id.Env != b.cfg.Environment || carriers[id.ID] != 1 {
+	for _, inst := range listing.Instances {
+		id := string(inst.Ref)
+		if recorded[id] || marked[id] || b.deletes[id] != nil || !b.abandonedCreate(inst) {
 			continue
 		}
-		if recorded[id.ID] || marked[id.ID] || b.deletes[id.ID] != nil || !b.abandonedCreate(inst) {
-			continue
-		}
-		m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: now.UTC()}
+		m := &state.Marker{ID: id, Name: inst.Name, Ref: inst.Ref, At: now.UTC()}
 		if err := b.saveMarkerLocked(m); err != nil {
-			b.logf("remote: periodic pass: instance %s (shed %s) is an abandoned create but its marker could not be written: %v", inst.Name, id.Name, err)
+			b.logf("remote: periodic pass: machine %s (shed %s) is an abandoned create but its marker could not be written: %v", id, inst.Name, err)
 			continue
 		}
-		b.logf("remote: periodic pass: instance %s (shed %s) has been %q since %s with no local record; destroying it",
-			inst.Name, id.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
+		b.logf("remote: periodic pass: machine %s (shed %s) has been %q since %s with no local record; destroying it",
+			id, inst.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
 		abandoned = append(abandoned, m)
 	}
 	var checks []sweepCheck
@@ -176,20 +174,26 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			}
 		case config.StatusRunning:
 			if r.Ref != "" && (!listed || inst.State == provider.StateStopped || inst.State == provider.StateStopping) {
-				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed})
+				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed, cause: deleted[r.Shed.ID]})
 			}
 		case config.StatusStopped:
 			if r.Ref != "" && (!listed || inst.State == provider.StateRunning || inst.State == provider.StateStarting) {
-				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed})
+				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed, cause: deleted[r.Shed.ID]})
 			}
 		}
-		// A listed instance that needs no correction and no job (its state
-		// matches the record) is still a read of its shed_user label, so a
-		// label that changes on a shed that keeps running is noticed at
-		// this pass, not at its next restart. A correction or a job reads
-		// the instance again and reconciles there.
-		if listed && carriers[r.Shed.ID] == 1 && len(checks)+len(launch) == scheduled && b.reconcileUserFromLocked(r, inst) {
-			b.saveLocked(r)
+		// A listed machine that needs no correction and no job (its state
+		// matches the record) is still a read of it: its facts are kept,
+		// and an owner that changes on a shed that keeps running is noticed
+		// at this pass, not at its next restart. A correction or a job
+		// reads the machine again and reconciles there.
+		if listed && len(checks)+len(launch) == scheduled {
+			seen, image := r.Machine, r.Shed.Image
+			b.noteMachineLocked(r, inst)
+			// Written only when it changed: a pass over unchanged sheds
+			// rewrites (and fsyncs) no record.
+			if b.reconcileUserFromLocked(r, inst) || seen == nil || r.Shed.Image != image || !reflect.DeepEqual(*seen, *r.Machine) {
+				b.saveLocked(r)
+			}
 		}
 	}
 	b.mu.Unlock()
@@ -213,16 +217,12 @@ func (b *Backend) Sweep(ctx context.Context) error {
 	return nil
 }
 
-// correct re-reads one instance and brings its shed's record into line.
+// correct re-reads one machine and brings its shed's record into line.
 func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	inst, err := b.prov.Get(ctx, c.ref)
 	gone := errors.Is(err, provider.ErrNotFound)
 	if err != nil && !gone {
-		b.logf("remote: reading the instance of shed %s (its record is kept): %v", c.name, err)
-		return
-	}
-	if !gone && inst.Labels[provider.LabelID] != c.id {
-		b.logf("remote: periodic pass: the instance at %s no longer carries shed id %s; leaving shed %s alone", c.ref, c.id, c.name)
+		b.logf("remote: reading the machine of shed %s (its record is kept): %v", c.name, err)
 		return
 	}
 
@@ -234,12 +234,20 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 		b.mu.Unlock()
 		return // a request got there first
 	}
-	if !gone && b.reconcileUserLocked(r, inst.Labels, b.logNote) {
+	if !gone {
+		b.noteMachineLocked(r, inst)
+		b.reconcileUserLocked(r, inst, b.logNote)
 		b.saveLocked(r)
 	}
+	var event *audit.ShedEvent
 	switch {
+	case gone && !c.listed && c.cause != "":
+		b.logf("remote: shed %s (%s): the account service deleted its machine (cause %s); dropping its record", c.name, c.id, c.cause)
+		event = serviceDeletionEvent(r, c.cause)
+		b.dropLocked(c.name)
+		dropped = true
 	case gone && !c.listed:
-		b.logf("remote: shed %s (%s) has no instance in the cloud any more; dropping its record", c.name, c.id)
+		b.logf("remote: shed %s (%s) has no machine any more; dropping its record", c.name, c.id)
 		b.dropLocked(c.name)
 		dropped = true
 	case gone:
@@ -261,12 +269,13 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 		r.Shed.Status = config.StatusStarting
 		r.Shed.StatusReason = ""
 		r.Job = state.JobProbe
-		r.Address = inst.Address
-		r.AddressAt = b.now()
 		b.saveLocked(r)
 		launch = b.newJobLocked(state.JobProbe, c.name, c.id)
 	}
+	auditLog := b.auditLog
 	b.mu.Unlock()
+
+	b.recordServiceDeletion(auditLog, event, c.name)
 
 	if dropped || stopped {
 		b.credMgr.StopListener(c.name)
@@ -277,25 +286,37 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	}
 }
 
-// recordStoppedLocked records a shed whose instance stopped without this
-// server asking: by its run limit when it stopped at about that age,
-// otherwise by something outside.
+// recordStoppedLocked records a shed whose machine stopped without this
+// server asking: by something outside.
 func (b *Backend) recordStoppedLocked(r *state.Record, inst provider.Instance) {
-	reason := config.StatusReasonExternal
-	if r.MaxRun > 0 && !inst.StartedAt.IsZero() {
-		stoppedAt := inst.StoppedAt
-		if stoppedAt.IsZero() || stoppedAt.Before(inst.StartedAt) {
-			stoppedAt = b.now()
-		}
-		if stoppedAt.Sub(inst.StartedAt) >= r.MaxRun-runLimitSlack {
-			reason = config.StatusReasonRunLimit
-		}
-	}
 	r.Shed.Status = config.StatusStopped
-	r.Shed.StatusReason = reason
+	r.Shed.StatusReason = config.StatusReasonExternal
 	r.Job = ""
 	r.Queued = ""
-	r.Pending = nil
-	r.Address = ""
+	r.Pending, r.Mutation = nil, nil
+	b.noteMachineLocked(r, inst)
 	b.saveLocked(r)
+}
+
+// serviceDeletionEvent is the activity event of a shed whose machine the
+// account service deleted (its lease ended, a delete at the service).
+func serviceDeletionEvent(r *state.Record, cause string) *audit.ShedEvent {
+	return &audit.ShedEvent{Event: audit.EventShedDelete, Identity: audit.SystemIdentity(), ShedRef: shedRefOf(r), Result: audit.ResultOK, Cause: cause}
+}
+
+// recordServiceDeletion writes a service deletion's event, when there is
+// one and an audit log.
+func (b *Backend) recordServiceDeletion(auditLog *audit.Log, event *audit.ShedEvent, name string) {
+	if event == nil || auditLog == nil {
+		return
+	}
+	if err := auditLog.Record(event); err != nil {
+		b.logf("remote: recording the service's delete of shed %s: %v", name, err)
+	}
+}
+
+// shedRefOf is the shed an audit event names, as its record reports it.
+func shedRefOf(r *state.Record) audit.ShedRef {
+	owner, user := ownership(r)
+	return audit.ShedRef{Shed: r.Shed.Name, ShedID: r.Shed.ID, ShedUser: user, ShedOwner: owner}
 }

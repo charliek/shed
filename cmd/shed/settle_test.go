@@ -198,9 +198,9 @@ func TestResolveCreateBackendRemote(t *testing.T) {
 
 func TestListVerboseRemote(t *testing.T) {
 	var buf bytes.Buffer
-	renderShedTableVerbose(&buf, []listedShed{{shed: config.Shed{Name: "a1", ID: "abcdefghijklmnopqrstuvwxyz", Status: config.StatusStopped, StatusReason: config.StatusReasonRunLimit}}}, false)
+	renderShedTableVerbose(&buf, []listedShed{{shed: config.Shed{Name: "a1", ID: "abcdefghijklmnopqrstuvwxyz", Status: config.StatusStopped, StatusReason: config.StatusReasonExternal}}}, false)
 	out := buf.String()
-	for _, want := range []string{"\tID", "ID", "abcdefghijklmnopqrstuvwxyz", "stopped (run_limit)"} {
+	for _, want := range []string{"\tID", "ID", "abcdefghijklmnopqrstuvwxyz", "stopped (external)"} {
 		if !strings.Contains(out, strings.TrimPrefix(want, "\t")) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}

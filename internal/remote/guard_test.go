@@ -153,7 +153,9 @@ func TestGuardedDeleteFollowsTheTombstoneUnderAReplacement(t *testing.T) {
 		wantErr error
 		wantVMs int
 	}{
-		{"failed destroy is reported", true, ErrDeleteOwed, 2},
+		// The failed destroy leaves the old machine holding the name at the
+		// service: the replacement's create is refused (it exists).
+		{"failed destroy is reported", true, ErrDeleteOwed, 1},
 		{"finished destroy is success", false, nil, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -167,7 +169,9 @@ func TestGuardedDeleteFollowsTheTombstoneUnderAReplacement(t *testing.T) {
 			g.SetBeforeAct(func(op, name string) {
 				if op == "DeleteAndWait.wait" && name == "box" && !replaced {
 					replaced = true
-					e.createFor("box", "bob")
+					if _, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "box", NoProvision: true, User: "bob"}); err != nil && !tc.fail {
+						t.Fatalf("the replacement: %v", err)
+					}
 				}
 			})
 			al, _ := backend.IsAsync(g)
@@ -179,8 +183,10 @@ func TestGuardedDeleteFollowsTheTombstoneUnderAReplacement(t *testing.T) {
 				t.Fatalf("delete-and-wait with a replacement holding the name = %v, want %v", err, tc.wantErr)
 			}
 			e.idle()
-			if got := e.userOf("box"); got != "bob" {
-				t.Errorf("the replacement after the delete: user %q, want bob", got)
+			if !tc.fail {
+				if got := e.userOf("box"); got != "bob" {
+					t.Errorf("the replacement after the delete: user %q, want bob", got)
+				}
 			}
 			if n := e.instances(); n != tc.wantVMs {
 				t.Errorf("%d instances, want %d", n, tc.wantVMs)

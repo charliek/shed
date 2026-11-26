@@ -480,8 +480,11 @@ func (l *Link) connect(ctx context.Context) (*conn, error) {
 		// The pin does not change: a second key is never learned.
 		if again, rerr := l.resolve(ctx); rerr == nil && again != addr {
 			l.cfg.Logf("sshlink: %s: host key mismatch at %s; the address is now %s", l.name(), addr, again)
-			return l.connectTo(ctx, again, pin)
+			c, err = l.connectTo(ctx, again, pin)
 		}
+	}
+	if err == nil && l.target.Connected != nil {
+		l.target.Connected()
 	}
 	return c, err
 }

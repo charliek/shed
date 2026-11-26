@@ -19,10 +19,12 @@ import (
 // one, and (through the access guard) its isolation, while the stored
 // record keeps only what it stored.
 
-// withArmSize adds a size "big" on arm64 beside the amd64 standard size.
+// withArmSize offers a size "big" on arm64 beside the amd64 standard size.
 func withArmSize() envOpt {
-	return func(e *env, _ *fake.Options) {
-		e.cfg.Sizes["big"] = config.RemoteSizeConfig{MachineType: "t2a-standard-8", CPUs: 8, MemoryMB: 32768, Arch: provider.ArchARM64}
+	return func(e *env, o *fake.Options) {
+		cat := fake.DefaultCatalog()
+		cat.Sizes = []provider.Size{cat.Sizes[0], {Name: "big", CPUs: 8, MemoryMB: 32768, Arch: provider.ArchARM64, DiskGBDefault: 50}}
+		o.Catalog = &cat
 	}
 }
 

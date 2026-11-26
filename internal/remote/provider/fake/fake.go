@@ -1,31 +1,37 @@
 // Package fake is an in-memory provider.Provider for tests and for the
-// development driver (remote.provider: fake). It keeps instances in a map,
-// runs no VM, and follows the provider contract strictly: wherever the
-// contract says a provider may return provider.ErrBusy, the fake does.
+// development driver (remote.provider: fake). It keeps machines in a map,
+// runs no VM, and follows the compute contract's rules where the seam
+// carries them: request ids answered once, creates idempotent by shed id, a
+// delete that ends the work in progress, leases, recent deletions with their
+// causes, refusals with the contract's codes.
 //
 // Knobs:
-//   - Options.*Delay: how long each kind of operation takes to finish.
-//   - Options.Manual: operations finish only when the test calls Complete.
+//   - Options.Manual: operations finish only when the test calls Complete;
+//     otherwise they finish before the accepting call returns.
 //   - FailNext: the next call of a kind returns an error and changes nothing.
+//   - LoseNextReply: the next call of a kind takes effect, keeps its answer
+//     under its request id, and returns ErrUnavailable (a lost reply).
 //   - FailOperation: the next operation of a kind is accepted, then fails, so
 //     Wait returns the error (a refusal that arrives late).
-//   - ExternalStop, ExternalDelete: the cloud changes an instance behind the
-//     server's back (a run limit, a console delete).
-//   - Seed: put an instance in the cloud directly, for adoption tests.
-//   - PublishHostKey: what the guest's boot unit would publish.
-//   - ResolveImage: exact names resolve to themselves, families to a fixed name.
-//   - SetFirewallRules, EditEnvRule, AddFirewallRule, SetDefaultNetwork: the
-//     cloud's firewall as someone else left it. A fake with an environment
-//     starts with the one rule the setup script makes.
-//   - Calls, Count: what was called, in order.
+//   - ForgetOperations: every operation is forgotten, as an operation kept
+//     past its 24 hours is.
+//   - ExternalStop, ExternalDelete, DeleteAs, EndLeases: the machine changes
+//     behind the server's back (stopped, deleted outside, deleted at the
+//     service, its lease ended).
+//   - Seed: put a machine in directly, for adoption tests.
+//   - PublishHostKey, SetAccess, SetOwner: what the service reports.
+//   - SetIngressState, SetIngressWritable, IngressWrites: the ingress as
+//     someone else left it.
+//   - Calls, Count, LabelWrites: what was called, in order.
 package fake
 
 import (
 	"context"
 	"fmt"
 	"maps"
+	"net/netip"
+	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,69 +42,83 @@ import (
 type Op string
 
 const (
-	OpCreate       Op = "create"
-	OpStart        Op = "start"
-	OpStop         Op = "stop"
-	OpDestroy      Op = "destroy"
-	OpWait         Op = "wait"
-	OpGet          Op = "get"
-	OpList         Op = "list"
-	OpSetLabels    Op = "set_labels"
-	OpClaimLabel   Op = "claim_label"
-	OpSetMetadata  Op = "set_metadata"
-	OpGuestHostKey Op = "guest_host_key"
-	OpResolveImage Op = "resolve_image"
-
-	OpEnvFirewallRule    Op = "env_firewall_rule"
-	OpNetworkIngress     Op = "network_ingress"
-	OpSetFirewallSources Op = "set_firewall_sources"
+	OpCatalog    Op = "catalog"
+	OpCreate     Op = "create"
+	OpStart      Op = "start"
+	OpStop       Op = "stop"
+	OpDestroy    Op = "destroy"
+	OpWait       Op = "wait"
+	OpGet        Op = "get"
+	OpList       Op = "list"
+	OpSetLabels  Op = "set_labels"
+	OpExtend     Op = "extend"
+	OpUsage      Op = "usage"
+	OpIngress    Op = "ingress"
+	OpSetIngress Op = "set_ingress"
 )
 
-// Zone is the Instance.Zone the fake reports.
-const Zone = "fake-zone-a"
+// DefaultIngressSource is the source the fake's ingress starts with unless
+// Options.IngressSources says otherwise. It is a documentation address.
+const DefaultIngressSource = "192.0.2.1/32"
 
-// DefaultNetwork is the network the fake's instances are on unless
-// Options.Network names another.
-const DefaultNetwork = "fake-net"
+// DefaultHostKey is the host key every machine's guest publishes unless
+// Options.HostKey names another or Options.NoHostKey is set.
+const DefaultHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZha2UtaG9zdC1rZXktZmFrZS1ob3N0LWtleS1mYWtl"
 
-// DefaultFirewallSource is the source range of the environment rule a fake
-// starts with unless Options.FirewallSources says otherwise. It is a
-// documentation address.
-const DefaultFirewallSource = "192.0.2.1/32"
+// ProviderWord is the word machines carry as their provider.
+const ProviderWord = "fake"
+
+// DefaultCatalog is the catalog the fake offers unless Options.Catalog says
+// otherwise: the compute contract's world, with generous limits.
+func DefaultCatalog() provider.Catalog {
+	return provider.Catalog{
+		Sizes: []provider.Size{
+			{Name: "standard", CPUs: 2, MemoryMB: 8192, Arch: provider.ArchAMD64, DiskGBDefault: 50},
+			{Name: "large", CPUs: 8, MemoryMB: 32768, Arch: provider.ArchAMD64, DiskGBDefault: 100},
+		},
+		DefaultSize:  "standard",
+		DefaultImage: "shed-remote-full-fake",
+		Aliases:      []string{"base", "cloud"},
+		AccessKinds:  []string{provider.AccessSSH},
+		Policy: provider.Policy{
+			PersonInitialLease: 24 * time.Hour,
+			PersonMaxAge:       5 * 24 * time.Hour,
+			PersonExtend:       true,
+			PresetsH:           []int{6, 12, 24, 48},
+			ClientMaxLease:     5 * 24 * time.Hour,
+			Warn:               2 * time.Hour,
+		},
+		Limits:          provider.Limits{PersonMax: 100, OrgMax: 100},
+		IngressWritable: true,
+	}
+}
 
 // Options configures a fake provider. The zero value is usable: operations
-// finish at once and no environment check is made.
+// finish before the accepting call returns.
 type Options struct {
-	// Env is the environment the provider serves. When set, a Create whose
-	// labels name another environment is ErrInvalid, and mutating calls on
-	// another environment's instance are ErrForeign.
-	Env string
-	// Now is the clock for timestamps. Nil means time.Now.
+	// Now is the clock for timestamps and leases. Nil means time.Now.
 	Now func() time.Time
-	// CreateDelay, StartDelay, StopDelay and DestroyDelay are how long an
-	// accepted operation takes to finish, in real time. Zero finishes the
-	// operation before the accepting call returns.
-	CreateDelay  time.Duration
-	StartDelay   time.Duration
-	StopDelay    time.Duration
-	DestroyDelay time.Duration
-	// Manual makes every operation wait for Complete instead of a delay.
+	// Manual makes every operation wait for Complete.
 	Manual bool
-	// Capabilities overrides the default (run limit enforced, address not
-	// stable), which matches GCE.
-	Capabilities *provider.Capabilities
-	// Network is the network's name. Empty means DefaultNetwork.
-	Network string
-	// FirewallSources are the source ranges of the environment rule the
-	// fake starts with (when Env is set). Empty means
-	// DefaultFirewallSource.
-	FirewallSources []string
+	// Catalog replaces DefaultCatalog.
+	Catalog *provider.Catalog
+	// OwnerRequired makes the catalog say a machine is made only for a
+	// person or a client, as the compute contract does.
+	OwnerRequired bool
+	// HostKey is the key every guest publishes when its machine first
+	// runs; empty means DefaultHostKey. NoHostKey publishes none (a guest
+	// that has not published yet: its machine has no access).
+	HostKey   string
+	NoHostKey bool
+	// IngressSources are the sources the fake's ingress starts with.
+	// Empty means DefaultIngressSource.
+	IngressSources []string
 }
 
 // Call records one provider call.
 type Call struct {
 	Op Op
-	// Ref is the instance the call named; for Create it is the new Ref.
+	// Ref is the machine the call named.
 	Ref provider.Ref
 }
 
@@ -110,285 +130,135 @@ type operation struct {
 	failWith error
 	done     chan struct{}
 	err      error
+	// gone: the operation ended with the machine deleted.
+	gone bool
 }
 
-type instance struct {
+type machine struct {
 	inst    provider.Instance
+	spec    provider.Spec
 	op      *operation // in flight; nil when settled
 	hostKey string
 }
 
+// kept is a request id's first answer.
+type kept struct {
+	call    string // op and ref the id was used for
+	pending provider.Pending
+	inst    provider.Instance
+	ingress provider.Ingress
+}
+
 // Provider is the fake. Create one with New.
 type Provider struct {
-	opts Options
+	opts    Options
+	catalog provider.Catalog
 
 	mu        sync.Mutex
-	instances map[provider.Ref]*instance
+	machines  map[provider.Ref]*machine
 	ops       map[string]*operation
+	requests  map[string]kept
+	deleted   []provider.Deletion
 	failCall  map[Op][]error
-	failAfter map[Op][]error
+	loseReply map[Op]int
 	failOp    map[Op][]error
 	calls     []Call
 	nextOp    int
 	nextAddr  int
-	// labelWrites counts the SetLabels and ClaimLabel calls that changed a
-	// label.
+	// labelWrites counts the SetLabels calls that changed a label.
 	labelWrites int
 
-	// rules is the whole cloud firewall: every rule on every network.
-	rules      []provider.FirewallRule
-	defaultNet bool
-	// patches are the source lists SetEnvFirewallSources applied, in order.
-	patches [][]string
+	ingress provider.Ingress
+	// ingressWrites are the source lists SetIngress applied, in order.
+	ingressWrites [][]string
 }
 
-var (
-	_ provider.Provider      = (*Provider)(nil)
-	_ provider.HostKeyReader = (*Provider)(nil)
-	_ provider.ImageResolver = (*Provider)(nil)
-
-	_ provider.FirewallSourceSetter = (*Provider)(nil)
-)
+var _ provider.Provider = (*Provider)(nil)
 
 // New returns an empty fake provider.
 func New(opts Options) *Provider {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	if opts.Network == "" {
-		opts.Network = DefaultNetwork
+	cat := DefaultCatalog()
+	if opts.Catalog != nil {
+		cat = cloneCatalog(*opts.Catalog)
+	}
+	if opts.OwnerRequired {
+		cat.OwnerRequired = true
 	}
 	p := &Provider{
 		opts:      opts,
-		instances: make(map[provider.Ref]*instance),
+		catalog:   cat,
+		machines:  make(map[provider.Ref]*machine),
 		ops:       make(map[string]*operation),
+		requests:  make(map[string]kept),
 		failCall:  make(map[Op][]error),
-		failAfter: make(map[Op][]error),
+		loseReply: make(map[Op]int),
 		failOp:    make(map[Op][]error),
 	}
-	if opts.Env != "" {
-		sources := opts.FirewallSources
-		if len(sources) == 0 {
-			sources = []string{DefaultFirewallSource}
-		}
-		p.rules = []provider.FirewallRule{EnvRule(opts.Env, opts.Network, sources...)}
+	sources := opts.IngressSources
+	if len(sources) == 0 {
+		sources = []string{DefaultIngressSource}
 	}
+	p.ingress.Sources = mustPrefixes(sources)
+	p.ingress.Exclusive = true
 	return p
 }
 
-// EnvRule returns an environment's firewall rule exactly as the setup script
-// makes it: ingress, allow tcp:22, to the environment's network tag, from the
-// given sources.
-func EnvRule(env, network string, sources ...string) provider.FirewallRule {
-	return provider.FirewallRule{
-		Name:         provider.FirewallRuleName(env),
-		Network:      network,
-		Direction:    provider.DirectionIngress,
-		Priority:     1000,
-		SourceRanges: append([]string(nil), sources...),
-		TargetTags:   []string{provider.NetworkTag(env)},
-		Allowed:      []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
-	}
-}
-
-// SetFirewallRules replaces the cloud's whole firewall. A rule whose Network
-// is empty is put on the fake's own network.
-func (p *Provider) SetFirewallRules(rules ...provider.FirewallRule) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.rules = nil
-	for _, r := range rules {
-		p.rules = append(p.rules, p.ownedRule(r))
-	}
-}
-
-// AddFirewallRule adds one rule to the cloud's firewall, replacing a rule of
-// the same name. A rule whose Network is empty is put on the fake's network.
-func (p *Provider) AddFirewallRule(rule provider.FirewallRule) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	rule = p.ownedRule(rule)
-	for i := range p.rules {
-		if p.rules[i].Name == rule.Name {
-			p.rules[i] = rule
-			return
-		}
-	}
-	p.rules = append(p.rules, rule)
-}
-
-// RemoveFirewallRule deletes a rule by name; a missing rule is ignored.
-func (p *Provider) RemoveFirewallRule(name string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i := range p.rules {
-		if p.rules[i].Name == name {
-			p.rules = append(p.rules[:i], p.rules[i+1:]...)
-			return
-		}
-	}
-}
-
-// EditEnvRule changes the environment's rule in place, as a person with the
-// console would. It reports false when the rule does not exist.
-func (p *Provider) EditEnvRule(edit func(*provider.FirewallRule)) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	name := provider.FirewallRuleName(p.opts.Env)
-	for i := range p.rules {
-		if p.rules[i].Name == name {
-			edit(&p.rules[i])
-			return true
-		}
-	}
-	return false
-}
-
-// SetDefaultNetwork makes the fake report its network as the cloud's default
-// one.
-func (p *Provider) SetDefaultNetwork(isDefault bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.defaultNet = isDefault
-}
-
-// FirewallPatches returns every source list SetEnvFirewallSources applied, in
-// order.
-func (p *Provider) FirewallPatches() [][]string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([][]string, len(p.patches))
-	for i, ranges := range p.patches {
-		out[i] = append([]string(nil), ranges...)
+// mustPrefixes parses a test's source list, masked.
+func mustPrefixes(sources []string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range sources {
+		out = append(out, netip.MustParsePrefix(s).Masked())
 	}
 	return out
 }
 
-func (p *Provider) ownedRule(r provider.FirewallRule) provider.FirewallRule {
-	r = cloneRule(r)
-	if r.Network == "" {
-		r.Network = p.opts.Network
-	}
-	if r.Direction == "" {
-		r.Direction = provider.DirectionIngress
-	}
-	return r
+func cloneCatalog(c provider.Catalog) provider.Catalog {
+	c.Sizes = slices.Clone(c.Sizes)
+	c.Aliases = slices.Clone(c.Aliases)
+	c.AccessKinds = slices.Clone(c.AccessKinds)
+	c.Policy.PresetsH = slices.Clone(c.Policy.PresetsH)
+	return c
 }
 
-func cloneRule(r provider.FirewallRule) provider.FirewallRule {
-	r.SourceRanges = append([]string(nil), r.SourceRanges...)
-	r.SourceTags = append([]string(nil), r.SourceTags...)
-	r.SourceServiceAccounts = append([]string(nil), r.SourceServiceAccounts...)
-	r.TargetTags = append([]string(nil), r.TargetTags...)
-	r.TargetServiceAccounts = append([]string(nil), r.TargetServiceAccounts...)
-	r.DestinationRanges = append([]string(nil), r.DestinationRanges...)
-	r.Allowed = clonePorts(r.Allowed)
-	r.Denied = clonePorts(r.Denied)
-	return r
+// errorf builds a provider error carrying a contract code.
+func errorf(kind error, op Op, code, format string, args ...any) error {
+	return &provider.Error{Kind: kind, Op: string(op), Code: code, Detail: fmt.Sprintf(format, args...)}
 }
 
-// clonePorts copies the entries and each entry's port list.
-func clonePorts(in []provider.FirewallPorts) []provider.FirewallPorts {
-	out := append([]provider.FirewallPorts(nil), in...)
-	for i := range out {
-		out[i].Ports = append([]string(nil), out[i].Ports...)
-	}
-	return out
-}
+// --- test hooks ---
 
-// EnvFirewallRule returns the environment's rule.
-func (p *Provider) EnvFirewallRule(ctx context.Context) (provider.FirewallRule, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpEnvFirewallRule, ""); err != nil {
-		return provider.FirewallRule{}, err
-	}
-	name := provider.FirewallRuleName(p.opts.Env)
-	for _, r := range p.rules {
-		if r.Name == name {
-			return cloneRule(r), nil
-		}
-	}
-	return provider.FirewallRule{}, provider.Errorf(provider.ErrNotFound, string(OpEnvFirewallRule), "no firewall rule named %s", name)
-}
-
-// NetworkIngress returns the fake's network and the ingress rules on it.
-func (p *Provider) NetworkIngress(ctx context.Context) (provider.NetworkIngress, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpNetworkIngress, ""); err != nil {
-		return provider.NetworkIngress{}, err
-	}
-	out := provider.NetworkIngress{Network: p.opts.Network, Default: p.defaultNet}
-	for _, r := range p.rules {
-		if r.Network == p.opts.Network && r.Direction == provider.DirectionIngress {
-			out.Rules = append(out.Rules, cloneRule(r))
-		}
-	}
-	provider.SortFirewallRules(out.Rules)
-	return out, nil
-}
-
-// SetEnvFirewallSources replaces the source ranges of the environment's rule.
-func (p *Provider) SetEnvFirewallSources(ctx context.Context, ranges []string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpSetFirewallSources, ""); err != nil {
-		return err
-	}
-	if err := provider.CheckFirewallSources(string(OpSetFirewallSources), ranges); err != nil {
-		return err
-	}
-	name := provider.FirewallRuleName(p.opts.Env)
-	for i := range p.rules {
-		if p.rules[i].Name == name {
-			p.rules[i].SourceRanges = append([]string(nil), ranges...)
-			p.patches = append(p.patches, append([]string(nil), ranges...))
-			return nil
-		}
-	}
-	return provider.Errorf(provider.ErrNotFound, string(OpSetFirewallSources), "no firewall rule named %s", name)
-}
-
-// FailNext makes the next call of the given kind return err without changing
-// anything. Calls queue: two FailNext calls fail the next two.
+// FailNext makes the next call of the given kind return err without
+// changing anything. Calls queue: two FailNext calls fail the next two.
 func (p *Provider) FailNext(op Op, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.failCall[op] = append(p.failCall[op], err)
 }
 
-// FailNextApplied makes the next call of the given kind (OpSetLabels or
-// OpClaimLabel) take effect and then return err, as a cloud
-// call whose answer is lost after the change was made. Calls queue.
-func (p *Provider) FailNextApplied(op Op, err error) {
+// LoseNextReply makes the next call of the given kind (a call that changes
+// something) take effect and keep its answer under its request id, then
+// return ErrUnavailable, as a reply lost on the way back. The same call sent
+// again with the same request id gets the kept answer.
+func (p *Provider) LoseNextReply(op Op) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.failAfter[op] = append(p.failAfter[op], err)
+	p.loseReply[op]++
 }
 
-// LabelWrites returns how many SetLabels and ClaimLabel calls changed a
-// label so far.
+// LabelWrites returns how many SetLabels calls changed a label so far.
 func (p *Provider) LabelWrites() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.labelWrites
 }
 
-// appliedErrLocked returns the error injected with FailNextApplied for a call
-// of kind op that has just taken effect, if there is one.
-func (p *Provider) appliedErrLocked(op Op) error {
-	if queue := p.failAfter[op]; len(queue) > 0 {
-		p.failAfter[op] = queue[1:]
-		return queue[0]
-	}
-	return nil
-}
-
 // FailOperation makes the next accepted operation of the given kind
 // (OpCreate, OpStart, OpStop or OpDestroy) fail when it finishes: the
 // accepting call succeeds and Wait returns err. A failed create removes the
-// instance; a failed start, stop or destroy puts it back in the state it was
+// machine; a failed start, stop or destroy puts it back in the state it was
 // in.
 func (p *Provider) FailOperation(op Op, err error) {
 	p.mu.Lock()
@@ -396,85 +266,201 @@ func (p *Provider) FailOperation(op Op, err error) {
 	p.failOp[op] = append(p.failOp[op], err)
 }
 
-// Complete finishes the operation in flight on an instance. It is how a
-// Manual provider moves forward, and it also cuts a delay short. It reports
-// whether there was an operation to finish.
+// ForgetOperations forgets every operation, as a provider does an operation
+// kept past its time: a Wait on one follows the machine instead. Work in
+// progress carries on.
+func (p *Provider) ForgetOperations() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ops = map[string]*operation{}
+}
+
+// Complete finishes the operation in flight on a machine. It is how a Manual
+// provider moves forward. It reports whether there was an operation to
+// finish.
 func (p *Provider) Complete(ref provider.Ref) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, ok := p.instances[ref]
-	if !ok || in.op == nil {
+	m, ok := p.machines[ref]
+	if !ok || m.op == nil {
 		return false
 	}
-	p.finishLocked(in.op)
+	p.finishLocked(m.op)
 	return true
 }
 
-// ExternalStop stops a settled, running instance at once, as a run limit
-// would. It records no call.
+// ExternalStop stops a settled, running machine at once, as something
+// outside the server would. It records no call.
 func (p *Provider) ExternalStop(ref provider.Ref) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, ok := p.instances[ref]
+	m, ok := p.machines[ref]
 	switch {
 	case !ok:
-		return provider.Errorf(provider.ErrNotFound, "external_stop", "%s", ref)
-	case in.op != nil || in.inst.State != provider.StateRunning:
-		return provider.Errorf(provider.ErrBusy, "external_stop", "%s is %s", ref, in.inst.State)
+		return errorf(provider.ErrNotFound, "external_stop", "NOT_FOUND", "%s", ref)
+	case m.op != nil || m.inst.State != provider.StateRunning:
+		return errorf(provider.ErrBusy, "external_stop", "BUSY", "%s is %s", ref, m.inst.State)
 	}
-	p.markStoppedLocked(in)
+	p.markStoppedLocked(m)
 	return nil
 }
 
-// ExternalDelete removes an instance at once, whatever it is doing. A Wait in
-// progress on it returns provider.ErrNotFound.
+// ExternalDelete removes a machine at once, whatever it is doing, as gone
+// from the cloud without the service (cause external). A Wait in progress on
+// it returns ErrDeleting.
 func (p *Provider) ExternalDelete(ref provider.Ref) {
+	p.DeleteAs(ref, provider.CauseExternal)
+}
+
+// DeleteAs removes a machine at once, whatever it is doing, and lists the
+// deletion with the cause (provider.Cause*). A Wait in progress on it returns
+// ErrDeleting.
+func (p *Provider) DeleteAs(ref provider.Ref, cause string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	in, ok := p.instances[ref]
-	if !ok {
-		return
-	}
-	delete(p.instances, ref)
-	if in.op != nil {
-		in.op.err = provider.Errorf(provider.ErrNotFound, string(OpWait), "%s was deleted", ref)
-		close(in.op.done)
-		in.op = nil
+	if m, ok := p.machines[ref]; ok {
+		code := "DELETING"
+		kind := provider.ErrDeleting
+		if cause == provider.CauseLeaseEnded {
+			code, kind = "LEASE_ENDED", provider.ErrLease
+		}
+		p.removeLocked(m, cause, errorf(kind, OpWait, code, "%s was deleted (%s)", ref, cause))
 	}
 }
 
-// Seed adds a settled instance as if another server had created it. State
-// must be running or stopped. A missing Ref, Zone or address is filled in.
-// It returns the instance's Ref.
+// EndLeases deletes every machine at or past its lease's end, as the
+// service's sweep does, with cause lease_ended. It returns the refs deleted.
+func (p *Provider) EndLeases() []provider.Ref {
+	p.mu.Lock()
+	now := p.opts.Now()
+	var due []provider.Ref
+	for ref, m := range p.machines {
+		if !m.inst.Lease.ExpiresAt.IsZero() && !now.Before(m.inst.Lease.ExpiresAt) {
+			due = append(due, ref)
+		}
+	}
+	p.mu.Unlock()
+	sort.Slice(due, func(i, k int) bool { return due[i] < due[k] })
+	for _, ref := range due {
+		p.DeleteAs(ref, provider.CauseLeaseEnded)
+	}
+	return due
+}
+
+// SetDeleting puts a machine in StateDeleting, as a service whose own delete
+// of it has begun, without ending it.
+func (p *Provider) SetDeleting(ref provider.Ref) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m, ok := p.machines[ref]; ok {
+		m.inst.State = provider.StateDeleting
+		m.inst.Access = nil
+	}
+}
+
+// Seed adds a settled machine as if this server had created it and lost its
+// record. State must be running or stopped. A missing Ref is the error of a
+// test; a missing size, lease or access is filled in. It returns the Ref.
 func (p *Provider) Seed(inst provider.Instance) provider.Ref {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if inst.Ref == "" {
-		inst.Ref = refFor(inst.Name)
+		panic("fake.Seed: the instance has no Ref (its shed id)")
 	}
-	if inst.Zone == "" {
-		inst.Zone = Zone
-	}
+	now := p.opts.Now()
 	if inst.CreatedAt.IsZero() {
-		inst.CreatedAt = p.opts.Now()
+		inst.CreatedAt = now
+	}
+	if inst.Size.Name == "" {
+		inst.Size = p.catalog.Sizes[0]
+		inst.Size.DiskGBDefault = 0
+	}
+	if inst.Provider == "" {
+		inst.Provider = ProviderWord
+	}
+	if inst.Lease.ExpiresAt.IsZero() {
+		inst.Lease = provider.Lease{ExpiresAt: inst.CreatedAt.Add(p.catalog.Policy.PersonInitialLease), MaxExpiresAt: inst.CreatedAt.Add(p.catalog.Policy.PersonMaxAge)}
 	}
 	inst.Labels = maps.Clone(inst.Labels)
-	inst.Metadata = maps.Clone(inst.Metadata)
-	if inst.State == provider.StateRunning && inst.Address == "" {
-		inst.Address = p.newAddrLocked()
+	m := &machine{inst: inst, hostKey: p.defaultHostKey()}
+	if inst.State == provider.StateRunning && len(inst.Access) == 0 {
+		p.giveAccessLocked(m)
 	}
-	p.instances[inst.Ref] = &instance{inst: inst}
+	m.inst.Lease = p.leaseLocked(m, now)
+	p.machines[inst.Ref] = m
 	return inst.Ref
 }
 
-// PublishHostKey sets the host key GuestHostKey returns for an instance, as
-// the guest's boot unit would.
+// PublishHostKey has the machine's guest publish key: kept only when the
+// machine has none yet (the service keeps the first key, write-once).
 func (p *Provider) PublishHostKey(ref provider.Ref, key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if in, ok := p.instances[ref]; ok {
-		in.hostKey = key
+	if m, ok := p.machines[ref]; ok && m.hostKey == "" {
+		m.hostKey = key
+		if m.inst.State == provider.StateRunning {
+			p.giveAccessLocked(m)
+		}
 	}
+}
+
+// AttestHostKey replaces the host key the service attests for the machine,
+// as a service that broke the write-once rule would: its access carries it
+// from the next start.
+func (p *Provider) AttestHostKey(ref provider.Ref, key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m, ok := p.machines[ref]; ok {
+		m.hostKey = key
+	}
+}
+
+// SetAccess replaces what the machine reports as its access options, with
+// ignored options of kinds this build does not know.
+func (p *Provider) SetAccess(ref provider.Ref, access []provider.Access, ignored int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m, ok := p.machines[ref]; ok {
+		m.inst.Access = slices.Clone(access)
+		m.inst.IgnoredAccess = ignored
+	}
+}
+
+// SetOwner replaces who the machine reports as its owner, as a service that
+// answers otherwise than it was asked would.
+func (p *Provider) SetOwner(ref provider.Ref, user, client string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m, ok := p.machines[ref]; ok {
+		m.inst.User, m.inst.Client = user, client
+	}
+}
+
+// SetIngressState replaces the ingress as the provider reports it.
+func (p *Provider) SetIngressState(sources []string, exclusive bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ingress.Sources = mustPrefixes(sources)
+	p.ingress.Exclusive = exclusive
+}
+
+// SetIngressWritable says whether SetIngress is allowed (false: the
+// provider's ingress is managed elsewhere, INGRESS_NOT_WRITABLE).
+func (p *Provider) SetIngressWritable(writable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.catalog.IngressWritable = writable
+}
+
+// IngressWrites returns the source lists SetIngress applied, in order.
+func (p *Provider) IngressWrites() [][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([][]string, len(p.ingressWrites))
+	for i, w := range p.ingressWrites {
+		out[i] = slices.Clone(w)
+	}
+	return out
 }
 
 // Calls returns every provider call so far, in order, failed ones included.
@@ -497,137 +483,222 @@ func (p *Provider) Count(op Op) int {
 	return n
 }
 
+// --- provider.Provider ---
+
 // Name implements provider.Provider.
 func (p *Provider) Name() string { return provider.NameFake }
 
-// Capabilities implements provider.Provider.
-func (p *Provider) Capabilities() provider.Capabilities {
-	if p.opts.Capabilities != nil {
-		return *p.opts.Capabilities
+// Catalog implements provider.Provider.
+func (p *Provider) Catalog(ctx context.Context) (provider.Catalog, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpCatalog, ""); err != nil {
+		return provider.Catalog{}, err
 	}
-	return provider.Capabilities{EnforcesRunLimit: true, StableAddress: false}
+	return cloneCatalog(p.catalog), nil
 }
 
 // Create implements provider.Provider.
-func (p *Provider) Create(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
-	ref := refFor(spec.Name)
+func (p *Provider) Create(ctx context.Context, spec provider.Spec) (provider.Pending, provider.Instance, error) {
+	ref := provider.Ref(spec.ShedID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpCreate, ref); err != nil {
-		return provider.Pending{}, err
+		return provider.Pending{}, provider.Instance{}, err
 	}
 	if err := spec.Validate(); err != nil {
-		return provider.Pending{}, err
+		return provider.Pending{}, provider.Instance{}, err
 	}
-	if p.opts.Env != "" && spec.Labels[provider.LabelEnv] != p.opts.Env {
-		return provider.Pending{}, provider.Errorf(provider.ErrInvalid, string(OpCreate),
-			"spec is for environment %q, this provider serves %q", spec.Labels[provider.LabelEnv], p.opts.Env)
+	if k, ok, err := p.keptLocked(spec.RequestID, OpCreate, ref); ok || err != nil {
+		return k.pending, k.inst, err
 	}
-	if in, ok := p.instances[ref]; ok {
-		if in.inst.Labels[provider.LabelID] != spec.Labels[provider.LabelID] {
-			return provider.Pending{}, provider.Errorf(provider.ErrExists, string(OpCreate), "%s", spec.Name)
+	if m, ok := p.machines[ref]; ok {
+		if !provider.SameCreate(m.spec, spec) {
+			return provider.Pending{}, provider.Instance{}, errorf(provider.ErrSpecMismatch, OpCreate, "SPEC_MISMATCH", "%s was created with another body", ref)
 		}
-		return pendingFor(in, provider.StateRunning), nil
+		pend := pendingFor(m, provider.StateRunning)
+		return p.answerLocked(OpCreate, spec.RequestID, ref, kept{pending: pend, inst: p.viewLocked(m)})
 	}
-	now := p.opts.Now()
-	in := &instance{inst: provider.Instance{
-		Ref:             ref,
-		Name:            spec.Name,
-		State:           provider.StateStarting,
-		Labels:          maps.Clone(spec.Labels),
-		Metadata:        maps.Clone(spec.Metadata),
-		InternalAddress: fmt.Sprintf("10.128.0.%d", 2+len(p.instances)%250),
-		Zone:            Zone,
-		MachineType:     spec.Size.MachineType,
-		CPUs:            spec.Size.CPUs,
-		MemoryMB:        spec.Size.MemoryMB,
-		Arch:            spec.Size.Arch,
-		DiskGB:          spec.DiskGB,
-		Image:           spec.Image,
-		MaxRun:          spec.MaxRun,
-		CreatedAt:       now,
+	for _, m := range p.machines {
+		if m.inst.Name == spec.Name {
+			return provider.Pending{}, provider.Instance{}, errorf(provider.ErrExists, OpCreate, "EXISTS", "%s is held by another machine", spec.Name)
+		}
+	}
+	if err := p.judgeLocked(spec); err != nil {
+		return provider.Pending{}, provider.Instance{}, err
+	}
+	size, _ := p.catalog.SizeNamed(spec.Size)
+	disk := spec.DiskGB
+	if disk == 0 {
+		disk = size.DiskGBDefault
+	}
+	size.DiskGBDefault = 0
+	resolved := p.catalog.DefaultImage
+	if spec.Image != provider.ImageDefault {
+		resolved = "shed-remote-" + spec.Image + "-fake"
+	}
+	now := p.stamp()
+	m := &machine{spec: *spec.Clone(), hostKey: p.defaultHostKey(), inst: provider.Instance{
+		Ref:           ref,
+		Name:          spec.Name,
+		State:         provider.StateStarting,
+		User:          spec.User,
+		Client:        spec.Client,
+		Size:          size,
+		DiskGB:        disk,
+		Image:         spec.Image,
+		ImageResolved: resolved,
+		Provider:      ProviderWord,
+		CreatedAt:     now,
+		Labels:        maps.Clone(spec.Labels),
+		Spec:          spec.Spec,
 	}}
-	p.instances[ref] = in
-	op := p.beginLocked(in, OpCreate, provider.StateAbsent, p.opts.CreateDelay)
-	return provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateRunning}, nil
+	if spec.Client != "" {
+		end := now.Add(time.Duration(spec.LeaseS) * time.Second)
+		m.inst.Lease = provider.Lease{ExpiresAt: end, MaxExpiresAt: end}
+	} else {
+		m.inst.Lease = provider.Lease{ExpiresAt: now.Add(p.catalog.Policy.PersonInitialLease), MaxExpiresAt: now.Add(p.catalog.Policy.PersonMaxAge)}
+	}
+	m.inst.Lease = p.leaseLocked(m, now)
+	p.machines[ref] = m
+	op := p.beginLocked(m, OpCreate, provider.StateAbsent)
+	pend := provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateRunning}
+	return p.answerLocked(OpCreate, spec.RequestID, ref, kept{pending: pend, inst: p.viewLocked(m)})
+}
+
+// judgeLocked is the create's judgement: the owner, the size, the image, a
+// client's lease, the access kinds and the limits.
+func (p *Provider) judgeLocked(spec provider.Spec) error {
+	c := p.catalog
+	if c.OwnerRequired && spec.User == "" && spec.Client == "" {
+		return errorf(provider.ErrPolicy, OpCreate, "PERSON_UNKNOWN", "a machine is made only for a person or a client")
+	}
+	if _, ok := c.SizeNamed(spec.Size); !ok {
+		return errorf(provider.ErrPolicy, OpCreate, "SIZE_UNKNOWN", "no size %q", spec.Size)
+	}
+	if !c.HasImage(spec.Image) {
+		return errorf(provider.ErrPolicy, OpCreate, "IMAGE_UNKNOWN", "no image %q", spec.Image)
+	}
+	if spec.Client != "" && time.Duration(spec.LeaseS)*time.Second > c.Policy.ClientMaxLease {
+		return errorf(provider.ErrPolicy, OpCreate, "LEASE_TOO_LONG", "a lease of %ds is over %s", spec.LeaseS, c.Policy.ClientMaxLease)
+	}
+	if !slices.ContainsFunc(spec.AccessKinds, func(k string) bool { return slices.Contains(c.AccessKinds, k) }) {
+		return errorf(provider.ErrPolicy, OpCreate, "ACCESS_UNSUPPORTED", "no access kind of %v is offered", spec.AccessKinds)
+	}
+	person := 0
+	for _, m := range p.machines {
+		if spec.User != "" && m.inst.User == spec.User {
+			person++
+		}
+	}
+	if spec.User != "" && person >= c.Limits.PersonMax {
+		return errorf(provider.ErrComputeLimit, OpCreate, "QUOTA_PERSON", "%s holds %d machines", spec.User, person)
+	}
+	if len(p.machines) >= c.Limits.OrgMax {
+		return errorf(provider.ErrComputeLimit, OpCreate, "QUOTA_ORG", "the organization holds %d machines", len(p.machines))
+	}
+	return nil
 }
 
 // Start implements provider.Provider.
-func (p *Provider) Start(ctx context.Context, ref provider.Ref, opts provider.StartOptions) (provider.Pending, error) {
+func (p *Provider) Start(ctx context.Context, ref provider.Ref, requestID string) (provider.Pending, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpStart, ref); err != nil {
 		return provider.Pending{}, err
 	}
-	in, err := p.mineLocked(OpStart, ref)
+	if k, ok, err := p.keptLocked(requestID, OpStart, ref); ok || err != nil {
+		return k.pending, err
+	}
+	m, err := p.liveLocked(OpStart, ref)
 	if err != nil {
 		return provider.Pending{}, err
 	}
-	switch in.inst.State {
-	case provider.StateRunning, provider.StateStarting:
-		return pendingFor(in, provider.StateRunning), nil
-	case provider.StateStopped:
-		if opts.MaxRun > 0 {
-			in.inst.MaxRun = opts.MaxRun
-		}
-		in.inst.State = provider.StateStarting
-		op := p.beginLocked(in, OpStart, provider.StateStopped, p.opts.StartDelay)
-		return provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateRunning}, nil
-	default:
-		return provider.Pending{}, provider.Errorf(provider.ErrBusy, string(OpStart), "%s is %s", ref, in.inst.State)
+	if !p.opts.Now().Before(m.inst.Lease.ExpiresAt) {
+		return provider.Pending{}, errorf(provider.ErrLease, OpStart, "LEASE_ENDED", "%s: the lease has ended", ref)
 	}
+	var pend provider.Pending
+	switch {
+	case m.inst.State == provider.StateRunning:
+		pend = provider.Pending{Ref: ref, Want: provider.StateRunning}
+	case m.inst.State == provider.StateStarting && m.op != nil && m.op.kind == OpStart:
+		pend = pendingFor(m, provider.StateRunning)
+	case m.inst.State == provider.StateStopped:
+		m.inst.State = provider.StateStarting
+		op := p.beginLocked(m, OpStart, provider.StateStopped)
+		pend = provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateRunning}
+	default:
+		return provider.Pending{}, errorf(provider.ErrBusy, OpStart, "BUSY", "%s is %s", ref, m.inst.State)
+	}
+	pend, _, err = p.answerLocked(OpStart, requestID, ref, kept{pending: pend})
+	return pend, err
 }
 
 // Stop implements provider.Provider.
-func (p *Provider) Stop(ctx context.Context, ref provider.Ref) (provider.Pending, error) {
+func (p *Provider) Stop(ctx context.Context, ref provider.Ref, requestID string) (provider.Pending, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpStop, ref); err != nil {
 		return provider.Pending{}, err
 	}
-	in, err := p.mineLocked(OpStop, ref)
+	if k, ok, err := p.keptLocked(requestID, OpStop, ref); ok || err != nil {
+		return k.pending, err
+	}
+	m, err := p.liveLocked(OpStop, ref)
 	if err != nil {
 		return provider.Pending{}, err
 	}
+	var pend provider.Pending
 	switch {
-	case in.inst.State == provider.StateStopped:
-		return pendingFor(in, provider.StateStopped), nil
-	case in.op != nil && in.op.kind == OpStop:
-		return pendingFor(in, provider.StateStopped), nil
-	case in.inst.State == provider.StateRunning:
-		in.inst.State = provider.StateStopping
-		op := p.beginLocked(in, OpStop, provider.StateRunning, p.opts.StopDelay)
-		return provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateStopped}, nil
+	case m.inst.State == provider.StateStopped:
+		pend = provider.Pending{Ref: ref, Want: provider.StateStopped}
+	case m.op != nil && m.op.kind == OpStop:
+		pend = pendingFor(m, provider.StateStopped)
+	case m.inst.State == provider.StateRunning:
+		m.inst.State = provider.StateStopping
+		m.inst.Access = nil
+		op := p.beginLocked(m, OpStop, provider.StateRunning)
+		pend = provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateStopped}
 	default:
-		return provider.Pending{}, provider.Errorf(provider.ErrBusy, string(OpStop), "%s is %s", ref, in.inst.State)
+		return provider.Pending{}, errorf(provider.ErrBusy, OpStop, "BUSY", "%s is %s", ref, m.inst.State)
 	}
+	pend, _, err = p.answerLocked(OpStop, requestID, ref, kept{pending: pend})
+	return pend, err
 }
 
 // Destroy implements provider.Provider.
-func (p *Provider) Destroy(ctx context.Context, ref provider.Ref) (provider.Pending, error) {
+func (p *Provider) Destroy(ctx context.Context, ref provider.Ref, requestID string) (provider.Pending, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpDestroy, ref); err != nil {
 		return provider.Pending{}, err
 	}
-	in, ok := p.instances[ref]
-	if !ok {
-		return provider.Pending{Ref: ref, Want: provider.StateAbsent}, nil
+	if k, ok, err := p.keptLocked(requestID, OpDestroy, ref); ok || err != nil {
+		return k.pending, err
 	}
-	if err := p.checkEnvLocked(OpDestroy, in); err != nil {
-		return provider.Pending{}, err
-	}
+	m, ok := p.machines[ref]
+	var pend provider.Pending
 	switch {
-	case in.op != nil && in.op.kind == OpDestroy:
-		return pendingFor(in, provider.StateAbsent), nil
-	case in.op != nil:
-		return provider.Pending{}, provider.Errorf(provider.ErrBusy, string(OpDestroy), "%s is %s", ref, in.inst.State)
+	case !ok:
+		pend = provider.Pending{Ref: ref, Want: provider.StateAbsent}
+	case m.op != nil && m.op.kind == OpDestroy:
+		pend = pendingFor(m, provider.StateAbsent)
+	default:
+		if m.op != nil {
+			// A delete ends the work in progress.
+			old := m.op
+			m.op = nil
+			old.err = errorf(provider.ErrDeleting, OpWait, "DELETING", "%s is being deleted", ref)
+			close(old.done)
+		}
+		prev := m.inst.State
+		m.inst.State = provider.StateDeleting
+		m.inst.Access = nil
+		op := p.beginLocked(m, OpDestroy, prev)
+		pend = provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateAbsent}
 	}
-	prev := in.inst.State
-	in.inst.State = provider.StateStopping
-	in.inst.Address = ""
-	op := p.beginLocked(in, OpDestroy, prev, p.opts.DestroyDelay)
-	return provider.Pending{Ref: ref, Operation: op.id, Want: provider.StateAbsent}, nil
+	pend, _, err := p.answerLocked(OpDestroy, requestID, ref, kept{pending: pend})
+	return pend, err
 }
 
 // Wait implements provider.Provider.
@@ -652,28 +723,38 @@ func (p *Provider) Wait(ctx context.Context, pend provider.Pending) (provider.In
 		}
 	}
 
-	// Then follow the instance until it is settled.
+	// Then follow the machine until it is settled.
 	for {
 		p.mu.Lock()
-		in, ok := p.instances[pend.Ref]
+		m, ok := p.machines[pend.Ref]
 		if !ok {
 			p.mu.Unlock()
 			if pend.Want == provider.StateAbsent {
 				return provider.Instance{}, nil
 			}
-			return provider.Instance{}, provider.Errorf(provider.ErrNotFound, string(OpWait), "%s", pend.Ref)
+			return provider.Instance{}, errorf(provider.ErrNotFound, OpWait, "NOT_FOUND", "%s", pend.Ref)
 		}
-		if in.op == nil {
-			view := clone(in.inst)
+		if m.op == nil && m.inst.State.Settled() {
+			view := p.viewLocked(m)
 			p.mu.Unlock()
-			if pend.Want == "" || view.State == pend.Want {
-				return view, nil
-			}
-			return view, provider.Errorf(provider.ErrUnexpectedState, string(OpWait),
-				"%s is %s, want %s", pend.Ref, view.State, pend.Want)
+			_, err := pend.Reached(view)
+			return view, err
 		}
-		done := in.op.done
+		var done <-chan struct{}
+		if m.op != nil {
+			done = m.op.done
+		}
 		p.mu.Unlock()
+		if done == nil {
+			// Not settled and nothing in progress here (deleting at the
+			// service): look again shortly.
+			select {
+			case <-time.After(5 * time.Millisecond):
+			case <-ctx.Done():
+				return provider.Instance{}, ctxErr(ctx, OpWait)
+			}
+			continue
+		}
 		select {
 		case <-done:
 		case <-ctx.Done():
@@ -689,181 +770,190 @@ func (p *Provider) Get(ctx context.Context, ref provider.Ref) (provider.Instance
 	if err := p.enterLocked(ctx, OpGet, ref); err != nil {
 		return provider.Instance{}, err
 	}
-	in, ok := p.instances[ref]
+	m, ok := p.machines[ref]
 	if !ok {
-		return provider.Instance{}, provider.Errorf(provider.ErrNotFound, string(OpGet), "%s", ref)
+		return provider.Instance{}, errorf(provider.ErrNotFound, OpGet, "NOT_FOUND", "%s", ref)
 	}
-	return clone(in.inst), nil
+	return p.viewLocked(m), nil
 }
 
 // List implements provider.Provider.
-func (p *Provider) List(ctx context.Context, sel provider.Selector) ([]provider.Instance, error) {
+func (p *Provider) List(ctx context.Context) (provider.Listing, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpList, ""); err != nil {
-		return nil, err
+		return provider.Listing{}, err
 	}
-	out := make([]provider.Instance, 0, len(p.instances))
-	for _, in := range p.instances {
-		if sel.Env != "" && in.inst.Labels[provider.LabelEnv] != sel.Env {
-			continue
+	out := provider.Listing{Instances: make([]provider.Instance, 0, len(p.machines))}
+	for _, m := range p.machines {
+		out.Instances = append(out.Instances, p.viewLocked(m))
+	}
+	sort.Slice(out.Instances, func(a, b int) bool { return out.Instances[a].Ref < out.Instances[b].Ref })
+	cutoff := p.opts.Now().Add(-24 * time.Hour)
+	for _, d := range p.deleted {
+		if d.At.After(cutoff) {
+			out.Deleted = append(out.Deleted, d)
 		}
-		out = append(out, clone(in.inst))
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
 	return out, nil
 }
 
 // SetLabels implements provider.Provider.
-func (p *Provider) SetLabels(ctx context.Context, ref provider.Ref, labels map[string]string) error {
+func (p *Provider) SetLabels(ctx context.Context, ref provider.Ref, requestID string, set, expect map[string]*string) (provider.Instance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.enterLocked(ctx, OpSetLabels, ref); err != nil {
-		return err
+		return provider.Instance{}, err
 	}
-	in, err := p.mineLocked(OpSetLabels, ref)
+	for _, labels := range []map[string]*string{set, expect} {
+		if err := provider.CheckLabels(labels); err != nil {
+			return provider.Instance{}, errorf(provider.ErrInvalid, OpSetLabels, "RESERVED_LABEL", "%v", err)
+		}
+	}
+	if k, ok, err := p.keptLocked(requestID, OpSetLabels, ref); ok || err != nil {
+		return k.inst, err
+	}
+	m, err := p.liveLocked(OpSetLabels, ref)
 	if err != nil {
-		return err
+		return provider.Instance{}, err
 	}
-	for k, v := range labels {
-		switch k {
-		case provider.LabelSchema, provider.LabelEnv, provider.LabelID:
-			if in.inst.Labels[k] != v {
-				return provider.Errorf(provider.ErrInvalid, string(OpSetLabels), "label %s cannot be changed", k)
+	for k, v := range expect {
+		cur, has := m.inst.Labels[k]
+		if (v == nil && has) || (v != nil && (!has || cur != *v)) {
+			return provider.Instance{}, errorf(provider.ErrLabelTaken, OpSetLabels, "LABEL_TAKEN", "%s: label %s is not as expected", ref, k)
+		}
+	}
+	merged := maps.Clone(m.inst.Labels)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	for k, v := range set {
+		if v == nil {
+			delete(merged, k)
+		} else {
+			merged[k] = *v
+		}
+	}
+	if len(merged) > provider.MaxLabels {
+		return provider.Instance{}, errorf(provider.ErrInvalid, OpSetLabels, "INVALID", "a machine takes at most %d labels", provider.MaxLabels)
+	}
+	if !maps.Equal(merged, m.inst.Labels) {
+		p.labelWrites++
+	}
+	m.inst.Labels = merged
+	_, inst, err := p.answerLocked(OpSetLabels, requestID, ref, kept{inst: p.viewLocked(m)})
+	return inst, err
+}
+
+// Extend implements provider.Provider.
+func (p *Provider) Extend(ctx context.Context, ref provider.Ref, requestID string, by time.Duration) (provider.Instance, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpExtend, ref); err != nil {
+		return provider.Instance{}, err
+	}
+	if !provider.ValidExtend(by) {
+		return provider.Instance{}, errorf(provider.ErrInvalid, OpExtend, "INVALID", "extend by whole hours, 1 to 720")
+	}
+	if k, ok, err := p.keptLocked(requestID, OpExtend, ref); ok || err != nil {
+		return k.inst, err
+	}
+	m, err := p.liveLocked(OpExtend, ref)
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	now := p.opts.Now()
+	switch {
+	case !now.Before(m.inst.Lease.ExpiresAt):
+		return provider.Instance{}, errorf(provider.ErrLease, OpExtend, "LEASE_ENDED", "%s: the lease has ended", ref)
+	case m.inst.Client != "" || !p.catalog.Policy.PersonExtend:
+		return provider.Instance{}, errorf(provider.ErrLease, OpExtend, "EXTEND_NOT_ALLOWED", "%s cannot be extended", ref)
+	case m.inst.Lease.ExpiresAt.Add(by).After(m.inst.Lease.MaxExpiresAt):
+		return provider.Instance{}, errorf(provider.ErrLease, OpExtend, "LEASE_AT_CAP", "%s: the lease would pass its cap", ref)
+	}
+	m.inst.Lease.ExpiresAt = m.inst.Lease.ExpiresAt.Add(by)
+	m.inst.Lease = p.leaseLocked(m, now)
+	_, inst, err := p.answerLocked(OpExtend, requestID, ref, kept{inst: p.viewLocked(m)})
+	return inst, err
+}
+
+// Usage implements provider.Provider.
+func (p *Provider) Usage(ctx context.Context, user string) (provider.Usage, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpUsage, ""); err != nil {
+		return provider.Usage{}, err
+	}
+	count := func(match func(*machine) bool, limit int) provider.Counts {
+		c := provider.Counts{Max: limit}
+		for _, m := range p.machines {
+			if !match(m) {
+				continue
+			}
+			c.Machines++
+			switch m.inst.State {
+			case provider.StateStarting, provider.StateRunning:
+				c.Running++
+			case provider.StateStopping, provider.StateStopped:
+				c.Stopped++
 			}
 		}
-		if !provider.ValidLabelValue(v) {
-			return provider.Errorf(provider.ErrInvalid, string(OpSetLabels), "label %s has an invalid value %q", k, v)
-		}
+		return c
 	}
-	if in.inst.Labels == nil {
-		in.inst.Labels = make(map[string]string)
+	u := provider.Usage{Org: count(func(*machine) bool { return true }, p.catalog.Limits.OrgMax)}
+	if user != "" {
+		pc := count(func(m *machine) bool { return m.inst.User == user }, p.catalog.Limits.PersonMax)
+		u.Person = &pc
 	}
-	for k, v := range labels {
-		if cur, ok := in.inst.Labels[k]; !ok || cur != v {
-			p.labelWrites++
-			break
-		}
-	}
-	maps.Copy(in.inst.Labels, labels)
-	return p.appliedErrLocked(OpSetLabels)
+	return u, nil
 }
 
-// ClaimLabel implements provider.Provider. The check and the write are made
-// under the fake's lock, so they are one.
-func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string, also map[string]string) error {
-	// The same validation as the gce client's, made before anything is read
-	// as it is there: a key that is a valid label (lowercase first), never an
-	// identity label, a non-empty valid value; and, below, at most 64 labels
-	// on the instance after the write.
-	if key == "" || !provider.ValidLabelValue(key) || key[0] < 'a' || key[0] > 'z' {
-		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label key %q is not valid", key)
-	}
-	switch key {
-	case provider.LabelSchema, provider.LabelEnv, provider.LabelID:
-		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label %s cannot be claimed", key)
-	}
-	if value == "" || !provider.ValidLabelValue(value) {
-		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label %s has an invalid value %q", key, value)
-	}
-	if err := checkAlso(string(OpClaimLabel), key, also); err != nil {
-		return err
-	}
+// Ingress implements provider.Provider.
+func (p *Provider) Ingress(ctx context.Context) (provider.Ingress, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpClaimLabel, ref); err != nil {
-		return err
+	if err := p.enterLocked(ctx, OpIngress, ""); err != nil {
+		return provider.Ingress{}, err
 	}
-	in, err := p.mineLocked(OpClaimLabel, ref)
-	if err != nil {
-		return err
-	}
-	switch cur := in.inst.Labels[key]; cur {
-	case value:
-		if alsoInPlace(in.inst.Labels, also) {
-			return nil
-		}
-	case "":
-	default:
-		return provider.Errorf(provider.ErrLabelTaken, string(OpClaimLabel), "%s has %s=%q", ref, key, cur)
-	}
-	merged := maps.Clone(in.inst.Labels)
-	if merged == nil {
-		merged = make(map[string]string)
-	}
-	merged[key] = value
-	maps.Copy(merged, also)
-	if len(merged) > 64 {
-		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "an instance takes at most 64 labels")
-	}
-	in.inst.Labels = merged
-	p.labelWrites++
-	return p.appliedErrLocked(OpClaimLabel)
+	return cloneIngress(p.ingress), nil
 }
 
-// SetMetadata implements provider.Provider.
-func (p *Provider) SetMetadata(ctx context.Context, ref provider.Ref, metadata map[string]string) error {
+// SetIngress implements provider.Provider.
+func (p *Provider) SetIngress(ctx context.Context, requestID string, sources []netip.Prefix) (provider.Ingress, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpSetMetadata, ref); err != nil {
-		return err
+	if err := p.enterLocked(ctx, OpSetIngress, ""); err != nil {
+		return provider.Ingress{}, err
 	}
-	in, err := p.mineLocked(OpSetMetadata, ref)
-	if err != nil {
-		return err
+	if k, ok, err := p.keptLocked(requestID, OpSetIngress, ""); ok || err != nil {
+		return k.ingress, err
 	}
-	for k := range metadata {
-		if !strings.HasPrefix(k, "shed-") {
-			return provider.Errorf(provider.ErrInvalid, string(OpSetMetadata), "metadata key %q does not begin \"shed-\"", k)
+	if !p.catalog.IngressWritable {
+		return provider.Ingress{}, errorf(provider.ErrIngress, OpSetIngress, "INGRESS_NOT_WRITABLE", "the ingress is managed elsewhere")
+	}
+	var applied []string
+	var canon []netip.Prefix
+	for _, s := range sources {
+		if !s.IsValid() || s.Masked() != s {
+			return provider.Ingress{}, errorf(provider.ErrInvalid, OpSetIngress, "INVALID", "source %s is not canonical", s)
 		}
-	}
-	if in.inst.Metadata == nil {
-		in.inst.Metadata = make(map[string]string)
-	}
-	for k, v := range metadata {
-		if v == "" {
-			delete(in.inst.Metadata, k)
-			continue
+		if (s.Addr().Is4() && s.Bits() < 24) || (s.Addr().Is6() && s.Bits() < 48) {
+			return provider.Ingress{}, errorf(provider.ErrIngress, OpSetIngress, "INGRESS_TOO_WIDE", "source %s is wider than allowed", s)
 		}
-		in.inst.Metadata[k] = v
+		canon = append(canon, s)
+		applied = append(applied, s.String())
 	}
-	return nil
+	p.ingress.Sources = canon
+	p.ingress.AppliedAt = p.stamp()
+	p.ingressWrites = append(p.ingressWrites, applied)
+	k := kept{ingress: cloneIngress(p.ingress)}
+	if _, _, err := p.answerLocked(OpSetIngress, requestID, "", k); err != nil {
+		return provider.Ingress{}, err
+	}
+	return k.ingress, nil
 }
 
-// GuestHostKey implements provider.HostKeyReader.
-func (p *Provider) GuestHostKey(ctx context.Context, ref provider.Ref) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpGuestHostKey, ref); err != nil {
-		return "", err
-	}
-	in, ok := p.instances[ref]
-	if !ok {
-		return "", provider.Errorf(provider.ErrNotFound, string(OpGuestHostKey), "%s", ref)
-	}
-	if in.hostKey == "" {
-		return "", provider.Errorf(provider.ErrNotFound, string(OpGuestHostKey), "%s has published no host key", ref)
-	}
-	return in.hostKey, nil
-}
-
-// ResolveImage implements provider.ImageResolver. An exact name resolves to
-// itself; "family/<name>" resolves to "<name>-fake0001". No image is ever
-// missing unless a failure is injected with FailNext(OpResolveImage, ...).
-func (p *Provider) ResolveImage(ctx context.Context, image string) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := p.enterLocked(ctx, OpResolveImage, ""); err != nil {
-		return "", err
-	}
-	if image == "" {
-		return "", provider.Errorf(provider.ErrInvalid, string(OpResolveImage), "image is empty")
-	}
-	if family, ok := strings.CutPrefix(image, provider.ImagePrefixFamily); ok {
-		return family + "-fake0001", nil
-	}
-	return image, nil
-}
+// --- internals ---
 
 // enterLocked records the call, then returns the context's error or an
 // injected failure, if there is one.
@@ -879,38 +969,119 @@ func (p *Provider) enterLocked(ctx context.Context, op Op, ref provider.Ref) err
 	return nil
 }
 
-// mineLocked returns the instance for a mutating call: ErrNotFound when it is
-// absent, ErrForeign when it belongs to another environment.
-func (p *Provider) mineLocked(op Op, ref provider.Ref) (*instance, error) {
-	in, ok := p.instances[ref]
+// keptLocked returns the kept answer of a request id used before for the
+// same call, ok false when it is new; an id used for another call is
+// ErrInvalid.
+func (p *Provider) keptLocked(requestID string, op Op, ref provider.Ref) (kept, bool, error) {
+	if requestID == "" {
+		return kept{}, false, nil
+	}
+	k, ok := p.requests[requestID]
 	if !ok {
-		return nil, provider.Errorf(provider.ErrNotFound, string(op), "%s", ref)
+		return kept{}, false, nil
 	}
-	if err := p.checkEnvLocked(op, in); err != nil {
-		return nil, err
+	if k.call != string(op)+" "+string(ref) {
+		return kept{}, false, errorf(provider.ErrInvalid, op, "INVALID", "request id %s was used for another call", requestID)
 	}
-	return in, nil
+	return k, true, nil
 }
 
-func (p *Provider) checkEnvLocked(op Op, in *instance) error {
-	if p.opts.Env == "" {
-		return nil
+// answerLocked keeps a successful answer under its request id and returns
+// it, or, when a lost reply was asked for, ErrUnavailable.
+func (p *Provider) answerLocked(op Op, requestID string, ref provider.Ref, k kept) (provider.Pending, provider.Instance, error) {
+	if requestID != "" {
+		k.call = string(op) + " " + string(ref)
+		p.requests[requestID] = k
 	}
-	if env := in.inst.Labels[provider.LabelEnv]; env != p.opts.Env {
-		return provider.Errorf(provider.ErrForeign, string(op), "%s has %s=%q", in.inst.Ref, provider.LabelEnv, env)
+	if p.loseReply[op] > 0 {
+		p.loseReply[op]--
+		return provider.Pending{}, provider.Instance{}, errorf(provider.ErrUnavailable, op, "", "the reply was lost")
 	}
-	return nil
+	return k.pending, k.inst, nil
 }
 
-// beginLocked registers a new operation on an instance and arranges for it to
-// finish: now, after a delay, or on Complete. prev is the state the instance
+// liveLocked returns the machine for a call on it: ErrNotFound when it is
+// absent, ErrDeleting while it is being deleted.
+func (p *Provider) liveLocked(op Op, ref provider.Ref) (*machine, error) {
+	m, ok := p.machines[ref]
+	if !ok {
+		return nil, errorf(provider.ErrNotFound, op, "NOT_FOUND", "%s", ref)
+	}
+	if m.inst.State == provider.StateDeleting {
+		return nil, errorf(provider.ErrDeleting, op, "DELETING", "%s is being deleted", ref)
+	}
+	return m, nil
+}
+
+func (p *Provider) defaultHostKey() string {
+	switch {
+	case p.opts.NoHostKey:
+		return ""
+	case p.opts.HostKey != "":
+		return p.opts.HostKey
+	}
+	return DefaultHostKey
+}
+
+// giveAccessLocked gives a running machine its access option at a fresh
+// address, when its guest has published a host key.
+func (p *Provider) giveAccessLocked(m *machine) {
+	if m.hostKey == "" {
+		m.inst.Access = nil
+		return
+	}
+	p.nextAddr++
+	host := fmt.Sprintf("203.0.113.%d", 1+(p.nextAddr-1)%254)
+	m.inst.Access = []provider.Access{{Kind: provider.AccessSSH, Host: host, Port: 22, User: "shed-link", HostKey: m.hostKey}}
+	m.inst.IgnoredAccess = 0
+}
+
+// leaseLocked returns m's lease with extendable and the presets computed
+// now.
+func (p *Provider) leaseLocked(m *machine, now time.Time) provider.Lease {
+	l := m.inst.Lease
+	l.PresetsH = nil
+	l.Extendable = false
+	if m.inst.Client == "" {
+		l.PresetsH = slices.Clone(p.catalog.Policy.PresetsH)
+		l.Extendable = p.catalog.Policy.PersonExtend && m.inst.State != provider.StateDeleting &&
+			now.Before(l.ExpiresAt) && !l.ExpiresAt.Add(time.Hour).After(l.MaxExpiresAt)
+	}
+	return l
+}
+
+func (p *Provider) viewLocked(m *machine) provider.Instance {
+	v := m.inst.Clone()
+	v.Lease = p.leaseLocked(m, p.opts.Now())
+	return v
+}
+
+// removeLocked deletes a machine with a cause, ending its work in progress
+// with err.
+func (p *Provider) removeLocked(m *machine, cause string, err error) {
+	delete(p.machines, m.inst.Ref)
+	p.deleted = append(p.deleted, provider.Deletion{Ref: m.inst.Ref, At: p.stamp(), Cause: cause})
+	if m.op != nil {
+		op := m.op
+		m.op = nil
+		if op.kind == OpDestroy {
+			op.gone = true
+		} else {
+			op.err = err
+		}
+		close(op.done)
+	}
+}
+
+// beginLocked registers a new operation on a machine and arranges for it to
+// finish: now, or on Complete when Manual. prev is the state the machine
 // returns to if the operation fails.
-func (p *Provider) beginLocked(in *instance, kind Op, prev provider.State, delay time.Duration) *operation {
+func (p *Provider) beginLocked(m *machine, kind Op, prev provider.State) *operation {
 	p.nextOp++
 	op := &operation{
 		id:   fmt.Sprintf("fake-op-%d", p.nextOp),
 		kind: kind,
-		ref:  in.inst.Ref,
+		ref:  m.inst.Ref,
 		prev: prev,
 		done: make(chan struct{}),
 	}
@@ -918,119 +1089,81 @@ func (p *Provider) beginLocked(in *instance, kind Op, prev provider.State, delay
 		p.failOp[kind] = queue[1:]
 		op.failWith = queue[0]
 	}
-	in.op = op
+	m.op = op
 	p.ops[op.id] = op
-	switch {
-	case p.opts.Manual:
-	case delay <= 0:
+	if !p.opts.Manual {
 		p.finishLocked(op)
-	default:
-		time.AfterFunc(delay, func() {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.finishLocked(op)
-		})
 	}
 	return op
 }
 
 // finishLocked applies an operation's result. It does nothing when the
-// operation already finished or its instance was deleted from outside.
+// operation already finished or its machine was deleted.
 func (p *Provider) finishLocked(op *operation) {
-	in, ok := p.instances[op.ref]
-	if !ok || in.op != op {
+	m, ok := p.machines[op.ref]
+	if !ok || m.op != op {
 		return
 	}
-	in.op = nil
+	m.op = nil
 	defer close(op.done)
 
 	if op.failWith != nil {
 		op.err = op.failWith
 		if op.kind == OpCreate {
-			delete(p.instances, op.ref)
+			// A create the cloud refused is no deletion.
+			delete(p.machines, op.ref)
 			return
 		}
-		in.inst.State = op.prev
-		if op.prev == provider.StateRunning && in.inst.Address == "" {
-			in.inst.Address = p.newAddrLocked()
+		m.inst.State = op.prev
+		if op.prev == provider.StateRunning {
+			p.giveAccessLocked(m)
 		}
 		return
 	}
 	switch op.kind {
 	case OpCreate, OpStart:
-		now := p.opts.Now()
-		in.inst.State = provider.StateRunning
-		in.inst.Address = p.newAddrLocked()
-		in.inst.StartedAt = now
-		in.inst.PlannedStopAt = time.Time{}
-		if in.inst.MaxRun > 0 {
-			in.inst.PlannedStopAt = now.Add(in.inst.MaxRun)
-		}
+		m.inst.State = provider.StateRunning
+		m.inst.StartedAt = p.stamp()
+		m.inst.StoppedAt = time.Time{}
+		p.giveAccessLocked(m)
 	case OpStop:
-		p.markStoppedLocked(in)
+		p.markStoppedLocked(m)
 	case OpDestroy:
-		delete(p.instances, op.ref)
+		op.gone = true
+		delete(p.machines, op.ref)
+		p.deleted = append(p.deleted, provider.Deletion{Ref: op.ref, At: p.stamp(), Cause: provider.CauseServer})
 	}
 }
 
-func (p *Provider) markStoppedLocked(in *instance) {
-	in.inst.State = provider.StateStopped
-	in.inst.Address = ""
-	in.inst.StoppedAt = p.opts.Now()
-	in.inst.PlannedStopAt = time.Time{}
+// stamp is the clock's time as the service writes a timestamp: UTC, whole
+// seconds.
+func (p *Provider) stamp() time.Time { return p.opts.Now().UTC().Truncate(time.Second) }
+
+func (p *Provider) markStoppedLocked(m *machine) {
+	m.inst.State = provider.StateStopped
+	m.inst.Access = nil
+	m.inst.StoppedAt = p.stamp()
 }
 
-// newAddrLocked hands out a fresh public address from 203.0.113.0/24 (a
-// documentation range), so every start gets a different one.
-func (p *Provider) newAddrLocked() string {
-	p.nextAddr++
-	return fmt.Sprintf("203.0.113.%d", 1+(p.nextAddr-1)%254)
-}
-
-// pendingFor describes an instance's work in flight, or none, for an
+// pendingFor describes a machine's work in flight, or none, for an
 // idempotent repeat of a call.
-func pendingFor(in *instance, want provider.State) provider.Pending {
-	pend := provider.Pending{Ref: in.inst.Ref, Want: want}
-	if in.op != nil {
-		pend.Operation = in.op.id
+func pendingFor(m *machine, want provider.State) provider.Pending {
+	pend := provider.Pending{Ref: m.inst.Ref, Want: want}
+	if m.op != nil {
+		pend.Operation = m.op.id
 	}
 	return pend
 }
 
-func refFor(name string) provider.Ref { return provider.Ref("fake/" + name) }
-
-func clone(inst provider.Instance) provider.Instance {
-	inst.Labels = maps.Clone(inst.Labels)
-	inst.Metadata = maps.Clone(inst.Metadata)
-	return inst
+func cloneIngress(in provider.Ingress) provider.Ingress {
+	in.Sources = slices.Clone(in.Sources)
+	return in
 }
 
+// ctxErr is a call whose context ended before the fake took it: like a
+// request the service client never wrote, it was never delivered and did
+// nothing.
 func ctxErr(ctx context.Context, op Op) error {
-	return &provider.Error{Op: string(op), Err: ctx.Err()}
-}
-
-// checkAlso validates ClaimLabel's also: keys under the claim's own rules
-// (never an identity label, nor the claimed key), valid values.
-func checkAlso(op, key string, also map[string]string) error {
-	for k, v := range also {
-		switch {
-		case k == "" || !provider.ValidLabelValue(k) || k[0] < 'a' || k[0] > 'z':
-			return provider.Errorf(provider.ErrInvalid, op, "label key %q is not valid", k)
-		case k == key || k == provider.LabelSchema || k == provider.LabelEnv || k == provider.LabelID:
-			return provider.Errorf(provider.ErrInvalid, op, "label %s cannot be written with a claim", k)
-		case !provider.ValidLabelValue(v):
-			return provider.Errorf(provider.ErrInvalid, op, "label %s has an invalid value %q", k, v)
-		}
-	}
-	return nil
-}
-
-// alsoInPlace reports whether every label of also already has its value.
-func alsoInPlace(labels, also map[string]string) bool {
-	for k, v := range also {
-		if labels[k] != v {
-			return false
-		}
-	}
-	return true
+	return &provider.Error{Kind: provider.ErrUnavailable, Op: string(op), Detail: "the call's context ended before it was sent: " + ctx.Err().Error(),
+		Err: provider.ErrNotDelivered}
 }

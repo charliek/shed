@@ -12,29 +12,21 @@ import (
 	"github.com/charliek/shed/internal/remote/provider/fake"
 )
 
-// seedCreating adds an instance labelled creating, made age ago, with no
-// local record: what a create leaves when its record is lost.
-func seedCreating(e *env, name, id, envName string, schema string, age time.Duration) {
-	ident := provider.Identity{Env: envName, ID: id, Name: name}
-	labels := ident.Labels(provider.ShedStateCreating)
-	if schema != "" {
-		labels[provider.LabelSchema] = schema
-	}
-	e.prov.Seed(provider.Instance{
-		Name: ident.InstanceName(), State: provider.StateRunning, Labels: labels,
-		CreatedAt: time.Now().Add(-age),
-	})
+// seedCreating adds a machine labelled creating, made age ago, with no local
+// record: what a create leaves when its record is lost.
+func seedCreating(e *env, name string, age time.Duration) {
+	e.seedMachine(name, newID(e.t), provider.ShedStateCreating, time.Now().Add(-age))
 }
 
 func namesLeft(t *testing.T, e *env) map[string]bool {
 	t.Helper()
-	insts, err := e.prov.List(context.Background(), provider.Selector{})
+	insts, err := instances(e.prov, context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	left := map[string]bool{}
 	for _, inst := range insts {
-		left[inst.Labels[provider.LabelName]] = true
+		left[inst.Name] = true
 	}
 	return left
 }
@@ -46,10 +38,8 @@ func namesLeft(t *testing.T, e *env) map[string]bool {
 // each destroy it, and nothing else.
 func TestAbandonedCreateIsDestroyed(t *testing.T) {
 	seedAll := func(e *env) {
-		seedCreating(e, "abandoned", "aaaaaaaaaaaa", testEnv, "", 2*StaleCreateAge)
-		seedCreating(e, "young", "bbbbbbbbbbbb", testEnv, "", StaleCreateAge/2)
-		seedCreating(e, "theirs", "cccccccccccc", "other", "", 2*StaleCreateAge)
-		seedCreating(e, "future", "dddddddddddd", testEnv, "99", 2*StaleCreateAge)
+		seedCreating(e, "abandoned", 2*StaleCreateAge)
+		seedCreating(e, "young", StaleCreateAge/2)
 	}
 	check := func(t *testing.T, e *env) {
 		t.Helper()
@@ -57,7 +47,7 @@ func TestAbandonedCreateIsDestroyed(t *testing.T) {
 		if left["abandoned"] {
 			t.Errorf("the abandoned create was left: %v", left)
 		}
-		for _, name := range []string{"young", "theirs", "future"} {
+		for _, name := range []string{"young"} {
 			if !left[name] {
 				t.Errorf("instance %s was destroyed; only the abandoned create may be", name)
 			}

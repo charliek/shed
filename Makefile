@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref provision-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-tool-pins check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref provision-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote dev-compute-ref-up dev-compute-ref-grant dev-compute-ref-down test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-tool-pins check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -875,31 +875,35 @@ dev-server-restart-fc: check-no-dev-auth-mode check-dev-users check-dev-config-f
 #
 # Runs the dev build with `default_backend: remote` on THIS machine, beside
 # any installed shed-server (which keeps 8080/2222 and is never touched).
-# Each shed is a cloud VM. Same intentionally-ephemeral shape as the other
-# dev servers: nohup + PID file, no unit, no auto-restart.
+# Every shed's machine comes from the account service the server is enrolled
+# with (remote.provider: service, auth.directory): a local account service,
+# or the in-tree reference service (make dev-compute-ref-up). Same
+# intentionally-ephemeral shape as the other dev servers: nohup + PID file,
+# no unit, no auto-restart.
 #
+#   make dev-compute-ref-up          # (optional) the reference service, on loopback
 #   make dev-server-up-remote        # render the config, build, start
+#   bin/shed-server directory enroll --config ~/.shed/dev-remote/server.yaml --code <code> --name remote-dev   # once
+#   make dev-compute-ref-grant       # (reference service) allow compute, register nocturn
 #   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev   # once
-#   shed -s remote-dev create t1
 #   make build && make dev-server-restart-remote   # pick up a rebuild
-#   make dev-server-down-remote      # sheds (cloud VMs) are NOT deleted
+#   make dev-server-down-remote      # machines are NOT deleted (their leases end them)
 #
-# Cloud settings are private and never in this repo. The targets source them
-# from $(SHED_REMOTE_ENV_FILE) (VAR=value lines): SHED_REMOTE_ENV (the
-# environment name), SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK,
-# SHED_GCE_SUBNET, SHED_GCE_CREDENTIALS_FILE, SHED_REMOTE_SSH_KEY_FILE and
-# SHED_REMOTE_SOURCE_RANGES (the firewall rule's source ranges). Two more
-# choose the firewall mode: SHED_REMOTE_FIREWALL_MODE (static, the default,
-# or auto) and, for auto, SHED_REMOTE_ECHO_URLS (two or more https echo
-# services on different hosts, comma-separated).
+# Settings are private and never in this repo. The targets source them from
+# $(SHED_REMOTE_ENV_FILE) (VAR=value lines): SHED_REMOTE_DIRECTORY_URL (the
+# account service's URL; http only to a loopback address, as the reference
+# service's), SHED_REMOTE_ADMIN_KEY (the local admin `dev`'s public key line;
+# default ~/.ssh/id_ed25519.pub), SHED_REMOTE_SSH_KEY_FILE and
+# SHED_REMOTE_SOURCE_RANGES (the ingress's sources). SHED_REMOTE_TRANSPORT is
+# ssh (the default) or local (a real agent on this host, no cloud machine:
+# the reference service's world). Two more choose the firewall mode:
+# SHED_REMOTE_FIREWALL_MODE (static, the default, or auto) and, for auto,
+# SHED_REMOTE_ECHO_URLS (two or more https echo services on different hosts,
+# comma-separated).
 # The config is rendered from configs/server.dev-remote.yaml.tmpl on every
 # start; edit the template, not the rendered file.
 SHED_REMOTE_ENV_FILE    ?= $(HOME)/.config/shed/remote-dev/env
 SHED_REMOTE_DEV_SERVER  ?= remote-dev
-# The GitHub account whose SSH keys may enrol a CLI against the dev server.
-# No account is named here: the default is the owner of this checkout's
-# origin remote. Set it in the environment, or in the env file, to override.
-SHED_REMOTE_GITHUB_USER ?= $(shell git remote get-url origin 2>/dev/null | sed -nE 's|^.*github\.com[:/]([^/]+)/[^/]+$$|\1|p')
 REMOTE_DEV_DIR          := $(HOME)/.shed/dev-remote
 REMOTE_DEV_TEMPLATE     := $(CURDIR)/configs/server.dev-remote.yaml.tmpl
 REMOTE_DEV_CONFIG       := $(REMOTE_DEV_DIR)/server.yaml
@@ -908,27 +912,50 @@ REMOTE_DEV_PID_PATH     := $(REMOTE_DEV_DIR)/server.pid
 REMOTE_DEV_AGENT        := $(REMOTE_DEV_DIR)/agent/shed-agent-linux-amd64
 
 # Source the env file and validate the settings the config is rendered from,
-# leaving GITHUB_USER, FW_MODE and FW_SETTING set for the caller's shell. One
+# leaving DIRECTORY_URL, DIRECTORY_SETTING, ADMIN_KEY, TRANSPORT,
+# TRANSPORT_SETTING, FW_MODE and FW_SETTING set for the caller's shell. One
 # shell snippet, used by check-remote-dev-settings (so a restart refuses bad
 # settings before it stops anything) and by dev-server-up-remote (which renders
 # from the same values).
 define remote-dev-settings
 if [ ! -f "$(SHED_REMOTE_ENV_FILE)" ]; then \
   echo "ERROR: no env file at $(SHED_REMOTE_ENV_FILE)."; \
-  echo "       It holds the cloud settings (see the comment above dev-server-up-remote);"; \
+  echo "       It holds the settings (see the comment above dev-server-up-remote);"; \
   echo "       point SHED_REMOTE_ENV_FILE at yours."; \
   exit 1; \
 fi; \
 set -a; . "$(SHED_REMOTE_ENV_FILE)"; set +a; \
-if [ -z "$$SHED_REMOTE_ENV" ]; then \
-  echo "ERROR: $(SHED_REMOTE_ENV_FILE) does not set SHED_REMOTE_ENV (the environment name)."; \
+if [ "$$SHED_DEV_USERS" = itest ]; then \
+  echo "ERROR: the remote dev server takes its people from the account service (auth.directory);"; \
+  echo "       list the itest people there, not with SHED_DEV_USERS=itest."; \
   exit 1; \
 fi; \
-GITHUB_USER="$${SHED_REMOTE_GITHUB_USER:-$(SHED_REMOTE_GITHUB_USER)}"; \
-if [ -z "$$GITHUB_USER" ]; then \
-  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
-  exit 1; \
-fi; \
+DIRECTORY_URL="$$SHED_REMOTE_DIRECTORY_URL"; \
+case "$$DIRECTORY_URL" in \
+  https://*) DIRECTORY_SETTING="# https: no allow_plain_http" ;; \
+  http://127.0.0.1:*|http://localhost:*|http://\[::1\]:*) DIRECTORY_SETTING="allow_plain_http: true" ;; \
+  *) \
+    echo "ERROR: $(SHED_REMOTE_ENV_FILE) must set SHED_REMOTE_DIRECTORY_URL: the account service's https URL,"; \
+    echo "       or http://127.0.0.1:<port> for one on this machine (the reference service: make dev-compute-ref-up)."; \
+    exit 1 ;; \
+esac; \
+case "$$DIRECTORY_URL" in *[!A-Za-z0-9:/._\[\]-]*) \
+  echo "ERROR: SHED_REMOTE_DIRECTORY_URL holds a character a URL origin does not."; exit 1 ;; \
+esac; \
+ADMIN_KEY="$${SHED_REMOTE_ADMIN_KEY:-$$(cat "$$HOME/.ssh/id_ed25519.pub" 2>/dev/null)}"; \
+case "$$ADMIN_KEY" in \
+  ssh-*" "*) ADMIN_KEY="$$(printf '%s' "$$ADMIN_KEY" | awk '{print $$1" "$$2}')" ;; \
+  *) \
+    echo "ERROR: set SHED_REMOTE_ADMIN_KEY in $(SHED_REMOTE_ENV_FILE) to the local admin's public key line"; \
+    echo "       (none, and no ~/.ssh/id_ed25519.pub)."; \
+    exit 1 ;; \
+esac; \
+TRANSPORT="$${SHED_REMOTE_TRANSPORT:-ssh}"; \
+case "$$TRANSPORT" in \
+  ssh) TRANSPORT_SETTING="allow_test_drivers: false" ;; \
+  local) TRANSPORT_SETTING="allow_test_drivers: true" ;; \
+  *) echo "ERROR: SHED_REMOTE_TRANSPORT is '$$TRANSPORT'; want ssh or local."; exit 1 ;; \
+esac; \
 FW_MODE="$${SHED_REMOTE_FIREWALL_MODE:-static}"; \
 case "$$FW_MODE" in \
   static) FW_SETTING="source_ranges_env: SHED_REMOTE_SOURCE_RANGES" ;; \
@@ -946,32 +973,27 @@ case "$$FW_MODE" in \
 esac
 endef
 
-# Render the remote dev server's config from the template, plus the itest
-# user list with SHED_DEV_USERS=itest, into $(REMOTE_DEV_CONFIG). Runs after
-# remote-dev-settings in the same shell (it reads what that sets). Sets
-# RUN_CONFIG; exits the shell when a step fails or the file is missing or
-# empty (dev-check-run-config), leaving no partial config behind.
+# Render the remote dev server's config from the template into
+# $(REMOTE_DEV_CONFIG). Runs after remote-dev-settings in the same shell (it
+# reads what that sets). Sets RUN_CONFIG; exits the shell when a step fails or
+# the file is missing or empty (dev-check-run-config), leaving no partial
+# config behind.
 define remote-dev-config
 RUN_CONFIG="$(REMOTE_DEV_CONFIG)"; \
 mkdir -p "$(REMOTE_DEV_DIR)"; \
-rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
+rm -f "$$RUN_CONFIG"; \
 if ! sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
-    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
-    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
+    -e "s|@DIRECTORY_URL@|$$DIRECTORY_URL|g" \
+    -e "s|@DIRECTORY_SETTING@|$$DIRECTORY_SETTING|g" \
+    -e "s|@ADMIN_KEY@|$$ADMIN_KEY|g" \
+    -e "s|@TRANSPORT@|$$TRANSPORT|g" \
+    -e "s|@TRANSPORT_SETTING@|$$TRANSPORT_SETTING|g" \
     -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
     -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
     "$(REMOTE_DEV_TEMPLATE)" > "$$RUN_CONFIG"; then \
   rm -f "$$RUN_CONFIG"; \
   echo "ERROR: rendering $(REMOTE_DEV_TEMPLATE) failed; not starting shed-server."; \
   exit 1; \
-fi; \
-if [ "$$SHED_DEV_USERS" = itest ]; then \
-  if ! $(DEV_RENDER_SCRIPT) "$$RUN_CONFIG" "$$RUN_CONFIG.users" --users "$$SHED_ITEST_USERS_DIR" \
-      || ! mv "$$RUN_CONFIG.users" "$$RUN_CONFIG"; then \
-    rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
-    echo "ERROR: rendering the itest user list into the remote dev config failed (above); not starting shed-server."; \
-    exit 1; \
-  fi; \
 fi; \
 $(dev-check-run-config)
 endef
@@ -1059,7 +1081,7 @@ dev-server-down-remote:
 	      echo "Remote dev server didn't stop gracefully after 10s; SIGKILL"; \
 	      kill -KILL $$PID 2>/dev/null; \
 	    fi; \
-	    echo "Remote dev server (pid $$PID) stopped. Its sheds are cloud VMs and keep running."; \
+	    echo "Remote dev server (pid $$PID) stopped. Its sheds' machines keep running until their leases end."; \
 	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
 	  fi; \
 	fi
@@ -1098,11 +1120,24 @@ dev-server-restart-remote: check-remote-dev-settings check-remote-dev-config bui
 	@$(MAKE) --no-print-directory dev-server-down-remote
 	@$(MAKE) --no-print-directory dev-server-up-remote
 
+# The in-tree reference account service (directory and compute) for the
+# remote dev server, on loopback (scripts/dev-compute-ref.sh): no cloud, no
+# private value. Run the dev server with SHED_REMOTE_TRANSPORT=local and
+# SHED_REMOTE_DIRECTORY_URL=http://127.0.0.1:18700 against it.
+dev-compute-ref-up: directory-ref
+	@./scripts/dev-compute-ref.sh up
+
+dev-compute-ref-grant:
+	@./scripts/dev-compute-ref.sh grant
+
+dev-compute-ref-down:
+	@./scripts/dev-compute-ref.sh down
+
 # Run the integration suite's [remote] cases against the remote dev server.
-# MANUAL ONLY: every case that creates a shed creates a billed cloud VM (a full
-# run is about 25 VMs, each up for a minute or two, at most
-# remote.limits.max_running at once). It does not start the dev server for
-# you; run `make dev-server-up-remote` first.
+# MANUAL ONLY: against a real account service every case that creates a shed
+# creates a billed cloud machine (a full run is about 25, each up for a
+# minute or two). It does not start the dev server for you; run
+# `make dev-server-up-remote` first.
 #
 # Every vz/fc server variable is set EMPTY so no [vz] or [fc] case runs (the
 # defaults can name production servers). Cases the remote backend cannot run

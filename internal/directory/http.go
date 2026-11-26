@@ -263,8 +263,14 @@ func statusFailure(step Step, a *answer) *Failure {
 // comparisons count time the host spent asleep.
 func wallClock(now func() time.Time) time.Time { return now().Round(0) }
 
-// newRequest builds a request with ctx. The body, if any, is never rewound:
-// GetBody is cleared so that no transport can send it a second time.
+// NewRequest builds a request with ctx, as every call to the account
+// service is built (the compute client's too): the body, if any, is never
+// rewound (GetBody is cleared so that no transport can send it a second
+// time), and the answer asked for is JSON.
+func NewRequest(ctx context.Context, method, target string, body io.Reader) (*http.Request, error) {
+	return newRequest(ctx, method, target, body)
+}
+
 func newRequest(ctx context.Context, method, target string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {

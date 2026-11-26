@@ -16,7 +16,9 @@ import (
 const DefaultReapInterval = 60 * time.Second
 
 // RunReaper deletes service-client sheds older than their client's
-// policy.max_age, the only server-side lifetime bound on an owned shed. It
+// policy.max_age, the only server-side lifetime bound on an owned shed of a
+// local backend. A cloud shed (remote) is never reaped: its lease, set from
+// max_age at create, is the account service's to enforce. It
 // runs one pass at once (so a shed that expired while the server was down goes
 // on the first pass) and then one every interval, until ctx ends. now is the
 // clock (time.Now in shed-server; a fake in tests).
@@ -80,6 +82,12 @@ func (s *Server) reapOnce(ctx context.Context, now time.Time) {
 	for i := range sheds {
 		sh := sheds[i]
 		if sh.Owner == "" {
+			continue
+		}
+		if sh.Backend == config.BackendRemote {
+			// A cloud shed's lifetime is its machine's lease, which the
+			// account service enforces (plan 041, S0 ruling 9): no server
+			// timer deletes it.
 			continue
 		}
 		cc, ok := s.cfg.ServiceClient(sh.Owner)

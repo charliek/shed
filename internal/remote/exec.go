@@ -36,11 +36,11 @@ func (w *capWriter) String() string { return w.buf.String() }
 
 // running returns a copy of the record of a shed that is running, with the
 // caller's ownership requirements checked against it. Any other status is
-// config.ErrShedNotRunningSentinel, which the API answers with 409.
+// config.ErrShedNotRunningSentinel, which the API answers with 409. It
+// answers while the backend is degraded too: a running shed is reached over
+// the access its record holds (Record.Machine) and its pinned host key,
+// with nothing asked of the service; only lifecycle calls are refused.
 func (b *Backend) running(ctx context.Context, name string) (*state.Record, error) {
-	if err := b.checkReady(); err != nil {
-		return nil, err
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	r, err := b.lookupLocked(ctx, name)

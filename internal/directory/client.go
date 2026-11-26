@@ -77,7 +77,10 @@ type Client struct {
 	// dhc is the hosted source's client (Deliver): no response-header
 	// timeout, a 5 s connect bound, every call bounded by its caller's
 	// context. The pull's hc is not touched.
-	dhc  *http.Client
+	dhc *http.Client
+	// chc is the compute calls' client (ComputeAccess): the pull's rules,
+	// its own connections. Every compute call is bounded by its caller.
+	chc  *http.Client
 	now  func() time.Time
 	rand io.Reader
 
@@ -91,6 +94,11 @@ type Client struct {
 	dtoken, dassertion string
 	dtokenUntil        time.Time
 	dflight            *deliveryFlight
+	// The compute token (scope compute:manage), cached the same way, with
+	// the assertion that got it; cflight is the token request in flight.
+	ctoken, cassertion string
+	ctokenUntil        time.Time
+	cflight            *computeFlight
 }
 
 // NewClient returns a Client for an enrolled server.
@@ -124,8 +132,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	chc, err := newHTTPClient(transportConfig{
+		issuer: e.Issuer, allowPlainHTTP: cfg.AllowPlainHTTP, rootCAs: cfg.RootCAs, base: cfg.baseTransport,
+	})
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
 		dhc:           dhc,
+		chc:           chc,
 		clientID:      e.ClientID,
 		issuer:        e.Issuer,
 		tokenEndpoint: e.TokenEndpoint,
@@ -338,6 +353,23 @@ func (c *Client) requestToken(ctx context.Context) (string, time.Duration, *answ
 	return tok, lifetime, a, scrub(f, assertion)
 }
 
+// tokenRequest is a client-credentials token request for scope, signed in
+// with the client assertion.
+func (c *Client) tokenRequest(ctx context.Context, scope, assertion string) (*http.Request, error) {
+	form := url.Values{
+		"grant_type":            {"client_credentials"},
+		"client_assertion_type": {assertionType},
+		"client_assertion":      {assertion},
+		"scope":                 {scope},
+	}
+	req, err := newRequest(ctx, http.MethodPost, c.tokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
 // sendToken sends the token request carrying assertion. It names its scope,
 // directory:read and nothing else: an absent scope means every scope the
 // service has (contract section 2), so a scope the service adds later is
@@ -345,17 +377,10 @@ func (c *Client) requestToken(ctx context.Context) (string, time.Duration, *answ
 // gives a failed refresh like any other refusal; the request is not sent
 // again without the scope.
 func (c *Client) sendToken(ctx context.Context, assertion string) (string, time.Duration, *answer, *Failure) {
-	form := url.Values{
-		"grant_type":            {"client_credentials"},
-		"client_assertion_type": {assertionType},
-		"client_assertion":      {assertion},
-		"scope":                 {directoryScope},
-	}
-	req, err := newRequest(ctx, http.MethodPost, c.tokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := c.tokenRequest(ctx, directoryScope, assertion)
 	if err != nil {
 		return "", 0, nil, &Failure{Step: StepToken, Kind: KindTransport, Err: err}
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	a, f := exchange(c.hc, req, StepToken, http.StatusOK, MaxAnswerBody, c.now)
 	if f != nil {
 		return "", 0, a, f

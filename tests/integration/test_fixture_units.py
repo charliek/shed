@@ -1114,14 +1114,25 @@ def _remote_home(tmp_path: Path) -> tuple[Path, int]:
     return run_dir / "server.pid", proc
 
 
+# A remote dev env file that passes the settings guard: the reference
+# service on loopback, a local admin key, the local transport.
+_REMOTE_ENV_OK = (
+    "SHED_REMOTE_DIRECTORY_URL=http://127.0.0.1:18700\n"
+    "SHED_REMOTE_ADMIN_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOk7m0g4b0dJ7J8cAqXqv8k3m1m2m3m4m5m6m7m8m9m0 dev'\n"
+    "SHED_REMOTE_TRANSPORT=local\n"
+)
+
+
 @pytest.mark.parametrize(
     "env_file, want",
     [
         (None, "no env file"),
-        ("SHED_GCE_PROJECT=x\n", "does not set SHED_REMOTE_ENV"),
-        ("SHED_REMOTE_ENV=dev\nSHED_REMOTE_FIREWALL_MODE=auto\n", "needs SHED_REMOTE_ECHO_URLS"),
+        ("SHED_REMOTE_SSH_KEY_FILE=x\n", "must set SHED_REMOTE_DIRECTORY_URL"),
+        ("SHED_REMOTE_DIRECTORY_URL=http://accounts.example.test\n", "must set SHED_REMOTE_DIRECTORY_URL"),
+        (_REMOTE_ENV_OK + "SHED_REMOTE_TRANSPORT=tailscale\n", "want ssh or local"),
+        (_REMOTE_ENV_OK + "SHED_REMOTE_FIREWALL_MODE=auto\n", "needs SHED_REMOTE_ECHO_URLS"),
     ],
-    ids=["missing-env-file", "no-environment-name", "auto-without-echo-urls"],
+    ids=["missing-env-file", "no-directory-url", "plain-http-off-loopback", "unknown-transport", "auto-without-echo-urls"],
 )
 def test_remote_restart_refuses_bad_settings_before_stopping(tmp_path, env_file, want):
     pid_file, proc = _remote_home(tmp_path)
@@ -1129,9 +1140,7 @@ def test_remote_restart_refuses_bad_settings_before_stopping(tmp_path, env_file,
         path = tmp_path / "remote.env"
         if env_file is not None:
             path.write_text(env_file)
-        r, calls = _make_with_stubs(
-            tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={path}", "SHED_REMOTE_GITHUB_USER=someone",
-        )
+        r, calls = _make_with_stubs(tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={path}")
         assert r.returncode != 0
         assert want in r.stdout + r.stderr
         # The stop never ran: the pid file of the "running server" is untouched.
@@ -1145,11 +1154,8 @@ def test_remote_restart_refuses_bad_settings_before_stopping(tmp_path, env_file,
 def test_remote_restart_stops_then_starts_in_its_recipe(tmp_path):
     # Dry run: make prints the recipes and recurses with -n, so nothing runs.
     env = tmp_path / "remote.env"
-    env.write_text("SHED_REMOTE_ENV=dev\n")
-    r, _ = _make_with_stubs(
-        tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
-        dry_run=True,
-    )
+    env.write_text(_REMOTE_ENV_OK)
+    r, _ = _make_with_stubs(tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={env}", dry_run=True)
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     stop = out.index("kill -TERM")
@@ -1441,11 +1447,8 @@ def test_remote_start_line_survives_a_padded_wc(tmp_path):
     # Take the remote target's own START_LINE assignment from a dry run and
     # run it with a wc that pads its count the way macOS wc does.
     env = tmp_path / "remote.env"
-    env.write_text("SHED_REMOTE_ENV=dev\n")
-    r, _ = _make_with_stubs(
-        tmp_path, "dev-server-up-remote", f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
-        dry_run=True,
-    )
+    env.write_text(_REMOTE_ENV_OK)
+    r, _ = _make_with_stubs(tmp_path, "dev-server-up-remote", f"SHED_REMOTE_ENV_FILE={env}", dry_run=True)
     assert r.returncode == 0, r.stdout + r.stderr
     m = re.search(r"START_LINE=(\$\([^;]*\));", r.stdout)
     assert m, r.stdout
@@ -1562,9 +1565,11 @@ def _rendered_remote_template(tmp_path: Path) -> Path:
     dev-server-up-remote fills them (dummy values; nothing private)."""
     text = REMOTE_TEMPLATE.read_text(encoding="utf-8")
     for k, v in {
-        "@DEV_REMOTE_DIR@": str(tmp_path / "dev-remote"), "@SHED_REMOTE_ENV@": "itest",
-        "@GITHUB_USER@": "someone", "@FIREWALL_MODE@": "static",
-        "@FIREWALL_SETTING@": "source_ranges_env: SHED_REMOTE_SOURCE_RANGES",
+        "@DEV_REMOTE_DIR@": str(tmp_path / "dev-remote"),
+        "@ADMIN_KEY@": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOk7m0g4b0dJ7J8cAqXqv8k3m1m2m3m4m5m6m7m8m9m0",
+        "@DIRECTORY_URL@": "http://127.0.0.1:18700", "@DIRECTORY_SETTING@": "allow_plain_http: true",
+        "@TRANSPORT@": "local", "@TRANSPORT_SETTING@": "allow_test_drivers: true",
+        "@FIREWALL_MODE@": "static", "@FIREWALL_SETTING@": "source_ranges_env: SHED_REMOTE_SOURCE_RANGES",
     }.items():
         text = text.replace(k, v)
     out = tmp_path / "remote.yaml"
@@ -1572,11 +1577,19 @@ def _rendered_remote_template(tmp_path: Path) -> Path:
     return out
 
 
-@pytest.mark.parametrize("which", ["mac", "fc", "remote"])
+def test_rendered_remote_template_loads(tmp_path):
+    # The remote dev template, rendered as dev-server-up-remote renders it
+    # against the reference service: the account service's compute with the
+    # local transport, a local admin and the directory.
+    v = _validate(_rendered_remote_template(tmp_path))
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+@pytest.mark.parametrize("which", ["mac", "fc"])
 def test_render_users_writes_a_config_the_server_loads(tmp_path, keys_dir, which):
     if shutil.which("uv") is None:
         pytest.skip("uv is not installed")
-    base = {"mac": MAC_DEV_CONFIG, "fc": FC_DEV_CONFIG}.get(which) or _rendered_remote_template(tmp_path)
+    base = {"mac": MAC_DEV_CONFIG, "fc": FC_DEV_CONFIG}[which]
     r = _render(tmp_path, base, "--users", str(keys_dir))
     assert r.returncode == 0, r.stdout + r.stderr
     out = tmp_path / "out.yaml"
@@ -1976,9 +1989,8 @@ def test_bus_listener_and_pinned_refuse_the_wrong_server(sse_listener):
 )
 def test_a_bad_dev_users_value_fails_before_anything_runs(tmp_path, target):
     env = tmp_path / "remote.env"
-    env.write_text("SHED_REMOTE_ENV=dev\n")
-    r, calls = _make_with_stubs(tmp_path, target, "SHED_DEV_USERS=alice", f"SHED_REMOTE_ENV_FILE={env}",
-                                "SHED_REMOTE_GITHUB_USER=someone")
+    env.write_text(_REMOTE_ENV_OK)
+    r, calls = _make_with_stubs(tmp_path, target, "SHED_DEV_USERS=alice", f"SHED_REMOTE_ENV_FILE={env}")
     assert r.returncode != 0
     assert "SHED_DEV_USERS is 'alice'" in r.stdout + r.stderr
     assert not [c for c in calls if "kill" in c or "serve --config" in c or c.startswith(("scp ", "uname -s"))], calls
@@ -2029,10 +2041,10 @@ def _launches(calls: list[str]) -> list[str]:
     return [c for c in calls if c.startswith("shed-server ") or "serve --config" in c or c.startswith("scp ")]
 
 
-def _remote_env(tmp_path: Path) -> tuple[str, str]:
+def _remote_env(tmp_path: Path) -> tuple[str]:
     env = tmp_path / "remote.env"
-    env.write_text("SHED_REMOTE_ENV=dev\n")
-    return f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone"
+    env.write_text(_REMOTE_ENV_OK)
+    return (f"SHED_REMOTE_ENV_FILE={env}",)
 
 
 @pytest.mark.parametrize("mode", ["fail", "empty", "nothing"])
@@ -2043,9 +2055,8 @@ def _remote_env(tmp_path: Path) -> tuple[str, str]:
         # The same hole without --users: a state-dir render that fails.
         ("dev-server-up", ("SHED_DEV_STATE_DIR={tmp}/state",)),
         ("dev-server-up-fc", ("SHED_DEV_USERS=itest",)),
-        ("dev-server-up-remote", ("SHED_DEV_USERS=itest",)),
     ],
-    ids=["mac-users", "mac-state-dir", "fc-users", "remote-users"],
+    ids=["mac-users", "mac-state-dir", "fc-users"],
 )
 def test_a_render_that_fails_never_starts_a_server(tmp_path, target, assigns, mode):
     # Before the fix the Mac target went on to `serve --config ""` (shed-server's
@@ -2092,8 +2103,6 @@ def test_the_dev_targets_start_with_the_config_they_rendered(tmp_path):
         ("dev-server-up-fc", "itest", "configs/server.dev-parallel.linux-fc.yaml",
          f"{home}/.shed/dev/server.dev-fc.users.yaml", "scp "),
         ("dev-server-up-fc", "", None, None, "scp "),
-        ("dev-server-up-remote", "itest", f"{home}/.shed/dev-remote/server.yaml",
-         f"{home}/.shed/dev-remote/server.yaml.users", "shed-server serve"),
         ("dev-server-up-remote", "", None, None, "shed-server serve"),
     ):
         stubs = _render_stubs(tmp_path, darwin=target == "dev-server-up")
@@ -2117,6 +2126,18 @@ def test_the_dev_targets_start_with_the_config_they_rendered(tmp_path):
                     "dev-server-up-remote": f"{home}/.shed/dev-remote/server.yaml"}[target]
             assert config == want, (target, users, calls)
             assert Path(config).stat().st_size > 0
+
+
+def test_the_remote_dev_server_takes_no_itest_user_list(tmp_path):
+    # Its people come from the account service (auth.directory): the itest
+    # user list is refused before anything is rendered or started.
+    stubs = _render_stubs(tmp_path)
+    r, calls = _make_with_stubs(tmp_path, "dev-server-up-remote", *stubs, "SHED_DEV_USERS=itest", *_remote_env(tmp_path),
+                                env_extra={"RENDER_MODE": "ok"})
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "takes its people from the account service" in out, out
+    assert not _renders(calls) and not _launches(calls), calls
 
 
 # A stand-in shed-server that comes up the way the probe wants it (two
@@ -2182,9 +2203,9 @@ def test_mac_dev_server_up_names_its_identity_and_says_when_to_re_add(tmp_path, 
         assert "NOTE:" not in out and "shed server remove" not in out, out
 
 
-@pytest.mark.parametrize(
-    "target", ["dev-server-restart", "dev-server-restart-fc", "dev-server-restart-remote"],
-)
+# The remote dev server takes no itest user list (its people are the account
+# service's); its own render's failure is test_an_empty_config_never_...'s.
+@pytest.mark.parametrize("target", ["dev-server-restart", "dev-server-restart-fc"])
 def test_a_render_that_fails_stops_a_restart_before_the_stop(tmp_path, target):
     pid_file, proc = _remote_home(tmp_path)
     try:
@@ -2204,16 +2225,15 @@ def test_a_render_that_fails_stops_a_restart_before_the_stop(tmp_path, target):
         proc.wait()
 
 
-@pytest.mark.parametrize(
-    "target", ["dev-server-restart", "dev-server-restart-fc", "dev-server-restart-remote"],
-)
+@pytest.mark.parametrize("target", ["dev-server-restart", "dev-server-restart-fc", "dev-server-restart-remote"])
 def test_a_restart_with_a_render_that_works_does_stop_then_start(tmp_path, target):
     # The control for the test above: the same restart with a working render
     # reaches the stop and then the launch.
     pid_file, proc = _remote_home(tmp_path)
     try:
         stubs = _render_stubs(tmp_path, darwin=target == "dev-server-restart")
-        r, calls = _make_with_stubs(tmp_path, target, *stubs, "SHED_DEV_USERS=itest", *_remote_env(tmp_path),
+        users = "" if target == "dev-server-restart-remote" else "itest"
+        r, calls = _make_with_stubs(tmp_path, target, *stubs, f"SHED_DEV_USERS={users}", *_remote_env(tmp_path),
                                     env_extra={"RENDER_MODE": "ok"})
         stop = {"dev-server-restart": lambda c: c.startswith("uname -s"),
                 "dev-server-restart-fc": lambda c: "kill -TERM" in c,
@@ -2268,7 +2288,7 @@ def test_the_fc_target_with_the_real_renderer_and_a_half_key_pair_uploads_nothin
     assert not (tmp_path / "home" / ".shed" / "dev" / "server.dev-fc.users.yaml").exists()
 
 
-@pytest.mark.parametrize("target", ["dev-server-up", "dev-server-up-fc", "dev-server-up-remote", "dev-itest-users"])
+@pytest.mark.parametrize("target", ["dev-server-up", "dev-server-up-fc", "dev-itest-users"])
 def test_the_users_dir_is_one_argument_and_never_code(tmp_path, target):
     pwned = tmp_path / "pwned"
     users_dir = f'{tmp_path}/keys dir"; touch {pwned}; echo "`touch {pwned}`'

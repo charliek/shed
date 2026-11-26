@@ -329,14 +329,18 @@ func TestShedRecordRoutesCarryIsolation(t *testing.T) {
 // local backend and the sizes' one architecture on remote, omitted when the
 // sizes mix; the uniform_shed_record token is always advertised.
 func TestInfoGuestArchAndUniformRecordToken(t *testing.T) {
-	remote := func(sizes map[string]config.RemoteSizeConfig) http.Handler {
+	remote := func(cat *backend.ComputeCatalog) http.Handler {
 		cfg := &config.ServerConfig{
 			Name:           "test-server",
 			DefaultBackend: config.BackendRemote,
-			Remote:         &config.RemoteConfig{Environment: "test", DefaultSize: "standard", Sizes: sizes},
+			Remote:         &config.RemoteConfig{},
 		}
-		return NewServer(newAsyncFakeBackend(), cfg, "", nil, nil).Router()
+		b := newAsyncFakeBackend()
+		b.catalog = cat
+		return NewServer(b, cfg, "", nil, nil).Router()
 	}
+	mixed := testCatalog("amd64")
+	mixed.Sizes[1].Arch, mixed.GuestArch = "arm64", ""
 	for _, tc := range []struct {
 		name string
 		h    http.Handler
@@ -344,14 +348,9 @@ func TestInfoGuestArchAndUniformRecordToken(t *testing.T) {
 	}{
 		{"firecracker", NewServer(newUserFakeBackend(), &config.ServerConfig{Name: "test-server", DefaultBackend: config.BackendFirecracker}, "", nil, nil).Router(), runtime.GOARCH},
 		{"vz", NewServer(routesFakeBackend{}, &config.ServerConfig{Name: "test-server", DefaultBackend: config.BackendVZ}, "", nil, nil).Router(), runtime.GOARCH},
-		{"remote, one arch", remote(map[string]config.RemoteSizeConfig{
-			"standard": {MachineType: "m-2", CPUs: 2, MemoryMB: 8192, Arch: "arm64"},
-			"large":    {MachineType: "m-8", CPUs: 8, MemoryMB: 32768, Arch: "arm64"},
-		}), "arm64"},
-		{"remote, mixed sizes", remote(map[string]config.RemoteSizeConfig{
-			"standard": {MachineType: "m-2", CPUs: 2, MemoryMB: 8192, Arch: "amd64"},
-			"large":    {MachineType: "m-8", CPUs: 8, MemoryMB: 32768, Arch: "arm64"},
-		}), ""},
+		{"remote, one arch", remote(testCatalog("arm64")), "arm64"},
+		{"remote, mixed sizes", remote(mixed), ""},
+		{"remote, no catalog read yet", remote(nil), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			raw, info := getInfo(t, tc.h)

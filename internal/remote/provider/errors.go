@@ -8,14 +8,13 @@ import (
 // Error kinds. Test for them with errors.Is; providers return them wrapped in
 // an *Error that says which call failed and why.
 var (
-	// ErrNotFound: the instance (or, for HostKeyReader, the published key)
-	// does not exist. Destroy never returns it: there, not found is
-	// success.
-	ErrNotFound = errors.New("instance not found")
+	// ErrNotFound: the machine (or the operation) does not exist. Destroy
+	// never returns it: there, not found is success.
+	ErrNotFound = errors.New("machine not found")
 
-	// ErrExists: Create's instance name is taken by an instance with a
-	// different shed_id.
-	ErrExists = errors.New("instance name already in use")
+	// ErrExists: Create's name is held by another machine of this server
+	// (another shed id).
+	ErrExists = errors.New("machine name already in use")
 
 	// ErrQuota: the cloud refused because the project is at a quota (CPUs,
 	// addresses, disk). Retrying soon will not help; someone must free
@@ -35,27 +34,22 @@ var (
 	// SERVER_LIMIT_REACHED.
 	ErrLimit = errors.New("server limit reached")
 
-	// ErrBusy: the instance is in a transition that does not allow this
+	// ErrBusy: the machine is in a transition that does not allow this
 	// call. Nothing was changed. The caller waits for the transition with
 	// Wait(ctx, Settle(ref)) and calls again.
-	ErrBusy = errors.New("instance is busy with another operation")
+	ErrBusy = errors.New("machine is busy with another operation")
 
-	// ErrForeign: the instance's shed_env label names another environment.
-	// Nothing was changed. This is the guard that keeps one server off
-	// another server's sheds.
-	ErrForeign = errors.New("instance belongs to another environment")
-
-	// ErrInvalid: the request is malformed (a bad spec, a label that
-	// cannot be set). Nothing was sent to the cloud.
+	// ErrInvalid: the request is malformed (a bad spec, a reserved label).
+	// Nothing was changed.
 	ErrInvalid = errors.New("invalid request")
 
-	// ErrLabelTaken: ClaimLabel found the label holding another non-empty
-	// value. Nothing was changed.
-	ErrLabelTaken = errors.New("label already holds another value")
+	// ErrLabelTaken: a SetLabels condition (expect) did not hold. Nothing
+	// was changed.
+	ErrLabelTaken = errors.New("the labels are not as expected")
 
-	// ErrUnexpectedState: Wait saw the instance settle in a state other
-	// than the one asked for. The instance is returned alongside.
-	ErrUnexpectedState = errors.New("instance settled in an unexpected state")
+	// ErrUnexpectedState: Wait saw the machine settle in a state other than
+	// the one asked for. The machine is returned alongside.
+	ErrUnexpectedState = errors.New("machine settled in an unexpected state")
 )
 
 // Error kinds of a compute service (tests/compute-contract/v1): what each
@@ -103,6 +97,15 @@ var (
 	// answers 503 COMPUTE_UNAVAILABLE.
 	ErrUnavailable = errors.New("compute service unavailable")
 
+	// ErrNotDelivered: the request provably never reached the service: the
+	// connection was never made (refused, no such host, a TLS handshake
+	// that failed), no token could be had for it, or the request was never
+	// written. It comes with ErrUnavailable (503 COMPUTE_UNAVAILABLE), and
+	// unlike a lost reply it changed nothing: a create that was never
+	// delivered made no machine, and a start or stop never sent changed
+	// none.
+	ErrNotDelivered = errors.New("the request was never delivered")
+
 	// ErrInvalidReply: the service answered 2xx with a body the contract
 	// refuses (too large, not the call's shape, a machine object that
 	// breaks a rule, or one that echoes the bearer token).
@@ -124,8 +127,13 @@ type Error struct {
 	Kind error
 	// Op is the provider call that failed: "create", "wait", and so on.
 	Op string
-	// Detail is the cloud's own words, safe to log and to show an
-	// operator. It never contains credentials.
+	// Code is the compute contract's code the failure carried (an error
+	// code of the service's reply, or a failed operation's), "" when it
+	// carried none. The backend maps a refusal to the shed API by it.
+	Code string
+	// Detail says what failed in the provider's own words, safe to log
+	// and to show an operator. It never contains credentials, and never a
+	// service's message.
 	Detail string
 	// Err is the underlying error, if any.
 	Err error
@@ -140,6 +148,9 @@ func (e *Error) Error() string {
 	msg := "provider"
 	if e.Op != "" {
 		msg += " " + e.Op
+	}
+	if e.Code != "" {
+		msg += " (" + e.Code + ")"
 	}
 	switch {
 	case e.Kind != nil && e.Detail != "":
@@ -188,4 +199,13 @@ func Reason(err error) string {
 // limit.
 func IsRefusal(err error) bool {
 	return Reason(err) != ""
+}
+
+// CodeOf returns the compute contract's code err carries (Error.Code), or "".
+func CodeOf(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code
+	}
+	return ""
 }

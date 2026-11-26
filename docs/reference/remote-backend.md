@@ -16,11 +16,11 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 
 | `status` | Meaning | `status_reason` values |
 |---|---|---|
-| `starting` | A create or start is in progress, or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable`, `cloud_unreadable` |
+| `starting` | A create or start is in progress (or kept for the next pass), or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable`, `cloud_unreadable`, `firewall` |
 | `running` | The agent answered a probe. | empty |
 | `stopping` | A stop is in progress. | empty |
-| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `unreachable`, `host_key`, `isolation_lost`, `layout`, `firewall` |
-| `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key`, `layout`, `firewall` |
+| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `external`, `unreachable`, `host_key`, `access`, `isolation_lost`, `layout`, `firewall` |
+| `error` | The create failed. Only a delete leaves this state; the VM, if one was made, stays until then. | `capacity`, `quota`, `create_failed`, `host_key`, `access`, `layout`, `firewall` |
 
 | Reason | Meaning |
 |---|---|
@@ -30,21 +30,21 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
 | `limit` | The server's `limits` (`max_running` or `max_sheds`) were reached. |
-| `run_limit` | The shed ran for as long as its run limit and the cloud stopped it. |
 | `external` | The VM was stopped outside shed. |
 | `isolation_lost` | The network no longer isolates the shed. Not reported yet. |
 | `layout` | The VM's agent or guest layout is not compatible with this server. |
 | `create_failed` | The create failed for another reason; the server log has the detail. |
-| `host_key` | The host key the VM presented did not match the pinned key: a create ends in `error`, and a start leaves the shed `stopped` with its VM stopped again. |
+| `host_key` | The host key the VM presented did not match the pinned key, or the account service attested another: a create ends in `error`, and a start leaves the shed `stopped` with its VM stopped again. |
+| `access` | The machine offers no way in this server can use (only access kinds it does not know), or one at a host outside `remote.access.allow`; the server does not dial it. |
 | `firewall` | The [firewall check](#the-firewall-check) was failing when the server was about to ask the cloud for the VM, so it did not. |
 
-The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed at its next [pass over the cloud](#keeping-records-and-the-cloud-in-step), at most about a minute later, and until then lists the shed as `running`. It records the shed as `stopped` with reason `run_limit` when the VM stopped within two minutes of its run limit, and with reason `external` otherwise. `isolation_lost` is defined but no code path sets it yet.
+There is no run limit: each machine has a lease, and the account service deletes it at the lease's end, running or stopped. The server notices a VM stopped from outside shed at its next [pass over the cloud](#keeping-records-and-the-cloud-in-step), at most about a minute later, and until then lists the shed as `running`; it records it `stopped` with reason `external`. `isolation_lost` is defined but no code path sets it yet.
 
 `shed list -v` shows the reason beside the status (`stopped (external)`), and `shed list --json` and the API carry it as `status_reason`.
 
 ## Calls and statuses
 
-`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. Before it answers, the server runs the [firewall check](#the-firewall-check) when its last result is more than 60 s old (waiting at most 10 s for it), looks the image up (at most 10 s), and then waits for the cloud to accept the new VM, for at most 15 s, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; measured JSON creates answered after 11 to 15 s. Each step has its own bound, but the reply has no single one (it can also wait behind other work on the server's records), so give the request a timeout of a minute or more. A client whose request timed out may still have created the shed: get it by name before creating it again. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
+`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. Before it answers, the server runs the [firewall check](#the-firewall-check) when its last result is more than 60 s old (waiting at most 10 s for it), looks the image up (at most 10 s), and then waits for the cloud to accept the new VM, for at most 15 s, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; measured JSON creates answered after 11 to 15 s. A create the account service never received (it could not be reached: the connection was refused, or no token could be had) answers `503 COMPUTE_UNAVAILABLE` and leaves no shed. A create it received whose reply never came is not refused, since it may have made the machine: it answers 201 `starting` with reason `cloud_unreadable`, nothing is cleaned up, and the periodic pass sends it again under the same request id. A create whose name is still held by a machine being deleted answers `409 COMPUTE_DELETING` (the server waits for the name up to the same 15 s first). Each step has its own bound, but the reply has no single one (it can also wait behind other work on the server's records), so give the request a timeout of a minute or more. A client whose request timed out may still have created the shed: get it by name before creating it again. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
 
 | Call | `starting` | `running` | `stopping` | `stopped` | `error` |
 |---|---|---|---|---|---|
@@ -67,16 +67,16 @@ The server reads the cloud when it starts and then once a minute. Each pass list
 | The server finds | It does |
 |---|---|
 | A delete acknowledged more than two minutes ago whose VM still exists and has no delete job | Retries the destroy. The shed stays hidden. |
-| A `running` shed whose VM is stopped | Records it `stopped`, with reason `run_limit` or `external`. A VM still on its way down is recorded `stopping` first. |
+| A `running` shed whose VM is stopped | Records it `stopped`, with reason `external`. A VM still on its way down is recorded `stopping` first. |
 | A `stopped` shed whose VM is running | Records it `starting` and probes its agent. It never stops the VM. |
 | A `running` or `stopped` shed whose VM no longer exists | Removes the shed, after a read of that one VM confirms it. `shed delete` on it then answers "not found". |
 | A shed left `stopping` by a failed cloud call | Stops it again. |
-| A create that failed | Destroys its VM, retrying until it is gone. The shed stays, in `error`, until it is deleted. |
+| A create kept `starting` (its outcome unknown, its guest not answering in time, or the firewall check failing on a later run) | Runs it again, first finding the VM an earlier send may have made. |
 | A VM of this environment still labelled `creating` 15 minutes after the cloud made it, with no record | Destroys it. It is a create whose record was lost (the `state_dir`, or a server that died before writing it); nothing would ever list, limit or delete it. A younger one is left alone. |
 
 Each pass also runs the [firewall check](#the-firewall-check). Its result decides only whether creates and starts are accepted.
 
-A pass destroys a VM only for a delete that was acknowledged, a create that failed, or a create abandoned as in the last row. Any other VM it does not know (another environment's, one with labels of a schema it cannot read, or a finished one with no record) is left alone.
+A pass destroys a VM only for a delete that was acknowledged, or a create abandoned as in the last row. A create is cleaned up only when the account service refused that create itself, or never received it on the request's first run; once it may have been received, a later failure keeps the shed (`starting` with a reason for the next pass, or `error` when no retry changes it) and its VM, until the shed is deleted or the VM's lease ends. Any other VM it does not know (another environment's, one with labels of a schema it cannot read, or a finished one with no record) is left alone.
 
 Measured on the development server: a VM stopped with the cloud's own tools was listed `stopped (external)` 10 s after it finished stopping, and `shed start` brought it back in 42 s. A VM deleted with the cloud's tools lost its record 2 to 12 s after it was gone. A stopped shed's VM started with the cloud's tools was listed `starting` at the next pass and `running` 3 s later. A `shed delete` sent in between, for a shed whose VM was already gone, succeeded in under a second.
 
@@ -84,7 +84,7 @@ A VM that cannot be destroyed still runs, so two minutes after its delete it cou
 
 Measured with a VM put under the cloud's deletion protection: `shed delete` returned after 4 s with the error above, the VM kept running with its delete marker, a create 2 min 5 s later was refused at `max_running`, and each pass from then on retried the destroy. The VM was gone 80 s after the protection was cleared.
 
-Measured for a create that fails late, from a stock image with no shed agent: the create ended in `error` (`create_failed`) after 324 s, which is the 5 minute wait for the agent, and its VM and disk were gone 58 s later with no delete sent. For the run limit, with `max_run_duration: 10m`: the cloud stopped the VM at the limit, the shed was listed `stopped (run_limit)` 63 s after it, and `shed start` (44 s) gave the VM a new limit counted from that start.
+A create whose guest never answers (a stock image with no shed agent) is kept `starting` (`unreachable`) after the 5 minute wait for the agent, and each pass tries it again; delete the shed to remove its VM.
 
 The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 minutes an attempt and at most 3 attempts. A clone that still fails is a warning, as on the other backends: the shed runs without the repository.
 
@@ -117,36 +117,27 @@ The CLI refuses `--local-dir`, `--add-dir`, `--from-snapshot`, `--egress` and na
 
 ## Server information
 
-`GET /api/info` on a remote server reports `backend: "remote"`, the remote `default_image`, and in `features` the token `async_lifecycle`, and `network_profiles` unless the `firewall` config admits more than the server (mode `any`, or `acknowledge_any`). Beside them are the tokens every server sends (`overview`, `http_exec`, `exec_limits`, `mount_selection`, `uniform_shed_record` and `source_binding`), and `service_clients` when `auth.clients` is set (see [API › GET /api/info](api.md#get-apiinfo)). It also reports `isolation: "topology"`, and `guest_arch` when every configured size has the same `arch` (omitted when they mix). `isolation` names the backend's kind whether or not the current `firewall` config offers the `isolated` profile: `network_profiles` says whether it does, and each shed record's own `isolation` says what that shed has.
+`GET /api/info` on a remote server reports `backend: "remote"`, the account service's default image, and in `features` the token `async_lifecycle`, and `network_profiles` unless the `firewall` config admits more than the server (mode `any`, or `acknowledge_any`). Beside them are the tokens every server sends (`overview`, `http_exec`, `exec_limits`, `mount_selection`, `uniform_shed_record` and `source_binding`), and `service_clients` when `auth.clients` is set (see [API › GET /api/info](api.md#get-apiinfo)). It also reports `isolation: "topology"`, and `guest_arch` when every size of the service's catalog has the same `arch` (omitted when they mix, or before the catalog is read). `isolation` names the backend's kind whether or not the current `firewall` config offers the `isolated` profile: `network_profiles` says whether it does, and each shed record's own `isolation` says what that shed has.
 
 A remote shed's record carries what a Firecracker or VZ record does ([API › GET /api/sheds](api.md#get-apisheds)): `mounts` (always `{"mode": "selected"}`), `network_profile`, `isolation` (`topology` for an `isolated` shed, `none` for an `open` one, and `none` for an `isolated` one while the `firewall` config admits more than the server) and `arch`, the architecture of the shed's size, stored at create. `isolation` is the kind the server's configuration provides, not a live check that the cloud's network still isolates the VM. A record rebuilt at [adoption](#keeping-records-and-the-cloud-in-step) takes `arch` from the cloud's report of the VM's boot disk, which wins over the configured sizes; when the cloud reports none, from the configured sizes with the VM's machine type, only if they all agree (none when they disagree or none has that machine type). A shed created by a server older than `arch` reports none; nothing fills it in later. No response to a service client names the cloud project, zone or any address; a `503 FIREWALL_CHECK_FAILED` sent to an admin does name the rule, its source ranges and the server's own address, because the admin is who must fix them, and a service client gets the code with a message that names none of them.
 
 ## Sizes
 
-A remote server offers named sizes instead of arbitrary CPU and memory values. A create with neither `cpus` nor `memory_mb` gets `default_size`; otherwise it gets the smallest size that has at least both. The shed's record reports that size's CPUs and memory, and a service client's caps are checked against it. `upper_size_bytes` (`--upper-size`) sets the boot disk size, rounded up to whole GB, between 10 and 500 GB.
+A remote server offers its account service's named sizes (its catalog) instead of arbitrary CPU and memory values. A create with neither `cpus` nor `memory_mb` gets the catalog's default size; otherwise it gets the smallest size that has at least both, and `422 SIZE_UNAVAILABLE` when none has. The shed's record reports that size's CPUs and memory, and a service client's caps are checked against it. `upper_size_bytes` (`--upper-size`) sets the boot disk size, rounded up to whole GB, between 10 and 500 GB.
 
 ## Configuration
 
-The config file holds no project, zone, address or key. Every `*_env` field names a process environment variable that the server reads once at start-up; start-up fails, naming the variable, when one is missing. On a deb install they go in [`/etc/shed/server.env`](#the-variables-on-an-installed-server-deb).
+Every machine comes from the account service the server is enrolled with (`auth.directory`), over the compute contract; the service holds the cloud credential and decides sizes, images, leases and quotas. The config file holds no address or key. Every `*_env` field names a process environment variable that the server reads once at start-up; start-up fails, naming the variable, when one is missing. On a deb install they go in [`/etc/shed/server.env`](#the-variables-on-an-installed-server-deb).
 
 ```yaml
 default_backend: remote          # `detect` never picks it
 remote:
-  provider: gce                  # gce | fake (fake needs allow_test_drivers)
+  provider: service              # service (needs auth.directory) | fake (needs allow_test_drivers)
   transport: ssh                 # ssh | local (local needs allow_test_drivers)
   allow_test_drivers: false
-  environment: <env-name>        # required: 1-20 of a-z, 0-9 and -, starts with a letter
   state_dir: <path>              # record cache and delete markers (default <state dir>/remote)
-  default_image: <image-name>    # required
-  image_aliases:
-    cloud: <image-name>
-  default_size: standard
-  sizes:
-    standard: {machine_type: e2-standard-2, cpus: 2, memory_mb: 8192, arch: amd64}
-    large:    {machine_type: e2-standard-8, cpus: 8, memory_mb: 32768, arch: amd64}
-  disk_gb: 50
-  limits: {max_running: 2, max_sheds: 8}
-  max_run_duration: 24h          # 10m to 2880h; a client's shed gets the larger of this and its max_age
+  disk_gb: 0                     # 0: the size's own default; set, it wins
+  limits: {max_running: 0, max_sheds: 0}   # 0 is off: the service holds the quotas
   agent_dir: <path>              # holds shed-agent-linux-<arch> (default <state dir>/agent)
   agent_install: incompatible    # incompatible | always | never; only never is built (see below)
   ssh:
@@ -154,20 +145,15 @@ remote:
     client_key_file_env: SHED_REMOTE_SSH_KEY_FILE   # or a path to it; exactly one must be set
   firewall:                      # see "The firewall check"
     mode: static                 # static | auto | any
-    source_ranges: []            # static: the rule's sources, as IPv4 CIDRs, or
+    source_ranges: []            # static: the ingress's sources, as IPv4 CIDRs, or
     source_ranges_env: SHED_REMOTE_SOURCE_RANGES   # static: a variable holding them, comma-separated
     acknowledge_any: false       # must be true for mode: any, and for a static range wider than a /24
     echo_urls: []                # auto: at least two https services, on different hosts, that answer with the caller's address
-  gce:
-    project_env: SHED_GCE_PROJECT
-    zone_env: SHED_GCE_ZONE
-    network_env: SHED_GCE_NETWORK
-    subnet_env: SHED_GCE_SUBNET
-    credentials_env: GOOGLE_CREDENTIALS_BASE64        # base64 of the service account JSON key
-    credentials_file_env: SHED_GCE_CREDENTIALS_FILE   # or a path to it; exactly one must be set
+  access:
+    allow: []                    # CIDRs a machine's access host must be in; empty: every unicast address outside loopback, link-local, unspecified and multicast
 ```
 
-Only `environment` and `default_image` are required; every other field has the default shown. With `default_backend: remote` the server refuses to load when the config also has a `firecracker:` or `vz:` block, `env_file`, top-level `mounts`, `egress.enabled`, `network.allow_cidrs`, `extensions.enabled`, a client `policy.server_mounts`, a client `policy.images` entry that is not an `image_aliases` name, or `firewall.mode: any` (or `firewall.acknowledge_any: true` in any mode) beside service clients or an `isolated` default profile. A `remote:` block under any other backend is refused too.
+Every field has the default shown. The keys `environment`, `sizes`, `default_size`, `default_image`, `image_aliases`, the run limit and `gce` of earlier releases are refused by name, as is `provider: gce`. With `default_backend: remote` the server refuses to load when the config also has a `firecracker:` or `vz:` block, `env_file`, top-level `mounts`, `egress.enabled`, `network.allow_cidrs`, `extensions.enabled`, a client `policy.server_mounts`, or `firewall.mode: any` (or `firewall.acknowledge_any: true` in any mode) beside service clients or an `isolated` default profile. A client's `policy.images` is checked at create against the service's catalog. A `remote:` block under any other backend is refused too.
 
 One field is accepted by the loader but not built yet:
 
@@ -179,20 +165,15 @@ One field is accepted by the loader but not built yet:
 
 The deb's systemd unit reads `/etc/shed/server.env` if it exists (`EnvironmentFile=-/etc/shed/server.env`). The package ships no such file, and a server without one starts as before. systemd reads the file and passes its variables to `shed-server`; nothing else reads it. It is not the config's `env_file`, which holds variables for sheds.
 
-For the configuration above, the file holds the four `gce` variables, one of each pair (credentials and SSH client key), and the firewall's source ranges. The `*_FILE` variants keep the secrets in their own files:
+For the configuration above, the file holds one of the SSH client key pair and the firewall's source ranges. The `*_FILE` variant keeps the key in its own file:
 
 ```sh
 # /etc/shed/server.env: one NAME=value per line, no "export"
-SHED_GCE_PROJECT=PROJECT_ID
-SHED_GCE_ZONE=ZONE
-SHED_GCE_NETWORK=NETWORK_NAME
-SHED_GCE_SUBNET=SUBNET_NAME
-SHED_GCE_CREDENTIALS_FILE=/etc/shed/remote/service-account.json
 SHED_REMOTE_SSH_KEY_FILE=/etc/shed/remote/ssh_client_key
 SHED_REMOTE_SOURCE_RANGES=203.0.113.7/32
 ```
 
-If your `server.yaml` names other variables, use its names. To use `GOOGLE_CREDENTIALS_BASE64` or `SHED_REMOTE_SSH_KEY` instead of a file, write the base64 value on one line (`base64 -w0`), and leave the matching `*_FILE` variable out: exactly one of each pair may be set. The files the `*_FILE` variables name must be readable by the user the server runs as (root, under the deb's unit).
+If your `server.yaml` names other variables, use its names. To use `SHED_REMOTE_SSH_KEY` instead of a file, write the base64 value on one line (`base64 -w0`), and leave `SHED_REMOTE_SSH_KEY_FILE` out: exactly one of the pair may be set. The files the `*_FILE` variables name must be readable by the user the server runs as (root, under the deb's unit).
 
 Create the file owned by root with mode 0600, since it can hold credentials, then restart the server. The first command makes an empty file: run it once, since it would empty a file that already holds your settings.
 
@@ -203,11 +184,10 @@ sudo systemctl restart shed-server
 sudo journalctl -u shed-server -n 50 --no-pager
 ```
 
-A server that started prints `Initialized remote backend (provider=gce, transport=ssh, environment=ENV_NAME, default_image="IMAGE_NAME")`, then the [firewall check](#the-firewall-check)'s result (`remote: firewall check passed (...)`). A variable that the config names and the file lacks stops the start, and the log names it:
+A server that started prints `Initialized remote backend (provider=service, transport=ssh)`, then the [firewall check](#the-firewall-check)'s result (`remote: firewall check passed (...)`). A variable that the config names and the file lacks stops the start, and the log names it:
 
 ```text
-remote backend: environment variable SHED_GCE_PROJECT (remote.gce.project_env) is not set
-remote backend: neither environment variable GOOGLE_CREDENTIALS_BASE64 (remote.gce.credentials_env) nor SHED_GCE_CREDENTIALS_FILE (remote.gce.credentials_file_env) is set; set exactly one
+remote backend: neither environment variable SHED_REMOTE_SSH_KEY (remote.ssh.client_key_env) nor SHED_REMOTE_SSH_KEY_FILE (remote.ssh.client_key_file_env) is set; set exactly one
 ```
 
 The unit tries again every 5 seconds; after fixing the file, run `sudo systemctl restart shed-server` to start it at once. `shed-server config-validate` does not read these variables.
@@ -327,7 +307,7 @@ A server stop leaves every VM as it is: running sheds keep running and keep cost
 - A VM labelled ready that has no record is adopted under its own shed ID, with the user its `shed_user` label names (see [Users](#users)).
 - A record left `starting` or `stopping` resumes its job (so does one the periodic pass picks up after a cloud read failed). A create resumed this way has lost its delivery bundle, which was held in memory only, and reads its record only: it never asks a source or probes the agent, whatever source would answer today, and never rewrites a step already recorded. When stage 1 was not recorded before the stop, no step runs, every step stays `owed`, and `shed provision <name>` finishes the shed. When stage 1 was recorded (in any state), the clone runs if it is owed; stage 2 is skipped `not_applicable` when stage 1 was, and stays `owed` otherwise (it needs the bundle); the install hook runs once stage 1, the clone and stage 2 are all `done` or `skipped`, and stays `owed` otherwise. A step recorded `failed` is not tried again by the resumed job. At the first start of a server that records where each shed's user came from, resumed creates wait until the older sheds' origins are recorded (see [Credential delivery](delivery.md#where-a-sheds-user-came-from)).
 - A VM's `shed_user_origin` label records where its user came from (`local` or `directory`), written at create and, with the `shed_user` label in the same update, when a shed is assigned. A VM adopted without a record, or a record restored from a VM's `shed_user` label, takes its origin from that label and nothing else; with no such label (or another value) the origin is recorded `unknown`, which the start-up migration never fills, and the shed gets no delivery until it is recreated. A record whose origin disagrees with its VM's label for the same user becomes `unknown` too. The label is trusted on adoption and recovery, so whoever can write the cloud project's instance labels is inside the trusted control plane.
-- A record whose VM is stopped but was `running` becomes `stopped` with reason `run_limit` or `external`.
+- A record whose VM is stopped but was `running` becomes `stopped` with reason `external`.
 - A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
 - A VM labelled `deleting`, or one with a local delete marker, is deleted. So is a VM still labelled `creating` 15 minutes after the cloud made it that has no record: a create nobody will finish. Nothing else is ever removed.
 

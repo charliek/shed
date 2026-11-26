@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -14,34 +13,31 @@ import (
 	"github.com/charliek/shed/internal/remote"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/provider/fake"
-	"github.com/charliek/shed/internal/remote/provider/gce"
+	"github.com/charliek/shed/internal/remote/provider/service"
 	"github.com/charliek/shed/internal/remote/transport"
 	"github.com/charliek/shed/internal/remote/transport/locallink"
 	"github.com/charliek/shed/internal/remote/transport/sshlink"
 )
 
 // backendReadyTimeout is how long start-up waits for the remote backend's
-// first complete list of the cloud before giving up. The list is retried for
-// that long; a server that cannot list its environment must not serve shed
-// routes, because it cannot tell which sheds exist.
+// first complete list of the machines. Past it the server starts degraded:
+// it serves its records, keeps existing links working and refuses creates,
+// starts, stops, deletes and extends with 503 COMPUTE_UNAVAILABLE, and the
+// start-up pass keeps retrying until the account service answers.
 const backendReadyTimeout = 2 * time.Minute
 
-// keepFailedCreateEnv, when set to "1", leaves the VM of a failed create in
-// place for inspection instead of destroying it. Deleting the shed removes
-// it.
-const keepFailedCreateEnv = "SHED_REMOTE_KEEP_FAILED_CREATE"
-
 // newRemoteBackend builds the remote backend from the server config and the
-// process environment: the provider (gce, or the in-memory fake), the link
-// factory (ssh with the server's client key, or the local test link) and the
-// record cache. It makes no cloud call; the caller runs Reconcile.
-func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.Backend, error) {
+// process environment: the provider (the account service's compute, over
+// the directory runtime's session, or the in-memory fake), the link factory
+// (ssh with the server's client key, or the local test link) and the record
+// cache. It makes no call to the service; the caller runs Reconcile.
+func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge, session service.Session) (*remote.Backend, error) {
 	rcfg := cfg.Remote
 	if rcfg == nil {
 		return nil, fmt.Errorf("remote backend enabled but the remote config block is missing")
 	}
-	// The one place the environment is read: project, zone, network, the
-	// credentials and the SSH client key. Errors name the variable.
+	// The one place the environment is read: the SSH client key and the
+	// firewall's sources. Errors name the variable.
 	rt, err := rcfg.Resolve(nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote backend: %w", err)
@@ -51,32 +47,23 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.
 
 	var prov provider.Provider
 	switch rcfg.Provider {
-	case config.RemoteProviderGCE:
-		creds, err := gce.ParseCredentials(rt.Credentials)
-		if err != nil {
-			return nil, fmt.Errorf("remote backend: service account credentials: %w", err)
+	case config.RemoteProviderService:
+		if session == nil {
+			return nil, fmt.Errorf("remote backend: provider: %s needs auth.directory (the account service it gets machines from)", config.RemoteProviderService)
 		}
-		client, err := gce.New(gce.Config{
-			Project: rt.Project,
-			Zone:    rt.Zone,
-			Env:     rcfg.Environment,
-			Network: rt.Network,
-			Subnet:  rt.Subnet,
-			Sizes:   rcfg.SizeList(),
-			Token:   creds,
-		})
+		client, err := service.New(service.Config{Session: session, TestDrivers: rcfg.AllowTestDrivers})
 		if err != nil {
-			return nil, fmt.Errorf("remote backend: gce provider: %w", err)
+			return nil, fmt.Errorf("remote backend: %w", err)
 		}
 		prov = client
 	case config.RemoteProviderFake:
-		// The fake's firewall rule carries whatever static mode expects, so
-		// the check passes; with no ranges given it is the fake's own
+		// The fake's ingress carries whatever static mode expects, so the
+		// check passes; with no ranges given it is the fake's own
 		// documentation address.
 		if rcfg.Firewall.Mode == config.RemoteFirewallStatic && len(firewallSources) == 0 {
-			firewallSources = []string{fake.DefaultFirewallSource}
+			firewallSources = []string{fake.DefaultIngressSource}
 		}
-		prov = fake.New(fake.Options{Env: rcfg.Environment, FirewallSources: firewallSources})
+		prov = fake.New(fake.Options{IngressSources: firewallSources})
 	default:
 		return nil, fmt.Errorf("remote backend: unknown provider %q", rcfg.Provider)
 	}
@@ -107,14 +94,13 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.
 	}
 
 	return remote.New(remote.Options{
-		Config:           rcfg,
-		Server:           cfg,
-		Provider:         prov,
-		Links:            links,
-		StateDir:         rcfg.StateDirPath(stateRoot),
-		AuthorizedKeys:   authorizedKeys,
-		FirewallSources:  firewallSources,
-		Bridge:           bridge,
-		KeepFailedCreate: os.Getenv(keepFailedCreateEnv) == "1",
+		Config:          rcfg,
+		Server:          cfg,
+		Provider:        prov,
+		Links:           links,
+		StateDir:        rcfg.StateDirPath(stateRoot),
+		AuthorizedKeys:  authorizedKeys,
+		FirewallSources: firewallSources,
+		Bridge:          bridge,
 	})
 }

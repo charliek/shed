@@ -323,9 +323,7 @@ def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: 
             "provider": "fake",
             "transport": "local",
             "allow_test_drivers": True,
-            "environment": "itest-dir",
             "state_dir": str(state_dir / "remote"),
-            "default_image": "family/fake-image",
             # serve runs <agent_dir>/shed-agent-linux-<arch>.
             "agent_dir": str(agent_dir),
             "agent_install": "never",
@@ -333,7 +331,7 @@ def server_config(*, http_port: int, https_port: int, ssh_port: int, state_dir: 
             # (the default lets two run).
             "limits": {"max_running": 8, "max_sheds": 12},
             # Static mode needs a source; a documentation address, which the
-            # fake provider's rule is made to match.
+            # fake provider's ingress is made to match.
             "firewall": {"mode": "static", "source_ranges": ["192.0.2.10/32"]},
         },
     }

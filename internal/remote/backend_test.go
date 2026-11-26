@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,7 +31,6 @@ import (
 )
 
 const (
-	testEnv     = "test"
 	testKey     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIserverkeyserverkeyserverkeyserverkeyserverke"
 	testHostKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIhostkeyhostkeyhostkeyhostkeyhostkeyhostkey00"
 	testTimeout = 20 * time.Second
@@ -49,7 +49,6 @@ type fakeLinks struct {
 	// presented, when set, makes each Dial run the host key check the SSH
 	// link runs: Pin, then Learn when there is no pin.
 	presented string
-	dials     int
 }
 
 func newFakeLinks() *fakeLinks {
@@ -64,13 +63,6 @@ func (f *fakeLinks) Name() string { return "fake" }
 
 func (f *fakeLinks) Open(_ context.Context, target transport.Target) (transport.Link, error) {
 	return &fakeLink{f: f, target: target}, nil
-}
-
-// dialCount is how many connections to guests have been asked for.
-func (f *fakeLinks) dialCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.dials
 }
 
 func (f *fakeLinks) fail(name string, errs ...error) {
@@ -108,7 +100,6 @@ func (l *fakeLink) Dial(ctx context.Context, port uint32) (net.Conn, error) {
 	}
 	f := l.f
 	f.mu.Lock()
-	f.dials++
 	name := l.target.ShedName
 	var err error
 	if q := f.queue[name]; len(q) > 0 {
@@ -216,21 +207,15 @@ func newEnv(t *testing.T, opts ...envOpt) *env {
 		fl:  newFakeLinks(),
 		dir: t.TempDir(),
 		cfg: &config.RemoteConfig{
-			Provider:     config.RemoteProviderFake,
-			Transport:    config.RemoteTransportSSH,
-			Environment:  testEnv,
-			DefaultImage: "shed-image-1",
-			DefaultSize:  provider.SizeStandard,
-			Sizes: map[string]config.RemoteSizeConfig{
-				provider.SizeStandard: {MachineType: "e2-standard-2", CPUs: 2, MemoryMB: 8192, Arch: provider.ArchAMD64},
-			},
-			DiskGB:         50,
-			Limits:         config.RemoteLimitsConfig{MaxRunning: 8, MaxSheds: 16},
-			MaxRunDuration: config.Duration(24 * time.Hour),
+			Provider:         config.RemoteProviderFake,
+			Transport:        config.RemoteTransportSSH,
+			AllowTestDrivers: true,
+			DiskGB:           50,
+			Limits:           config.RemoteLimitsConfig{MaxRunning: 8, MaxSheds: 16},
 		},
 	}
 	e.links = e.fl
-	fo := fake.Options{Env: testEnv}
+	fo := fake.Options{}
 	for _, o := range opts {
 		o(e, &fo)
 	}
@@ -269,13 +254,14 @@ func (e *env) open() *Backend {
 		Links:               e.links,
 		StateDir:            e.dir,
 		AuthorizedKeys:      []string{testKey},
-		FirewallSources:     []string{fake.DefaultFirewallSource},
-		FastFailWindow:      60 * time.Millisecond,
+		FirewallSources:     []string{fake.DefaultIngressSource},
+		FastFailWindow:      250 * time.Millisecond,
 		BootTimeout:         2 * time.Second,
 		AuthGrace:           300 * time.Millisecond,
 		ProbeInterval:       5 * time.Millisecond,
 		HostKeyPollInterval: 20 * time.Millisecond,
 		CloneRetryPause:     time.Millisecond,
+		UnknownRetryPause:   time.Millisecond,
 		// The periodic pass runs only when a test calls Sweep, and a delete
 		// marker with no job is retried whatever its age.
 		SweepInterval:  -1,
@@ -328,16 +314,22 @@ func ctxT(t *testing.T) context.Context {
 
 func (e *env) ref(name string) provider.Ref {
 	e.t.Helper()
-	insts, err := e.prov.List(context.Background(), provider.Selector{Env: testEnv})
+	insts, err := instances(e.prov, context.Background())
 	if err != nil {
 		e.t.Fatalf("List: %v", err)
 	}
 	for _, inst := range insts {
-		if inst.Labels[provider.LabelName] == name {
+		if inst.Name == name {
 			return inst.Ref
 		}
 	}
 	return ""
+}
+
+// instances is the provider's live machines.
+func instances(p provider.Provider, ctx context.Context) ([]provider.Instance, error) {
+	l, err := p.List(ctx)
+	return l.Instances, err
 }
 
 // finish completes the cloud operation in flight on a shed's instance,
@@ -368,7 +360,7 @@ func (e *env) auto() {
 				return
 			case <-time.After(2 * time.Millisecond):
 			}
-			insts, _ := e.prov.List(context.Background(), provider.Selector{})
+			insts, _ := instances(e.prov, context.Background())
 			for _, inst := range insts {
 				e.prov.Complete(inst.Ref)
 			}
@@ -512,7 +504,7 @@ func TestCallTable(t *testing.T) {
 				// WaitSettled lasts until the VM is gone, then reports the
 				// shed not found. The provider is manual, so while an
 				// instance exists the delete cannot have finished.
-				if insts, _ := e.prov.List(ctx, provider.Selector{}); len(insts) != 0 {
+				if insts, _ := instances(e.prov, ctx); len(insts) != 0 {
 					short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 					_, err := e.b.WaitSettled(short, name)
 					cancel()
@@ -524,7 +516,7 @@ func TestCallTable(t *testing.T) {
 				if _, err := e.b.WaitSettled(ctx, name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
 					t.Fatalf("WaitSettled after delete = %v, want not found", err)
 				}
-				if insts, _ := e.prov.List(ctx, provider.Selector{}); len(insts) != 0 {
+				if insts, _ := instances(e.prov, ctx); len(insts) != 0 {
 					t.Fatalf("%d instances left when WaitSettled reported the shed gone", len(insts))
 				}
 				e.idle()
@@ -579,9 +571,9 @@ func TestCreateFastFailLeavesNoRecord(t *testing.T) {
 		arrange func(p *fake.Provider)
 		want    error
 	}{
-		{"capacity from the operation", func(p *fake.Provider) {
-			p.FailOperation(fake.OpCreate, provider.Errorf(provider.ErrCapacity, "wait", "zone is full"))
-		}, config.ErrZoneCapacityUnavailableSentinel},
+		// A refusal at the create call itself. One from the operation
+		// comes after the create was accepted: the record stays
+		// (TestCreateLateFailureLeavesError).
 		{"quota from the call", func(p *fake.Provider) {
 			p.FailNext(fake.OpCreate, provider.Errorf(provider.ErrQuota, "create", "CPUS"))
 		}, config.ErrCloudQuotaExceededSentinel},
@@ -609,26 +601,31 @@ func TestCreateFastFailLeavesNoRecord(t *testing.T) {
 }
 
 func TestCreateLateFailureLeavesError(t *testing.T) {
+	// A create that was accepted and failed later keeps its record and its
+	// machine (the clean-up rule in failCreate): in error with the reason
+	// when no retry changes it, or kept starting for the next pass (a guest
+	// that does not answer in time). A person's delete removes both.
 	tests := []struct {
 		name       string
 		arrange    func(e *env)
+		wantStatus string
 		wantReason string
 	}{
-		{"capacity", func(e *env) {
+		{"capacity from the operation", func(e *env) {
 			e.prov.FailOperation(fake.OpCreate, provider.Errorf(provider.ErrCapacity, "wait", "zone is full"))
-		}, config.StatusReasonCapacity},
+		}, config.StatusError, config.StatusReasonCapacity},
 		{"operation error", func(e *env) {
 			e.prov.FailOperation(fake.OpCreate, errors.New("boom"))
-		}, config.StatusReasonCreateFailed},
+		}, config.StatusError, config.StatusReasonCreateFailed},
 		{"host key mismatch", func(e *env) {
 			e.fl.failAlways("late", transport.ErrHostKeyMismatch)
-		}, config.StatusReasonHostKey},
+		}, config.StatusError, config.StatusReasonHostKey},
 		{"incompatible agent", func(e *env) {
 			e.fl.info = guest.AgentInfo{Protocol: 0, Layout: 1}
-		}, config.StatusReasonLayout},
+		}, config.StatusError, config.StatusReasonLayout},
 		{"key refused for too long", func(e *env) {
 			e.fl.failAlways("late", transport.ErrAuth)
-		}, config.StatusReasonCreateFailed},
+		}, config.StatusStarting, config.StatusReasonUnreachable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -640,20 +637,29 @@ func TestCreateLateFailureLeavesError(t *testing.T) {
 				t.Fatalf("create = %+v, %v; want starting", shed, err)
 			}
 			e.auto()
-			got := e.settled("late")
-			if got.Status != config.StatusError || got.StatusReason != tt.wantReason {
-				t.Fatalf("settled %q (%q), want error (%q)", got.Status, got.StatusReason, tt.wantReason)
-			}
 			e.idle()
-			// The failed create's VM is destroyed; the record outlives it.
-			if insts, _ := e.prov.List(context.Background(), provider.Selector{}); len(insts) != 0 {
-				t.Fatalf("%d instances left after a failed create", len(insts))
+			got, _ := e.b.GetShed(ctxT(t), "late")
+			if got.Status != tt.wantStatus || got.StatusReason != tt.wantReason {
+				t.Fatalf("ended %q (%q), want %s (%q)", got.Status, got.StatusReason, tt.wantStatus, tt.wantReason)
 			}
-			if _, err := e.b.StartShed(ctxT(t), "late"); !errors.Is(err, config.ErrShedNotStoppedSentinel) {
-				t.Fatalf("start on an error shed = %v", err)
+			// Nothing is cleaned up: no marker, and the machine stays.
+			if n := markerCount(t, e.dir); n != 0 {
+				t.Fatalf("%d delete markers after a failed create", n)
+			}
+			if e.prov.Count(fake.OpDestroy) != 0 {
+				t.Fatal("a failed create was destroyed")
+			}
+			if tt.wantStatus == config.StatusError {
+				if _, err := e.b.StartShed(ctxT(t), "late"); !errors.Is(err, config.ErrShedNotStoppedSentinel) {
+					t.Fatalf("start on an error shed = %v", err)
+				}
 			}
 			if err := e.b.DeleteShed(ctxT(t), "late"); err != nil {
-				t.Fatalf("delete of an error shed: %v", err)
+				t.Fatalf("delete of the shed: %v", err)
+			}
+			e.idle()
+			if insts, _ := instances(e.prov, context.Background()); len(insts) != 0 {
+				t.Fatalf("%d instances left after the delete", len(insts))
 			}
 		})
 	}
@@ -709,18 +715,6 @@ func TestStartRefused(t *testing.T) {
 			t.Fatalf("shed is %q (%q), want stopped (limit)", got.Status, got.StatusReason)
 		}
 	})
-	t.Run("run limit is passed to the provider", func(t *testing.T) {
-		e := newEnv(t)
-		e.cfg.MaxRunDuration = config.Duration(3 * time.Hour)
-		if _, err := e.create("lim"); err != nil {
-			t.Fatal(err)
-		}
-		e.settled("lim")
-		inst, err := e.prov.Get(context.Background(), e.ref("lim"))
-		if err != nil || inst.MaxRun != 3*time.Hour {
-			t.Fatalf("instance run limit = %v, %v; want 3h", inst.MaxRun, err)
-		}
-	})
 }
 
 // --- delete ---
@@ -734,16 +728,30 @@ func TestDeleteDuringCreate(t *testing.T) {
 	if n := markerCount(t, e.dir); n != 1 {
 		t.Fatalf("%d delete markers right after the delete, want 1", n)
 	}
-	// The name is free at once.
-	if _, err := e.create("gone"); err != nil {
-		t.Fatalf("create under the deleted shed's name: %v", err)
+	// The name is free here at once, but the old machine holds it at the
+	// service until it is gone: a create waits for it for the fast-fail
+	// window, then is refused 409 COMPUTE_DELETING (never
+	// SHED_ALREADY_EXISTS: nothing is there to adopt) and leaves nothing.
+	_, err := e.create("gone")
+	var cr *config.ComputeRefusal
+	if !errors.As(err, &cr) || cr.Status != http.StatusConflict || cr.Code != config.ErrComputeDeleting || cr.Reason != "" ||
+		errors.Is(err, config.ErrShedAlreadyExistsSentinel) {
+		t.Fatalf("create while the old machine is deleted = %v, want 409 COMPUTE_DELETING", err)
 	}
+	if _, err := e.b.GetShed(ctxT(t), "gone"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("the refused create left a record: %v", err)
+	}
+	// Once the machine is gone the same create goes through.
 	e.auto()
+	e.idle()
+	if _, err := e.create("gone"); err != nil {
+		t.Fatalf("create under the deleted shed's name after its machine went: %v", err)
+	}
 	if got := e.settled("gone"); got.Status != config.StatusRunning {
 		t.Fatalf("the new shed settled %q", got.Status)
 	}
 	e.idle()
-	insts, _ := e.prov.List(context.Background(), provider.Selector{})
+	insts, _ := instances(e.prov, context.Background())
 	if len(insts) != 1 {
 		t.Fatalf("%d instances after delete and re-create, want 1", len(insts))
 	}
@@ -765,7 +773,7 @@ func TestDeleteMarkerSurvivesRestart(t *testing.T) {
 	}
 	e.auto()
 	e.idle()
-	if insts, _ := e.prov.List(context.Background(), provider.Selector{}); len(insts) != 0 {
+	if insts, _ := instances(e.prov, context.Background()); len(insts) != 0 {
 		t.Fatalf("%d instances left; the restarted server should have finished the delete", len(insts))
 	}
 }
@@ -811,7 +819,7 @@ func TestRestartResumesJobs(t *testing.T) {
 			if got.Status != tt.wantEnd || got.ID != id {
 				t.Fatalf("came to rest %q (%q) id %s, want %q id %s", got.Status, got.StatusReason, got.ID, tt.wantEnd, id)
 			}
-			if insts, _ := e.prov.List(context.Background(), provider.Selector{}); len(insts) != 1 {
+			if insts, _ := instances(e.prov, context.Background()); len(insts) != 1 {
 				t.Fatalf("%d instances after the resumed job, want 1", len(insts))
 			}
 			if n := e.prov.Count(fake.OpDestroy); n != 0 {
@@ -881,9 +889,34 @@ func TestAdoptionAfterCacheLoss(t *testing.T) {
 	if n := e.prov.Count(fake.OpDestroy) + e.prov.Count(fake.OpStart); n != 0 {
 		t.Fatalf("adoption made %d destroy or start calls, want none", n)
 	}
-	if insts, _ := e.prov.List(context.Background(), provider.Selector{}); len(insts) != 3 {
+	if insts, _ := instances(e.prov, context.Background()); len(insts) != 3 {
 		t.Fatalf("%d instances after adoption, want 3", len(insts))
 	}
+}
+
+// newID is a new shed id.
+func newID(t *testing.T) string {
+	t.Helper()
+	id, err := config.NewShedID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// seedMachine puts a settled, running machine in the provider as if this
+// server had made it and lost its record.
+func (e *env) seedMachine(name, id string, st provider.ShedState, created time.Time) provider.Ref {
+	e.t.Helper()
+	spec, err := provider.ShedSpec{CreatedAt: time.Now(), Network: "open", UserOrigin: "local"}.Encode()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	labels := map[string]string{}
+	if st != "" {
+		labels[provider.LabelState] = string(st)
+	}
+	return e.prov.Seed(provider.Instance{Ref: provider.Ref(id), Name: name, State: provider.StateRunning, Labels: labels, Spec: spec, CreatedAt: created})
 }
 
 func TestReconcileLeavesTheRestAlone(t *testing.T) {
@@ -891,26 +924,9 @@ func TestReconcileLeavesTheRestAlone(t *testing.T) {
 	if err := e.b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	seed := func(name, id string, st provider.ShedState, env string) {
-		ident := provider.Identity{Env: env, ID: id, Name: name}
-		spec, _ := provider.ShedSpec{CreatedAt: time.Now(), Image: "img", Size: "standard", Network: "open"}.Encode()
-		e.prov.Seed(provider.Instance{
-			Name:     ident.InstanceName(),
-			State:    provider.StateRunning,
-			Labels:   ident.Labels(st),
-			Metadata: map[string]string{provider.MetadataShedSpec: spec},
-		})
-	}
-	seed("half-made", "aaaaaaaaaaaa", provider.ShedStateCreating, testEnv)
-	seed("doomed", "bbbbbbbbbbbb", provider.ShedStateDeleting, testEnv)
-	// Old enough to be an abandoned create, but another environment's.
-	theirs := provider.Identity{Env: "other", ID: "dddddddddddd", Name: "their-half"}
-	e.prov.Seed(provider.Instance{
-		Name: theirs.InstanceName(), State: provider.StateRunning,
-		Labels: theirs.Labels(provider.ShedStateCreating), CreatedAt: time.Now().Add(-2 * StaleCreateAge),
-	})
-	seed("theirs", "cccccccccccc", provider.ShedStateReady, "other")
-	e.prov.Seed(provider.Instance{Name: "unlabelled", State: provider.StateRunning})
+	e.seedMachine("half-made", newID(t), provider.ShedStateCreating, time.Now())
+	e.seedMachine("doomed", newID(t), provider.ShedStateDeleting, time.Now())
+	e.seedMachine("unlabelled", newID(t), "", time.Now())
 
 	e.b = e.open()
 	e.idle()
@@ -918,23 +934,25 @@ func TestReconcileLeavesTheRestAlone(t *testing.T) {
 	if len(sheds) != 0 {
 		t.Fatalf("reconcile adopted %d sheds, want none", len(sheds))
 	}
-	insts, _ := e.prov.List(context.Background(), provider.Selector{})
+	insts, _ := instances(e.prov, context.Background())
 	left := map[string]bool{}
 	for _, inst := range insts {
-		left[inst.Labels[provider.LabelName]] = true
+		left[inst.Name] = true
 	}
-	if left["doomed"] || !left["half-made"] || !left["theirs"] || !left["their-half"] || len(insts) != 4 {
-		t.Fatalf("instances left: %v; want everything but the one labelled deleting", left)
+	if left["doomed"] || !left["half-made"] || !left["unlabelled"] || len(insts) != 2 {
+		t.Fatalf("machines left: %v; want everything but the one labelled deleting", left)
 	}
-	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, "half-made") {
-		t.Fatalf("the creating instance was not reported: %q", rep)
+	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, "half-made") || !strings.Contains(rep, "unlabelled") {
+		t.Fatalf("the creating and unlabelled machines were not reported: %q", rep)
 	}
 }
 
 // --- limits ---
 
 func TestLimitsUnderConcurrentCreates(t *testing.T) {
-	e := newEnv(t, limits(4, 8))
+	// Twenty creates at once on a loaded machine: a window long enough
+	// that each first run's sends end inside it (they are bound to it).
+	e := newEnv(t, limits(4, 8), tuned(func(o *Options) { o.FastFailWindow = 5 * time.Second }))
 	const n = 20
 	errs := make([]error, n)
 	var wg sync.WaitGroup
@@ -959,7 +977,7 @@ func TestLimitsUnderConcurrentCreates(t *testing.T) {
 		t.Fatalf("%d of %d concurrent creates passed at max_running 4, want exactly 4", passed, n)
 	}
 	e.idle()
-	if insts, _ := e.prov.List(context.Background(), provider.Selector{}); len(insts) != 4 {
+	if insts, _ := instances(e.prov, context.Background()); len(insts) != 4 {
 		t.Fatalf("%d instances exist, want 4", len(insts))
 	}
 }
@@ -979,12 +997,13 @@ func TestMaxSheds(t *testing.T) {
 // --- host keys ---
 
 func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
-	e := newEnv(t, manual())
+	e := newEnv(t, manual(), func(_ *env, o *fake.Options) { o.NoHostKey = true })
 	e.fl.presented = testHostKey
 	e.put("keys", config.StatusStarting)
 	e.finish("keys")
 	ref := e.ref("keys")
-	// The guest has not published its key yet: the create keeps waiting.
+	// The guest has not published its key yet: the machine has no access,
+	// and the create keeps waiting.
 	time.Sleep(50 * time.Millisecond)
 	if got := e.status("keys"); got != config.StatusStarting {
 		t.Fatalf("status before the key is published: %q", got)
@@ -993,14 +1012,13 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	if got := e.settled("keys"); got.Status != config.StatusRunning {
 		t.Fatalf("settled %q (%q)", got.Status, got.StatusReason)
 	}
-	inst, _ := e.prov.Get(context.Background(), ref)
-	if inst.HostKeyPin() != testHostKey {
-		t.Fatalf("pin in metadata = %q", inst.HostKeyPin())
+	if pin := e.storedRecord("keys").HostKeyPin; pin != testHostKey {
+		t.Fatalf("pin in the record = %q, want the attested key sshd presented", pin)
 	}
+	inst, _ := e.prov.Get(context.Background(), ref)
 	if inst.ShedState() != provider.ShedStateReady || inst.Layout() != guest.Layout {
 		t.Fatalf("labels after create: state %q layout %d", inst.ShedState(), inst.Layout())
 	}
-	reads := e.prov.Count(fake.OpGuestHostKey)
 
 	// A pinned shed is never learned again: a different key is a mismatch.
 	e.auto()
@@ -1017,9 +1035,6 @@ func TestHostKeyIsLearnedOnceAndPinned(t *testing.T) {
 	got := e.settled("keys")
 	if got.Status != config.StatusStopped || got.StatusReason != config.StatusReasonHostKey {
 		t.Fatalf("start with a changed host key settled %q (%q), want stopped (host_key)", got.Status, got.StatusReason)
-	}
-	if n := e.prov.Count(fake.OpGuestHostKey); n != reads {
-		t.Fatalf("the published key was read again for a pinned shed (%d reads, was %d)", n, reads)
 	}
 }
 
@@ -1167,7 +1182,7 @@ func TestEndToEndLocalLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, fl: newFakeLinks(), dir: t.TempDir(), prov: fake.New(fake.Options{Env: testEnv})}
+	e := &env{t: t, fl: newFakeLinks(), dir: t.TempDir(), prov: fake.New(fake.Options{})}
 	e.cfg = newEnv(t).cfg
 	e.links = factory
 	e.b = e.open()
@@ -1228,7 +1243,7 @@ func TestEndToEndLocalLink(t *testing.T) {
 	if err := e.b.WaitIdle(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if insts, _ := e.prov.List(ctx, provider.Selector{}); len(insts) != 0 {
+	if insts, _ := instances(e.prov, ctx); len(insts) != 0 {
 		t.Fatalf("%d instances left after delete", len(insts))
 	}
 }

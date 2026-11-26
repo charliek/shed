@@ -70,6 +70,10 @@ type ShedEvent struct {
 	Identity Identity `json:"identity"`
 	ShedRef
 	Result string `json:"result"`
+	// Cause is, for a delete the server did not make (a cloud shed whose
+	// machine the account service deleted), why: lease_ended, page,
+	// external or server.
+	Cause string `json:"cause,omitempty"`
 }
 
 // DeliveryEvent is the outcome of one delivery: a create's, or a

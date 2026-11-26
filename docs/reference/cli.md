@@ -401,7 +401,7 @@ mcp-test      firecracker  stopped  -                               -           
 | `USER` | The user the shed belongs to (`-` for none). Shown, after `OWNER`, only when a listed shed has a user. |
 | `MOUNTS` | The shed's server-mount selection: `all`, `none`, or the selected names (`claude,gh`); `-` when the server does not report one (an older server) |
 | `NETWORK` | `open` or `isolated`; `-` when the server does not report one |
-| `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
+| `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (external)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
 With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)), and, as `--json create` does, the record's `isolation` and `arch` when the server sends them (each omitted otherwise). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.

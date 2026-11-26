@@ -1,927 +1,910 @@
 // Package providertest is the conformance suite every provider.Provider must
-// pass. A provider's own tests call Run with a Harness that builds a fresh,
-// empty provider and, where the provider can do them, the out-of-band changes
-// the suite needs (an instance another server made, a published host key, a
-// refusal).
+// pass: the in-memory fake, and the compute service's client against the
+// reference compute service. A provider's own tests call Run with a Harness
+// that builds a fresh world for each subtest and the out-of-band changes the
+// suite needs (finishing work, a lost reply, an expired operation, a delete
+// at the service, the clock).
 //
-// The suite checks what the contract in package provider promises and nothing
-// a particular cloud happens to do: idempotent calls, the environment guard,
-// not-found rules, refusals on the call and on the operation, label and
-// metadata merging, and that Pending survives a JSON round trip.
+// The suite checks what the seam in package provider promises: idempotent
+// calls by shed id and by request id, the state rules of start and stop, a
+// delete that ends the work in progress, refusals on the call and on the
+// operation, labels with a condition, leases and extends, recent deletions
+// with their causes, and that a Pending stored by one process is waited on
+// by another.
 package providertest
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"maps"
+	"net/netip"
 	"slices"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/provider"
 )
 
 // Harness describes the provider under test.
 type Harness struct {
-	// Env is the environment the provider serves. Required.
-	Env string
-	// New returns a fresh provider with no instances, serving Env. It is
-	// called once per subtest.
-	New func(t *testing.T) (provider.Provider, Controls)
-	// Size is the machine shape to create with. Required.
-	Size provider.Size
-	// Image is an exact image the provider can boot. When the provider is
-	// an ImageResolver it must resolve Image to itself.
-	Image string
-	// Family, when set and the provider is an ImageResolver, is a family
-	// name ("family/<name>") that resolves to an exact image.
-	Family string
-	// Timeout bounds each Wait. Zero means 30 s.
+	// New returns a fresh world. It is called once per subtest.
+	New func(t *testing.T) *Target
+	// Timeout bounds each Wait. Zero means 20 s.
 	Timeout time.Duration
 }
 
-// Controls are the out-of-band changes a harness can make. A nil field skips
-// the subtests that need it.
-type Controls struct {
-	// Seed puts a settled, running instance with the given name and labels
-	// in the cloud, as another server would have made it, and returns its
-	// Ref.
-	Seed func(t *testing.T, name string, labels map[string]string) provider.Ref
-	// PublishHostKey sets the guest's published host key.
-	PublishHostKey func(t *testing.T, ref provider.Ref, key string)
-	// RefuseNextCreate makes the next Create return kind (ErrQuota or
-	// ErrCapacity) from the accepting call.
-	RefuseNextCreate func(t *testing.T, kind error)
-	// FailNextCreateOperation makes the next Create be accepted and its
-	// operation fail with kind, so Wait returns it.
-	FailNextCreateOperation func(t *testing.T, kind error)
-	// SetFirewall replaces the cloud's whole firewall with rules. A rule
-	// whose Network is empty goes on the provider's own network; any other
-	// value names another network in the same cloud.
-	SetFirewall func(t *testing.T, rules []provider.FirewallRule)
+// Target is one world: a provider and what the suite needs to drive it.
+type Target struct {
+	// Provider is the provider under test.
+	Provider provider.Provider
+	// Fresh returns a new provider over the same machines: what a server
+	// process started again holds (its own token, nothing in memory).
+	Fresh func() provider.Provider
+	// Settle finishes the work in progress on a machine. The world's
+	// operations finish only by it.
+	Settle func(ref provider.Ref)
+	// LoseNextReply has the next call of the kind (create, start, stop,
+	// delete, labels, extend) take effect and keep its answer, and its
+	// reply lost on the way back.
+	LoseNextReply func(call string)
+	// ExpireOperations has every finished operation forgotten, as one kept
+	// past its 24 hours is.
+	ExpireOperations func()
+	// DeleteOutside deletes a machine at the service (provider.CausePage)
+	// or outside it (provider.CauseExternal).
+	DeleteOutside func(ref provider.Ref, cause string)
+	// Advance moves the world's clock by d and ends every lease that is
+	// then due.
+	Advance func(d time.Duration)
+	// FailNextCreate has the next create accepted and its work fail with
+	// the cloud's quota.
+	FailNextCreate func()
+	// User is a person the provider makes machines for; Client a client
+	// registered for the server.
+	User, Client string
+	// Key is an authorized key line to create with.
+	Key string
 }
 
-var idCounter atomic.Int64
-
-// NewID returns a fresh, valid shed ID.
-func NewID() string {
-	return fmt.Sprintf("t%025d", idCounter.Add(1))
-}
-
-// Spec returns a valid create spec for a new shed called name in env.
-func (h Harness) Spec(t *testing.T, env, name string) provider.Spec {
-	t.Helper()
-	id := provider.Identity{Env: env, ID: NewID(), Name: name, Owner: "nocturn"}
-	shed := provider.ShedSpec{
-		CreatedAt:  time.Date(2026, 11, 13, 1, 2, 3, 0, time.UTC),
-		Repo:       "https://token@github.com/o/r.git",
-		Network:    "isolated",
-		LandingDir: "/home/shed/r",
+// Run runs the suite.
+func Run(t *testing.T, h Harness) {
+	timeout := h.Timeout
+	if timeout == 0 {
+		timeout = 20 * time.Second
 	}
-	spec, err := provider.NewSpec(id, shed, []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIConformanceKey shed-server"}, h.Size, 20, h.Image, 2*time.Hour)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*timeout)
+			defer cancel()
+			w := &world{t: t, Target: h.New(t), ctx: ctx, timeout: timeout}
+			tc.run(w)
+		})
+	}
+}
+
+type world struct {
+	*Target
+	t       *testing.T
+	ctx     context.Context
+	timeout time.Duration
+}
+
+var cases = []struct {
+	name string
+	run  func(*world)
+}{
+	{"catalog", testCatalog},
+	{"create then wait", testCreate},
+	{"create is idempotent by shed id", testCreateIdempotent},
+	{"a request id is answered once", testRequestID},
+	{"stop and start", testStopStart},
+	{"busy", testBusy},
+	{"labels", testLabels},
+	{"extend", testExtend},
+	{"a client's machine", testClient},
+	{"destroy", testDestroy},
+	{"destroy ends the work in progress", testDestroyEndsWork},
+	{"deleted outside the server", testDeletedOutside},
+	{"the lease ends", testLeaseEnds},
+	{"a refusal that arrives late", testLateRefusal},
+	{"unknown machines", testUnknown},
+	{"usage", testUsage},
+	{"ingress", testIngress},
+	{"a lost reply for each mutation", testLostReplies},
+	{"an expired operation for each mutation", testExpiredOperations},
+	{"a fresh process waits on a stored pending", testFreshProcess},
+}
+
+// --- helpers ---
+
+func newShedID() string {
+	id, err := config.NewShedID()
 	if err != nil {
-		t.Fatalf("NewSpec: %v", err)
+		panic(err)
+	}
+	return id
+}
+
+func (w *world) spec(name string, owner provider.Owner) provider.Spec {
+	w.t.Helper()
+	spec, err := provider.NewSpec(newShedID(), name, owner,
+		provider.ShedSpec{CreatedAt: time.Now().UTC(), Network: "open", UserOrigin: "directory"},
+		[]string{w.Key}, "standard", 0, provider.ImageDefault)
+	if err != nil {
+		w.t.Fatalf("NewSpec: %v", err)
 	}
 	return spec
 }
 
-func (h Harness) ctx(t *testing.T) context.Context {
+// sub is w for a subtest.
+func (w *world) sub(t *testing.T) *world {
+	cp := *w
+	cp.t = t
+	return &cp
+}
+
+func (w *world) personSpec(name string) provider.Spec {
+	return w.spec(name, provider.Owner{User: w.User})
+}
+
+func (w *world) wait(p provider.Provider, pend provider.Pending) (provider.Instance, error) {
+	ctx, cancel := context.WithTimeout(w.ctx, w.timeout)
+	defer cancel()
+	return p.Wait(ctx, pend)
+}
+
+// waitSettled settles the machine's work and waits for it.
+func (w *world) settled(pend provider.Pending) provider.Instance {
+	w.t.Helper()
+	w.Settle(pend.Ref)
+	inst, err := w.wait(w.Provider, pend)
+	if err != nil {
+		w.t.Fatalf("Wait(%+v): %v", pend, err)
+	}
+	return inst
+}
+
+// running creates a person's machine and waits for it to run.
+func (w *world) running(name string) provider.Instance {
+	w.t.Helper()
+	pend, _, err := w.Provider.Create(w.ctx, w.personSpec(name))
+	if err != nil {
+		w.t.Fatalf("Create(%s): %v", name, err)
+	}
+	inst := w.settled(pend)
+	if inst.State != provider.StateRunning {
+		w.t.Fatalf("machine %s is %s after its create, want running", name, inst.State)
+	}
+	return inst
+}
+
+// stopped creates a machine and stops it.
+func (w *world) stopped(name string) provider.Instance {
+	w.t.Helper()
+	inst := w.running(name)
+	pend, err := w.Provider.Stop(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatalf("Stop: %v", err)
+	}
+	return w.settled(pend)
+}
+
+func (w *world) get(ref provider.Ref) (provider.Instance, error) {
+	return w.Provider.Get(w.ctx, ref)
+}
+
+func (w *world) list() provider.Listing {
+	w.t.Helper()
+	l, err := w.Provider.List(w.ctx)
+	if err != nil {
+		w.t.Fatalf("List: %v", err)
+	}
+	return l
+}
+
+func deletionOf(l provider.Listing, ref provider.Ref) (provider.Deletion, bool) {
+	for _, d := range l.Deleted {
+		if d.Ref == ref {
+			return d, true
+		}
+	}
+	return provider.Deletion{}, false
+}
+
+func listed(l provider.Listing, ref provider.Ref) bool {
+	for _, i := range l.Instances {
+		if i.Ref == ref {
+			return true
+		}
+	}
+	return false
+}
+
+func wantKind(t *testing.T, what string, err, kind error) {
 	t.Helper()
-	d := h.Timeout
-	if d <= 0 {
-		d = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), d)
-	t.Cleanup(cancel)
-	return ctx
-}
-
-// Run runs the conformance suite.
-func Run(t *testing.T, h Harness) {
-	if h.Env == "" || h.New == nil || h.Size.MachineType == "" || h.Image == "" {
-		t.Fatal("providertest: Harness needs Env, New, Size and Image")
-	}
-	tests := []struct {
-		name string
-		fn   func(*testing.T, Harness)
-	}{
-		{"create wait get list", testCreate},
-		{"create is idempotent", testCreateIdempotent},
-		{"create refuses a bad spec", testCreateInvalid},
-		{"stop and start", testStopStart},
-		{"labels", testLabels},
-		{"user label", testUserLabel},
-		{"claim label", testClaimLabel},
-		{"metadata", testMetadata},
-		{"destroy", testDestroy},
-		{"missing instance", testMissing},
-		{"other environment", testForeign},
-		{"wait honours its context", testWaitCancelled},
-		{"guest host key", testHostKey},
-		{"resolve image", testResolveImage},
-		{"refusal on the call", testRefusalOnCall},
-		{"refusal on the operation", testRefusalOnOperation},
-		{"firewall reads", testFirewallReads},
-		{"firewall sources", testFirewallSources},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) { tc.fn(t, h) })
+	if !errors.Is(err, kind) {
+		t.Fatalf("%s = %v, want %v", what, err, kind)
 	}
 }
 
-func mustCreate(t *testing.T, h Harness, p provider.Provider, name string) (provider.Spec, provider.Instance) {
+func wantCode(t *testing.T, what string, err error, code string) {
 	t.Helper()
-	ctx := h.ctx(t)
-	spec := h.Spec(t, h.Env, name)
-	pend, err := p.Create(ctx, spec)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	inst, err := p.Wait(ctx, pend)
-	if err != nil {
-		t.Fatalf("Wait(create): %v", err)
-	}
-	return spec, inst
-}
-
-func testCreate(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	spec := h.Spec(t, h.Env, "alpha")
-	pend, err := p.Create(ctx, spec)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if pend.Ref == "" || pend.Want != provider.StateRunning {
-		t.Fatalf("Create pending = %+v, want a ref and want=running", pend)
-	}
-	// Pending is plain data: a stored copy works the same.
-	raw, err := json.Marshal(pend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var stored provider.Pending
-	if err := json.Unmarshal(raw, &stored); err != nil {
-		t.Fatal(err)
-	}
-	inst, err := p.Wait(ctx, stored)
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if inst.State != provider.StateRunning || inst.Address == "" {
-		t.Errorf("after create: state %s address %q, want running with an address", inst.State, inst.Address)
-	}
-	if inst.Ref != pend.Ref || inst.Name != spec.Name {
-		t.Errorf("instance ref/name = %s/%s, want %s/%s", inst.Ref, inst.Name, pend.Ref, spec.Name)
-	}
-	for k, v := range spec.Labels {
-		if inst.Labels[k] != v {
-			t.Errorf("label %s = %q, want %q", k, inst.Labels[k], v)
-		}
-	}
-	for k, v := range spec.Metadata {
-		if inst.Metadata[k] != v {
-			t.Errorf("metadata %s = %q, want %q", k, inst.Metadata[k], v)
-		}
-	}
-	for k := range inst.Metadata {
-		if len(k) < 5 || k[:5] != "shed-" {
-			t.Errorf("Instance.Metadata holds non-shed key %q", k)
-		}
-	}
-	shed, err := inst.ShedSpec()
-	if err != nil {
-		t.Fatalf("ShedSpec: %v", err)
-	}
-	if shed.Repo != "https://github.com/o/r.git" || shed.Image != h.Image || shed.Size != h.Size.Name {
-		t.Errorf("shed-spec = %+v", shed)
-	}
-	if inst.DiskGB != spec.DiskGB || inst.MachineType != h.Size.MachineType || inst.MaxRun != spec.MaxRun {
-		t.Errorf("disk %d type %s maxrun %v, want %d %s %v", inst.DiskGB, inst.MachineType, inst.MaxRun, spec.DiskGB, h.Size.MachineType, spec.MaxRun)
-	}
-	if id, err := inst.Identity(); err != nil || id.Name != "alpha" || id.Env != h.Env {
-		t.Errorf("Identity = %+v, %v", id, err)
-	}
-
-	got, err := p.Get(ctx, pend.Ref)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got.State != provider.StateRunning || got.Address != inst.Address {
-		t.Errorf("Get = %s %q, want running %q", got.State, got.Address, inst.Address)
-	}
-
-	list, err := p.List(ctx, provider.Selector{Env: h.Env})
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(list) != 1 || list[0].Ref != pend.Ref {
-		t.Errorf("List(env) = %v, want just %s", refs(list), pend.Ref)
-	}
-	other, err := p.List(ctx, provider.Selector{Env: "zz-other"})
-	if err != nil {
-		t.Fatalf("List(other): %v", err)
-	}
-	if len(other) != 0 {
-		t.Errorf("List(other env) = %v, want none", refs(other))
+	if got := provider.CodeOf(err); got != code {
+		t.Fatalf("%s: code %q (%v), want %s", what, got, err, code)
 	}
 }
 
-func testCreateIdempotent(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	spec := h.Spec(t, h.Env, "beta")
-	first, err := p.Create(ctx, spec)
+// --- cases ---
+
+func testCatalog(w *world) {
+	c, err := w.Provider.Catalog(w.ctx)
 	if err != nil {
-		t.Fatalf("Create: %v", err)
+		w.t.Fatalf("Catalog: %v", err)
 	}
-	if _, err := p.Wait(ctx, first); err != nil {
-		t.Fatalf("Wait: %v", err)
+	if _, ok := c.SizeNamed(c.DefaultSize); !ok {
+		w.t.Errorf("the default size %q is not one of the sizes %v", c.DefaultSize, c.Sizes)
 	}
-	again, err := p.Create(ctx, spec)
-	if err != nil {
-		t.Fatalf("second Create: %v", err)
+	if _, ok := c.SizeNamed("standard"); !ok {
+		w.t.Errorf("no size standard: %v", c.Sizes)
 	}
-	if again.Ref != first.Ref {
-		t.Errorf("second Create ref %s, want %s", again.Ref, first.Ref)
+	if !c.HasImage(provider.ImageDefault) || slices.Contains(c.Aliases, provider.ImageDefault) {
+		w.t.Errorf("images: default %v, aliases %v", c.HasImage(provider.ImageDefault), c.Aliases)
 	}
-	inst, err := p.Wait(ctx, again)
-	if err != nil || inst.State != provider.StateRunning {
-		t.Fatalf("Wait(second) = %s, %v", inst.State, err)
+	if !slices.Contains(c.AccessKinds, provider.AccessSSH) {
+		w.t.Errorf("access kinds %v lack ssh", c.AccessKinds)
 	}
-	list, err := p.List(ctx, provider.Selector{Env: h.Env})
-	if err != nil || len(list) != 1 {
-		t.Errorf("List = %v, %v; want one instance", refs(list), err)
+	if c.Policy.PersonMaxAge < c.Policy.PersonInitialLease || c.Policy.PersonInitialLease <= 0 {
+		w.t.Errorf("policy %+v", c.Policy)
 	}
 }
 
-func testCreateInvalid(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	t.Run("empty authorized keys", func(t *testing.T) {
-		spec := h.Spec(t, h.Env, "gamma")
-		spec.Metadata[provider.MetadataAuthorizedKeys] = ""
-		if _, err := p.Create(ctx, spec); !errors.Is(err, provider.ErrInvalid) {
-			t.Errorf("Create = %v, want ErrInvalid", err)
+func testCreate(w *world) {
+	spec := w.personSpec("widgets")
+	pend, inst, err := w.Provider.Create(w.ctx, spec)
+	if err != nil {
+		w.t.Fatalf("Create: %v", err)
+	}
+	if pend.Ref != provider.Ref(spec.ShedID) || pend.Want != provider.StateRunning || pend.Operation == "" {
+		w.t.Errorf("Pending = %+v, want the shed id, an operation and Want running", pend)
+	}
+	// The create's answer carries the machine at once.
+	if inst.Ref != pend.Ref || inst.Name != "widgets" || inst.User != w.User || inst.State != provider.StateStarting {
+		w.t.Errorf("the create's machine = %+v", inst)
+	}
+	if inst.Size.Name != "standard" || inst.Size.CPUs <= 0 || inst.DiskGB <= 0 || inst.Image != provider.ImageDefault || inst.ImageResolved == "" {
+		w.t.Errorf("the create's machine size and image: %+v %d %q %q", inst.Size, inst.DiskGB, inst.Image, inst.ImageResolved)
+	}
+	if inst.Lease.ExpiresAt.IsZero() || inst.Lease.ExpiresAt.Before(inst.CreatedAt) || inst.Lease.MaxExpiresAt.Before(inst.Lease.ExpiresAt) {
+		w.t.Errorf("lease %+v from created %v", inst.Lease, inst.CreatedAt)
+	}
+	if inst.Labels[provider.LabelState] != string(provider.ShedStateCreating) || inst.Spec != spec.Spec {
+		w.t.Errorf("labels %v, spec kept verbatim %v", inst.Labels, inst.Spec == spec.Spec)
+	}
+	if len(inst.Access) != 0 {
+		w.t.Errorf("a machine being created has access %v", inst.Access)
+	}
+	got := w.settled(pend)
+	if got.State != provider.StateRunning || got.StartedAt.IsZero() {
+		w.t.Errorf("after the create: %s, started %v", got.State, got.StartedAt)
+	}
+	if len(got.Access) == 0 || got.Access[0].Kind != provider.AccessSSH || got.Access[0].HostKey == "" || got.Access[0].Port == 0 {
+		w.t.Errorf("a running machine's access = %+v", got.Access)
+	}
+	if g, err := w.get(pend.Ref); err != nil || g.State != provider.StateRunning {
+		w.t.Errorf("Get = %+v, %v", g.State, err)
+	}
+	if !listed(w.list(), pend.Ref) {
+		w.t.Errorf("the machine is not listed")
+	}
+}
+
+func testCreateIdempotent(w *world) {
+	spec := w.personSpec("idem")
+	pend, _, err := w.Provider.Create(w.ctx, spec)
+	if err != nil {
+		w.t.Fatalf("Create: %v", err)
+	}
+	again := *spec.Clone()
+	again.RequestID = provider.NewRequestID()
+	p2, inst, err := w.Provider.Create(w.ctx, again)
+	if err != nil || p2.Ref != pend.Ref || inst.Ref != pend.Ref {
+		w.t.Fatalf("the same create again (another request id) = %+v, %+v, %v; want the same machine", p2, inst.Ref, err)
+	}
+	w.settled(pend)
+	// After the create has finished: the machine, with no operation.
+	again.RequestID = provider.NewRequestID()
+	p3, inst, err := w.Provider.Create(w.ctx, again)
+	if err != nil || p3.Ref != pend.Ref || inst.State != provider.StateRunning {
+		w.t.Fatalf("the same create after it finished = %+v, %s, %v", p3, inst.State, err)
+	}
+	other := *spec.Clone()
+	other.RequestID = provider.NewRequestID()
+	other.AuthorizedKeys = append(other.AuthorizedKeys, w.Key+" second")
+	_, _, err = w.Provider.Create(w.ctx, other)
+	wantKind(w.t, "a create of the shed id with another body", err, provider.ErrSpecMismatch)
+	wantCode(w.t, "a create of the shed id with another body", err, "SPEC_MISMATCH")
+	_, _, err = w.Provider.Create(w.ctx, w.personSpec("idem"))
+	wantKind(w.t, "a create of the name for another shed id", err, provider.ErrExists)
+	if n := len(w.list().Instances); n != 1 {
+		w.t.Errorf("%d machines, want 1", n)
+	}
+}
+
+func testRequestID(w *world) {
+	spec := w.personSpec("rid")
+	pend, _, err := w.Provider.Create(w.ctx, spec)
+	if err != nil {
+		w.t.Fatalf("Create: %v", err)
+	}
+	again, _, err := w.Provider.Create(w.ctx, spec)
+	if err != nil || again != pend {
+		w.t.Fatalf("the create's request id again = %+v, %v; want the first answer %+v", again, err, pend)
+	}
+	w.settled(pend)
+	rid := provider.NewRequestID()
+	p1, err := w.Provider.Stop(w.ctx, pend.Ref, rid)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	p2, err := w.Provider.Stop(w.ctx, pend.Ref, rid)
+	if err != nil || p1 != p2 {
+		w.t.Errorf("a stop's request id again = %+v, %v; want %+v", p2, err, p1)
+	}
+	// An id used for another call is refused.
+	_, err = w.Provider.Start(w.ctx, pend.Ref, rid)
+	wantKind(w.t, "a request id used for another call", err, provider.ErrInvalid)
+}
+
+func testStopStart(w *world) {
+	inst := w.running("cycle")
+	pend, err := w.Provider.Stop(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil || pend.Want != provider.StateStopped {
+		w.t.Fatalf("Stop = %+v, %v", pend, err)
+	}
+	if g, _ := w.get(inst.Ref); g.State != provider.StateStopping || len(g.Access) != 0 {
+		w.t.Errorf("a stopping machine: %s, access %v", g.State, g.Access)
+	}
+	got := w.settled(pend)
+	if got.State != provider.StateStopped || got.StoppedAt.IsZero() {
+		w.t.Errorf("after the stop: %s, stopped %v", got.State, got.StoppedAt)
+	}
+	if got.Lease.ExpiresAt != inst.Lease.ExpiresAt || got.Lease.MaxExpiresAt != inst.Lease.MaxExpiresAt {
+		w.t.Errorf("the stop moved the lease: %+v, was %+v", got.Lease, inst.Lease)
+	}
+	// Stop on a stopped machine: nothing to follow.
+	again, err := w.Provider.Stop(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatalf("Stop of a stopped machine: %v", err)
+	}
+	if g, err := w.wait(w.Provider, again); err != nil || g.State != provider.StateStopped {
+		w.t.Errorf("Wait on the repeated stop = %s, %v", g.State, err)
+	}
+	pend, err = w.Provider.Start(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil || pend.Want != provider.StateRunning {
+		w.t.Fatalf("Start = %+v, %v", pend, err)
+	}
+	// Start on a starting machine follows the start in progress.
+	if p2, err := w.Provider.Start(w.ctx, inst.Ref, provider.NewRequestID()); err != nil || p2.Ref != inst.Ref {
+		w.t.Errorf("Start of a starting machine = %+v, %v", p2, err)
+	}
+	got = w.settled(pend)
+	if got.State != provider.StateRunning {
+		w.t.Errorf("after the start: %s", got.State)
+	}
+	if got.Lease.ExpiresAt != inst.Lease.ExpiresAt {
+		w.t.Errorf("the start moved the lease")
+	}
+	if p, err := w.Provider.Start(w.ctx, inst.Ref, provider.NewRequestID()); err != nil {
+		w.t.Errorf("Start of a running machine: %v", err)
+	} else if g, err := w.wait(w.Provider, p); err != nil || g.State != provider.StateRunning {
+		w.t.Errorf("Wait on the start of a running machine = %s, %v", g.State, err)
+	}
+}
+
+func testBusy(w *world) {
+	inst := w.stopped("busy")
+	pend, err := w.Provider.Start(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	_, err = w.Provider.Stop(w.ctx, inst.Ref, provider.NewRequestID())
+	wantKind(w.t, "Stop of a starting machine", err, provider.ErrBusy)
+	wantCode(w.t, "Stop of a starting machine", err, "BUSY")
+	w.settled(pend)
+	pend, err = w.Provider.Stop(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	_, err = w.Provider.Start(w.ctx, inst.Ref, provider.NewRequestID())
+	wantKind(w.t, "Start of a stopping machine", err, provider.ErrBusy)
+	w.settled(pend)
+	// Settle on a machine at rest returns at once.
+	if g, err := w.wait(w.Provider, provider.Settle(inst.Ref)); err != nil || g.State != provider.StateStopped {
+		w.t.Errorf("Wait(Settle) = %s, %v", g.State, err)
+	}
+}
+
+func testLabels(w *world) {
+	inst := w.running("labels")
+	set := map[string]*string{provider.LabelState: provider.Str("ready"), provider.LabelLayout: provider.Str("1")}
+	got, err := w.Provider.SetLabels(w.ctx, inst.Ref, provider.NewRequestID(), set, map[string]*string{provider.LabelState: provider.Str("creating")})
+	if err != nil || got.ShedState() != provider.ShedStateReady || got.Layout() != 1 {
+		w.t.Fatalf("SetLabels = %v %v, %v", got.Labels, got.Layout(), err)
+	}
+	_, err = w.Provider.SetLabels(w.ctx, inst.Ref, provider.NewRequestID(), map[string]*string{"extra": provider.Str("x")}, map[string]*string{provider.LabelState: nil})
+	wantKind(w.t, "a write whose expect does not hold", err, provider.ErrLabelTaken)
+	wantCode(w.t, "a write whose expect does not hold", err, "LABEL_TAKEN")
+	if g, _ := w.get(inst.Ref); g.Labels["extra"] != "" {
+		w.t.Errorf("a refused write wrote: %v", g.Labels)
+	}
+	got, err = w.Provider.SetLabels(w.ctx, inst.Ref, provider.NewRequestID(), map[string]*string{provider.LabelLayout: nil}, nil)
+	if _, has := got.Labels[provider.LabelLayout]; err != nil || has {
+		w.t.Errorf("a removal = %v, %v", got.Labels, err)
+	}
+	_, err = w.Provider.SetLabels(w.ctx, inst.Ref, provider.NewRequestID(), map[string]*string{"shed_user": provider.Str("x")}, nil)
+	wantKind(w.t, "a write of a reserved label", err, provider.ErrInvalid)
+}
+
+func testExtend(w *world) {
+	cat, err := w.Provider.Catalog(w.ctx)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	inst := w.running("extend")
+	got, err := w.Provider.Extend(w.ctx, inst.Ref, provider.NewRequestID(), 6*time.Hour)
+	if err != nil {
+		w.t.Fatalf("Extend: %v", err)
+	}
+	if d := got.Lease.ExpiresAt.Sub(inst.Lease.ExpiresAt); d != 6*time.Hour {
+		w.t.Errorf("the extend moved the lease by %s, want 6h", d)
+	}
+	if got.Lease.MaxExpiresAt != inst.Lease.MaxExpiresAt {
+		w.t.Errorf("the extend moved the cap")
+	}
+	past := cat.Policy.PersonMaxAge.Round(time.Hour) + time.Hour
+	_, err = w.Provider.Extend(w.ctx, inst.Ref, provider.NewRequestID(), past)
+	wantKind(w.t, "an extend past the cap", err, provider.ErrLease)
+	wantCode(w.t, "an extend past the cap", err, "LEASE_AT_CAP")
+	if g, _ := w.get(inst.Ref); g.Lease.ExpiresAt != got.Lease.ExpiresAt {
+		w.t.Errorf("a refused extend moved the lease")
+	}
+	_, err = w.Provider.Extend(w.ctx, inst.Ref, provider.NewRequestID(), 90*time.Minute)
+	wantKind(w.t, "an extend by a part of an hour", err, provider.ErrInvalid)
+}
+
+func testClient(w *world) {
+	spec := w.spec("client-1", provider.Owner{Client: w.Client, Lease: 30 * time.Hour})
+	pend, inst, err := w.Provider.Create(w.ctx, spec)
+	if err != nil {
+		w.t.Fatalf("Create for a client: %v", err)
+	}
+	if inst.Client != w.Client || inst.User != "" {
+		w.t.Errorf("owner = %q/%q", inst.User, inst.Client)
+	}
+	if d := inst.Lease.ExpiresAt.Sub(inst.CreatedAt); d != 30*time.Hour || inst.Lease.MaxExpiresAt != inst.Lease.ExpiresAt {
+		w.t.Errorf("a client's lease = %+v from %v", inst.Lease, inst.CreatedAt)
+	}
+	if inst.Lease.Extendable || len(inst.Lease.PresetsH) != 0 {
+		w.t.Errorf("a client's machine is extendable: %+v", inst.Lease)
+	}
+	w.settled(pend)
+	_, err = w.Provider.Extend(w.ctx, pend.Ref, provider.NewRequestID(), time.Hour)
+	wantKind(w.t, "an extend of a client's machine", err, provider.ErrLease)
+	wantCode(w.t, "an extend of a client's machine", err, "EXTEND_NOT_ALLOWED")
+	long := w.spec("client-2", provider.Owner{Client: w.Client, Lease: 400 * 24 * time.Hour})
+	_, _, err = w.Provider.Create(w.ctx, long)
+	wantKind(w.t, "a client's lease over the policy", err, provider.ErrPolicy)
+	wantCode(w.t, "a client's lease over the policy", err, "LEASE_TOO_LONG")
+}
+
+func testDestroy(w *world) {
+	inst := w.running("gone")
+	pend, err := w.Provider.Destroy(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil || pend.Want != provider.StateAbsent {
+		w.t.Fatalf("Destroy = %+v, %v", pend, err)
+	}
+	if g, err := w.get(inst.Ref); err == nil && g.State != provider.StateDeleting {
+		w.t.Errorf("a machine being destroyed is %s", g.State)
+	}
+	w.Settle(pend.Ref)
+	if _, err := w.wait(w.Provider, pend); err != nil {
+		w.t.Fatalf("Wait(destroy) = %v", err)
+	}
+	_, err = w.get(inst.Ref)
+	wantKind(w.t, "Get after the destroy", err, provider.ErrNotFound)
+	l := w.list()
+	if listed(l, inst.Ref) {
+		w.t.Errorf("a destroyed machine is listed")
+	}
+	if d, ok := deletionOf(l, inst.Ref); !ok || d.Cause != provider.CauseServer {
+		w.t.Errorf("the deletion = %+v (%v), want cause server", d, ok)
+	}
+	// Again, on nothing: success, and the wait returns at once.
+	again, err := w.Provider.Destroy(w.ctx, inst.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatalf("Destroy of a gone machine = %v", err)
+	}
+	if _, err := w.wait(w.Provider, again); err != nil {
+		w.t.Errorf("Wait on the destroy of a gone machine = %v", err)
+	}
+}
+
+func testDestroyEndsWork(w *world) {
+	pend, _, err := w.Provider.Create(w.ctx, w.personSpec("cut"))
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	del, err := w.Provider.Destroy(w.ctx, pend.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatalf("Destroy of a machine being created: %v", err)
+	}
+	_, err = w.wait(w.Provider, pend)
+	wantKind(w.t, "the create a destroy ended", err, provider.ErrDeleting)
+	w.Settle(del.Ref)
+	if _, err := w.wait(w.Provider, del); err != nil {
+		w.t.Errorf("Wait(destroy) = %v", err)
+	}
+}
+
+func testDeletedOutside(w *world) {
+	if w.DeleteOutside == nil {
+		w.t.Skip("the world cannot delete outside the server")
+	}
+	a := w.running("page-del")
+	b := w.stopped("ext-del")
+	w.DeleteOutside(a.Ref, provider.CausePage)
+	w.DeleteOutside(b.Ref, provider.CauseExternal)
+	l := w.list()
+	for ref, cause := range map[provider.Ref]string{a.Ref: provider.CausePage, b.Ref: provider.CauseExternal} {
+		if listed(l, ref) {
+			w.t.Errorf("%s is listed after its delete", ref)
+		}
+		if d, ok := deletionOf(l, ref); !ok || d.Cause != cause {
+			w.t.Errorf("deletion of %s = %+v (%v), want cause %s", ref, d, ok, cause)
+		}
+		_, err := w.get(ref)
+		wantKind(w.t, "Get of a machine deleted outside", err, provider.ErrNotFound)
+	}
+	_, err := w.Provider.Start(w.ctx, b.Ref, provider.NewRequestID())
+	wantKind(w.t, "Start of a deleted machine", err, provider.ErrNotFound)
+}
+
+func testLeaseEnds(w *world) {
+	if w.Advance == nil {
+		w.t.Skip("the world has no clock")
+	}
+	cat, err := w.Provider.Catalog(w.ctx)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	run := w.running("lease-run")
+	stop := w.stopped("lease-stop")
+	// Past the lease's end the service deletes the machine, running or
+	// stopped, and lists why.
+	w.Advance(cat.Policy.PersonInitialLease + time.Second)
+	l := w.list()
+	for _, ref := range []provider.Ref{run.Ref, stop.Ref} {
+		if listed(l, ref) {
+			w.t.Errorf("%s outlived its lease", ref)
+		}
+		if d, ok := deletionOf(l, ref); !ok || d.Cause != provider.CauseLeaseEnded {
+			w.t.Errorf("deletion of %s = %+v (%v), want lease_ended", ref, d, ok)
+		}
+	}
+}
+
+func testLateRefusal(w *world) {
+	if w.FailNextCreate == nil {
+		w.t.Skip("the world cannot fail a create")
+	}
+	w.FailNextCreate()
+	pend, _, err := w.Provider.Create(w.ctx, w.personSpec("late"))
+	if err != nil {
+		w.t.Fatalf("Create: %v (the refusal must arrive with the operation)", err)
+	}
+	w.Settle(pend.Ref)
+	_, err = w.wait(w.Provider, pend)
+	wantKind(w.t, "Wait on a create the cloud refused", err, provider.ErrQuota)
+	if !provider.IsRefusal(err) {
+		w.t.Errorf("a cloud quota is not a refusal: %v", err)
+	}
+	_, err = w.get(pend.Ref)
+	wantKind(w.t, "Get after a refused create", err, provider.ErrNotFound)
+	if _, ok := deletionOf(w.list(), pend.Ref); ok {
+		w.t.Errorf("a refused create is listed as a deletion")
+	}
+}
+
+func testUnknown(w *world) {
+	ref := provider.Ref(newShedID())
+	_, err := w.get(ref)
+	wantKind(w.t, "Get of an unknown machine", err, provider.ErrNotFound)
+	_, err = w.Provider.Start(w.ctx, ref, provider.NewRequestID())
+	wantKind(w.t, "Start of an unknown machine", err, provider.ErrNotFound)
+	_, err = w.Provider.Stop(w.ctx, ref, provider.NewRequestID())
+	wantKind(w.t, "Stop of an unknown machine", err, provider.ErrNotFound)
+	_, err = w.Provider.Extend(w.ctx, ref, provider.NewRequestID(), time.Hour)
+	wantKind(w.t, "Extend of an unknown machine", err, provider.ErrNotFound)
+	p, err := w.Provider.Destroy(w.ctx, ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatalf("Destroy of an unknown machine = %v", err)
+	}
+	if _, err := w.wait(w.Provider, p); err != nil {
+		w.t.Errorf("Wait on it = %v", err)
+	}
+	_, err = w.wait(w.Provider, provider.Pending{Ref: ref, Want: provider.StateRunning})
+	wantKind(w.t, "Wait for an unknown machine to run", err, provider.ErrNotFound)
+}
+
+func testUsage(w *world) {
+	w.running("use-1")
+	w.stopped("use-2")
+	u, err := w.Provider.Usage(w.ctx, w.User)
+	if err != nil {
+		w.t.Fatalf("Usage: %v", err)
+	}
+	if u.Person == nil || u.Person.Machines != 2 || u.Person.Running != 1 || u.Person.Stopped != 1 || u.Person.Max <= 0 {
+		w.t.Errorf("person usage = %+v", u.Person)
+	}
+	if u.Org.Machines < 2 || u.Org.Max <= 0 {
+		w.t.Errorf("organization usage = %+v", u.Org)
+	}
+	if u, err := w.Provider.Usage(w.ctx, ""); err != nil || u.Person != nil {
+		w.t.Errorf("Usage with no user = %+v, %v", u, err)
+	}
+}
+
+func testIngress(w *world) {
+	ing, err := w.Provider.Ingress(w.ctx)
+	if err != nil {
+		w.t.Fatalf("Ingress: %v", err)
+	}
+	_ = ing
+	want := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
+	got, err := w.Provider.SetIngress(w.ctx, provider.NewRequestID(), want)
+	if err != nil {
+		w.t.Fatalf("SetIngress: %v", err)
+	}
+	if !slices.Equal(got.Sources, want) || got.AppliedAt.IsZero() {
+		w.t.Errorf("SetIngress = %+v", got)
+	}
+	if read, err := w.Provider.Ingress(w.ctx); err != nil || !slices.Equal(read.Sources, want) || !read.Exclusive {
+		w.t.Errorf("Ingress after the write = %+v, %v", read, err)
+	}
+	_, err = w.Provider.SetIngress(w.ctx, provider.NewRequestID(), []netip.Prefix{netip.MustParsePrefix("198.51.0.0/16")})
+	wantKind(w.t, "a source wider than allowed", err, provider.ErrIngress)
+	wantCode(w.t, "a source wider than allowed", err, "INGRESS_TOO_WIDE")
+}
+
+func testLostReplies(w *world) {
+	if w.LoseNextReply == nil {
+		w.t.Skip("the world cannot lose a reply")
+	}
+	p := w.Provider
+	parent := w
+	w.t.Run("create", func(t *testing.T) {
+		w := parent.sub(t)
+		spec := w.personSpec("lost-create")
+		w.LoseNextReply("create")
+		_, _, err := p.Create(w.ctx, spec)
+		wantKind(t, "a create whose reply is lost", err, provider.ErrUnavailable)
+		pend, inst, err := p.Create(w.ctx, spec)
+		if err != nil || inst.Ref != provider.Ref(spec.ShedID) {
+			t.Fatalf("the create sent again = %+v, %v", pend, err)
+		}
+		w.settled(pend)
+		n := 0
+		for _, i := range w.list().Instances {
+			if i.Name == "lost-create" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%d machines after a create sent twice, want 1", n)
 		}
 	})
-	t.Run("another environment", func(t *testing.T) {
-		spec := h.Spec(t, "zz-other", "gamma")
-		if _, err := p.Create(ctx, spec); !errors.Is(err, provider.ErrInvalid) {
-			t.Errorf("Create = %v, want ErrInvalid", err)
-		}
-	})
-	list, err := p.List(ctx, provider.Selector{})
-	if err != nil || len(list) != 0 {
-		t.Errorf("List after refused creates = %v, %v; want none", refs(list), err)
-	}
-}
-
-func testStopStart(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	_, inst := mustCreate(t, h, p, "delta")
-	ref := inst.Ref
-
-	// Start on a running instance starts nothing.
-	pend, err := p.Start(ctx, ref, provider.StartOptions{})
-	if err != nil {
-		t.Fatalf("Start(running): %v", err)
-	}
-	if got, err := p.Wait(ctx, pend); err != nil || got.State != provider.StateRunning {
-		t.Fatalf("Wait(start running) = %s, %v", got.State, err)
-	}
-
-	pend, err = p.Stop(ctx, ref)
-	if err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if pend.Want != provider.StateStopped {
-		t.Errorf("Stop pending want %s", pend.Want)
-	}
-	stopped, err := p.Wait(ctx, pend)
-	if err != nil {
-		t.Fatalf("Wait(stop): %v", err)
-	}
-	if stopped.State != provider.StateStopped || stopped.Address != "" {
-		t.Errorf("after stop: %s %q, want stopped with no address", stopped.State, stopped.Address)
-	}
-
-	// Stop again is a no-op that resolves at once.
-	pend, err = p.Stop(ctx, ref)
-	if err != nil {
-		t.Fatalf("Stop(stopped): %v", err)
-	}
-	if got, err := p.Wait(ctx, pend); err != nil || got.State != provider.StateStopped {
-		t.Fatalf("Wait(stop stopped) = %s, %v", got.State, err)
-	}
-
-	pend, err = p.Start(ctx, ref, provider.StartOptions{MaxRun: 3 * time.Hour})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	started, err := p.Wait(ctx, pend)
-	if err != nil {
-		t.Fatalf("Wait(start): %v", err)
-	}
-	if started.State != provider.StateRunning || started.Address == "" {
-		t.Errorf("after start: %s %q", started.State, started.Address)
-	}
-	if started.MaxRun != 3*time.Hour {
-		t.Errorf("after start with MaxRun 3h: MaxRun %v", started.MaxRun)
-	}
-
-	// A Settle pending on a settled instance returns it.
-	if got, err := p.Wait(ctx, provider.Settle(ref)); err != nil || got.State != provider.StateRunning {
-		t.Errorf("Wait(Settle) = %s, %v", got.State, err)
-	}
-	// Waiting for a state it is not in, with nothing in flight, says so.
-	_, err = p.Wait(ctx, provider.Pending{Ref: ref, Want: provider.StateStopped})
-	if !errors.Is(err, provider.ErrUnexpectedState) {
-		t.Errorf("Wait(want stopped on running) = %v, want ErrUnexpectedState", err)
-	}
-}
-
-func testLabels(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	_, inst := mustCreate(t, h, p, "epsilon")
-	ref := inst.Ref
-
-	set := map[string]string{
-		provider.LabelState:  string(provider.ShedStateReady),
-		provider.LabelLayout: provider.LayoutLabel(1),
-	}
-	if err := p.SetLabels(ctx, ref, set); err != nil {
-		t.Fatalf("SetLabels: %v", err)
-	}
-	got, err := p.Get(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ShedState() != provider.ShedStateReady || got.Layout() != 1 {
-		t.Errorf("after SetLabels: state %q layout %d", got.ShedState(), got.Layout())
-	}
-	if got.Labels[provider.LabelName] != "epsilon" {
-		t.Errorf("SetLabels dropped %s: %v", provider.LabelName, got.Labels)
-	}
-	// Same values again: success.
-	if err := p.SetLabels(ctx, ref, set); err != nil {
-		t.Errorf("SetLabels(same): %v", err)
-	}
-	// An empty value sets the empty string.
-	if err := p.SetLabels(ctx, ref, map[string]string{provider.LabelOwner: ""}); err != nil {
-		t.Errorf("SetLabels(empty owner): %v", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelOwner] != "" {
-		t.Errorf("owner = %q, want empty", got.Labels[provider.LabelOwner])
-	} else if _, ok := got.Labels[provider.LabelOwner]; !ok {
-		t.Errorf("owner label removed, want it present and empty")
-	}
-	for _, k := range []string{provider.LabelSchema, provider.LabelEnv, provider.LabelID} {
-		if err := p.SetLabels(ctx, ref, map[string]string{k: "changed1"}); !errors.Is(err, provider.ErrInvalid) {
-			t.Errorf("SetLabels(%s) = %v, want ErrInvalid", k, err)
-		}
-	}
-	if err := p.SetLabels(ctx, ref, map[string]string{"shed_state": "Not Valid"}); !errors.Is(err, provider.ErrInvalid) {
-		t.Errorf("SetLabels(bad value) = %v, want ErrInvalid", err)
-	}
-}
-
-// testUserLabel: shed_user is carried from the spec to the instance, read
-// back into the Identity, and can be changed and emptied later (an admin's
-// assignment of a shed made before users existed writes it).
-func testUserLabel(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	spec := h.Spec(t, h.Env, "eta")
-	spec.Labels[provider.LabelOwner] = ""
-	spec.Labels[provider.LabelUser] = "alice"
-	pend, err := p.Create(ctx, spec)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	inst, err := p.Wait(ctx, pend)
-	if err != nil {
-		t.Fatalf("Wait(create): %v", err)
-	}
-	id, err := inst.Identity()
-	if err != nil {
-		t.Fatalf("Identity: %v", err)
-	}
-	if id.User != "alice" || id.Owner != "" {
-		t.Errorf("identity after create = %+v, want user alice and no owner", id)
-	}
-	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: "bob"}); err != nil {
-		t.Fatalf("SetLabels(user): %v", err)
-	}
-	if got, _ := p.Get(ctx, inst.Ref); got.Labels[provider.LabelUser] != "bob" {
-		t.Errorf("user = %q after SetLabels, want bob", got.Labels[provider.LabelUser])
-	}
-	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: ""}); err != nil {
-		t.Fatalf("SetLabels(empty user): %v", err)
-	}
-	got, _ := p.Get(ctx, inst.Ref)
-	if id, err := got.Identity(); err != nil || id.User != "" {
-		t.Errorf("identity after emptying the user = %+v, %v; want no user", id, err)
-	}
-}
-
-func testMetadata(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	spec, inst := mustCreate(t, h, p, "zeta")
-	ref := inst.Ref
-	pin := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPinnedHostKey"
-	if err := p.SetMetadata(ctx, ref, map[string]string{provider.MetadataHostKeyPin: pin}); err != nil {
-		t.Fatalf("SetMetadata: %v", err)
-	}
-	got, err := p.Get(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.HostKeyPin() != pin {
-		t.Errorf("pin = %q, want %q", got.HostKeyPin(), pin)
-	}
-	if got.Metadata[provider.MetadataShedSpec] != spec.Metadata[provider.MetadataShedSpec] {
-		t.Errorf("SetMetadata changed shed-spec")
-	}
-	if err := p.SetMetadata(ctx, ref, map[string]string{provider.MetadataHostKeyPin: pin}); err != nil {
-		t.Errorf("SetMetadata(same): %v", err)
-	}
-	if err := p.SetMetadata(ctx, ref, map[string]string{provider.MetadataHostKeyPin: ""}); err != nil {
-		t.Fatalf("SetMetadata(remove): %v", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.HostKeyPin() != "" {
-		t.Errorf("pin after removal = %q", got.HostKeyPin())
-	}
-	if err := p.SetMetadata(ctx, ref, map[string]string{"startup-script": "x"}); !errors.Is(err, provider.ErrInvalid) {
-		t.Errorf("SetMetadata(non-shed key) = %v, want ErrInvalid", err)
-	}
-}
-
-func testDestroy(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	_, inst := mustCreate(t, h, p, "eta")
-	ref := inst.Ref
-	pend, err := p.Destroy(ctx, ref)
-	if err != nil {
-		t.Fatalf("Destroy: %v", err)
-	}
-	if pend.Want != provider.StateAbsent {
-		t.Errorf("Destroy pending want %s", pend.Want)
-	}
-	if got, err := p.Wait(ctx, pend); err != nil || got.Ref != "" {
-		t.Fatalf("Wait(destroy) = %+v, %v; want the zero Instance", got, err)
-	}
-	if _, err := p.Get(ctx, ref); !errors.Is(err, provider.ErrNotFound) {
-		t.Errorf("Get after destroy = %v, want ErrNotFound", err)
-	}
-	again, err := p.Destroy(ctx, ref)
-	if err != nil {
-		t.Fatalf("Destroy(absent) = %v, want nil", err)
-	}
-	if _, err := p.Wait(ctx, again); err != nil {
-		t.Errorf("Wait(destroy absent) = %v", err)
-	}
-	if _, err := p.Wait(ctx, provider.Settle(ref)); !errors.Is(err, provider.ErrNotFound) {
-		t.Errorf("Wait(Settle) on a deleted instance = %v, want ErrNotFound", err)
-	}
-	list, err := p.List(ctx, provider.Selector{Env: h.Env})
-	if err != nil || len(list) != 0 {
-		t.Errorf("List after destroy = %v, %v", refs(list), err)
-	}
-}
-
-func testMissing(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	// A ref for an instance that never existed: create one, destroy it.
-	_, inst := mustCreate(t, h, p, "theta")
-	ref := inst.Ref
-	pend, err := p.Destroy(ctx, ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.Wait(ctx, pend); err != nil {
-		t.Fatal(err)
-	}
-	checks := map[string]error{}
-	_, checks["Get"] = p.Get(ctx, ref)
-	_, checks["Start"] = p.Start(ctx, ref, provider.StartOptions{})
-	_, checks["Stop"] = p.Stop(ctx, ref)
-	checks["SetLabels"] = p.SetLabels(ctx, ref, map[string]string{provider.LabelState: "ready"})
-	checks["SetMetadata"] = p.SetMetadata(ctx, ref, map[string]string{provider.MetadataHostKeyPin: "x y"})
-	_, checks["Wait(running)"] = p.Wait(ctx, provider.Pending{Ref: ref, Want: provider.StateRunning})
-	for name, err := range checks {
-		if !errors.Is(err, provider.ErrNotFound) {
-			t.Errorf("%s on a missing instance = %v, want ErrNotFound", name, err)
-		}
-	}
-}
-
-func testForeign(t *testing.T, h Harness) {
-	p, ctl := h.New(t)
-	if ctl.Seed == nil {
-		t.Skip("harness cannot seed instances")
-	}
-	ctx := h.ctx(t)
-	id := provider.Identity{Env: "zz-other", ID: NewID(), Name: "iota"}
-	ref := ctl.Seed(t, id.InstanceName(), id.Labels(provider.ShedStateReady))
-
-	if got, err := p.Get(ctx, ref); err != nil || got.Labels[provider.LabelEnv] != "zz-other" {
-		t.Errorf("Get(foreign) = %v, %v; reads are allowed", got.Labels, err)
-	}
-	checks := map[string]error{}
-	_, checks["Start"] = p.Start(ctx, ref, provider.StartOptions{})
-	_, checks["Stop"] = p.Stop(ctx, ref)
-	_, checks["Destroy"] = p.Destroy(ctx, ref)
-	checks["SetLabels"] = p.SetLabels(ctx, ref, map[string]string{provider.LabelState: "deleting"})
-	checks["SetMetadata"] = p.SetMetadata(ctx, ref, map[string]string{provider.MetadataHostKeyPin: "x y"})
-	for name, err := range checks {
-		if !errors.Is(err, provider.ErrForeign) {
-			t.Errorf("%s on another environment's instance = %v, want ErrForeign", name, err)
-		}
-	}
-	if got, err := p.Get(ctx, ref); err != nil || got.State != provider.StateRunning || got.ShedState() != provider.ShedStateReady {
-		t.Errorf("foreign instance changed: %s %q, %v", got.State, got.ShedState(), err)
-	}
-
-	mine, err := p.List(ctx, provider.Selector{Env: h.Env})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if slices.Contains(refs(mine), ref) {
-		t.Errorf("List(env) includes another environment's instance")
-	}
-	all, err := p.List(ctx, provider.Selector{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(refs(all), ref) {
-		t.Errorf("List(all) = %v, want it to include %s", refs(all), ref)
-	}
-}
-
-func testWaitCancelled(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	_, inst := mustCreate(t, h, p, "kappa")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := p.Wait(ctx, provider.Pending{Ref: inst.Ref, Want: provider.StateStopped})
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("Wait on a cancelled context = %v, want context.Canceled", err)
-	}
-}
-
-func testHostKey(t *testing.T, h Harness) {
-	p, ctl := h.New(t)
-	hk, ok := p.(provider.HostKeyReader)
-	if !ok || ctl.PublishHostKey == nil {
-		t.Skip("provider reads no host key, or harness cannot publish one")
-	}
-	ctx := h.ctx(t)
-	_, inst := mustCreate(t, h, p, "lambda")
-	if _, err := hk.GuestHostKey(ctx, inst.Ref); !errors.Is(err, provider.ErrNotFound) {
-		t.Errorf("GuestHostKey before publish = %v, want ErrNotFound", err)
-	}
-	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGuestKey"
-	ctl.PublishHostKey(t, inst.Ref, key)
-	got, err := hk.GuestHostKey(ctx, inst.Ref)
-	if err != nil || got != key {
-		t.Errorf("GuestHostKey = %q, %v; want %q", got, err, key)
-	}
-}
-
-func testResolveImage(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	r, ok := p.(provider.ImageResolver)
-	if !ok {
-		t.Skip("provider resolves no images")
-	}
-	ctx := h.ctx(t)
-	got, err := r.ResolveImage(ctx, h.Image)
-	if err != nil || got != h.Image {
-		t.Errorf("ResolveImage(%q) = %q, %v; want itself", h.Image, got, err)
-	}
-	if h.Family != "" {
-		got, err := r.ResolveImage(ctx, h.Family)
-		if err != nil || got == "" || got == h.Family {
-			t.Errorf("ResolveImage(%q) = %q, %v; want an exact name", h.Family, got, err)
-		}
-	}
-	if _, err := r.ResolveImage(ctx, ""); err == nil {
-		t.Errorf("ResolveImage(\"\") succeeded")
-	}
-}
-
-func testRefusalOnCall(t *testing.T, h Harness) {
-	for _, kind := range []error{provider.ErrQuota, provider.ErrCapacity} {
-		t.Run(kind.Error(), func(t *testing.T) {
-			p, ctl := h.New(t)
-			if ctl.RefuseNextCreate == nil {
-				t.Skip("harness cannot inject a refusal")
-			}
-			ctx := h.ctx(t)
-			ctl.RefuseNextCreate(t, kind)
-			_, err := p.Create(ctx, h.Spec(t, h.Env, "mu"))
-			if !errors.Is(err, kind) || !provider.IsRefusal(err) {
-				t.Errorf("Create = %v, want %v", err, kind)
-			}
-			list, err := p.List(ctx, provider.Selector{Env: h.Env})
-			if err != nil || len(list) != 0 {
-				t.Errorf("List after refusal = %v, %v; want none", refs(list), err)
-			}
-		})
-	}
-}
-
-func testRefusalOnOperation(t *testing.T, h Harness) {
-	for _, kind := range []error{provider.ErrQuota, provider.ErrCapacity} {
-		t.Run(kind.Error(), func(t *testing.T) {
-			p, ctl := h.New(t)
-			if ctl.FailNextCreateOperation == nil {
-				t.Skip("harness cannot fail an operation")
-			}
-			ctx := h.ctx(t)
-			ctl.FailNextCreateOperation(t, kind)
-			pend, err := p.Create(ctx, h.Spec(t, h.Env, "nu"))
-			if err != nil {
-				// A provider may notice the failure on the call already.
-				if !errors.Is(err, kind) {
-					t.Fatalf("Create = %v, want nil or %v", err, kind)
-				}
-				return
-			}
-			if _, err := p.Wait(ctx, pend); !errors.Is(err, kind) {
-				t.Errorf("Wait = %v, want %v", err, kind)
-			}
-			list, err := p.List(ctx, provider.Selector{Env: h.Env})
-			if err != nil || len(list) != 0 {
-				t.Errorf("List after failed create = %v, %v; want none", refs(list), err)
-			}
-		})
-	}
-}
-
-// envRule is the environment's rule as the setup script makes it.
-func envRule(env string, sources ...string) provider.FirewallRule {
-	return provider.FirewallRule{
-		Name:         provider.FirewallRuleName(env),
-		Direction:    provider.DirectionIngress,
-		Priority:     1000,
-		SourceRanges: sources,
-		TargetTags:   []string{provider.NetworkTag(env)},
-		Allowed:      []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
-	}
-}
-
-func testFirewallReads(t *testing.T, h Harness) {
-	p, c := h.New(t)
-	if c.SetFirewall == nil {
-		t.Skip("the harness cannot set the cloud's firewall")
-	}
-	ctx := h.ctx(t)
-
-	t.Run("no rule", func(t *testing.T) {
-		c.SetFirewall(t, nil)
-		if _, err := p.EnvFirewallRule(ctx); !errors.Is(err, provider.ErrNotFound) {
-			t.Errorf("EnvFirewallRule with no rule: %v, want ErrNotFound", err)
-		}
-		view, err := p.NetworkIngress(ctx)
-		if err != nil || view.Network == "" || len(view.Rules) != 0 {
-			t.Errorf("NetworkIngress with no rule = %+v, %v", view, err)
-		}
-	})
-
-	t.Run("rules", func(t *testing.T) {
-		c.SetFirewall(t, []provider.FirewallRule{
-			{Name: "zz-stray", Direction: provider.DirectionIngress, Priority: 900, SourceRanges: []string{"198.51.100.0/24"},
-				Allowed: []provider.FirewallPorts{{Protocol: "all"}}},
-			envRule(h.Env, "192.0.2.10/32", "203.0.113.0/24"),
-			{Name: "aa-deny", Direction: provider.DirectionIngress, Priority: 500, Disabled: true, SourceTags: []string{"other"},
-				TargetServiceAccounts: []string{"sa@example.iam.gserviceaccount.com"},
-				Denied:                []provider.FirewallPorts{{Protocol: "udp", Ports: []string{"53", "1000-2000"}}}},
-			{Name: "egress-rule", Direction: provider.DirectionEgress, DestinationRanges: []string{"0.0.0.0/0"},
-				Denied: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"25"}}}},
-			{Name: "elsewhere", Network: "another-network", Direction: provider.DirectionIngress, SourceRanges: []string{"0.0.0.0/0"},
-				Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}}},
-		})
-		rule, err := p.EnvFirewallRule(ctx)
-		if err != nil {
-			t.Fatalf("EnvFirewallRule: %v", err)
-		}
-		view, err := p.NetworkIngress(ctx)
-		if err != nil {
-			t.Fatalf("NetworkIngress: %v", err)
-		}
-		if rule.Name != provider.FirewallRuleName(h.Env) || rule.Network != view.Network || rule.Direction != provider.DirectionIngress ||
-			rule.Disabled || rule.Priority != 1000 ||
-			!slices.Equal(rule.SourceRanges, []string{"192.0.2.10/32", "203.0.113.0/24"}) ||
-			!slices.Equal(rule.TargetTags, []string{provider.NetworkTag(h.Env)}) ||
-			len(rule.Allowed) != 1 || rule.Allowed[0].Protocol != "tcp" || !slices.Equal(rule.Allowed[0].Ports, []string{"22"}) || len(rule.Denied) != 0 {
-			t.Errorf("EnvFirewallRule = %+v", rule)
-		}
-		if view.Default {
-			t.Error("the test network is reported as the default network")
-		}
-		var names []string
-		for _, r := range view.Rules {
-			names = append(names, r.Name)
-			if r.Network != view.Network || r.Direction != provider.DirectionIngress {
-				t.Errorf("NetworkIngress returned %+v", r)
-			}
-		}
-		// Ordered by name; the egress rule and the other network's rule
-		// are left out; a disabled rule is still listed.
-		if want := []string{"aa-deny", provider.FirewallRuleName(h.Env), "zz-stray"}; !slices.Equal(names, want) {
-			t.Fatalf("NetworkIngress rules = %v, want %v", names, want)
-		}
-		deny := view.Rules[0]
-		if !deny.Disabled || deny.Priority != 500 || !slices.Equal(deny.SourceTags, []string{"other"}) || len(deny.TargetServiceAccounts) != 1 ||
-			len(deny.Allowed) != 0 || len(deny.Denied) != 1 || deny.Denied[0].Protocol != "udp" || !slices.Equal(deny.Denied[0].Ports, []string{"53", "1000-2000"}) {
-			t.Errorf("deny rule = %+v", deny)
-		}
-		stray := view.Rules[2]
-		if len(stray.TargetTags) != 0 || len(stray.Allowed) != 1 || stray.Allowed[0].Protocol != "all" || len(stray.Allowed[0].Ports) != 0 {
-			t.Errorf("stray rule = %+v", stray)
-		}
-	})
-
-	t.Run("the rule on another network is still found by name", func(t *testing.T) {
-		moved := envRule(h.Env, "192.0.2.10/32")
-		moved.Network = "another-network"
-		c.SetFirewall(t, []provider.FirewallRule{moved})
-		rule, err := p.EnvFirewallRule(ctx)
-		if err != nil || rule.Network != "another-network" {
-			t.Errorf("EnvFirewallRule = %+v, %v", rule, err)
-		}
-		view, err := p.NetworkIngress(ctx)
-		if err != nil || len(view.Rules) != 0 {
-			t.Errorf("NetworkIngress = %+v, %v", view, err)
-		}
-	})
-}
-
-func testFirewallSources(t *testing.T, h Harness) {
-	p, c := h.New(t)
-	setter, ok := p.(provider.FirewallSourceSetter)
-	if !ok || c.SetFirewall == nil {
-		t.Skip("the provider cannot set firewall sources, or the harness cannot set the firewall")
-	}
-	ctx := h.ctx(t)
-	other := provider.FirewallRule{Name: "shed-otherenv-ssh", Direction: provider.DirectionIngress, Priority: 1000,
-		SourceRanges: []string{"198.51.100.7/32"}, TargetTags: []string{"shed-otherenv"},
-		Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}}}
-	c.SetFirewall(t, []provider.FirewallRule{envRule(h.Env, "192.0.2.10/32"), other})
-
-	t.Run("invalid ranges send nothing", func(t *testing.T) {
-		for _, bad := range [][]string{
-			nil, {}, {"203.0.113.9"}, {"203.0.113.9/24"}, {"2001:db8::1/128"}, {"0.0.0.0/0"}, {"203.0.0.0/16"}, {"203.0.113.9/32", "junk"},
+	w.t.Run("stop and start", func(t *testing.T) {
+		w := parent.sub(t)
+		inst := w.running("lost-cycle")
+		for _, c := range []struct {
+			call  string
+			do    func(rid string) (provider.Pending, error)
+			state provider.State
+		}{
+			{"stop", func(rid string) (provider.Pending, error) { return p.Stop(w.ctx, inst.Ref, rid) }, provider.StateStopped},
+			{"start", func(rid string) (provider.Pending, error) { return p.Start(w.ctx, inst.Ref, rid) }, provider.StateRunning},
 		} {
-			if err := setter.SetEnvFirewallSources(ctx, bad); !errors.Is(err, provider.ErrInvalid) {
-				t.Errorf("SetEnvFirewallSources(%v): %v, want ErrInvalid", bad, err)
+			rid := provider.NewRequestID()
+			w.LoseNextReply(c.call)
+			_, err := c.do(rid)
+			wantKind(t, "a "+c.call+" whose reply is lost", err, provider.ErrUnavailable)
+			pend, err := c.do(rid)
+			if err != nil {
+				t.Fatalf("the %s sent again = %v", c.call, err)
 			}
-		}
-		rule, err := p.EnvFirewallRule(ctx)
-		if err != nil || !slices.Equal(rule.SourceRanges, []string{"192.0.2.10/32"}) {
-			t.Errorf("the rule changed: %+v, %v", rule, err)
-		}
-	})
-
-	t.Run("sets the one rule's sources and nothing else", func(t *testing.T) {
-		before, err := p.EnvFirewallRule(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := setter.SetEnvFirewallSources(ctx, []string{"203.0.113.9/32"}); err != nil {
-			t.Fatalf("SetEnvFirewallSources: %v", err)
-		}
-		after, err := p.EnvFirewallRule(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !slices.Equal(after.SourceRanges, []string{"203.0.113.9/32"}) {
-			t.Errorf("sources = %v", after.SourceRanges)
-		}
-		before.SourceRanges, after.SourceRanges = nil, nil
-		if fmt.Sprintf("%+v", before) != fmt.Sprintf("%+v", after) {
-			t.Errorf("more than the sources changed:\n before %+v\n after  %+v", before, after)
-		}
-		view, err := p.NetworkIngress(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, r := range view.Rules {
-			if r.Name == other.Name && !slices.Equal(r.SourceRanges, other.SourceRanges) {
-				t.Errorf("another environment's rule changed: %+v", r)
+			if g := w.settled(pend); g.State != c.state {
+				t.Errorf("after the %s sent again: %s", c.call, g.State)
 			}
 		}
 	})
-
-	t.Run("a missing rule is not created", func(t *testing.T) {
-		c.SetFirewall(t, []provider.FirewallRule{other})
-		if err := setter.SetEnvFirewallSources(ctx, []string{"203.0.113.9/32"}); !errors.Is(err, provider.ErrNotFound) {
-			t.Errorf("SetEnvFirewallSources with no rule: %v, want ErrNotFound", err)
+	w.t.Run("labels", func(t *testing.T) {
+		w := parent.sub(t)
+		inst := w.running("lost-labels")
+		rid := provider.NewRequestID()
+		set := map[string]*string{"probe": provider.Str("one")}
+		expect := map[string]*string{"probe": nil}
+		w.LoseNextReply("labels")
+		_, err := p.SetLabels(w.ctx, inst.Ref, rid, set, expect)
+		wantKind(t, "a labels write whose reply is lost", err, provider.ErrUnavailable)
+		// The condition no longer holds; the kept answer is given all the
+		// same: the write took effect once.
+		got, err := p.SetLabels(w.ctx, inst.Ref, rid, set, expect)
+		if err != nil || got.Labels["probe"] != "one" {
+			t.Fatalf("the labels write sent again = %v, %v", got.Labels, err)
 		}
-		if _, err := p.EnvFirewallRule(ctx); !errors.Is(err, provider.ErrNotFound) {
-			t.Errorf("the rule exists now: %v", err)
+	})
+	w.t.Run("extend", func(t *testing.T) {
+		w := parent.sub(t)
+		inst := w.running("lost-extend")
+		rid := provider.NewRequestID()
+		w.LoseNextReply("extend")
+		_, err := p.Extend(w.ctx, inst.Ref, rid, 6*time.Hour)
+		wantKind(t, "an extend whose reply is lost", err, provider.ErrUnavailable)
+		got, err := p.Extend(w.ctx, inst.Ref, rid, 6*time.Hour)
+		if err != nil {
+			t.Fatalf("the extend sent again = %v", err)
 		}
+		if d := got.Lease.ExpiresAt.Sub(inst.Lease.ExpiresAt); d != 6*time.Hour {
+			t.Errorf("an extend sent twice moved the lease by %s, want 6h once", d)
+		}
+	})
+	w.t.Run("delete", func(t *testing.T) {
+		w := parent.sub(t)
+		inst := w.running("lost-delete")
+		rid := provider.NewRequestID()
+		w.LoseNextReply("delete")
+		_, err := p.Destroy(w.ctx, inst.Ref, rid)
+		wantKind(t, "a delete whose reply is lost", err, provider.ErrUnavailable)
+		pend, err := p.Destroy(w.ctx, inst.Ref, rid)
+		if err != nil {
+			t.Fatalf("the delete sent again = %v", err)
+		}
+		w.Settle(pend.Ref)
+		if _, err := w.wait(p, pend); err != nil {
+			t.Errorf("Wait on the delete sent again = %v", err)
+		}
+		_, err = w.get(inst.Ref)
+		wantKind(t, "Get after the delete", err, provider.ErrNotFound)
 	})
 }
 
-func refs(insts []provider.Instance) []provider.Ref {
-	out := make([]provider.Ref, 0, len(insts))
-	for _, i := range insts {
-		out = append(out, i.Ref)
+func testExpiredOperations(w *world) {
+	if w.ExpireOperations == nil {
+		w.t.Skip("the world cannot expire an operation")
 	}
-	return out
-}
-
-// testClaimLabel: ClaimLabel writes a label that is empty, accepts one that
-// already has the value without a change, and refuses one that holds another
-// value with ErrLabelTaken, writing nothing. The labels that identify an
-// instance cannot be claimed.
-func testClaimLabel(t *testing.T, h Harness) {
-	p, _ := h.New(t)
-	ctx := h.ctx(t)
-	_, inst := mustCreate(t, h, p, "theta")
-	ref := inst.Ref
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob", nil); err != nil {
-		t.Fatalf("ClaimLabel(empty): %v", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" || got.Labels[provider.LabelName] != "theta" {
-		t.Errorf("after ClaimLabel: %v", got.Labels)
-	}
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob", nil); err != nil {
-		t.Errorf("ClaimLabel(same): %v", err)
-	}
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "alice", nil); !errors.Is(err, provider.ErrLabelTaken) {
-		t.Errorf("ClaimLabel(other) = %v, want ErrLabelTaken", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" {
-		t.Errorf("user = %q after a refused claim, want bob", got.Labels[provider.LabelUser])
-	}
-	// Labels written with a claim land with it, and not without it.
-	also := map[string]string{provider.LabelUserOrigin: "directory"}
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "alice", also); !errors.Is(err, provider.ErrLabelTaken) {
-		t.Errorf("ClaimLabel(other, also) = %v, want ErrLabelTaken", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUserOrigin] != "" {
-		t.Errorf("a refused claim wrote its other labels: %v", got.Labels)
-	}
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob", also); err != nil {
-		t.Errorf("ClaimLabel(same, also) = %v", err)
-	}
-	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" || got.Labels[provider.LabelUserOrigin] != "directory" {
-		t.Errorf("after a claim with other labels: %v", got.Labels)
-	}
-	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob", map[string]string{provider.LabelID: "x1234567"}); !errors.Is(err, provider.ErrInvalid) {
-		t.Errorf("ClaimLabel(also an identity label) = %v, want ErrInvalid", err)
-	}
-	for _, k := range []string{provider.LabelSchema, provider.LabelEnv, provider.LabelID} {
-		if err := p.ClaimLabel(ctx, ref, k, "changed1", nil); !errors.Is(err, provider.ErrInvalid) {
-			t.Errorf("ClaimLabel(%s) = %v, want ErrInvalid", k, err)
-		}
-	}
-
-	// An empty key is not a label: refused, nothing written.
-	before, err := p.Get(ctx, ref)
+	p := w.Provider
+	// Each operation finishes, is forgotten, and its stored Pending is
+	// waited on: the machine is followed by what the Pending waits for.
+	create, _, err := p.Create(w.ctx, w.personSpec("expire"))
 	if err != nil {
-		t.Fatal(err)
+		w.t.Fatal(err)
 	}
-	if err := p.ClaimLabel(ctx, ref, "", "bob", nil); !errors.Is(err, provider.ErrInvalid) {
-		t.Errorf("ClaimLabel(empty key) = %v, want ErrInvalid", err)
+	ref := create.Ref
+	steps := []struct {
+		name string
+		do   func() provider.Pending
+		want provider.State
+	}{
+		{"create", func() provider.Pending { return create }, provider.StateRunning},
+		{"stop", func() provider.Pending {
+			pend, err := p.Stop(w.ctx, ref, provider.NewRequestID())
+			if err != nil {
+				w.t.Fatal(err)
+			}
+			return pend
+		}, provider.StateStopped},
+		{"start", func() provider.Pending {
+			pend, err := p.Start(w.ctx, ref, provider.NewRequestID())
+			if err != nil {
+				w.t.Fatal(err)
+			}
+			return pend
+		}, provider.StateRunning},
 	}
-	if got, _ := p.Get(ctx, ref); !maps.Equal(got.Labels, before.Labels) {
-		t.Errorf("labels after a refused empty-key claim: %v, was %v", got.Labels, before.Labels)
+	for _, s := range steps {
+		pend := s.do()
+		if pend.Operation == "" {
+			w.t.Fatalf("%s gave no operation", s.name)
+		}
+		w.Settle(ref)
+		w.ExpireOperations()
+		got, err := w.wait(p, pend)
+		if err != nil || got.State != s.want {
+			w.t.Errorf("Wait on an expired %s = %s, %v; want %s", s.name, got.State, err, s.want)
+		}
 	}
+	del, err := p.Destroy(w.ctx, ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	w.Settle(ref)
+	w.ExpireOperations()
+	if _, err := w.wait(p, del); err != nil {
+		w.t.Errorf("Wait on an expired delete = %v", err)
+	}
+	// A Pending stored with its operation unknown, for a machine still
+	// running, is waited on by its Want.
+	inst := w.running("expire-2")
+	w.ExpireOperations()
+	got, err := w.wait(p, provider.Pending{Ref: inst.Ref, Operation: "an-operation-never-made", Want: provider.StateRunning})
+	if err != nil || got.State != provider.StateRunning {
+		w.t.Errorf("Wait on an unknown operation = %s, %v", got.State, err)
+	}
+	_, err = w.wait(p, provider.Pending{Ref: inst.Ref, Operation: "an-operation-never-made", Want: provider.StateStopped})
+	wantKind(w.t, "Wait for stopped on a running machine", err, provider.ErrUnexpectedState)
+}
 
-	// An instance takes at most 64 labels: filled to 64, a claim that would
-	// add a 65th is refused and writes nothing.
-	_, full := mustCreate(t, h, p, "iota")
-	fill := map[string]string{}
-	for i := len(full.Labels); i < 64; i++ {
-		fill[fmt.Sprintf("fill-%02d", i)] = "x"
+func testFreshProcess(w *world) {
+	if w.Fresh == nil {
+		w.t.Skip("the world has one process")
 	}
-	if err := p.SetLabels(ctx, full.Ref, fill); err != nil {
-		t.Fatalf("SetLabels(to 64): %v", err)
+	// Each Pending is stored as JSON by one process and waited on by
+	// another, which knows nothing of it but what was stored.
+	store := func(p provider.Pending) []byte {
+		b, err := json.Marshal(p)
+		if err != nil {
+			w.t.Fatal(err)
+		}
+		return b
 	}
-	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 {
-		t.Fatalf("test set-up: %d labels, want 64", len(got.Labels))
+	load := func(b []byte) provider.Pending {
+		var p provider.Pending
+		if err := json.Unmarshal(b, &p); err != nil {
+			w.t.Fatal(err)
+		}
+		return p
 	}
-	const extra = "claimed-extra"
-	if _, ok := full.Labels[extra]; ok {
-		t.Fatalf("test set-up: the instance already has label %s", extra)
+	spec := w.personSpec("fresh")
+	pend, _, err := w.Provider.Create(w.ctx, spec)
+	if err != nil {
+		w.t.Fatal(err)
 	}
-	if err := p.ClaimLabel(ctx, full.Ref, extra, "bob", nil); !errors.Is(err, provider.ErrInvalid) {
-		t.Errorf("ClaimLabel(a 65th label) = %v, want ErrInvalid", err)
+	stored := store(pend)
+	fresh := w.Fresh()
+	loaded := load(stored)
+	if loaded != pend || loaded.Want != provider.StateRunning {
+		w.t.Fatalf("the stored Pending reads back as %+v, want %+v", loaded, pend)
 	}
-	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 || got.Labels[extra] != "" {
-		t.Errorf("after a refused 65th-label claim: %d labels, %s=%q", len(got.Labels), extra, got.Labels[extra])
+	w.Settle(loaded.Ref)
+	got, err := w.wait(fresh, loaded)
+	if err != nil || got.State != provider.StateRunning {
+		w.t.Fatalf("a fresh process waiting on the stored create = %s, %v", got.State, err)
 	}
+	// The create replayed verbatim by the fresh process: the same machine.
+	if p2, _, err := fresh.Create(w.ctx, spec); err != nil || p2.Ref != pend.Ref {
+		w.t.Errorf("the stored create replayed by a fresh process = %+v, %v", p2, err)
+	}
+	stop, err := w.Provider.Stop(w.ctx, pend.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	stored = store(stop)
+	fresh = w.Fresh()
+	w.Settle(pend.Ref)
+	if got, err := w.wait(fresh, load(stored)); err != nil || got.State != provider.StateStopped {
+		w.t.Errorf("a fresh process waiting on the stored stop = %s, %v", got.State, err)
+	}
+	del, err := w.Provider.Destroy(w.ctx, pend.Ref, provider.NewRequestID())
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	stored = store(del)
+	fresh = w.Fresh()
+	w.Settle(pend.Ref)
+	if _, err := w.wait(fresh, load(stored)); err != nil {
+		w.t.Errorf("a fresh process waiting on the stored delete = %v", err)
+	}
+	_, err = fresh.Get(w.ctx, pend.Ref)
+	wantKind(w.t, "Get after the delete", err, provider.ErrNotFound)
 }

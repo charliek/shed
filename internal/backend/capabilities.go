@@ -2,7 +2,11 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"slices"
+	"sort"
+	"strings"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -184,4 +188,90 @@ func CapabilitiesOf(b Backend) Capabilities {
 // has its own, which its record carries.
 func RemoteCapabilities() Capabilities {
 	return Capabilities{AsyncLifecycle: true, Isolation: IsolationTopology}
+}
+
+// CatalogSize is one size a backend's compute service offers.
+type CatalogSize struct {
+	Name          string
+	CPUs          int
+	MemoryMB      int
+	Arch          string
+	DiskGBDefault int
+}
+
+// ComputeCatalog is what a backend whose machines come from a compute
+// service offers: its sizes and default size, the image names a create may
+// give (besides the default), what the default image is now (for display),
+// and the architecture every size shares ("" when they differ).
+type ComputeCatalog struct {
+	Sizes        []CatalogSize
+	DefaultSize  string
+	DefaultImage string
+	Images       []string
+	GuestArch    string
+}
+
+// Cataloger is implemented by a backend whose sizes and images come from a
+// compute service (remote). ok is false until the backend has read the
+// catalog (a server that started degraded, with the service down).
+type Cataloger interface {
+	ComputeCatalog() (c ComputeCatalog, ok bool)
+}
+
+// CatalogOf returns b's catalog, seeing through a Guard. offers is false for
+// a backend that has none (Firecracker, VZ); ok is false for one that has
+// not read it yet.
+func CatalogOf(b Backend) (c ComputeCatalog, ok, offers bool) {
+	if b == nil {
+		return ComputeCatalog{}, false, false
+	}
+	cat, isCat := unwrap(b).(Cataloger)
+	if !isCat {
+		return ComputeCatalog{}, false, false
+	}
+	c, ok = cat.ComputeCatalog()
+	return c, ok, true
+}
+
+// HasImage reports whether a create may name image: empty or "default", or
+// one of the catalog's images.
+func (c ComputeCatalog) HasImage(image string) bool {
+	return image == "" || image == "default" || slices.Contains(c.Images, image)
+}
+
+// ResolveSize picks the size for a create's cpus and memory_mb: both zero
+// gives the default size; otherwise the smallest size (fewest CPUs, then
+// least memory) that provides at least both, a zero in one meaning no
+// requirement. When nothing fits the error wraps
+// config.ErrSizeUnavailableSentinel (422 SIZE_UNAVAILABLE) and names the
+// sizes that exist.
+func (c ComputeCatalog) ResolveSize(cpus, memoryMB int) (CatalogSize, error) {
+	if cpus < 0 || memoryMB < 0 {
+		return CatalogSize{}, fmt.Errorf("%w: cpus and memory_mb must not be negative", config.ErrInvalidShedRequestSentinel)
+	}
+	names := make([]string, 0, len(c.Sizes))
+	for _, s := range c.Sizes {
+		names = append(names, fmt.Sprintf("%s=%d CPUs/%d MB", s.Name, s.CPUs, s.MemoryMB))
+	}
+	if cpus == 0 && memoryMB == 0 {
+		for _, s := range c.Sizes {
+			if s.Name == c.DefaultSize {
+				return s, nil
+			}
+		}
+		return CatalogSize{}, fmt.Errorf("%w: the default size %q is not offered (sizes: %s)", config.ErrSizeUnavailableSentinel, c.DefaultSize, strings.Join(names, ", "))
+	}
+	sorted := append([]CatalogSize(nil), c.Sizes...)
+	sort.SliceStable(sorted, func(a, b int) bool {
+		if sorted[a].CPUs != sorted[b].CPUs {
+			return sorted[a].CPUs < sorted[b].CPUs
+		}
+		return sorted[a].MemoryMB < sorted[b].MemoryMB
+	})
+	for _, s := range sorted {
+		if s.CPUs >= cpus && s.MemoryMB >= memoryMB {
+			return s, nil
+		}
+	}
+	return CatalogSize{}, fmt.Errorf("%w: no size provides %d CPUs and %d MB (sizes: %s)", config.ErrSizeUnavailableSentinel, cpus, memoryMB, strings.Join(names, ", "))
 }

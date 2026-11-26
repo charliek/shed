@@ -32,6 +32,14 @@ func (s *Server) clientCreateRefusal(c Caller, req *config.CreateShedRequest) st
 	case !strings.HasPrefix(req.Name, p.NamePrefix):
 		return fmt.Sprintf("shed name %q must start with %q", req.Name, p.NamePrefix)
 	}
+	// A remote server's images are its compute service's (S0 ruling 3): a
+	// client's image must be one the catalog offers as well as one its
+	// policy allows. (Its cpus and memory were already resolved to a
+	// catalog size by handleCreateShed, so the defaults below are unused
+	// there.)
+	if cat, ok, _ := backend.CatalogOf(s.backend); ok && req.Image != "" && !cat.HasImage(req.Image) {
+		return fmt.Sprintf("image %q is not one the account service offers", req.Image)
+	}
 	defCPUs, defMem := s.cfg.ActiveDefaultResources()
 	cpus, mem := req.CPUs, req.MemoryMB
 	if cpus == 0 {
@@ -82,6 +90,14 @@ func (s *Server) userCreateRefusal(c Caller, req *config.CreateShedRequest) stri
 	case req.Mounts != nil && len(*req.Mounts) > 0:
 		return "mounts"
 	case req.Image != "":
+		if cat, ok, offers := backend.CatalogOf(s.backend); offers {
+			// A remote server's images are its compute service's catalog;
+			// with none read yet, the backend refuses the create itself.
+			if ok && !cat.HasImage(req.Image) {
+				return fmt.Sprintf("image %q (only the default image or one the account service offers)", req.Image)
+			}
+			return ""
+		}
 		if _, ok := s.cfg.ActiveImageAliases()[req.Image]; !ok {
 			return fmt.Sprintf("image %q (only the server default image or an image alias)", req.Image)
 		}

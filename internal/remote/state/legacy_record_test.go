@@ -50,7 +50,7 @@ func TestLegacyRecordLoadsAsMachine(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw := `{"shed":{"name":"one","id":"abcdefgh","status":"running"},"env":"test","delivery":` + c.record + `}`
+			raw := `{"schema":2,"shed":{"name":"one","id":"abcdefgh","status":"running"},"delivery":` + c.record + `}`
 			if err := os.WriteFile(filepath.Join(dir, "sheds", "one.json"), []byte(raw), 0o600); err != nil {
 				t.Fatal(err)
 			}

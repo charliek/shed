@@ -125,13 +125,7 @@ func (s *Server) applyComputeControl() error {
 	for k, v := range f.Replies {
 		c.replies[k] = v
 	}
-	c.autoSettle = time.Duration(f.AutoSettleS) * time.Second
-	c.hostKeyDefault = f.HostKey
-	if f.Access != nil {
-		c.world.Access = *f.Access
-	} else {
-		c.world.Access = DefaultComputeWorld().Access
-	}
+	c.setSettingsLocked(time.Duration(f.AutoSettleS)*time.Second, f.HostKey, f.Access)
 	var todo []map[string]json.RawMessage
 	for _, st := range f.Steps {
 		if st.ID == "" {
@@ -149,11 +143,7 @@ func (s *Server) applyComputeControl() error {
 			return errors.New("compute.json: a step is not an object with one member")
 		}
 		for name, raw := range st {
-			err := s.applyComputeStep(name, raw, func(d time.Duration) {
-				c.mu.Lock()
-				c.offset += d
-				c.mu.Unlock()
-			})
+			err := s.applyComputeStep(name, raw, c.advance)
 			if err != nil {
 				return fmt.Errorf("compute.json: %s: %w", name, err)
 			}

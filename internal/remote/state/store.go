@@ -1,8 +1,9 @@
 // Package state is the remote backend's local cache: one JSON record per shed
-// and one delete marker per shed whose delete was acknowledged and whose VM
-// may still exist. The cloud's labels and metadata are the record of which
-// sheds exist; this cache is what GetShed and ListSheds read, and what lets a
-// restarted server pick up the work it was doing.
+// and one delete marker per shed whose delete was acknowledged and whose
+// machine may still exist. The provider's machines (each with its spec and
+// working labels) are the record of which sheds exist; this cache is what
+// GetShed and ListSheds read, and what lets a restarted server pick up the
+// work it was doing.
 //
 // Layout under the state directory:
 //
@@ -43,33 +44,63 @@ const (
 	QueuedStop  = "stop"
 )
 
+// Schema is the version of the record and marker files this build writes
+// and reads. A file without it, or with another value, was written by an
+// earlier server (the in-tree cloud provider's, or before the compute
+// contract) and is never read as a record: the backend refuses to start
+// while one is there (plan 041 R15).
+const Schema = 2
+
+// Mutation is the request id a job's call that changes the machine sends,
+// stored before it is sent so that a retry, in this process or after a
+// restart, sends the same one (the compute contract's idempotency).
+type Mutation struct {
+	// Call is the call it is for ("start", "stop", "labels:ready").
+	Call string `json:"call"`
+	// Ref is the machine it is for.
+	Ref provider.Ref `json:"ref"`
+	// RequestID is the id sent.
+	RequestID string `json:"request_id"`
+}
+
 // Record is everything the server keeps about one shed.
 type Record struct {
+	// Schema is Schema; SaveRecord writes it.
+	Schema int `json:"schema"`
+
 	// Shed is what the API reports. Shed.Status is "starting" or
 	// "stopping" exactly while Job is set.
 	Shed config.Shed `json:"shed"`
 
-	// Env and Zone are the environment and zone the shed was created in.
-	Env  string `json:"env"`
-	Zone string `json:"zone,omitempty"`
+	// Env is the environment of a record the in-tree cloud provider wrote
+	// (before the compute service). This build never writes it: a record
+	// that has it and no Machine is refused at start-up (Legacy).
+	Env string `json:"env,omitempty"`
 
-	// Ref is the provider's handle, empty until the cloud has accepted the
-	// create.
+	// Ref is the provider's handle (the shed id), empty until the provider
+	// has accepted the create.
 	Ref provider.Ref `json:"ref,omitempty"`
-	// Pending is the cloud operation the job in flight is waiting on, when
-	// the provider gave one.
+	// Pending is the operation the job in flight is waiting on, when the
+	// provider gave one, with what it waits for (Pending.Want).
 	Pending *provider.Pending `json:"pending,omitempty"`
-	// Spec is what the instance is created from. It is kept so a create
+	// Mutation is the request id of the job's call in flight, kept from
+	// before the call is sent until the job's step ends.
+	Mutation *Mutation `json:"mutation,omitempty"`
+	// Spec is the create, request id included. It is kept so a create
 	// resumed after a restart sends the same request.
 	Spec *provider.Spec `json:"spec,omitempty"`
+	// Machine is the machine as the provider last answered it: filled from
+	// the create's answer at once, and from every read since. Its access
+	// options are what a reconnect dials.
+	Machine *provider.Instance `json:"machine,omitempty"`
 
 	// Job is the work in flight: JobCreate, JobStart, JobStop or empty.
 	Job string `json:"job,omitempty"`
 	// Queued is what to do when Job ends: QueuedStart, QueuedStop or empty.
 	Queued string `json:"queued,omitempty"`
 
-	// Ready is true once the instance carries shed_state=ready: the host
-	// key is pinned and the agent answered. A shed that is Ready is never
+	// Ready is true once the machine carries shed_state=ready: the host key
+	// is pinned and the agent answered. A shed that is Ready is never
 	// re-learned and never has its create steps run again.
 	Ready bool `json:"ready,omitempty"`
 	// Delivery is the shed's delivery record: the four tracked steps
@@ -103,26 +134,37 @@ type Record struct {
 	// is stamped once, at the server's first start that knows it.
 	UserOrigin string `json:"user_origin,omitempty"`
 
-	// Address is the last address the cloud reported; AddressAt is when.
-	Address   string    `json:"address,omitempty"`
-	AddressAt time.Time `json:"address_at,omitempty"`
-	// HostKeyPin is a copy of the pinned host key in instance metadata.
+	// HostKeyPin is the one host key the server accepts from the machine:
+	// the key the service attested, compared with the key sshd presented
+	// at first contact, in authorized_keys form with no comment. A later
+	// change is refused.
 	HostKeyPin string `json:"host_key_pin,omitempty"`
 	// Layout is the guest layout the agent reported.
 	Layout int `json:"layout,omitempty"`
-	// Size and DiskGB are the named size and boot disk.
-	Size   string `json:"size,omitempty"`
-	DiskGB int    `json:"disk_gb,omitempty"`
-	// MaxRun is the run limit applied at each start.
-	MaxRun time.Duration `json:"max_run,omitempty"`
 
-	// UserConflict is the shed_user label a read of the shed's instance
-	// found when it named a user other than the one Shed.User (or
-	// Shed.Owner) records, or was not a valid user name at all. While it is
+	// UserConflict is the owner a read of the shed's machine found when it
+	// named another user or client than the one Shed.User (or Shed.Owner)
+	// records, or a user that is not a valid user name at all. While it is
 	// set the shed is reported with config.UserUnresolved, so only an admin
-	// can reach it. A later read that finds the label in line with the
+	// can reach it. A later read that finds the machine in line with the
 	// record clears it.
 	UserConflict string `json:"user_conflict,omitempty"`
+}
+
+// Legacy says why a record was written by an earlier server, or "" when it
+// was not: it does not carry this build's Schema, its Ref has the in-tree
+// cloud provider's shape (a zone and a name, not a shed id), or it has an
+// environment and no machine.
+func (r *Record) Legacy() string {
+	switch {
+	case r.Schema != Schema:
+		return "it was written by an earlier server"
+	case r.Ref != "" && string(r.Ref) != r.Shed.ID:
+		return fmt.Sprintf("its cloud reference %q is the old provider's", r.Ref)
+	case r.Env != "" && r.Machine == nil:
+		return fmt.Sprintf("it belongs to environment %q of the old provider", r.Env)
+	}
+	return ""
 }
 
 // Clone returns a deep copy.
@@ -136,24 +178,16 @@ func (r *Record) Clone() *Record {
 		p := *r.Pending
 		out.Pending = &p
 	}
-	if r.Spec != nil {
-		s := *r.Spec
-		s.Labels = cloneMap(r.Spec.Labels)
-		s.Metadata = cloneMap(r.Spec.Metadata)
-		out.Spec = &s
+	if r.Mutation != nil {
+		m := *r.Mutation
+		out.Mutation = &m
+	}
+	out.Spec = r.Spec.Clone()
+	if r.Machine != nil {
+		m := r.Machine.Clone()
+		out.Machine = &m
 	}
 	return &out
-}
-
-func cloneMap(m map[string]string) map[string]string {
-	if m == nil {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
 
 // LegacySteps is how a record written before delivery existed reads as
@@ -174,13 +208,17 @@ func (r *Record) LegacySteps() *delivery.Steps {
 	return &s
 }
 
-// Marker says a delete was acknowledged for a shed and its VM may still
-// exist. It is removed once the VM is gone.
+// Marker says a delete was acknowledged for a shed and its machine may still
+// exist. It is removed once the machine is gone.
 type Marker struct {
-	ID   string       `json:"id"`
-	Name string       `json:"name"`
-	Env  string       `json:"env"`
-	Ref  provider.Ref `json:"ref,omitempty"`
+	// Schema is Schema; SaveMarker writes it.
+	Schema int    `json:"schema"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	// Env is a marker the in-tree cloud provider wrote; this build never
+	// writes it (Legacy).
+	Env string       `json:"env,omitempty"`
+	Ref provider.Ref `json:"ref,omitempty"`
 	// At is when the delete was acknowledged.
 	At time.Time `json:"at"`
 	// Owner and CreatedAt are the deleted shed's, so a caller waiting for
@@ -195,6 +233,18 @@ type Marker struct {
 	// destroyed, and the shed's record (in status "error") stays until the
 	// shed itself is deleted.
 	KeepRecord bool `json:"keep_record,omitempty"`
+	// LabelID and DestroyID are the request ids of the delete's label
+	// write and its destroy, stored before each is sent so that a retry,
+	// or the delete resumed after a restart, sends the same one.
+	LabelID   string `json:"label_request_id,omitempty"`
+	DestroyID string `json:"destroy_request_id,omitempty"`
+}
+
+// Legacy reports whether the marker was written by an earlier server: it
+// does not carry this build's Schema, it names an environment, or a Ref of
+// the in-tree cloud provider's shape.
+func (m *Marker) Legacy() bool {
+	return m.Schema != Schema || m.Env != "" || (m.Ref != "" && string(m.Ref) != m.ID)
 }
 
 // Store reads and writes records and markers. It does no locking: the
@@ -245,6 +295,7 @@ func (s *Store) SaveRecord(r *Record) error {
 	if err := safeName(r.Shed.Name); err != nil {
 		return err
 	}
+	r.Schema = Schema
 	return writeJSON(s.recordPath(r.Shed.Name), r)
 }
 
@@ -256,16 +307,73 @@ func (s *Store) DeleteRecord(name string) error {
 	return removeIfExists(s.recordPath(name))
 }
 
-// Records returns every record, ordered by name. A file that cannot be
-// parsed is returned in bad, by path, and left in place.
+// probe is the part of a record or marker file read before the rest: its
+// schema, and what names it. An earlier server's file may not decode as
+// this build's types, so it is recognised by these alone.
+type probe struct {
+	Schema int    `json:"schema"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Shed   struct {
+		Name string `json:"name"`
+		ID   string `json:"id"`
+	} `json:"shed"`
+}
+
+// Stale is a record or marker file an earlier server wrote (its schema is
+// not Schema): what names it, and its path.
+type Stale struct {
+	Name, ID, Path string
+	// Marker says it is a delete marker, not a record.
+	Marker bool
+}
+
+// StaleFiles returns every record and marker file an earlier server wrote,
+// recognised by its schema before anything else is decoded. A file that is
+// not JSON at all is not one of them (Records reports it as bad).
+func (s *Store) StaleFiles() ([]Stale, error) {
+	var out []Stale
+	for _, dir := range []struct {
+		path   string
+		marker bool
+	}{{s.shedsDir(), false}, {s.markersDir(), true}} {
+		paths, err := jsonFiles(dir.path)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range paths {
+			var pr probe
+			if err := readJSON(p, &pr); err != nil || pr.Schema == Schema {
+				continue
+			}
+			st := Stale{Name: pr.Shed.Name, ID: pr.Shed.ID, Path: p, Marker: dir.marker}
+			if dir.marker {
+				st.Name, st.ID = pr.Name, pr.ID
+			}
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+// Records returns every record of this build's Schema, ordered by name. A
+// file that cannot be parsed is returned in bad, by path, and left in
+// place; one an earlier server wrote is left out (StaleFiles).
 func (s *Store) Records() (records []*Record, bad []string, err error) {
 	paths, err := jsonFiles(s.shedsDir())
 	if err != nil {
 		return nil, nil, err
 	}
 	for _, p := range paths {
-		var r Record
+		var pr probe
 		data, err := os.ReadFile(p)
+		if err == nil {
+			err = json.Unmarshal(data, &pr)
+		}
+		if err == nil && pr.Schema != Schema {
+			continue
+		}
+		var r Record
 		if err == nil {
 			err = json.Unmarshal(data, &r)
 		}
@@ -286,6 +394,7 @@ func (s *Store) SaveMarker(m *Marker) error {
 	if err := safeName(m.ID); err != nil {
 		return err
 	}
+	m.Schema = Schema
 	return writeJSON(s.markerPath(m.ID), m)
 }
 
@@ -306,7 +415,7 @@ func (s *Store) Markers() ([]*Marker, error) {
 	var out []*Marker
 	for _, p := range paths {
 		var m Marker
-		if err := readJSON(p, &m); err != nil || m.ID == "" {
+		if err := readJSON(p, &m); err != nil || m.ID == "" || m.Schema != Schema {
 			continue
 		}
 		out = append(out, &m)
