@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref provision-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote dev-compute-ref-up dev-compute-ref-grant dev-compute-ref-down test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-tool-pins check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref provision-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory test-integration-compute check-directory-itest-host test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote dev-compute-ref-up dev-compute-ref-grant dev-compute-ref-down test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-tool-pins check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -137,6 +137,44 @@ test-integration-directory: check-directory-itest-host build directory-ref provi
 	  SHED_ITEST_DIRECTORY_CONTROL= \
 	  SHED_ITEST_DIRECTORY_LOG= \
 	  uv run pytest -v $(DIRECTORY_ITEST_FILES) $(PYTEST_ARGS)
+
+# Cloud sheds from the account service, hermetically (plan 041 §6), with no
+# cloud: the [hermetic] cases of tests/integration/test_remote_compute.py,
+# each against a private reference service (directory and compute) and a
+# private shed-server from bin/ with remote.provider: service and the local
+# link (a machine is a shed-agent on this host); and the shared [remote]
+# cases (SHED_REMOTE_HERMETIC=1), against one such world for the session,
+# acting as its person itest-alice as on any compute server. Every other
+# server variable is set empty, so the vz, fc and real [remote] cases skip,
+# as do the [remote] cases that need a real guest (`real_guest`). Linux only,
+# not in CI. Narrow it with COMPUTE_ITEST_FILES or PYTEST_ARGS, e.g.
+#   make test-integration-compute PYTEST_ARGS="-k quotas"
+#   make test-integration-compute COMPUTE_ITEST_FILES=test_remote_compute.py
+COMPUTE_ITEST_FILES ?= test_remote_compute.py test_remote_refusals.py test_remote_lifecycle.py \
+  test_smoke.py test_lifecycle.py test_delete_fast.py test_exec_shell.py test_exec_stderr.py \
+  test_exec_disconnect.py test_zed_binary_channel.py test_tunnels_background.py \
+  test_users.py test_source_pin.py test_cred_bus.py test_delivery.py test_delivery_hosted.py
+test-integration-compute: check-directory-itest-host build directory-ref
+	cd tests/integration && uv sync && \
+	  PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_COMPUTE_ITEST=1 \
+	  SHED_REMOTE_HERMETIC=1 \
+	  SHED_BIN_DIR="$(CURDIR)/bin" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
+	  SHED_VZ_LOG_PATH= \
+	  SHED_VZ_DEV_LOG_PATH= \
+	  SHED_FC_HOST= \
+	  SHED_FC_SERVER= \
+	  SHED_FC_DEV_SERVER= \
+	  SHED_FC_LOG_PATH= \
+	  SHED_FC_DEV_LOG_PATH= \
+	  SHED_REMOTE_SERVER= \
+	  SHED_REMOTE_SERVICE= \
+	  SHED_ITEST_SOURCE= \
+	  SHED_ITEST_DIRECTORY_CONTROL= \
+	  SHED_ITEST_DIRECTORY_LOG= \
+	  uv run pytest -v -rs $(COMPUTE_ITEST_FILES) $(PYTEST_ARGS)
 
 check-directory-itest-host:
 	@if [ "$$(uname -s)" != "Linux" ]; then \

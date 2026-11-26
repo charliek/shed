@@ -9,7 +9,9 @@
 #
 #   up      start it (bin/test/shed-directory-ref, from `make directory-ref`),
 #           with an empty list of people and a fresh enrolment code for the
-#           server name, and print the URL and the code
+#           server name, and print the URL and the code; it rewrites
+#           <dir>/inventory.json every second with the machines it holds (the
+#           integration suite confirms its machines are gone by their ids)
 #   grant   let the enrolled server manage compute and register the client
 #           nocturn for it (run after `shed-server directory enroll`)
 #   down    stop it (every machine it held is forgotten)
@@ -48,7 +50,7 @@ case "${1:-}" in
     printf '%s %s\n' "$SERVER" "$code" > "$CONTROL/codes"
     printf '{"steps": [], "auto_settle_s": 3}\n' > "$CONTROL/compute.json"
     : > "$LOG"
-    nohup "$BIN" --control "$CONTROL" --listen "127.0.0.1:$PORT" >> "$LOG" 2>&1 &
+    nohup "$BIN" --control "$CONTROL" --listen "127.0.0.1:$PORT" --inventory "$DIR/inventory.json" >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     for _ in $(seq 1 50); do
       grep -q '^listening on ' "$LOG" 2>/dev/null && break

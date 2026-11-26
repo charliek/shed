@@ -107,6 +107,7 @@ def test_phase_timer_emitted(shed_server, test_shed_name):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_guest("the clone lands in the guest user's home, /home/shed")
 def test_repo_clone_https(shed_server, test_shed_name):
     """`--repo <https url>` clones; the cloned HEAD matches the known SHA."""
     handle = shed_server.create(

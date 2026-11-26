@@ -30,6 +30,7 @@ unnecessary surface.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -104,7 +105,7 @@ DEFAULT_AGENT_P50_MS = {
 }
 
 
-def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
+def resolve_server_entry(name: str, timeout: int = 10, env: Optional[dict] = None) -> Optional[dict]:
     """Return the `~/.shed/config.yaml` entry for `name`, or None.
 
     Runs `shed --json server list` and finds the dict whose `name`
@@ -116,7 +117,7 @@ def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
     try:
         r = subprocess.run(
             ["shed", "--json", "server", "list"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
@@ -243,10 +244,18 @@ class LocalServer:
         name: str,
         backend: str,
         log_path: Optional[Path] = None,
+        env: Optional[dict] = None,
+        home: Optional[Path] = None,
     ) -> None:
         self.name = name
         self.backend = backend
         self.log_path = log_path
+        # Who the CLI and ssh run as: None is the developer (this process's
+        # environment and HOME); a test identity's environment (its own HOME
+        # and an ssh shim first on PATH) and HOME make every command this
+        # object runs that identity's (`as_person`).
+        self.env = env
+        self.home = home
 
     # ------------------------------------------------------------------
     # Availability
@@ -262,12 +271,12 @@ class LocalServer:
         completion); a side-effect-free probe via `/api/info` is a
         follow-up, tracked in §16 as a "first big test" improvement.
         """
-        if not shutil.which("shed"):
+        if not shutil.which("shed", path=(self.env or os.environ).get("PATH")):
             return False
         try:
             r = subprocess.run(
                 ["shed", "-s", self.name, "list"],
-                capture_output=True,
+                capture_output=True, env=self.env,
                 text=True,
                 timeout=10,
             )
@@ -287,7 +296,14 @@ class LocalServer:
         if it was near expiry. Without one the version is unknown (None), as it
         is for any unreachable server.
         """
-        entry = resolve_server_entry(self.name)
+        info = self.info(timeout)
+        version = info.get("version") if isinstance(info, dict) else None
+        return version if isinstance(version, str) and version else None
+
+    def info(self, timeout: float = 5.0) -> Optional[dict]:
+        """`GET /api/info` as this object's identity sees it, or None
+        (`server_version` says how it is read)."""
+        entry = resolve_server_entry(self.name, env=self.env)
         endpoint = entry.get("endpoint") if entry else None
         if not endpoint:
             return None
@@ -297,7 +313,7 @@ class LocalServer:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            pair = client_cert_pair(self.name)
+            pair = client_cert_pair(self.name, (self.home / ".shed" / "config.yaml") if self.home else None)
             if pair is not None:
                 try:
                     ctx.load_cert_chain(*pair)
@@ -310,8 +326,12 @@ class LocalServer:
                 info = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, ValueError):
             return None
-        version = info.get("version") if isinstance(info, dict) else None
-        return version if isinstance(version, str) and version else None
+        return info if isinstance(info, dict) else None
+
+    def features(self) -> list[str]:
+        """The feature tokens `/api/info` lists ([] when it cannot be read)."""
+        feats = (self.info() or {}).get("features")
+        return [f for f in feats if isinstance(f, str)] if isinstance(feats, list) else []
 
     def skip_if_released_before(self, minimum: str, needs: str) -> None:
         """Skip the calling test when this server is a RELEASED version older
@@ -366,7 +386,7 @@ class LocalServer:
             cmd += ["--from-snapshot", from_snapshot]
 
         offset = self._log_offset()
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, env=self.env, text=True, timeout=timeout)
         if r.returncode != 0:
             raise AssertionError(
                 f"shed create failed (exit {r.returncode}) on {self.name}: "
@@ -385,13 +405,13 @@ class LocalServer:
     ) -> subprocess.CompletedProcess:
         """Run a command inside the shed via `shed exec`."""
         full = ["shed", "-s", self.name, "exec", name, "--"] + cmd
-        return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(full, capture_output=True, env=self.env, text=True, timeout=timeout)
 
     def stop(self, name: str, timeout: int = 60) -> None:
         """Stop a running shed via `shed stop` (fail-loud)."""
         r = subprocess.run(
             ["shed", "-s", self.name, "stop", name],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, env=self.env, text=True, timeout=timeout,
         )
         if r.returncode != 0:
             raise AssertionError(
@@ -403,7 +423,7 @@ class LocalServer:
         """Start a stopped shed via `shed start` (fail-loud)."""
         r = subprocess.run(
             ["shed", "-s", self.name, "start", name],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, env=self.env, text=True, timeout=timeout,
         )
         if r.returncode != 0:
             raise AssertionError(
@@ -429,7 +449,7 @@ class LocalServer:
         """
         return subprocess.run(
             self.ssh_argv(name, raw_command),
-            capture_output=True,
+            capture_output=True, env=self.env,
             text=True,
             timeout=timeout,
         )
@@ -492,7 +512,7 @@ class LocalServer:
         return subprocess.run(
             self.ssh_argv(name, raw_command),
             input=input,
-            capture_output=True,
+            capture_output=True, env=self.env,
             timeout=timeout,
         )
 
@@ -508,7 +528,7 @@ class LocalServer:
         # The CLI's known-hosts default; only set if it exists so a
         # fresh test environment skips StrictHostKeyChecking rather than
         # failing with "no known-hosts file."
-        kh = Path.home() / ".shed" / "known_hosts"
+        kh = (self.home or Path.home()) / ".shed" / "known_hosts"
         if not kh.exists():
             kh = None
         host, port = self._resolve_ssh_endpoint()
@@ -521,7 +541,7 @@ class LocalServer:
         CLI's view of the server entry; falls back to 2222 (the brew
         default).
         """
-        entry = resolve_server_entry(self.name, timeout=5)
+        entry = resolve_server_entry(self.name, timeout=5, env=self.env)
         if entry is not None:
             try:
                 return entry.get("host", "localhost"), int(entry.get("ssh_port", 2222))
@@ -541,7 +561,7 @@ class LocalServer:
         try:
             r = subprocess.run(
                 ["shed", "-s", self.name, "delete", name, "-f"],
-                capture_output=True,
+                capture_output=True, env=self.env,
                 text=True,
                 timeout=60,
             )
@@ -629,7 +649,7 @@ class LocalServer:
         try:
             r = subprocess.run(
                 ["shed", "--json", "-s", self.name, "list"],
-                capture_output=True,
+                capture_output=True, env=self.env,
                 text=True,
                 timeout=10,
             )
@@ -656,7 +676,7 @@ class LocalServer:
         """
         r = subprocess.run(
             ["shed", "--json", "-s", self.name, "image", "ls"],
-            capture_output=True,
+            capture_output=True, env=self.env,
             text=True,
             timeout=15,
         )
@@ -680,7 +700,7 @@ class LocalServer:
         """
         r = subprocess.run(
             ["shed", "--json", "-s", self.name, "tunnels", "list"],
-            capture_output=True,
+            capture_output=True, env=self.env,
             text=True,
             timeout=15,
         )
@@ -704,7 +724,7 @@ class LocalServer:
         """
         return subprocess.run(
             ["shed", "-s", self.name, *args],
-            capture_output=True,
+            capture_output=True, env=self.env,
             text=True,
             timeout=timeout,
         )
@@ -741,7 +761,7 @@ class LocalServer:
                     "--since", str(offset),
                     "--no-pager",
                 ],
-                capture_output=True,
+                capture_output=True, env=self.env,
                 text=True,
                 timeout=5,
             )
@@ -1011,9 +1031,18 @@ class CloudServer(LocalServer):
         name: str,
         log_path: Optional[Path] = None,
         image: Optional[str] = None,
+        env: Optional[dict] = None,
+        home: Optional[Path] = None,
     ) -> None:
-        super().__init__(name=name, backend="remote", log_path=log_path)
+        super().__init__(name=name, backend="remote", log_path=log_path, env=env, home=home)
         self.image = image
+
+    def as_person(self, identity) -> "CloudServer":
+        """This server as `identity` (a `fixtures.identity.Identity` with an
+        entry for it): every command runs with the identity's environment
+        and HOME, so creates, execs and ssh are that person's."""
+        return CloudServer(name=identity.entry, log_path=self.log_path, image=self.image,
+                           env=identity.env(), home=Path(identity.home))
 
     def create(self, name: str, image: Optional[str] = "base", **kwargs) -> ShedHandle:
         kwargs.setdefault("timeout", 300)

@@ -80,8 +80,11 @@ const (
 	// sweepTimeout bounds one periodic pass.
 	sweepTimeout = 2 * time.Minute
 	// localAuthorizedKey stands in for the server's public key when the
-	// transport needs none (the local link).
-	localAuthorizedKey = "none local-transport"
+	// transport needs none (the local link). It is one well-formed
+	// authorized_keys line, as the compute contract requires of every key a
+	// create names (a service refuses anything else as INVALID); its private
+	// half was discarded when it was made, so nobody can log in with it.
+	localAuthorizedKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN7Ig741G+LZ7HvFwT5YGDMQ8q+YVi5wYbcntd2EqsrE shed-local-transport"
 )
 
 // ErrNotReady is the cause of the refusal (503 COMPUTE_UNAVAILABLE) a create,

@@ -1038,6 +1038,11 @@ func mapBackendError(err error) (int, string, string) {
 		// --with-layers). Preserve the actionable message.
 		return http.StatusConflict, config.ErrBackendError, err.Error()
 	}
+	// A feature this backend refuses by name (the remote backend wraps both
+	// sentinels) is FEATURE_UNSUPPORTED, before the generic 501.
+	if errors.Is(err, config.ErrFeatureUnsupportedSentinel) {
+		return http.StatusNotImplemented, config.ErrFeatureUnsupported, err.Error()
+	}
 	if errors.Is(err, config.ErrNotSupportedSentinel) {
 		return http.StatusNotImplemented, config.ErrBackendError, err.Error()
 	}
@@ -1077,9 +1082,6 @@ func mapBackendError(err error) (int, string, string) {
 	// tries again, with the reason in the message.
 	if errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
 		return http.StatusServiceUnavailable, config.ErrFirewallCheckFailed, err.Error()
-	}
-	if errors.Is(err, config.ErrFeatureUnsupportedSentinel) {
-		return http.StatusNotImplemented, config.ErrFeatureUnsupported, err.Error()
 	}
 	if errors.Is(err, errSettledNotRunning) {
 		return http.StatusInternalServerError, config.ErrBackendError, err.Error()

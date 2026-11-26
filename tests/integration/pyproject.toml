@@ -16,6 +16,7 @@ markers = [
     "slow: tests that take more than ~10 s wall-clock",
     "local_vm_only(reason): a shed_server test only a local VM backend (vz, fc) can run; its [remote] case skips with this reason",
     "not_under_directory_source(reason): a users case that skips with this reason when SHED_ITEST_SOURCE=directory",
+    "real_guest(reason): a [remote] case that needs a real guest (the shed user, /home/shed, sudo); it skips with this reason against the hermetic compute world, whose machines are shed-agents on this host",
 ]
 addopts = "-ra --strict-markers"
 # Make repeated runs deterministic: tests pick unique shed names per node id.

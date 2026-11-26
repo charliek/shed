@@ -279,8 +279,13 @@ class DeliveryEnv:
 
 
 @pytest.fixture(scope="module")
-def delivery_env(users_env, tmp_path_factory):
+def delivery_env(users_env, tmp_path_factory, request):
     env = users_env
+    if env.backend == "remote" and request.getfixturevalue("remote_compute"):
+        # Its people are the account service's, whose credentials the
+        # service answers for (a machine source is SOURCE_IS_SERVICE).
+        pytest.skip("on a server whose machines come from the account service, its people's credentials come "
+                    "from the account service too (plan 040): the hosted cases are test_delivery_hosted.py")
     # users_env reaches dev servers only, and enrolment checks again; this
     # says so before anything else is done.
     _assert_dev_target(env.server.name)

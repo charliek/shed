@@ -242,10 +242,11 @@ shed server add mini3 --ssh-port 12222 --name mini3-dev           # FC
 
 #### Remote backend (cloud sheds)
 
-A dev server with `default_backend: remote` runs on your machine and creates one cloud VM per shed. Its setup (the private env file, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). The suite's `[remote]` cases are opt-in and billed:
+A dev server with `default_backend: remote` runs on your machine and gets one machine per shed from an account service. Its setup (the private env file, the in-tree reference service, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). Two targets run the suite's cloud cases:
 
 ```bash
-make test-integration-remote
+make test-integration-compute   # no cloud: each case starts a reference service and a private server (Linux only, not in CI)
+make test-integration-remote    # the [remote] cases against the running remote dev server; billed against a real service
 ```
 
 #### Service clients, HTTPS exec and network profiles (FC, mtls)

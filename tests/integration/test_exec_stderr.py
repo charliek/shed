@@ -50,7 +50,7 @@ def test_pty_merges_streams(shed_server, test_shed_name):
     shed_server.create(test_shed_name, image="base")
 
     argv = shed_server.ssh_argv(test_shed_name, "echo OUT; echo ERR 1>&2", pty=True)
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=shed_server.env)
     # Over a PTY both lines land on the client's stdout (the tty stream).
     assert "OUT" in r.stdout, f"PTY stdout missing OUT: stdout={r.stdout!r}"
     assert "ERR" in r.stdout, (

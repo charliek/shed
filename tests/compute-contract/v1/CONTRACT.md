@@ -65,8 +65,9 @@ skipped (section "Access").
   document does not give a grammar is treated the same way.
 - Every answer carries `Cache-Control: no-store`.
 - **Deadlines.** A service answers every call within **10 seconds**: its
-  judgement, its own storage work and at most one cloud call, bounded at
-  8 seconds. A server waits at most **12 seconds** for any one call (it
+  judgement, its own storage work and its cloud work for the call, which
+  is bounded at 8 seconds in total (it may make more than one cloud
+  request within that bound). A server waits at most **12 seconds** for any one call (it
   then treats the call as unanswered, section "Status and error matrix").
   A service that cannot finish cloud work inside its deadline accepts it
   and reports it through an operation.
@@ -653,7 +654,7 @@ none twice). A reply that breaks any of these is an invalid reply.
 | Usage counts, `person_max`, `org_max` | 0 to 1000000 |
 | Policy durations | 1 second to one year (`warn_s` may be 0) |
 | Catalog sizes, aliases, access kinds | 1 to 64, 0 to 64, 1 to 8 |
-| A service's answer | 10 seconds (one cloud call within it, 8 seconds) |
+| A service's answer | 10 seconds (its cloud work for the call within it, 8 seconds in total) |
 | A server's wait for one call | 12 seconds |
 | A kept answer, a finished operation, a listed deletion | 24 hours |
 | `Retry-After`, as a server honours it | 30 seconds |

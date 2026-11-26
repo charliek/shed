@@ -386,6 +386,38 @@ A `DELIVERY` column (before `CREATED`) appears only when some listed shed has a 
 A `USER` column (before `CREATED`) appears only when the listed sheds belong to
 more than one user, which on a server with users means an admin's list.
 
+Two columns (before `CREATED`) appear only when a listed shed is a [cloud
+shed](remote-backend.md), and are `-` for any other shed in the same list:
+
+| Column | Values |
+|--------|--------|
+| `SIZE` | The name of the machine's size in the account service's catalog (`standard`). |
+| `LEASE` | The time left before the account service deletes the machine, running or stopped: `5h 10m`, `1d 2h`, `20m`. A lease with less than its warning time left is marked `!` (`1h 20m !`); `0m !` means it has ended. `-` when the lease is not known yet (a create the service has not answered). |
+
+```text
+NAME      BACKEND  STATUS   SSH                   SIZE      LEASE      CREATED
+ada-dev   remote   running  ada-dev@my-server:..  standard  5h 10m     2026-11-26 09:00
+ada-old   remote   stopped  -                     standard  1h 20m !   2026-11-25 16:00
+```
+
+The warning time is the account service's (`warn_s`; 2 hours when it names
+none, never when it is 0). `shed extend` moves the lease.
+
+After the table, `shed list` prints one line for each server in the listing
+that lists a cloud shed, with the machines you hold against the account
+service's limits and the organization's:
+
+```text
+Cloud: 3 of 4 machines (2 running, 1 stopped) · organization 7 of 10
+```
+
+With `--all` the line names its server (`Cloud (my-server): ...`). A caller
+who is not a person of the account service (a local admin) gets the
+organization's part alone (`Cloud: organization 7 of 10`). A server whose
+usage cannot be read (an older server, the account service down) prints no
+line, and the listing is not an error. `--json` prints no footer: read
+[`GET /api/cloud/usage`](api.md#get-apicloudusage).
+
 **Output with `-v` (expanded):**
 
 ```text
@@ -403,8 +435,25 @@ mcp-test      firecracker  stopped  -                               -           
 | `NETWORK` | `open` or `isolated`; `-` when the server does not report one |
 | `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (external)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
+| `IMAGE` | Cloud sheds only, after `LEASE`: the image the machine was made from. |
+| `UPTIME` | For a running cloud shed, the time since its machine's last start, as the account service reports it. |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)), and, as `--json create` does, the record's `isolation` and `arch` when the server sends them (each omitted otherwise). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. A cloud shed also gets a `Cloud:` block:
+
+```text
+Cloud:
+  Provider:     cloud-a
+  Size:         standard (2 vCPU, 8192 MB)
+  Disk:         50 GB
+  Image:        shed-full-v1-0-0-20261120-120000
+  Created:      2026-11-26 09:00 UTC
+  Running for:  3h 5m
+  Deleted at:   2026-11-26 21:00 UTC (in 8h 55m)
+  Cap:          2026-11-29 09:00 UTC
+  Extendable:   yes (+6h, +12h, +24h)
+```
+
+A line is left out when its value is not known; `Lease: not known yet` replaces the lease lines before the account service has answered for the machine. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)), and, as `--json create` does, the record's `isolation` and `arch` when the server sends them (each omitted otherwise). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`. A cloud shed's `cloud` object is passed through as the server sent it (see [API › The `cloud` object](api.md#the-cloud-object)); it has the same members as the `Cloud:` block, plus the lease's `presets_h` and `warn_s`.
 
 ### shed start
 
@@ -476,6 +525,51 @@ shed delete <name> [flags]
 On a server with users, an admin may stop and delete any shed, but may not
 start, enter or snapshot another user's.
 
+On a [cloud shed](remote-backend.md) the confirmation reads `This deletes the machine and its disk.` instead of the data-volume wording: the account service deletes the machine and its boot disk, and nothing is kept. The delete is final, and the same one the lease's end performs.
+
+### shed extend
+
+Moves a cloud shed's lease later, so its machine is deleted later.
+
+```bash
+shed extend <name> (--hours N | --by DURATION)
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hours` | | Hours to move the lease's end by, 1 to 720 |
+| `--by` | | The same as a duration of whole hours (`6h`, `48h`); `--hours` and `--by` are exclusive, and one is required |
+
+A cloud shed's machine is deleted, running or stopped, at its lease's end;
+nothing else deletes it. An extend adds the hours to the lease's current end
+and is refused past the lease's cap (the longest the account service lets a
+machine live). The shed's own user or an admin (a local admin included) may
+extend; a service client's shed has a fixed lease and cannot be extended, and
+a script key is refused.
+
+The CLI makes one request id per invocation and sends the request again (up to
+three sends, 2 s apart) when no answer came or the server could not decide, so
+a lost reply moves the lease once, not twice. On success it prints the new
+end and the cap:
+
+```text
+$ shed extend ada-dev --hours 6
+✓ Extended shed ada-dev: it is deleted at 2026-11-27 03:00 UTC (in 14h 5m); the cap is 2026-11-29 09:00 UTC
+```
+
+With `--json` the output is `{"status":"ok","action":"extended","name":...,"details":<the shed>}`. The refusals are the account service's, in fixed words:
+
+| Code | Meaning |
+|------|---------|
+| `EXTEND_NOT_ALLOWED` | The lease cannot be extended (a service client's shed, or the account service's policy). |
+| `LEASE_AT_CAP` | The extend would take the lease past its cap, and nothing changed. Extend by fewer hours. |
+| `LEASE_ENDED` | The lease has ended; the machine is being deleted. |
+| `PERSON_INACTIVE` | The shed's person is no longer active at the account service. |
+| `COMPUTE_DELETING` | The account service is deleting the machine. |
+| `COMPUTE_UNAVAILABLE` | The account service could not be reached; try again. |
+
+A shed on a server whose sheds have no lease answers `shed <name> on <server> has no lease to extend`. See [API › POST /api/sheds/{name}/extend](api.md#post-apishedsnameextend).
+
 ### shed assign
 
 Gives a shed that has no user to one of the server's users (`auth.users`).
@@ -493,7 +587,7 @@ service client can be assigned: a shed is never moved between users. A shed
 that mounts host directories (`--local-dir`, `--add-dir`) or server mounts is
 refused (`409 SHED_HOST_RESOURCES`), because the user would get those too;
 recreate it with `--mounts none` and no host directories instead. A shed that
-already has a user or a client answers `409 SHED_ALREADY_ASSIGNED`.
+already has a user or a client answers `409 SHED_ALREADY_ASSIGNED`. A [cloud shed](remote-backend.md) cannot be assigned (`501 FEATURE_UNSUPPORTED`): its user is its machine's, fixed by the account service at create.
 
 Without `-s/--server` the command looks for the shed on your servers and sends
 the assignment only to a server that shows it; with `-s` it asks that server
@@ -1228,6 +1322,32 @@ shed system prune --json --dry-run     # Machine-readable preview
 ```
 
 ## Interactive Access
+
+### The lease banner
+
+When a cloud shed's lease has less than its warning time left, entering the
+shed prints one line on stderr:
+
+```text
+shed: this cloud shed is deleted at 14:30 UTC (in 1h 20m); extend with: shed extend ada-dev --hours N
+```
+
+The time carries its date (`2026-11-27 14:30 UTC`) when it is not today, and
+the `extend with` part is left out when the lease cannot be extended (a service
+client's shed, or one at its cap). The warning time is the account service's
+`warn_s` (2 hours when it names none; the banner is off when it is 0). A shed
+whose lease is not known yet shows none.
+
+| Where | Who prints it |
+|-------|---------------|
+| A session that asked for a terminal: `shed console`, `shed attach`, an interactive `shed exec`, a raw `ssh <shed>@<server>` login, the desktop app's terminal | The server, once per session |
+| `shed exec` with a command and no terminal on the shed's side, and `shed attach` into a roost tab | The CLI, only when its stderr is a terminal and `--json` is off |
+| A command over SSH that asked for no terminal (`ssh <shed>@<server> 'cmd'`, `rsync`) | Nobody: its output is data |
+
+The CLI keeps the server's line out of a session whose stderr nobody reads
+(`--json`, or a redirected stderr) by sending the SSH environment request
+`SHED_LEASE_BANNER=0`; a raw `ssh -o SetEnv=SHED_LEASE_BANNER=0
+<shed>@<server>` opts out the same way.
 
 ### shed console
 

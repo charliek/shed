@@ -863,7 +863,7 @@ def users_environment(
                          "which the directory source never does: a caller that needs its own "
                          "configuration skips under the directory source")
     base = ensure_keys(keys_dir)
-    entry = resolve_server_entry(server.name)
+    entry = resolve_server_entry(server.name, env=getattr(server, "env", None))
     if entry is None:
         pytest.skip(f"{server.name!r} is not in ~/.shed/config.yaml")
     host = entry.get("host", "localhost")

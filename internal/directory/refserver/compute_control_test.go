@@ -63,8 +63,15 @@ func TestComputeControlFile(t *testing.T) {
 		t.Fatalf("after compute.allow: %d", code)
 	}
 	create := `{"request_id":"00000000-0000-4000-8000-000000000001","name":"widgets","user":"ada","size":"standard","image":"default","labels":{},"authorized_keys":["ssh-ed25519 AAAA"],"spec":"","access_kinds":["ssh"]}`
+	if inv := srv.ComputeInventory(); len(inv) != 0 {
+		t.Fatalf("inventory before any create: %v", inv)
+	}
 	if code, v, body := do("PUT", "/v1/compute/machines/"+id, create); code != http.StatusAccepted || v["operation"] == nil {
 		t.Fatalf("create: %d %s", code, body)
+	}
+	// The machine is in the inventory from its create, by its server.
+	if inv := srv.ComputeInventory(); len(inv) != 1 || len(inv["srv-a"]) != 1 || inv["srv-a"][0] != id {
+		t.Fatalf("inventory after the create: %v", inv)
 	}
 	// Not yet due: still creating.
 	if err := srv.ComputeTick(); err != nil {

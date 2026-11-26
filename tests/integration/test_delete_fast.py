@@ -46,6 +46,7 @@ def test_delete_running_shed_is_fast(shed_server, test_shed_name):
     r = subprocess.run(
         ["shed", "-s", shed_server.name, "delete", test_shed_name, "--force"],
         capture_output=True,
+        env=shed_server.env,
         text=True,
         timeout=max(60, ceiling + 30),
     )
@@ -65,6 +66,7 @@ def test_delete_running_shed_is_fast(shed_server, test_shed_name):
     listing = subprocess.run(
         ["shed", "-s", shed_server.name, "list"],
         capture_output=True,
+        env=shed_server.env,
         text=True,
         timeout=30,
     )

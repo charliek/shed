@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -576,4 +577,22 @@ func (s *Server) generateComputeReply(w http.ResponseWriter, r *http.Request, ca
 		body := encode(map[string]any{"error": map[string]string{"code": "BUSY", "message": strings.Repeat("busy ", 1000)}})
 		writeBody(w, http.StatusConflict, body, true)
 	}
+}
+
+// ComputeInventory is every machine the compute service holds, by the name
+// of the server it belongs to: shed ids, sorted (a machine being deleted
+// counts until it is gone). The command writes it to its --inventory file,
+// so a test can confirm the machines it made are gone by their ids.
+func (s *Server) ComputeInventory() map[string][]string {
+	c := s.compute
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[string][]string{}
+	for k := range c.machines {
+		out[k.server] = append(out[k.server], k.shedID)
+	}
+	for _, ids := range out {
+		sort.Strings(ids)
+	}
+	return out
 }

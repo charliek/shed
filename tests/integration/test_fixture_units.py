@@ -99,7 +99,7 @@ class _FakeResponse(io.BytesIO):
 
 def _fake_entry(monkeypatch, endpoint, cert_pair=None):
     entry = None if endpoint is None else {"name": "srv", "endpoint": endpoint}
-    monkeypatch.setattr(fx, "resolve_server_entry", lambda name, timeout=10: entry)
+    monkeypatch.setattr(fx, "resolve_server_entry", lambda name, timeout=10, env=None: entry)
     # Never read the developer's real ~/.shed/config.yaml from a unit test.
     monkeypatch.setattr(fx, "client_cert_pair", lambda name, config_path=None: cert_pair)
 
@@ -3625,7 +3625,7 @@ def users_env_fakes(monkeypatch, keys_dir):
         events.append(("dev_config", name))
         yield
 
-    monkeypatch.setattr(fx, "resolve_server_entry", lambda name: {"host": "127.0.0.1", "ssh_port": 2222})
+    monkeypatch.setattr(fx, "resolve_server_entry", lambda name, env=None: {"host": "127.0.0.1", "ssh_port": 2222})
     monkeypatch.setattr(dc, "dev_config", fake_dev_config)
     monkeypatch.setattr(ident, "_check_host_resolves_without_ssh_config", lambda host: None)
     monkeypatch.setattr(ident.Identity, "add_server", lambda self, timeout=90: events.append(("add_server", self.user)))
@@ -5713,3 +5713,545 @@ def test_render_answer_fixture_is_the_reference_sources(tmp_path):
         dlv.render_answer_fixture(tmp_path / "none.json")
     with pytest.raises(AssertionError, match="missing"):
         dlv.render_answer_fixture(refuse / "bad-provider.json", binary=tmp_path / "absent")
+
+
+# ----------------------------------------------------------------------------
+# Cloud sheds from the account service (plan 041 §6): fixtures/compute.py,
+# the compute world of fixtures/directory.py, test_remote_compute.py and the
+# Makefile's test-integration-compute. No server: the helpers are run on
+# local files and local processes, and the words they match are checked
+# against the Go sources that write them.
+# ----------------------------------------------------------------------------
+
+from fixtures import compute as cfx  # noqa: E402
+
+
+def test_service_kind_reads_shed_remote_service():
+    assert cfx.service_kind({"SHED_REMOTE_SERVICE": "ref"}) == ("ref", "")
+    assert cfx.service_kind({"SHED_REMOTE_SERVICE": " service "}) == ("service", "")
+    kind, why = cfx.service_kind({})
+    assert kind is None and "SHED_REMOTE_SERVICE is not set" in why and "make dev-compute-ref-up" in why
+    kind, why = cfx.service_kind({"SHED_REMOTE_SERVICE": "other"})
+    assert kind is None and "expected one of ref, service" in why
+
+
+@pytest.mark.parametrize("text, want", [
+    ("2026-11-26T09:38:08Z", "2026-11-26T09:38:08+00:00"),
+    ("2026-11-26T09:38:08.123456789Z", "2026-11-26T09:38:08.123456+00:00"),
+    ("2026-11-26T10:38:08.5+01:00", "2026-11-26T09:38:08.500000+00:00"),
+])
+def test_parse_time_reads_go_rfc3339(text, want):
+    assert cfx.parse_time(text).isoformat() == want
+
+
+def test_parse_time_refuses_what_is_not_rfc3339():
+    for bad in ("2026-11-26", "2026-11-26 09:38:08Z", "yesterday"):
+        with pytest.raises(ValueError):
+            cfx.parse_time(bad)
+
+
+def test_lease_helpers_read_the_cloud_object():
+    shed = {"name": "a", "cloud": {"lease": {"expires_at": "2026-11-26T10:00:00Z", "max_expires_at": "x"}}}
+    assert cfx.expires_at(shed).isoformat() == "2026-11-26T10:00:00+00:00"
+    with pytest.raises(AssertionError, match="no cloud object"):
+        cfx.lease_of({"name": "a"})
+    with pytest.raises(AssertionError, match="no lease yet"):
+        cfx.lease_of({"name": "a", "cloud": {"size": {}}})
+
+
+def test_the_banner_words_are_the_servers():
+    src = (dc.REPO_ROOT / "internal" / "config" / "cloud.go").read_text()
+    assert 'fmt.Sprintf("shed: this cloud shed is deleted at %s (in %s)"' in src
+    assert cfx.BANNER == "shed: this cloud shed is deleted at "
+    line = "shed: this cloud shed is deleted at 14:30 UTC (in 1h 20m); extend with: shed extend a --hours N\n"
+    assert cfx.banner_count(line) == 1 and cfx.banner_count(line * 2) == 2 and cfx.banner_count("") == 0
+
+
+def test_the_deletion_line_is_the_sweeps():
+    src = (dc.REPO_ROOT / "internal" / "remote" / "sweep.go").read_text()
+    assert 'the account service deleted its machine (cause %s); dropping its record"' in src
+    assert cfx.DELETED_BY_SERVICE.format(cause="lease_ended") == (
+        "the account service deleted its machine (cause lease_ended); dropping its record")
+
+
+def test_the_refusal_words_are_the_clis():
+    src = (dc.REPO_ROOT / "cmd" / "shed" / "cloud.go").read_text()
+    assert 'fmt.Sprintf("%s (%s): %s", code, sdkbootstrap.SafeText(d.Reason), words)' in src
+    assert cfx.refusal_text("COMPUTE_LIMIT_REACHED", "person") == "COMPUTE_LIMIT_REACHED (person):"
+
+
+def test_policy_args_are_the_hooks_and_the_reference_services():
+    assert cfx.policy_args({"org_max": 2, "person_max": 1}) == ["person_max=1", "org_max=2"]
+    assert cfx.policy_args({}) == []
+    for bad in ({"sizes": 1}, {"person_max": -1}, {"person_max": "1"}, {"person_max": True}):
+        with pytest.raises(ValueError):
+            cfx.policy_args(bad)
+    # Every key a case sets is one the reference service's policy.set takes.
+    src = (dc.REPO_ROOT / "internal" / "directory" / "refserver" / "compute_control.go").read_text()
+    for k in cfx.POLICY_KEYS:
+        assert f'`json:"{k}"`' in src, k
+    start = cfx.world_policy()
+    assert set(cfx.POLICY_KEYS) <= set(start)
+    assert (start["person_max"], start["org_max"], start["warn_s"]) == (4, 10, 7200)
+
+
+def test_with_steps_appends_and_keeps_every_other_member():
+    doc = {"steps": [{"id": "old", "step": {"compute.allow": "s"}}], "auto_settle_s": 3, "replies": {}}
+    out = cfx.with_steps(doc, [("quota.fill", ["org"]), ("clock.advance", 601)], "p")
+    assert out["auto_settle_s"] == 3 and out["replies"] == {}
+    assert out["steps"] == [{"id": "old", "step": {"compute.allow": "s"}},
+                            {"id": "p-0", "step": {"quota.fill": ["org"]}},
+                            {"id": "p-1", "step": {"clock.advance": 601}}]
+    assert doc["steps"] == [{"id": "old", "step": {"compute.allow": "s"}}], "the input was changed"
+    assert cfx.with_steps(None, [("x", 1)], "q") == {"steps": [{"id": "q-0", "step": {"x": 1}}]}
+    with pytest.raises(ValueError):
+        cfx.with_steps({"steps": {}}, [], "q")
+
+
+def test_ref_control_writes_compute_json_privately(tmp_path):
+    (tmp_path / "compute.json").write_text('{"steps": [], "auto_settle_s": 3}')
+    ctl = cfx.RefControl(tmp_path, "remote-dev")
+    ctl.steps(("compute.allow", "remote-dev"), wait=False)
+    ctl.settings(auto_settle_s=1)
+    doc = json.loads((tmp_path / "compute.json").read_text())
+    assert doc["auto_settle_s"] == 1
+    assert [list(s["step"]) for s in doc["steps"]] == [["compute.allow"]]
+    assert stat.S_IMODE((tmp_path / "compute.json").stat().st_mode) == 0o600
+    assert not list(tmp_path.glob(".*.tmp")), "a temporary file was left behind"
+    # The service-down case: only through a gate (the hermetic world's),
+    # never on the dev server's reference service (its state is in its
+    # process).
+    with pytest.raises(cfx.Unsupported, match="keeps its state"):
+        ctl.check_stop()
+    gate = _FakeGate()
+    down = cfx.RefControl(tmp_path, "s", gate=gate)
+    down.check_stop()
+    assert not down.stopped
+    down.stop()
+    assert down.stopped, "a stop is recorded before it is attempted"
+    down.start()
+    assert gate.calls == ["down", "up"] and not down.stopped
+    # A stop that fails half-way still leaves `stopped` set for clean-up.
+    gate.down = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        down.stop()
+    assert down.stopped
+    # The reference service's limits go back to the values read before.
+    down.restore_limits(4, 10)
+    doc = json.loads((tmp_path / "compute.json").read_text())
+    assert doc["steps"][-1]["step"] == {"policy.set": {"person_max": 4, "org_max": 10}}
+
+
+class _FakeGate:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def down(self) -> None:
+        self.calls.append("down")
+
+    def up(self) -> None:
+        self.calls.append("up")
+
+
+def test_service_gate_refuses_while_down_and_relays_on_the_same_port_after():
+    echo = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    echo.bind(("127.0.0.1", 0))
+    echo.listen(8)
+    stop = threading.Event()
+
+    def serve() -> None:
+        echo.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                c, _ = echo.accept()
+            except (socket.timeout, OSError):
+                continue
+            with c:
+                c.sendall(c.recv(64).upper())
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    port = dfx.free_ports(1)[0]
+    gate = cfx.ServiceGate(port, echo.getsockname()[1]).up()
+
+    def ask() -> bytes:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+            c.sendall(b"ping")
+            return c.recv(64)
+
+    try:
+        assert gate.is_up and ask() == b"PING"
+        gate.down()
+        assert not gate.is_up
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port), timeout=5).close()
+        gate.up()
+        assert ask() == b"PING"
+    finally:
+        gate.close()
+        stop.set()
+        t.join(5)
+        echo.close()
+
+
+def test_ref_control_fails_a_step_the_service_logged_it_could_not_apply(tmp_path, monkeypatch):
+    log = ["started\n"]
+    ctl = cfx.RefControl(tmp_path, "s", lambda: "".join(log))
+    monkeypatch.setattr(cfx.time, "sleep", lambda s: log.append("compute: compute.json: policy.set: bad\n"))
+    with pytest.raises(AssertionError, match="could not apply"):
+        ctl.policy(person_max=1)
+
+
+def test_hook_control_runs_the_hook_with_its_verbs(tmp_path):
+    out = tmp_path / "calls"
+    hook = tmp_path / "hook"
+    hook.write_text(f'#!/bin/sh\necho "$@" >> {out}\n[ "$1" != fail ] || exit 3\n')
+    hook.chmod(0o755)
+    h = cfx.HookControl.from_env({"SHED_COMPUTE_CONTROL": f"{hook}"})
+    h.policy(person_max=1, org_max=2)
+    h.policy_reset("person_max")
+    h.check_stop()
+    h.stop()
+    assert h.stopped
+    h.start()
+    assert not h.stopped
+    h.restore_limits(1, 2)
+    assert out.read_text().splitlines() == ["policy person_max=1 org_max=2", "policy-reset", "stop", "start",
+                                            "policy-reset"]
+    lister = tmp_path / "lister"
+    lister.write_text('#!/bin/sh\n[ "$1" = machines ] && printf "id1\\n\\nid2\\n"\n')
+    lister.chmod(0o755)
+    assert cfx.HookControl([str(lister)]).machines() == {"id1", "id2"}
+    with pytest.raises(ValueError):
+        h.run("fail")
+    with pytest.raises(cfx.Unsupported):
+        h.quota_fill_person("a")
+    bad = cfx.HookControl([str(tmp_path / "missing")])
+    with pytest.raises(OSError):
+        bad.stop()
+    failing = tmp_path / "failing"
+    failing.write_text("#!/bin/sh\necho nope >&2\nexit 3\n")
+    failing.chmod(0o755)
+    with pytest.raises(AssertionError, match="exit 3"):
+        cfx.HookControl([str(failing)]).start()
+    f = cfx.HookControl([str(failing)])
+    with pytest.raises(AssertionError, match="exit 3"):
+        f.stop()
+    assert f.stopped, "a failed stop is still started again at clean-up"
+    assert cfx.HookControl.from_env({}) is None
+
+
+def test_no_control_skips_with_what_to_set():
+    n = cfx.NoControl()
+    for call in (lambda: n.policy(person_max=1), n.policy_reset, n.check_stop, n.stop, n.start,
+                 lambda: n.clock_advance(1), lambda: n.quota_fill_org()):
+        with pytest.raises(cfx.Unsupported):
+            call()
+    with pytest.raises(cfx.Unsupported, match="SHED_COMPUTE_CONTROL"):
+        n.stop()
+
+
+def test_client_policy_reads_the_servers_config(tmp_path):
+    cfg = {"auth": {"clients": {"nocturn": {"policy": {"name_prefix": "nocturn-", "max_age": "30h",
+                                                       "images": ["cloud"], "network": "isolated",
+                                                       "max_sheds": 4}}}}}
+    assert cfx.client_policy(cfg, "nocturn") == {"name_prefix": "nocturn-", "max_age_s": 30 * 3600,
+                                                "images": ["cloud"], "network": "isolated", "max_sheds": 4}
+    with pytest.raises(KeyError, match="no service client"):
+        cfx.client_policy(cfg, "other")
+    # The dev template's client is the default SHED_COMPUTE_CLIENT.
+    rendered = yaml.safe_load(_rendered_remote_template(tmp_path).read_text())
+    assert rendered["remote"]["provider"] == "service"
+    assert cfx.client_policy(rendered, "nocturn")["name_prefix"] == "nocturn-"
+
+
+@pytest.mark.parametrize("text, want", [("30h", 108000), ("1h30m", 5400), ("90s", 90), ("0s", 0), ("2h", 7200)])
+def test_duration_seconds(text, want):
+    assert cfx.duration_seconds(text) == want
+
+
+def test_duration_seconds_refuses_other_units():
+    for bad in ("1d", "1.5h", "h", "1h 2m"):
+        with pytest.raises(ValueError):
+            cfx.duration_seconds(bad)
+
+
+def test_binary_script_writes_every_byte_once():
+    r = subprocess.run(["bash", "-c", cfx.binary_script()], capture_output=True, timeout=30)
+    assert r.returncode == 0 and r.stdout == bytes(range(256)), r.stdout[:40]
+
+
+@pytest.mark.parametrize("on_tty, want_tty, want_stdout, want_stderr", [
+    (("stdin", "stdout", "stderr"), b"in\r\nout\r\nerr\r\nplain\r\n", b"", b""),
+    (("stderr",), b"err\r\n", b"plain\n", b""),
+    (("stdin", "stdout"), b"in\r\nout\r\nplain\r\n", b"", b"e\n"),
+    ((), b"", b"plain\n", b"e\n"),
+])
+def test_run_with_tty_puts_exactly_the_named_streams_on_the_terminal(on_tty, want_tty, want_stdout, want_stderr):
+    script = ("test -t 0 && echo in; test -t 1 && echo out; test -t 2 && echo err >&2; "
+              "test -t 2 || echo e >&2; echo plain")
+    r = cfx.run_with_tty(["sh", "-c", script], dict(os.environ), on_tty=on_tty, timeout=30)
+    assert r.code == 0, r
+    assert (r.tty, r.stdout, r.stderr) == (want_tty, want_stdout, want_stderr), r
+
+
+def test_run_with_tty_types_its_input_and_kills_at_its_timeout():
+    r = cfx.run_with_tty(["bash", "--norc", "--noprofile", "-i"], {**os.environ, "TERM": "dumb"},
+                         input=b"echo got-$((40+2))\nexit\n", timeout=30)
+    assert r.code == 0 and b"got-42" in r.tty, r
+    t0 = time.monotonic()
+    r = cfx.run_with_tty(["sleep", "60"], dict(os.environ), timeout=1)
+    assert r.code is None and time.monotonic() - t0 < 15, r
+    with pytest.raises(ValueError):
+        cfx.run_with_tty(["true"], dict(os.environ), on_tty=("stderr",), input=b"x")
+    with pytest.raises(ValueError):
+        cfx.run_with_tty(["true"], dict(os.environ), on_tty=("tty",))
+
+
+def test_the_compute_module_runs_only_under_its_make_target():
+    full = {"SHED_COMPUTE_ITEST": "1", "SHED_BIN_DIR": "/repo/bin"}
+    assert dfx.compute_skip_reason(full, "linux") is None
+    assert "run make test-integration-compute" in dfx.compute_skip_reason({}, "linux")
+    assert "Linux only" in dfx.compute_skip_reason(full, "darwin")
+    assert "SHED_BIN_DIR" in dfx.compute_skip_reason({"SHED_COMPUTE_ITEST": "1"}, "linux")
+
+
+def test_the_compute_cases_skip_under_plain_test_integration():
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SHED_COMPUTE_ITEST", "SHED_BIN_DIR", "SHED_REMOTE_SERVER", "SHED_REMOTE_SERVICE")}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
+                        "test_remote_compute.py"], cwd=INTEGRATION_DIR, capture_output=True, text=True,
+                       timeout=120, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "passed" not in r.stdout and "failed" not in r.stdout, r.stdout
+    assert "run make test-integration-compute" in r.stdout and "SHED_REMOTE_SERVER not set" in r.stdout, r.stdout
+
+
+def test_the_compute_server_config_takes_its_machines_from_the_service(tmp_path):
+    cfg = dfx.server_config(http_port=1, https_port=2, ssh_port=3, state_dir=tmp_path / "state",
+                            issuer="http://127.0.0.1:9", admin_key="ssh-ed25519 AAAA", agent_dir=tmp_path / "agent",
+                            compute=True)
+    remote = cfg["remote"]
+    assert (remote["provider"], remote["transport"], remote["allow_test_drivers"]) == ("service", "local", True)
+    assert "limits" not in remote, "the service holds the quotas"
+    client = cfg["auth"]["clients"][dfx.COMPUTE_CLIENT]
+    assert client["policy"]["name_prefix"] == dfx.COMPUTE_CLIENT_PREFIX
+    # The directory world itself is unchanged.
+    plain = dfx.server_config(http_port=1, https_port=2, ssh_port=3, state_dir=tmp_path / "state",
+                              issuer="http://127.0.0.1:9", admin_key="ssh-ed25519 AAAA", agent_dir=tmp_path / "agent")
+    assert plain["remote"]["provider"] == "fake" and "clients" not in plain["auth"]
+
+
+def test_the_compute_server_config_loads(tmp_path):
+    binary = dc.REPO_ROOT / "bin" / "shed-server"
+    if not os.access(binary, os.X_OK):
+        pytest.skip(f"{binary} is not built")
+    (tmp_path / "agent").mkdir()
+    cfg = dfx.server_config(http_port=40001, https_port=40002, ssh_port=40003, state_dir=tmp_path / "state",
+                            issuer="http://127.0.0.1:40009", admin_key=ED_A, agent_dir=tmp_path / "agent",
+                            compute=True)
+    path = tmp_path / "server.yaml"
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    r = subprocess.run([str(binary), "--config", str(path), "config-validate"], capture_output=True, text=True,
+                       timeout=60, env={**os.environ, "HOME": str(tmp_path)})
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_the_compute_target_builds_then_runs_the_module_against_no_other_server():
+    deps, recipe = _make_recipe("test-integration-compute")
+    assert deps.split() == ["check-directory-itest-host", "build", "directory-ref"]
+    assert "uv run pytest -v -rs $(COMPUTE_ITEST_FILES) $(PYTEST_ARGS)" in recipe
+    assert 'PATH="$(CURDIR)/bin:$$PATH"' in recipe
+    assert "SHED_COMPUTE_ITEST=1" in recipe and 'SHED_BIN_DIR="$(CURDIR)/bin"' in recipe
+    # The shared [remote] cases against the session's hermetic world.
+    assert "SHED_REMOTE_HERMETIC=1" in recipe
+    text = (dc.REPO_ROOT / "Makefile").read_text()
+    files = re.search(r"^COMPUTE_ITEST_FILES \?= ((?:[^\n]*\\\n)*[^\n]*)$", text, re.MULTILINE)
+    assert files, "no COMPUTE_ITEST_FILES"
+    names = files.group(1).replace("\\\n", " ").split()
+    assert names[0] == "test_remote_compute.py" and {"test_remote_lifecycle.py", "test_smoke.py"} <= set(names)
+    for n in names:
+        assert (INTEGRATION_DIR / n).is_file(), n
+    conftest_src = (INTEGRATION_DIR / "conftest.py").read_text()
+    names = set(re.findall(r'os\.environ\.get\(\s*"(SHED_(?:VZ|FC)_[A-Z_]+|SHED_REMOTE_SERVER)"', conftest_src))
+    for name in names | {"SHED_REMOTE_SERVICE", "SHED_ITEST_SOURCE"}:
+        assert re.search(rf"^\s*{name}= \\$", recipe, re.MULTILINE), f"{name} is not set empty"
+    phony = (dc.REPO_ROOT / "Makefile").read_text().splitlines()[0]
+    assert " test-integration-compute " in phony
+
+
+def test_the_local_links_stand_in_key_is_a_public_key_line():
+    # A local-link server names this key in every create; a service holding
+    # to the contract refuses anything that is not one public key line.
+    src = (dc.REPO_ROOT / "internal" / "remote" / "backend.go").read_text()
+    m = re.search(r'localAuthorizedKey = "([^"]+)"', src)
+    assert m, "no localAuthorizedKey in internal/remote/backend.go"
+    assert re.match(r"^[a-z0-9@.-]{1,64} [A-Za-z0-9+/]+={0,2}( [\x20-\x7e]*)?$", m.group(1)), m.group(1)
+    assert m.group(1).startswith("ssh-ed25519 ")
+
+
+# The shared [remote] cases on a compute server act as the service's person
+# (conftest: remote_person, through CloudServer.as_person); the hermetic
+# world skips the cases that need a real guest (`real_guest`).
+
+
+def test_a_local_server_runs_every_command_as_its_identity(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append((argv, kw.get("env")))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(fx.subprocess, "run", fake_run)
+    monkeypatch.setattr(fx, "resolve_server_entry", lambda name, timeout=10, env=None: {"host": "h", "ssh_port": 7})
+    env = {"HOME": str(tmp_path), "PATH": "/x"}
+    s = fx.CloudServer(name="e", env=env, home=tmp_path)
+    s.create("n")
+    s.exec("n", ["true"])
+    s.stop("n")
+    s.start("n")
+    s.cli("list")
+    s.ssh_exec("n", "true")
+    s.delete("n", ignore_missing=True)
+    assert seen and all(e is env for _, e in seen), seen
+    (tmp_path / ".shed").mkdir()
+    (tmp_path / ".shed" / "known_hosts").write_text("")
+    argv = s.ssh_argv("n", "true")
+    assert f"UserKnownHostsFile={tmp_path / '.shed' / 'known_hosts'}" in argv
+    # The developer's own view runs with this process's environment.
+    seen.clear()
+    fx.CloudServer(name="e").cli("list")
+    assert seen[0][1] is None
+
+
+def test_as_person_takes_the_identitys_environment_and_home(tmp_path):
+    person = ident.Identity(user="itest-alice", key=tmp_path / "k", home=tmp_path / "h", entry="remote-dev",
+                            host="localhost", ssh_port=12290, shim=tmp_path / "h" / "bin" / "ssh")
+    admin = fx.CloudServer(name="remote-dev", log_path=tmp_path / "log", image="cloud")
+    p = admin.as_person(person)
+    assert (p.name, p.home, p.image, p.log_path) == ("remote-dev", tmp_path / "h", "cloud", tmp_path / "log")
+    assert p.env["HOME"] == str(tmp_path / "h") and p.env["PATH"].startswith(str(tmp_path / "h" / "bin"))
+
+
+def test_person_identity_has_a_home_apart_from_users_environments(tmp_path):
+    keys = tmp_path / "keys"
+    a = cfx.person_identity("itest-alice", "remote-dev", "localhost", 12290, keys_dir=keys)
+    assert a.home == keys / "itest-alice" / "home-remote-dev-shared"
+    assert a.home != keys / "itest-alice" / "home-remote-dev"  # users_environment's
+    assert a.shim.is_file() and a.key == keys / "itest-alice" / "id_ed25519"
+    (a.home / "leftover").write_text("x")
+    again = cfx.person_identity("itest-alice", "remote-dev", "localhost", 12290, keys_dir=keys)
+    assert not (again.home / "leftover").exists(), "a leftover HOME is made fresh"
+
+
+def test_list_itest_people_keeps_everyone_else(tmp_path):
+    users = tmp_path / "users.json"
+    users.write_text(json.dumps([{"name": "ada", "admin": False, "keys": []},
+                                 {"name": "itest-alice", "admin": False, "keys": []}]))
+    cfx.list_itest_people(users, keys_dir=tmp_path / "keys")
+    got = json.loads(users.read_text())
+    names = [u["name"] for u in got]
+    assert names == sorted(names) and "ada" in names and {"itest-alice", "itest-bob", "itest-admin"} <= set(names)
+    alice = next(u for u in got if u["name"] == "itest-alice")
+    assert alice["keys"], "itest-alice's entry is the one with her key"
+    assert stat.S_IMODE(users.stat().st_mode) == 0o600
+
+
+def test_unlisted_people_reads_the_users_status():
+    class Server:
+        def __init__(self, users, code=0):
+            self.users, self.code, self.calls = users, code, []
+
+        def cli(self, *args, timeout=60):
+            self.calls.append(args)
+            out = json.dumps({"users": [{"name": n} for n in self.users]})
+            return subprocess.CompletedProcess(args, self.code, out, "")
+
+    s = Server(["itest-alice"])
+    assert cfx.unlisted_people(s) == ["itest-bob"]
+    assert s.calls[0] == ("users", "refresh")
+    assert cfx.unlisted_people(Server(["itest-alice", "itest-bob"])) == []
+    assert cfx.unlisted_people(Server([], code=1), ["x"]) == ["x"]
+
+
+def test_real_guest_cases_skip_only_on_the_hermetic_remote(monkeypatch):
+    import conftest
+
+    class Item:
+        def __init__(self, params):
+            self.callspec = None if params is None else type("C", (), {"params": params})()
+
+        def get_closest_marker(self, name):
+            return pytest.mark.real_guest("why").mark if name == "real_guest" else None
+
+    monkeypatch.setattr(conftest, "REMOTE_HERMETIC", True)
+    for params in ({"shed_server": "remote"}, {"users_env": "remote"}, None):
+        with pytest.raises(pytest.skip.Exception, match="needs a real guest.*: why"):
+            conftest.pytest_runtest_setup(Item(params))
+    conftest.pytest_runtest_setup(Item({"shed_server": "fc"}))
+    monkeypatch.setattr(conftest, "REMOTE_HERMETIC", False)
+    conftest.pytest_runtest_setup(Item({"shed_server": "remote"}))
+
+
+# test_remote_compute.py's clean-up never trusts `shed list` alone.
+
+
+class _FakeAdmin:
+    def __init__(self, listed, delete_code=0):
+        self.listed, self.delete_code = set(listed), delete_code
+        self.deleted = []
+
+    def list_sheds(self):
+        return [{"name": n} for n in sorted(self.listed)]
+
+    def cli(self, *args, timeout=60):
+        self.deleted.append(args[1])
+        return subprocess.CompletedProcess(args, self.delete_code, "", "boom")
+
+
+def test_delete_confirmed_needs_a_successful_delete_of_a_listed_shed():
+    import test_remote_compute as trc
+
+    ok = _FakeAdmin(["a"])
+    trc.delete_confirmed(ok, "a", "id-a")
+    assert ok.deleted == ["a"]
+    with pytest.raises(AssertionError, match=r"CLEAN-UP FAILED: deleting shed a \(id id-a\)"):
+        trc.delete_confirmed(_FakeAdmin(["a"], delete_code=1), "a", "id-a")
+    gone = _FakeAdmin([])
+    trc.delete_confirmed(gone, "a", "id-a")
+    assert gone.deleted == [], "a shed not listed is left to the inventory check"
+
+
+def test_confirm_gone_asks_the_service_for_each_shed_id(monkeypatch):
+    import test_remote_compute as trc
+
+    monkeypatch.setattr(trc.time, "sleep", lambda s: None)
+
+    class Control:
+        def __init__(self, *answers):
+            self.answers = list(answers)
+
+        def machines(self):
+            return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+    ids = {"itest-cc-a": "ida", "itest-cc-b": "idb", "never": "?"}
+    trc.confirm_gone(Control({"other-server-machine"}), ids, timeout=0)
+    trc.confirm_gone(Control({"ida"}, {"ida"}, set()), ids, timeout=60)
+    with pytest.raises(AssertionError, match=r"still holds itest-cc-b \(id idb\)"):
+        trc.confirm_gone(Control({"idb", "unrelated"}), ids, timeout=0)
+    with pytest.raises(cfx.Unsupported):
+        trc.confirm_gone(cfx.NoControl(), ids, timeout=0)
+
+
+def test_ref_control_reads_the_services_inventory(tmp_path):
+    inv = tmp_path / "inventory.json"
+    ctl = cfx.RefControl(tmp_path, "remote-dev", inventory=inv)
+    with pytest.raises(cfx.Unsupported, match="--inventory"):
+        ctl.machines()
+    inv.write_text(json.dumps({"servers": {"remote-dev": ["a", "b"], "other": ["c"]}}))
+    assert ctl.machines() == {"a", "b"}
+    inv.write_text(json.dumps({"servers": {}}))
+    assert ctl.machines() == set()
+    # The dev script starts the service with the file.
+    script = (dc.REPO_ROOT / "scripts" / "dev-compute-ref.sh").read_text()
+    assert '--inventory "$DIR/inventory.json"' in script
