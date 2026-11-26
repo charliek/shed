@@ -2,6 +2,7 @@ package egress
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -103,10 +104,30 @@ func TestManager_ReleaseFreesPort(t *testing.T) {
 }
 
 func TestManager_RemoveKeepsPort(t *testing.T) {
-	lo := freePortPair(t)              // lo and lo+1 both free
+	// The pair is free when chosen but released before the manager binds it,
+	// so another process on the host can take one in between: the whole case
+	// runs again on a fresh pair when a bind says the address is in use,
+	// rather than fail on someone else's port.
+	for attempt := 0; attempt < 10; attempt++ {
+		if !removeKeepsPort(t) {
+			return
+		}
+	}
+	t.Fatal("no two adjacent ports stayed free for the case")
+}
+
+// removeKeepsPort runs TestManager_RemoveKeepsPort's case once; it reports
+// true (run it again) only when a bind found its port taken by another process.
+func removeKeepsPort(t *testing.T) (retry bool) {
+	t.Helper()
+	lo := freePortPair(t)              // lo and lo+1 both free when chosen
 	m := managerWithProxy(t, lo, lo+1) // two-port range
+	inUse := func(err error) bool { return err != nil && strings.Contains(err.Error(), "address already in use") }
 
 	port, _, err := m.Configure("web", time.Time{}, 0, "", "", []ProfileSpec{{}})
+	if inUse(err) {
+		return true
+	}
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -122,6 +143,9 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 	}
 	// Another shed must NOT be allocated web's reserved port while web is stopped.
 	port2, _, err := m.Configure("web2", time.Time{}, 0, "", "", []ProfileSpec{{}})
+	if inUse(err) {
+		return true
+	}
 	if err != nil {
 		t.Fatalf("Configure web2: %v", err)
 	}
@@ -130,12 +154,16 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 	}
 	// web restarts on the SAME reserved port.
 	port3, _, err := m.Configure("web", time.Time{}, port, "", "", []ProfileSpec{{}})
+	if inUse(err) {
+		return true
+	}
 	if err != nil {
 		t.Fatalf("restart Configure web: %v", err)
 	}
 	if port3 != port {
 		t.Errorf("web restarted on port %d, want its reserved %d", port3, port)
 	}
+	return false
 }
 
 func TestManager_RejectsPortOwnedByAnother(t *testing.T) {

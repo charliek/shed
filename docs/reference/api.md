@@ -557,7 +557,7 @@ Delivers the shed's credentials again and finishes whatever its create left owed
 | 409 | `SHED_NOT_RUNNING` | the shed is not running |
 | 409 | `PROVISION_IN_PROGRESS` | a provision, or a remote job, is already running for the shed |
 | 409 | `SHED_ORIGIN_CHANGED` | the shed's user's name has moved between the server's local admins and the account service since the shed was made. Fixed message; nothing is requested. See [Credential delivery](delivery.md#where-a-sheds-user-came-from) |
-| 409 | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin: no credentials are delivered to it. Recreate it (a shed made before v0.12 is recorded by the first successful origin migration on v0.12, at a start; a failed one stamps nothing and is retried at the next start; one made after that by an older shed-server stays unknown). Fixed message |
+| 409 | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin: no credentials are delivered to it. Recreate it (a shed made before v0.12 is recorded by the first successful origin migration on v0.12, at a start; until a decision is recorded nothing is stamped and the next start decides again; once it is, a shed whose stamp failed is stamped from it at a later start; one made after that by an older shed-server stays unknown). Fixed message |
 
 A failed delivery is a progress warning, `Credentials were not delivered (<reason>). Run: shed provision <name>`, not an error status.
 

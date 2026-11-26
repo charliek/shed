@@ -51,7 +51,7 @@ var ErrShedOriginChanged = errors.New("the shed's user is no longer the one who 
 // nothing until a start stamps it, so no principal's credentials can reach
 // a shed whose maker is not known. Nothing is requested and the record is
 // unchanged.
-var ErrShedOriginUnknown = errors.New("the shed has no record of where its user came from; no credentials are delivered to it; recreate the shed (a shed made before this version is recorded by this version's first successful origin migration, at a start; a failed one stamps nothing and is retried at the next start; one made after that by an older shed-server stays unknown)")
+var ErrShedOriginUnknown = errors.New("the shed has no record of where its user came from; no credentials are delivered to it; recreate the shed (a shed made before this version is recorded by this version's first successful origin migration, at a start; until a decision is recorded nothing is stamped and the next start decides again; once it is, a shed whose stamp failed is stamped from it at a later start; one made after that by an older shed-server stays unknown)")
 
 // Source is who answers a delivery request: the user's bound machine (the
 // machine source, the contract's section 3a) or the account service (the
