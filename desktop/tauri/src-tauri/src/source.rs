@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use shed_app::{source_error_class, source_error_words, Backend, HostSource};
 use shed_core::config::{ShedConfig, ShedServerEntry};
-use shed_core::http::{Client, SourceError, SOURCE_MACHINE_NOT_FOUND};
+use shed_core::http::{Client, SourceError, SOURCE_MACHINE_NOT_FOUND, SOURCE_MOVED};
 use shed_core::models::{display_source_text, SOURCE_IS_SERVICE, SOURCE_TEXT_MAX_BYTES};
 use shed_desktop_core::delivery::source::machine::{self, MachineIdentity};
 use shed_desktop_core::delivery::DeliveryRuntime;
@@ -352,7 +352,11 @@ fn identity_json(me: &Result<MachineIdentity, String>) -> (Value, Value) {
 /// nothing is sent). The pause is taken back only after a refusal that proves nothing
 /// changed ([`refusal_changed_nothing`]); on any other failure (no answer, an answer
 /// that cannot be read, a server error) it stays, since the unbind may have happened.
-/// One request, never retried; refusals in fixed words ([`refusal`]).
+/// Every unbind sent (the first and the re-check's) names this machine
+/// ([`unbind_this_machine`]): the server clears the binding only while it still names
+/// this machine, and when another machine took over meanwhile it refuses `409
+/// SOURCE_MOVED`, changing nothing: that is `source_moved`, the pause stays and no
+/// further unbind is sent. Refusals in fixed words ([`refusal`]).
 pub async fn unbind(
     servers: &Resolver,
     rt: Option<&DeliveryRuntime>,
@@ -440,7 +444,14 @@ pub async fn unbind(
             }));
         }
     }
-    let done = match client.source_unbind().await {
+    // `Unbind` is decided only on a read naming this machine, so the identity is known.
+    let Some(me_id) = me_id else {
+        return Err(err(
+            "machine_identity_unavailable",
+            "this machine has no identity, so nothing was sent".to_string(),
+        ));
+    };
+    let done = match unbind_this_machine(client, me_id).await {
         Ok(done) => done,
         Err(e) => {
             if let (Some(rt), false, true) = (rt, was_paused, refusal_changed_nothing(&e)) {
@@ -456,7 +467,14 @@ pub async fn unbind(
     let verified = match me.as_ref() {
         Some(m) => match still_bound(client, &m.id).await {
             Some(true) => {
-                let _ = client.source_unbind().await;
+                // Another machine that took over meanwhile is never cleared: the
+                // server refuses SOURCE_MOVED, and nothing more is sent. The first
+                // unbind did clear this machine, so the refusal says so.
+                if let Err(e) = unbind_this_machine(client, &m.id).await {
+                    if is_source_moved(&e) {
+                        return Err(moved_after_unbind(host));
+                    }
+                }
                 match still_bound(client, &m.id).await {
                     Some(true) => {
                         return Err(err(
@@ -554,6 +572,27 @@ fn other_machine_bound(
     }))
 }
 
+/// The unbind a stop sends: a compare-and-clear naming this machine (`me`), which the
+/// server refuses `409 SOURCE_MOVED` when another machine is the source. A server older
+/// than the compare (v0.11) refuses the field `400 INVALID_REQUEST` before changing
+/// anything; it gets the plain unbind, as before.
+async fn unbind_this_machine(
+    client: &Client,
+    me: &str,
+) -> Result<shed_core::models::SourceUnbound, SourceError> {
+    match client.source_unbind_if(me).await {
+        Err(SourceError::Api {
+            status: 400, code, ..
+        }) if code == "INVALID_REQUEST" => client.source_unbind().await,
+        other => other,
+    }
+}
+
+/// Whether an unbind was refused because another machine is the source now.
+fn is_source_moved(e: &SourceError) -> bool {
+    matches!(e, SourceError::Api { status: 409, code, .. } if code == SOURCE_MOVED)
+}
+
 /// Whether `host`'s sources document binds the machine `id` (one `GET /api/sources`);
 /// `None` when it could not be read.
 async fn still_bound(client: &Client, id: &str) -> Option<bool> {
@@ -601,6 +640,19 @@ fn refusal_changed_nothing(e: &SourceError) -> bool {
     }
 }
 
+/// A stop whose first unbind cleared this machine, which a late admission then bound
+/// again, and whose second unbind was refused `SOURCE_MOVED`: another machine took
+/// over in between. Its own class, since (unlike `source_moved`) something was cleared.
+fn moved_after_unbind(host: &str) -> (String, String) {
+    err(
+        "moved_after_unbind",
+        format!(
+            "the unbind on {host} cleared this machine, then another machine took over as \
+             your credential source; this machine stays stopped there"
+        ),
+    )
+}
+
 /// The refusal for a user the account service answers for on `host` (`409
 /// SOURCE_IS_SERVICE` on every source route): fixed words, not the server's.
 fn service_refusal(host: &str) -> (String, String) {
@@ -621,6 +673,13 @@ fn refusal(host: &str, e: &SourceError, what: &str) -> (String, String) {
             ),
         ),
         SourceError::Api { code, .. } if code == SOURCE_IS_SERVICE => service_refusal(host),
+        e if is_source_moved(e) => err(
+            "source_moved",
+            format!(
+                "another machine took over as your credential source on {host}; nothing was \
+                 cleared, and this machine stays stopped there"
+            ),
+        ),
         SourceError::Api { code, .. } if code == SOURCE_MACHINE_NOT_FOUND => err(
             "source_machine_not_found",
             format!(
@@ -1001,6 +1060,12 @@ mod tests {
                  server. Check the server, then try again.",
             ),
             (
+                api(409, SOURCE_MOVED, "ghp_SENTINEL"),
+                "source_moved",
+                "another machine took over as your credential source on mini; nothing was \
+                 cleared, and this machine stays stopped there",
+            ),
+            (
                 api(403, "ghp_SENTINEL_CODE", "ghp_SENTINEL"),
                 "forbidden",
                 "mini does not let this client change its credential source",
@@ -1045,6 +1110,23 @@ mod tests {
             refusal("mini", &api(418, "X", "ghp_SENTINEL"), "unbind").1,
             "mini refused the unbind"
         );
+    }
+
+    /// A SOURCE_MOVED on the re-check's unbind follows a clear that completed: its own
+    /// class and words, never `source_moved`'s "nothing was cleared".
+    #[test]
+    fn a_takeover_after_the_first_unbind_says_the_clear_completed() {
+        let (code, words) = moved_after_unbind("mini");
+        assert_eq!(code, "moved_after_unbind");
+        assert_eq!(
+            words,
+            "the unbind on mini cleared this machine, then another machine took over as your \
+             credential source; this machine stays stopped there"
+        );
+        // Negative control: the first unbind's refusal says nothing was cleared.
+        let first = refusal("mini", &api(409, SOURCE_MOVED, "x"), "unbind");
+        assert_eq!(first.0, "source_moved");
+        assert!(first.1.contains("nothing was cleared") && !words.contains("nothing"));
     }
 
     /// An unbind where the account service answers is refused before any pause: from
@@ -1158,6 +1240,9 @@ mod tests {
             api(500, "INTERNAL_ERROR", "x"),
             api(503, "PLUGINS_DISABLED", "x"),
             api(409, "SOMETHING_ELSE", "x"),
+            // Another machine took over: nothing changed, but the pause stays (this
+            // machine was asked to stop answering there).
+            api(409, SOURCE_MOVED, "x"),
             api(500, "FORBIDDEN", "x"),
             SourceError::Busy {
                 retry_after: None,

@@ -219,6 +219,13 @@ credential, refuses a script key and a service client with `403`, and answers `5
 INTERNAL_ERROR` when the change could not be saved (check `shed source status` before
 retrying). A server older than v0.11 does not have it.
 
+The body may also name `"machine_id"`: the pin is then cleared only while it still names that
+machine, and one naming another machine is `409 SOURCE_MOVED` with nothing changed. The
+desktop app's **Stop answering from here** sends its own machine's id, so on a server of this
+version (v0.12 or newer) it never clears a machine that took over meanwhile; `shed source
+unbind` sends none. A v0.11 server refuses the field, and the app falls back to the plain
+unbind there, which clears whichever machine is bound by then.
+
 ## Who may be or move a source
 
 - A user may move or clear their own source from any of their keys that is not a script

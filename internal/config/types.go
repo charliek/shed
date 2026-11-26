@@ -954,9 +954,12 @@ type SourceUseRequest struct {
 
 // SourceUnbindRequest is the body of POST /api/sources/unbind: clear the
 // user's credential source. User names another user; only an admin may. An
-// empty body ({}) is the caller's own.
+// empty body ({}) is the caller's own. MachineID, when given, makes it a
+// compare-and-clear: the binding is cleared only while it still names that
+// machine (409 SOURCE_MOVED otherwise, and nothing changes).
 type SourceUnbindRequest struct {
-	User string `json:"user,omitempty"`
+	User      string `json:"user,omitempty"`
+	MachineID string `json:"machine_id,omitempty"`
 }
 
 // SourceUnbindResponse is returned by POST /api/sources/unbind (`shed source
@@ -1509,7 +1512,7 @@ const (
 	// ShedOriginUnknownMessage.
 	ErrShedOriginUnknown = "SHED_ORIGIN_UNKNOWN"
 	// ShedOriginUnknownMessage is ErrShedOriginUnknown's one fixed message.
-	ShedOriginUnknownMessage = "this shed has no record of where its user came from: no credentials are delivered to it and none can be added: recreate the shed (a shed made before this version is recorded at the server's next start)"
+	ShedOriginUnknownMessage = "this shed has no record of where its user came from: no credentials are delivered to it and none can be added: recreate the shed (a shed made before this version is recorded by this version's first successful origin migration, at a start; until a decision is recorded nothing is stamped and the next start decides again; once it is, a shed whose stamp failed is stamped from it at a later start; one made after that by an older shed-server stays unknown)"
 	// ShedOriginChangedMessage is ErrShedOriginChanged's one fixed message.
 	ShedOriginChangedMessage = "this shed's user was a different principal when it was created (the name moved between this server's local admins and the account service): no credentials are delivered to it; create a new shed"
 	// ErrExecLimit (429) means the shed already runs
@@ -1608,6 +1611,10 @@ const (
 	// machine that has never presented itself for the user (or was forgotten
 	// since).
 	ErrSourceMachineNotFound = "SOURCE_MACHINE_NOT_FOUND"
+	// ErrSourceMoved (409) means POST /api/sources/unbind named a machine_id
+	// and the user's credential source is another machine: nothing was
+	// cleared.
+	ErrSourceMoved = "SOURCE_MOVED"
 	// ErrSourceBusy (503, with Retry-After) means GET /api/sources waited its
 	// bounded time for the user's records while a move or a machine's
 	// admission was saving them, and answered nothing rather than a mixed

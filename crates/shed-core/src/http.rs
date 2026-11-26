@@ -86,6 +86,10 @@ pub enum SourceError {
 /// has not tried to subscribe to that server yet.
 pub const SOURCE_MACHINE_NOT_FOUND: &str = "SOURCE_MACHINE_NOT_FOUND";
 
+/// The API error code a compare-and-clear unbind ([`Client::source_unbind_if`]) is
+/// refused with (`409`) when the user's source is another machine: nothing changed.
+pub const SOURCE_MOVED: &str = "SOURCE_MOVED";
+
 /// The API error code of a read that waited too long behind a move or a save (503, with
 /// `Retry-After`): transient, see [`SourceError::Busy`].
 pub const SOURCE_BUSY: &str = "SOURCE_BUSY";
@@ -1216,8 +1220,33 @@ impl Client {
     /// retry). Nothing to clear is a success with `unbound: false`. A server older than
     /// the route answers a plain 404: [`SourceError::Unsupported`].
     pub async fn source_unbind(&self) -> Result<SourceUnbound, SourceError> {
+        self.unbind_with(serde_json::json!({})).await
+    }
+
+    /// `POST /api/sources/unbind` with `{"machine_id": …}` — a compare-and-clear: the
+    /// server clears the caller's source only while it still names `machine_id`, and
+    /// answers `409` [`SOURCE_MOVED`] (changing nothing) when another machine is the
+    /// source; with no source bound it is a success with `unbound: false`, as for
+    /// [`Client::source_unbind`]. `machine_id` must be a machine id (32 lowercase hex),
+    /// refused here before any request otherwise. A server older than the field refuses
+    /// it with `400 INVALID_REQUEST` before changing anything; one older than the route
+    /// answers a plain 404: [`SourceError::Unsupported`].
+    pub async fn source_unbind_if(&self, machine_id: &str) -> Result<SourceUnbound, SourceError> {
+        if !crate::models::valid_machine_id(machine_id) {
+            return Err(SourceError::Shed(ShedError::Config(format!(
+                "not a machine id (want 32 lowercase hex characters): {:?}",
+                crate::models::display_source_text(
+                    machine_id,
+                    crate::models::SOURCE_TEXT_MAX_BYTES
+                )
+            ))));
+        }
+        self.unbind_with(serde_json::json!({ "machine_id": machine_id }))
+            .await
+    }
+
+    async fn unbind_with(&self, body: serde_json::Value) -> Result<SourceUnbound, SourceError> {
         let url = self.build_url(&["api", "sources", "unbind"], &[])?;
-        let body = serde_json::json!({});
         let answer = self
             .request_with_status(
                 reqwest::Method::POST,
@@ -1994,6 +2023,49 @@ mod tests {
             client(&server).source_unbind().await.unwrap_err(),
             SourceError::Unsupported
         ));
+    }
+
+    #[tokio::test]
+    async fn source_unbind_if_sends_the_machine_id_and_maps_source_moved() {
+        let server = MockServer::start_async().await;
+        let cleared = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sources/unbind")
+                    .json_body(serde_json::json!({ "machine_id": THIS_ID }));
+                t.status(200).body(format!(
+                    r#"{{"user":"ada","unbound":true,"previous":{{"id":"{THIS_ID}","name":"desk"}},"forgotten_machines":1}}"#
+                ));
+            })
+            .await;
+        let got = client(&server).source_unbind_if(THIS_ID).await.unwrap();
+        cleared.assert_async().await;
+        assert!(got.unbound);
+        cleared.delete_async().await;
+        let moved = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sources/unbind");
+                t.status(409).body(
+                    r#"{"error":{"code":"SOURCE_MOVED","message":"the credential source is another machine"}}"#,
+                );
+            })
+            .await;
+        match client(&server).source_unbind_if(THIS_ID).await.unwrap_err() {
+            SourceError::Api { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, SOURCE_MOVED);
+            }
+            e => panic!("want Api, got {e:?}"),
+        }
+        // A malformed id is refused before any request.
+        assert!(matches!(
+            client(&server)
+                .source_unbind_if("not-an-id")
+                .await
+                .unwrap_err(),
+            SourceError::Shed(ShedError::Config(_))
+        ));
+        moved.assert_hits_async(1).await;
     }
 
     /// A malformed id is refused before anything is sent.

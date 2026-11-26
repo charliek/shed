@@ -557,7 +557,7 @@ Delivers the shed's credentials again and finishes whatever its create left owed
 | 409 | `SHED_NOT_RUNNING` | the shed is not running |
 | 409 | `PROVISION_IN_PROGRESS` | a provision, or a remote job, is already running for the shed |
 | 409 | `SHED_ORIGIN_CHANGED` | the shed's user's name has moved between the server's local admins and the account service since the shed was made. Fixed message; nothing is requested. See [Credential delivery](delivery.md#where-a-sheds-user-came-from) |
-| 409 | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin: no credentials are delivered to it. Recreate it (a shed made before v0.12 is recorded at the server's next start). Fixed message |
+| 409 | `SHED_ORIGIN_UNKNOWN` | the shed has no recorded origin: no credentials are delivered to it. Recreate it (a shed made before v0.12 is recorded by the first successful origin migration on v0.12, at a start; until a decision is recorded nothing is stamped and the next start decides again; once it is, a shed whose stamp failed is stamped from it at a later start; one made after that by an older shed-server stays unknown). Fixed message |
 
 A failed delivery is a progress warning, `Credentials were not delivered (<reason>). Run: shed provision <name>`, not an error status.
 
@@ -1657,6 +1657,18 @@ Clears the user's credential source. The body is `{}` (or empty) and, for an
 admin, optionally `{"user": "<name>"}`; any other field, a field given twice,
 or trailing data is refused.
 
+The body may also name `"machine_id": "<32 lowercase hex digits>"`, which
+makes the unbind a compare-and-clear: the pin is cleared only while it still
+names that machine. When the pin names another machine the answer is `409
+SOURCE_MOVED` and nothing changes. When the user has no pin the answer is
+`200` with `"unbound": false`, as without the field. The desktop app sends
+its own machine id on every unbind, so on a v0.12 or newer server it never
+clears a pin that another machine took over in the meantime. Without
+`machine_id` (`shed source unbind`) the pin is cleared whichever machine it
+names. A server older than v0.12 refuses the field with `400
+INVALID_REQUEST` and changes nothing; the desktop app then sends the plain
+unbind, which clears whichever machine is bound by then.
+
 **Response (200 OK):**
 
 ```json
@@ -1684,8 +1696,9 @@ create asks no source (delivery is `not_applicable`).
 
 | Code | Error | Description |
 |------|-------|-------------|
-| 400 | `INVALID_REQUEST` | The body, or an admin naming a user who is not configured |
+| 400 | `INVALID_REQUEST` | The body, a malformed `machine_id`, or an admin naming a user who is not configured |
 | 403 | `FORBIDDEN` | As for `GET /api/sources` |
+| 409 | `SOURCE_MOVED` | `machine_id` was given and the pin names another machine: nothing changed |
 | 500 | `INTERNAL_ERROR` | The change was not confirmed: the store could not save it. The current source stays in use for now, but the change may take effect when the server restarts; check with `GET /api/sources` before retrying |
 | 503 | `PLUGINS_DISABLED` | The server has no credential bus |
 

@@ -153,6 +153,17 @@ fn provider_config(
     Some((t.enabled, t.only, m))
 }
 
+/// One provider's view: [`provider_config`] with `enabled` and `only` in its `config`
+/// (the view's `config`, which is what `delivery.set` takes and its `base` is).
+fn shown_config(s: &Settings, d: &Descriptor) -> Option<(bool, Option<Only>, Map<String, Value>)> {
+    let (enabled, only, mut config) = provider_config(s, d)?;
+    config.insert("enabled".into(), json!(enabled));
+    if only.is_some() {
+        config.insert("only".into(), only_json(only.as_ref()));
+    }
+    Some((enabled, only, config))
+}
+
 /// The `delivery.settings` view of `loaded`, read from `path`.
 pub fn view(path: &Path, loaded: &Loaded) -> Value {
     let (error, providers) = match &loaded.settings {
@@ -162,17 +173,13 @@ pub fn view(path: &Path, loaded: &Loaded) -> Value {
             Value::Array(
                 describe()
                     .iter()
-                    .map(|d| (d.name, provider_config(s, d)))
+                    .map(|d| (d.name, shown_config(s, d)))
                     .map(|(name, config)| match config {
                         None => json!({
                             "name": name, "configured": false, "enabled": false,
                             "only": null, "config": null,
                         }),
-                        Some((enabled, only, mut config)) => {
-                            config.insert("enabled".into(), json!(enabled));
-                            if only.is_some() {
-                                config.insert("only".into(), only_json(only.as_ref()));
-                            }
+                        Some((enabled, only, config)) => {
                             json!({
                                 "name": name, "configured": true, "enabled": enabled,
                                 "only": only_json(only.as_ref()), "config": config,
@@ -280,8 +287,24 @@ fn render_table(provider: &str, config: &Map<String, Value>) -> Result<String, S
 /// Replaces `provider`'s table in the settings file at `path` with `config` (flat JSON,
 /// as [`view`] shows it), or removes it when `config` is null, and writes the whole
 /// file back. Refused, with the file unchanged, for an unknown provider, a change the
-/// schema refuses, or a file that cannot be read as settings now.
+/// schema refuses, or a file that cannot be read as settings now. [`set_if`] with no
+/// `base`.
 pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> {
+    set_if(path, provider, config, None)
+}
+
+/// [`set`], and with `base` (the provider's `config` as the view showed it when the change was
+/// begun, null for a provider not set up) it is a compare-and-swap: inside the same
+/// lock the provider's table as it is now, in the view's shape, must equal `base`, or
+/// the change is refused `conflict` and nothing is written. Other providers' tables
+/// are not compared. A write-only value compares as the view shows it ([`KEEP`]), so a
+/// command changed by hand meanwhile is not a conflict, and `KEEP` keeps that command.
+pub fn set_if(
+    path: &Path,
+    provider: &str,
+    config: &Value,
+    base: Option<&Value>,
+) -> Result<(), SetError> {
     let names = provider_names();
     if !names.contains(&provider) {
         return Err(bad(format!(
@@ -304,6 +327,21 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
             ))
         }
     };
+    if let Some(base) = base {
+        let d = describe()
+            .into_iter()
+            .find(|d| d.name == provider)
+            .ok_or_else(|| bad("unknown provider"))?;
+        let now = shown_config(&settings, &d)
+            .map(|(_, _, c)| Value::Object(c))
+            .unwrap_or(Value::Null);
+        if &now != base {
+            return Err((
+                "conflict".to_string(),
+                format!("{provider} changed since it was read; nothing was written: read it again"),
+            ));
+        }
+    }
     let new = match config {
         Value::Null => Settings::default(),
         Value::Object(o) => {
@@ -646,6 +684,56 @@ mod tests {
         let v = view(&path, &load(&path));
         assert_eq!(provider(&v, "github")["configured"], false);
         assert_eq!(provider(&v, "files")["configured"], true);
+    }
+
+    /// With a `base`, a write is a compare-and-swap on that provider's table, in the
+    /// view's shape: a table changed since the base was read is refused `conflict` and
+    /// nothing is written; the current table (or null for a provider not set up) is
+    /// written; another provider's change is not compared. No base: as before.
+    #[test]
+    fn a_base_that_is_not_the_table_now_is_a_conflict_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.toml");
+        set(&path, "github", &json!({"enabled": true})).unwrap();
+        let base = provider(&view(&path, &load(&path)), "github")["config"].clone();
+        assert_eq!(base["enabled"], true, "{base}");
+        // Changed elsewhere after the form read it.
+        set(&path, "github", &json!({"enabled": true, "gh": "/opt/gh"})).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (code, msg) =
+            set_if(&path, "github", &json!({"enabled": false}), Some(&base)).unwrap_err();
+        assert_eq!(code, "conflict", "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing written"
+        );
+        // A provider not set up has the base null; a table there now is a conflict too.
+        let (code, _) = set_if(&path, "github", &Value::Null, Some(&Value::Null)).unwrap_err();
+        assert_eq!(code, "conflict");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // The table as it is now: written.
+        let now = provider(&view(&path, &load(&path)), "github")["config"].clone();
+        set_if(&path, "github", &json!({"enabled": false}), Some(&now)).unwrap();
+        assert_eq!(
+            provider(&view(&path, &load(&path)), "github")["enabled"],
+            false
+        );
+        // Another provider changed meanwhile is not compared; null is "not set up".
+        set(&path, "files", &Value::Null).unwrap();
+        set_if(
+            &path,
+            "ssh-key",
+            &json!({"enabled": true, "key_file": "~/.ssh/id"}),
+            Some(&Value::Null),
+        )
+        .unwrap();
+        // No base: written whatever the table is.
+        set_if(&path, "ssh-key", &Value::Null, None).unwrap();
+        assert_eq!(
+            provider(&view(&path, &load(&path)), "ssh-key")["configured"],
+            false
+        );
     }
 
     #[test]

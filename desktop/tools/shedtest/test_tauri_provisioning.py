@@ -554,6 +554,55 @@ def test_scope_ticks_write_only_servers_exactly(r):
     assert _stored(r)["github"]["only"] == {"servers": ["mock", "lab"]}
 
 
+DISCARDED = ("The settings changed while you were editing; your unsaved changes were "
+             "discarded.")
+
+
+def test_a_save_over_a_change_made_elsewhere_is_refused_unwritten(r):
+    """Save is a compare-and-swap: the provider's table as the form read it goes with
+    the change (`base`), and a table changed elsewhere while the form was open is
+    refused `conflict` with nothing written. The view discards the form, says so, and
+    shows the settings as they are now. Over IPC: a stale `base` is `conflict` and
+    writes nothing; the current one writes; no `base` writes as before."""
+    c = r.client
+    # The fixture's table (no `only`), so the form is not opened on the last cell's.
+    _fresh(c, lambda w: _cfg(w, "github").get("enabled") is True and "only" not in _cfg(w, "github"),
+           "github on, on every server")
+    _edit(c, "github")
+    _press(c, "github", "scope:only")
+    c.wait_until(lambda: _values(c).get("scope:only") is True, timeout=10, what="Only these")
+    _tick(c, "github", "server:mock")
+    # Changed by hand while the form is open (the view does not read it again).
+    _write(r.settings, _settings(r.home, github_only='only = { servers = ["lab"] }'))
+    elsewhere = r.settings.read_text()
+    _press(c, "github", "save")
+    c.wait_until(lambda: _provider(c, "github").get("notice"), timeout=15,
+                 what="the discard notice")
+    gh = _provider(c, "github")
+    assert gh["notice"] == DISCARDED and not gh["editing"] and not gh["error"], gh
+    assert r.settings.read_text() == elsewhere, "nothing written over the change"
+    c.wait_until(lambda: (_cfg(_what(c), "github").get("only") or {}).get("servers") == ["lab"],
+                 timeout=15, what="the settings as they are now")
+
+    # The same rule over IPC.
+    now = _cfg(c.call("delivery.settings"), "github")
+    stale = {**now, "only": {"servers": ["mock"]}}
+    with pytest.raises(ShedError) as e:
+        c.call("delivery.set", {"provider": "github", "config": {**now, "enabled": False},
+                                "base": stale})
+    assert e.value.code == "conflict", e.value
+    assert r.settings.read_text() == elsewhere
+    with pytest.raises(ShedError) as e:
+        c.call("delivery.set", {"provider": "github", "config": {**now, "enabled": False},
+                                "base": None})
+    assert e.value.code == "conflict", "null is a provider not set up: github is"
+    out = c.call("delivery.set", {"provider": "github", "config": {**now, "enabled": False},
+                                  "base": now})
+    assert _cfg(out, "github")["enabled"] is False, out
+    c.call("delivery.set", {"provider": "github", "config": now})  # no base: as before
+    assert _cfg(c.call("delivery.settings"), "github") == now
+
+
 def test_a_provider_cannot_be_turned_on_with_a_required_field_empty(r):
     """Criterion 16: there is no bare switch. A provider that is not set up offers Set
     up, whose form cannot be saved (so the provider cannot be turned on) until its

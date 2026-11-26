@@ -629,6 +629,21 @@ type UnbindResult struct {
 // retry, so unless it has stopped it becomes the source again. ctx bounds the
 // wait for the gate. ErrNotPinned with no source bindings.
 func (r *Registry) Unbind(ctx context.Context, user, by string) (UnbindResult, error) {
+	return r.UnbindIf(ctx, user, "", by)
+}
+
+// ErrSourceMoved refuses an UnbindIf whose user's binding names another
+// machine than the one the caller named: nothing changed.
+var ErrSourceMoved = errors.New("the credential source is another machine now: nothing was cleared")
+
+// UnbindIf is Unbind, compare-and-clear: with machineID non-empty the binding
+// is cleared only while it still names that machine, checked under the
+// user's gate (which every change of the user's records but start-up steps
+// runs under, so no move or first-connect bind can land between the check
+// and the clearing). A binding naming another machine is ErrSourceMoved and
+// nothing changes; a user with no binding changes nothing, as for Unbind.
+// An empty machineID is Unbind.
+func (r *Registry) UnbindIf(ctx context.Context, user, machineID, by string) (UnbindResult, error) {
 	b := r.pin()
 	if b == nil {
 		return UnbindResult{}, ErrNotPinned
@@ -640,7 +655,10 @@ func (r *Registry) Unbind(ctx context.Context, user, by string) (UnbindResult, e
 	defer g.unlock()
 
 	var res UnbindResult
-	if _, ok := b.Get(user); ok {
+	if bd, ok := b.Get(user); ok {
+		if machineID != "" && bd.MachineID() != machineID {
+			return UnbindResult{}, ErrSourceMoved
+		}
 		res.Previous = boundMachine(b, user)
 		res.Forgotten = len(b.Machines(user))
 	}

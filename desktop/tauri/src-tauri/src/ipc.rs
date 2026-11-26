@@ -1077,7 +1077,9 @@ impl Handler {
                 let config = params
                     .get("config")
                     .ok_or_else(|| err("bad_request", "missing 'config' (null removes)"))?;
-                crate::delivery::set(&*self.delivery_rt()?, provider, config)
+                // `base` absent: no compare; present (null included): compare-and-swap.
+                let base = params.get("base");
+                crate::delivery::set(&*self.delivery_rt()?, provider, config, base)
             }
             "delivery.preview" => {
                 let server = req_str(params, "server")?;

@@ -1108,7 +1108,7 @@ func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []str
 
 // stampUserOrigins is the start-up step that records where the user of each
 // shed made before user_origin came from (plan 040, section 3.2), from the
-// one decision the first start recorded in the origin migration file
+// one decision the first successful migration recorded in the origin migration file
 // (backend.MigrateUserOrigins: <state dir>/delivery/origin-migration.json),
 // never from a later start's configuration. A backend that keeps no origin
 // is skipped. A failure is logged; a shed it leaves unstamped is refused

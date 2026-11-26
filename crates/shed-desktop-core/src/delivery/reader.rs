@@ -237,20 +237,25 @@ impl Reader for DiskReader {
     }
 
     fn run(&self, command: &Command) -> Result<CommandOutput, RunError> {
-        self.run_spawning(command, |program| {
-            std::process::Command::new(program)
-                .args(&command.args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()
-        })
+        self.run_spawning(
+            command,
+            |program| {
+                std::process::Command::new(program)
+                    .args(&command.args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+            },
+            std::thread::sleep,
+        )
     }
 }
 
 impl DiskReader {
-    /// [`Reader::run`], starting the command with `spawn`. The command's time is
+    /// [`Reader::run`], starting the command with `spawn` and sleeping between spawn
+    /// retries with `sleep` (both seams for tests). The command's time is
     /// absolute from the call: the lookup and every spawn attempt count against it, no
     /// attempt starts once it has passed (that is [`RunError::TimedOut`], the command
     /// never started), a retry never sleeps past it, the command is killed at that same
@@ -260,6 +265,7 @@ impl DiskReader {
         &self,
         command: &Command,
         mut spawn: impl FnMut(&Path) -> std::io::Result<std::process::Child>,
+        mut sleep: impl FnMut(Duration),
     ) -> Result<CommandOutput, RunError> {
         let start = std::time::Instant::now();
         // A timeout too large to add is no practical bound: a far instant, not a panic.
@@ -293,7 +299,7 @@ impl DiskReader {
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && retries < 50 => {
                     retries += 1;
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    std::thread::sleep(Duration::from_millis(20).min(left));
+                    sleep(Duration::from_millis(20).min(left));
                 }
                 r => break r,
             }
@@ -580,7 +586,8 @@ mod tests {
     }
 
     /// A spawn that keeps failing with ETXTBSY past a tiny timeout: the retry sleeps no
-    /// further than the deadline, no attempt starts after it, and the result is the
+    /// further than the deadline (the sleep it asks for is capped at the time left,
+    /// never the full 20 ms), no attempt starts after it, and the result is the
     /// timed-out outcome.
     #[test]
     fn a_spawn_retried_past_the_deadline_never_starts_and_times_out() {
@@ -592,22 +599,34 @@ mod tests {
         let attempts = std::cell::Cell::new(Vec::new());
         let started = std::time::Instant::now();
         let deadline = started + c.timeout;
-        let result = r.run_spawning(&c, |program| {
-            let mut a = attempts.take();
-            a.push(std::time::Instant::now());
-            let first = a.len() == 1;
-            attempts.set(a);
-            if first {
-                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
-            } else {
-                // A later attempt would start the command for real.
-                std::process::Command::new(program).spawn()
-            }
-        });
+        let mut sleeps = Vec::new();
+        let result = r.run_spawning(
+            &c,
+            |program| {
+                let mut a = attempts.take();
+                a.push(std::time::Instant::now());
+                let first = a.len() == 1;
+                attempts.set(a);
+                if first {
+                    Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+                } else {
+                    // A later attempt would start the command for real.
+                    std::process::Command::new(program).spawn()
+                }
+            },
+            |d| {
+                sleeps.push(d);
+                std::thread::sleep(d);
+            },
+        );
         assert_eq!(result, Err(RunError::TimedOut));
         let a = attempts.take();
         assert_eq!(a.len(), 1, "an attempt started after the deadline");
         assert!(a.iter().all(|t| *t < deadline));
+        // The one retry asked to sleep only what was left of the 5 ms, never 20 ms: the
+        // requested duration, so no wall clock is involved.
+        assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+        assert!(sleeps.iter().all(|d| *d <= c.timeout), "{sleeps:?}");
         // No wall-clock bound on the whole call: a loaded runner stretches it, and the
         // attempt count and the before-deadline check above already pin the behaviour.
         assert_eq!(r.children().running(), 0);
@@ -615,17 +634,21 @@ mod tests {
         c.timeout = Duration::from_secs(5);
         let mut once = true;
         let out = r
-            .run_spawning(&c, |program| {
-                if std::mem::take(&mut once) {
-                    return Err(std::io::Error::from_raw_os_error(libc::ETXTBSY));
-                }
-                std::process::Command::new(program)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .process_group(0)
-                    .spawn()
-            })
+            .run_spawning(
+                &c,
+                |program| {
+                    if std::mem::take(&mut once) {
+                        return Err(std::io::Error::from_raw_os_error(libc::ETXTBSY));
+                    }
+                    std::process::Command::new(program)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .process_group(0)
+                        .spawn()
+                },
+                std::thread::sleep,
+            )
             .unwrap();
         assert_eq!(out.stdout, b"started\n");
     }
@@ -640,16 +663,20 @@ mod tests {
         let r = reader(dir.path());
         let mut c = Command::new(echo.to_str().unwrap(), Vec::<String>::new());
         c.timeout = Duration::from_millis(50);
-        let result = r.run_spawning(&c, |program| {
-            let child = std::process::Command::new(program)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()?;
-            std::thread::sleep(Duration::from_millis(150));
-            Ok(child)
-        });
+        let result = r.run_spawning(
+            &c,
+            |program| {
+                let child = std::process::Command::new(program)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .process_group(0)
+                    .spawn()?;
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(child)
+            },
+            std::thread::sleep,
+        );
         assert_eq!(result, Err(RunError::TimedOut));
         assert_eq!(r.children().running(), 0);
     }

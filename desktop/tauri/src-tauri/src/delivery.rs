@@ -198,12 +198,21 @@ pub fn recent(rt: &DeliveryRuntime) -> Value {
     json!({ "recent": rt.recent() })
 }
 
-/// `delivery.set`.
-pub fn set(rt: &DeliveryRuntime, provider: &str, config: &Value) -> Result<Value, OpError> {
+/// `delivery.set`. With `base` (the provider's `config` as the form read it, null for a
+/// provider not set up) a table changed since is refused `conflict`, nothing written.
+pub fn set(
+    rt: &DeliveryRuntime,
+    provider: &str,
+    config: &Value,
+    base: Option<&Value>,
+) -> Result<Value, OpError> {
     if !config.is_object() && !config.is_null() {
         return Err(bad("config is an object, or null to remove the provider"));
     }
-    rt.set(provider, config)
+    if base.is_some_and(|b| !b.is_object() && !b.is_null()) {
+        return Err(bad("base is an object, or null for a provider not set up"));
+    }
+    rt.set(provider, config, base)
 }
 
 /// What a `delivery.preview` names: a shed on the server, or a new shed's backend and

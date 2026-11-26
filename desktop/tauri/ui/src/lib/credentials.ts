@@ -331,6 +331,10 @@ export function refusalText(code: string, server: string, what: "use" | "unbind"
       return "This machine has no identity, so it cannot answer.";
     case "rebound":
       return `${server} bound this machine again after the stop; it stays stopped here. Try again.`;
+    case "source_moved":
+      return `Another machine took over as your credential source on ${server}; nothing was cleared, and this machine stays stopped there.`;
+    case "moved_after_unbind":
+      return `The stop on ${server} cleared this machine, then another machine took over as your credential source; this machine stays stopped there.`;
     case "stream_not_stopped":
       return `This machine's stream to ${server} did not stop in time, so nothing was sent. Try again.`;
     case "bad_request":
