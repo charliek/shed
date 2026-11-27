@@ -451,6 +451,7 @@ impl Backend {
         // moving, so the shed is read again (at most once: that settling happens
         // once per turn).
         let before = loop {
+            let read_at = self.extends.now();
             let read = client.shed_document(name).await.and_then(|doc| {
                 let mut shed: Shed = serde_json::from_value(doc)
                     .map_err(|e| ApiFailure::from_shed(&ShedError::Decode(e.to_string())))?;
@@ -461,7 +462,7 @@ impl Backend {
                 Ok(shed) => shed,
                 Err(e) => return Err(if turn.release() { pending() } else { e }),
             };
-            match self.extends.admit(server, name, &shed) {
+            match self.extends.admit(server, name, &shed, read_at) {
                 Ok(()) => break shed,
                 Err(NotAdmitted::Reread) => continue,
                 Err(NotAdmitted::Busy) => {
