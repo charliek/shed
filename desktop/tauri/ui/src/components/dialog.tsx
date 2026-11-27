@@ -104,24 +104,32 @@ function focusReport() {
 /** Keyboard focus for one open dialog card: into it on open, Tab kept inside while
  *  it is on top, and back to `opener` on close. A layout effect, so focus has moved
  *  before the first paint and before the dialog's own reports run. */
+/** Focus moved into dialog `el` by the open rules ([`initialFocus`]): a control it
+ *  already holds focus on keeps it. */
+function focusInto(el: HTMLElement) {
+  const controls = tabbables(el);
+  const marked = el.querySelector<HTMLElement>("[data-dialog-initial]");
+  const inBody = controls.find((c) => !c.closest("[data-dialog-header]"));
+  const choice = initialFocus({
+    holdsFocus: el.contains(document.activeElement),
+    hasMarked: marked !== null && controls.includes(marked),
+    hasBodyControl: inBody !== undefined,
+    hasControl: controls.length > 0,
+  });
+  const target = { keep: null, marked, body: inBody, first: controls[0], dialog: el }[choice];
+  target?.focus({ preventScroll: true });
+}
+
 function useDialogFocus(card: React.RefObject<HTMLDivElement>, opener: Element | null) {
   useLayoutEffect(() => {
     const el = card.current;
     if (!el) return;
     openDialogs.push(el);
-    const controls = tabbables(el);
-    const marked = el.querySelector<HTMLElement>("[data-dialog-initial]");
-    const inBody = controls.find((c) => !c.closest("[data-dialog-header]"));
-    const choice = initialFocus({
-      holdsFocus: el.contains(document.activeElement),
-      hasMarked: marked !== null && controls.includes(marked),
-      hasBodyControl: inBody !== undefined,
-      hasControl: controls.length > 0,
-    });
-    const target = { keep: null, marked, body: inBody, first: controls[0], dialog: el }[choice];
-    // A dialog opened under another (drawn below it) takes no focus: the keyboard
-    // stays with the one the eye sees.
-    if (openDialogs.isTop(el)) target?.focus({ preventScroll: true });
+    // The keyboard is the dialog the eye sees: one opened under another (drawn below
+    // it) takes no focus, and hands back any its own autoFocus took.
+    const top = openDialogs.top();
+    if (top === el) focusInto(el);
+    else if (top && el.contains(document.activeElement)) focusInto(top);
     reportDialogFocus(focusReport());
 
     // Window bubble phase, after the focused control's own handlers: a Tab one of
@@ -140,6 +148,19 @@ function useDialogFocus(card: React.RefObject<HTMLDivElement>, opener: Element |
       window.removeEventListener("keydown", onKey);
       openDialogs.remove(el);
       const a = document.activeElement;
+      const focusHere = a === null || a === document.body || el.contains(a);
+      // A dialog still open is now on top: it takes the keyboard, by its opener
+      // when that is in it (a dialog opened from another), else by its own rules.
+      const next = openDialogs.top();
+      if (next && focusHere) {
+        if (opener instanceof HTMLElement && opener.isConnected && next.contains(opener)) {
+          opener.focus({ preventScroll: true });
+        } else if (!next.contains(document.activeElement)) {
+          focusInto(next);
+        }
+        reportDialogFocus(focusReport());
+        return;
+      }
       if (
         opener instanceof HTMLElement &&
         shouldRestore({
