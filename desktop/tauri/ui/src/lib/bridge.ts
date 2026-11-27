@@ -510,6 +510,14 @@ export function reportShedCloud(key: "shed_cloud" | "cloud_usage" | "cloud_delet
   void invoke("ui_report", { snapshot: { [key]: value } });
 }
 
+/** Where keyboard focus is after a modal dialog opened or closed
+ *  (`components/dialog.tsx`): `{dialog, active}`, the top dialog's title (null with
+ *  none open) and the focused control. `ui.focus` relays it. */
+export function reportDialogFocus(value: unknown): void {
+  if (!inTauri()) return;
+  void invoke("ui_report", { snapshot: { dialog_focus: value } });
+}
+
 /** What the New-shed sheet rendered (`{phase, name, host, state, error, doors}`: `form`
  *  or `progress`, its Name and Host, the create's state, the error line it shows, and
  *  whether its doors' listeners are attached), or null once it closes.

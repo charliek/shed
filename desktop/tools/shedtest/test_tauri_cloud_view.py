@@ -569,6 +569,30 @@ def test_delete_on_a_cloud_row_asks_first(r: Rig):
     assert r.cloud()["delete_confirm"] is None
 
 
+def test_the_delete_question_holds_the_keyboard(r: Rig):
+    """The delete confirmation is modal for the keyboard too: it opens with focus on
+    its Cancel (the safe answer), and Cancel gives focus back to the row's Delete that
+    opened it. `ui.press_shed_delete` focuses that Delete before pressing it, as a key
+    press would."""
+    _wait_rows(r)
+    _ask_delete(r, "cloud-stopped")
+    r.c.wait_until(lambda: (r.c.focus() or {}).get("dialog") == "Delete cloud-stopped?",
+                   timeout=10, what="focus reported in the question")
+    active = r.c.focus()["active"]
+    assert active is not None, r.c.focus()
+    assert active["tag"] == "button" and active["text"] == "Cancel", active
+    assert "data-delete-cancel" in active["marks"] and active["in_dialog"] is True, active
+    r.c.call("ui.press_delete_confirm", {"button": "cancel"})
+    r.c.wait_until(lambda: r.cloud()["delete_confirm"] is None, timeout=10, what="cancelled")
+    r.c.wait_until(lambda: (r.c.focus() or {}).get("dialog", "open") is None, timeout=10,
+                   what="focus reported after the question closed")
+    active = r.c.focus()["active"]
+    assert active is not None, "focus went back to nothing"
+    assert active["tag"] == "button" and active["title"] == "Delete", active
+    assert active["shed"] == "cloud-stopped" and active["in_dialog"] is False, active
+    assert r.mock.shed("cloud-stopped") is not None
+
+
 def test_a_failed_delete_is_shown_in_its_question(r: Rig):
     """A delete the server refuses keeps the question open and says so, with the app's
     words, never the server's text; Delete again then deletes."""

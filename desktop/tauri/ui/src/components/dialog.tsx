@@ -1,10 +1,19 @@
 /* shed desktop — the modal dialog kit, translated from the design mockup
    (design/plex/dialogs.jsx) into typed React: Scrim, DialogShell, Field, Select,
    Stepper, Switch, Segmented. Shared by the New-shed / New-session / Preferences
-   dialogs so they read as one system. */
-import { useEffect } from "react";
+   dialogs so they read as one system.
+
+   Every DialogShell is modal for the keyboard too: a `dialog` (an `alertdialog`
+   with `alert`) labelled by its title. It takes focus when it opens (a control
+   already holding it by `autoFocus` keeps it, else the one marked
+   `data-dialog-initial`, else the first control in its body), Tab and Shift+Tab
+   cycle inside it, and on close focus goes back to the control that opened it.
+   The rules are `lib/focusTrap`'s. */
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import { ChevronsUpDown, X } from "lucide-react";
+import { reportDialogFocus } from "@/lib/bridge";
+import { DialogStack, initialFocus, shouldRestore, tabTarget } from "@/lib/focusTrap";
 import { cn } from "@/lib/utils";
 
 /** The shared dialog text-input class (Plex inset + accent focus ring). */
@@ -50,8 +59,100 @@ export function Scrim({ onClose, mark, children }: { onClose: () => void; mark?:
   );
 }
 
+/** The open dialogs' cards; the top one keeps Tab inside itself. */
+const openDialogs = new DialogStack<HTMLElement>();
+
+const CONTROLS =
+  'a[href], area[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable=""], [contenteditable="true"]';
+
+/** The controls in `root` that Tab reaches, in document order. */
+function tabbables(root: Element): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(CONTROLS)).filter(
+    (el) =>
+      el.tabIndex >= 0 &&
+      !el.matches(":disabled") &&
+      !(el instanceof HTMLInputElement && el.type === "hidden") &&
+      !el.closest("[inert]") &&
+      el.getClientRects().length > 0 &&
+      getComputedStyle(el).visibility !== "hidden",
+  );
+}
+
+/** Where focus is, as the harness reads it (`ui.focus`): the top dialog's title
+ *  (null with none open) and the focused control (null on the page itself). */
+function focusReport() {
+  const top = openDialogs.top();
+  const a = document.activeElement;
+  const active =
+    a instanceof HTMLElement && a !== document.body
+      ? {
+          tag: a.tagName.toLowerCase(),
+          text: (a.textContent ?? "").trim().slice(0, 80),
+          title: a.title || null,
+          marks: a.getAttributeNames().filter((n) => n.startsWith("data-")),
+          shed: a.closest<HTMLElement>("[data-shed-row]")?.dataset.shedName ?? null,
+          in_dialog: top !== null && top.contains(a),
+        }
+      : null;
+  return { dialog: top?.querySelector("[data-dialog-title]")?.textContent ?? null, active };
+}
+
+/** Keyboard focus for one open dialog card: into it on open, Tab kept inside while
+ *  it is on top, and back to `opener` on close. A layout effect, so focus has moved
+ *  before the first paint and before the dialog's own reports run. */
+function useDialogFocus(card: React.RefObject<HTMLDivElement>, opener: Element | null) {
+  useLayoutEffect(() => {
+    const el = card.current;
+    if (!el) return;
+    openDialogs.push(el);
+    const controls = tabbables(el);
+    const marked = el.querySelector<HTMLElement>("[data-dialog-initial]");
+    const inBody = controls.find((c) => !c.closest("[data-dialog-header]"));
+    const choice = initialFocus({
+      holdsFocus: el.contains(document.activeElement),
+      hasMarked: marked !== null && controls.includes(marked),
+      hasBodyControl: inBody !== undefined,
+      hasControl: controls.length > 0,
+    });
+    const target = { keep: null, marked, body: inBody, first: controls[0], dialog: el }[choice];
+    target?.focus({ preventScroll: true });
+    reportDialogFocus(focusReport());
+
+    // Window bubble phase, after the focused control's own handlers: a Tab one of
+    // them handled (`defaultPrevented`) is not the dialog's.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Tab" || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      if (!openDialogs.isTop(el)) return;
+      const list = tabbables(el);
+      const to = tabTarget(list.length, list.indexOf(document.activeElement as HTMLElement), e.shiftKey);
+      if (to === null) return;
+      e.preventDefault();
+      (to < 0 ? el : list[to]).focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      openDialogs.remove(el);
+      const a = document.activeElement;
+      if (
+        opener instanceof HTMLElement &&
+        shouldRestore({
+          openerConnected: opener.isConnected,
+          openerIsPage: opener === document.body || opener === document.documentElement,
+          focusInDialogOrLost: a === null || a === document.body || el.contains(a),
+        })
+      ) {
+        opener.focus({ preventScroll: true });
+      }
+      reportDialogFocus(focusReport());
+    };
+  }, [card, opener]);
+}
+
 /** The dialog card: accent-tiled header (icon + title + sub + close), a scrolling
-    body, and an optional footer row. `onClose` fires from the header X. */
+    body, and an optional footer row. `onClose` fires from the header X. `alert`
+    makes it an `alertdialog`, for a confirmation; mark its safe answer (Cancel)
+    `data-dialog-initial` so focus starts there. */
 export function DialogShell({
   icon: Icon,
   title,
@@ -59,6 +160,7 @@ export function DialogShell({
   onClose,
   width = 480,
   footer,
+  alert = false,
   children,
 }: {
   icon: LucideIcon;
@@ -67,12 +169,25 @@ export function DialogShell({
   onClose: () => void;
   width?: number;
   footer?: React.ReactNode;
+  alert?: boolean;
   children: React.ReactNode;
 }) {
+  const titleId = useId();
+  const subId = useId();
+  const card = useRef<HTMLDivElement>(null);
+  // Read in the first render, before a child's `autoFocus` moves focus in.
+  const [opener] = useState<Element | null>(() => (typeof document === "undefined" ? null : document.activeElement));
+  useDialogFocus(card, opener);
   return (
     <div
+      ref={card}
+      role={alert ? "alertdialog" : "dialog"}
+      aria-modal="true"
+      aria-labelledby={titleId}
+      aria-describedby={sub ? subId : undefined}
+      tabIndex={-1}
       onMouseDown={(e) => e.stopPropagation()}
-      className="flex flex-col overflow-hidden"
+      className="flex flex-col overflow-hidden outline-none"
       style={{
         width,
         maxWidth: "100%",
@@ -84,7 +199,7 @@ export function DialogShell({
         animation: "dialog-in .18s cubic-bezier(.2,.8,.2,1)",
       }}
     >
-      <div className="flex items-start gap-3 border-b border-shed-border px-6 pb-[18px] pt-4">
+      <div className="flex items-start gap-3 border-b border-shed-border px-6 pb-[18px] pt-4" data-dialog-header>
         <div
           className="flex h-[38px] w-[38px] flex-none items-center justify-center rounded-[10px] border"
           style={{ background: "var(--shed-accent-subtle)", borderColor: "var(--shed-accent-border)" }}
@@ -92,8 +207,8 @@ export function DialogShell({
           <Icon size={20} style={{ color: "var(--shed-accent)" }} />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-[18px] font-bold leading-tight text-shed-text" data-dialog-title>{title}</div>
-          {sub && <div className="mt-1 text-[13px] leading-snug text-shed-text-muted">{sub}</div>}
+          <div id={titleId} className="text-[18px] font-bold leading-tight text-shed-text" data-dialog-title>{title}</div>
+          {sub && <div id={subId} className="mt-1 text-[13px] leading-snug text-shed-text-muted">{sub}</div>}
         </div>
         <button
           onClick={onClose}
