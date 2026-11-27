@@ -667,6 +667,26 @@ func (c *ClientConfig) RemoveShedCache(name string) {
 	delete(c.Sheds, name)
 }
 
+// PruneShedCache drops every cached shed attributed to server whose name is
+// not in listed. Call it only with the names from a listing that server
+// ANSWERED: a shed it no longer lists was deleted (here, elsewhere or by
+// another client), and its row would otherwise stay forever.
+//
+// The cache is keyed by shed name alone, so a row attributed to any other
+// server is never touched, even when its name is missing from listed. Deletes
+// commute, so the result does not depend on map order and the call is safe as
+// an Update mutation.
+func (c *ClientConfig) PruneShedCache(server string, listed map[string]struct{}) {
+	for name, cache := range c.Sheds {
+		if cache.Server != server {
+			continue
+		}
+		if _, ok := listed[name]; !ok {
+			delete(c.Sheds, name)
+		}
+	}
+}
+
 // KnownHostLine renders the exact ~/.shed/known_hosts line for an endpoint, in
 // OpenSSH's syntax: a bare hostname on port 22, the bracketed "[host]:port"
 // form otherwise.

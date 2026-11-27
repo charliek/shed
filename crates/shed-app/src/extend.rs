@@ -169,9 +169,14 @@ pub enum NotAdmitted {
     Reread,
 }
 
-/// What a listing is compared with ([`ExtendBook::listing_mark`]).
+/// What a listing is compared with ([`ExtendBook::listing_mark`]): the outcomes
+/// recorded before it was sent, and when it was sent (the time the not-applied wait
+/// is measured to: the server read the lease no earlier than that).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListingMark(u64);
+pub struct ListingMark {
+    seq: u64,
+    at: i64,
+}
 
 impl ExtendBook {
     pub fn with_clock(clock: Clock) -> Self {
@@ -237,8 +242,15 @@ impl ExtendBook {
     /// refuses ([`NotAdmitted::Busy`]). A read during which a listing settled the
     /// held outcome is no baseline ([`NotAdmitted::Reread`], the turn kept). On `Ok`
     /// the turn is the extend's until [`Self::finish`].
-    pub fn admit(&self, host: &str, name: &str, observed: &Shed) -> Result<(), NotAdmitted> {
-        let now = self.now();
+    pub fn admit(
+        &self,
+        host: &str,
+        name: &str,
+        observed: &Shed,
+        read_at: i64,
+    ) -> Result<(), NotAdmitted> {
+        // `read_at`: when the read of `observed` was sent (see [`Self::observe`]).
+        let now = read_at;
         let mut slots = self.slots.lock().unwrap();
         let k = key(host, name);
         let admitted = Slot::InFlight {
@@ -324,17 +336,24 @@ impl ExtendBook {
     /// sent, since one sent earlier may predate the extend (a shed not yet listed
     /// would look gone).
     pub fn listing_mark(&self) -> ListingMark {
-        ListingMark(self.slots.lock().unwrap().recorded)
+        let at = self.now();
+        ListingMark {
+            seq: self.slots.lock().unwrap().recorded,
+            at,
+        }
     }
 
     /// Settle what `host`'s listing (`rows`, every shed it listed), sent after
     /// `mark` was taken, shows. Called only for a listing that succeeded: a failed
     /// one settles nothing.
     pub fn observe(&self, host: &str, rows: &[Shed], mark: ListingMark) {
-        let now = self.now();
+        // Measured to when the listing was sent, not when it answered: the server
+        // read the lease no earlier than that, so a slow answer cannot stand in for
+        // a later reading.
+        let sent = mark.at;
         let settle_s = self.settle_s;
         let settles = |name: &str, r: &Recorded| {
-            r.seq <= mark.0 && settled(&r.u, rows.iter().find(|s| s.name == name), now, settle_s)
+            r.seq <= mark.seq && settled(&r.u, rows.iter().find(|s| s.name == name), sent, settle_s)
         };
         let mut slots = self.slots.lock().unwrap();
         slots.by_shed.retain(|(h, name), slot| {
@@ -518,7 +537,8 @@ mod tests {
     /// Reserve and admit at once (the shed read in between is `observed`).
     fn begin(b: &ExtendBook, host: &str, observed: &Shed) -> Result<(), Busy> {
         b.reserve(host, &observed.name)?;
-        b.admit(host, &observed.name, observed).map_err(|_| Busy)
+        b.admit(host, &observed.name, observed, b.now())
+            .map_err(|_| Busy)
     }
 
     fn book() -> (ExtendBook, Arc<AtomicI64>) {
@@ -555,6 +575,35 @@ mod tests {
         b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(!b.has_unknown("cloud-a", "w"));
         assert!(b.snapshot().is_empty());
+    }
+
+    /// The not-applied wait is measured to when a listing (or the baseline read) was
+    /// sent, not to when it answered: a listing sent before the wait was up that
+    /// answers after it settles nothing, since the server read the lease too soon.
+    #[test]
+    fn the_wait_is_measured_to_when_the_listing_was_sent() {
+        let (b, t) = book();
+        let w = shed("w", "c1", Some(BEFORE));
+        begin(&b, "cloud-a", &w).unwrap();
+        b.finish("cloud-a", "w", Some(unknown(6, 0)));
+        // Sent a second before the wait is up, answered six seconds after it.
+        t.store(T0 + EXTEND_SETTLE_S - 1, Ordering::SeqCst);
+        let mark = b.listing_mark();
+        t.store(T0 + EXTEND_SETTLE_S + 5, Ordering::SeqCst);
+        b.observe("cloud-a", std::slice::from_ref(&w), mark);
+        assert!(
+            b.has_unknown("cloud-a", "w"),
+            "a slow early listing settled it"
+        );
+        // The same for a baseline read: sent early, it does not admit.
+        assert!(b.reserve("cloud-a", "w").is_ok());
+        assert_eq!(
+            b.admit("cloud-a", "w", &w, T0 + EXTEND_SETTLE_S - 1),
+            Err(NotAdmitted::Busy)
+        );
+        // A listing sent once the wait is up settles it.
+        b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
+        assert!(!b.has_unknown("cloud-a", "w"));
     }
 
     #[test]
@@ -652,7 +701,7 @@ mod tests {
         assert!(!b.in_flight("cloud-a", "w"));
         // Read, still at its old end, too soon: refused and put back.
         b.reserve("cloud-a", "w").unwrap();
-        assert_eq!(b.admit("cloud-a", "w", &w), Err(NotAdmitted::Busy));
+        assert_eq!(b.admit("cloud-a", "w", &w, b.now()), Err(NotAdmitted::Busy));
         assert!(b.has_unknown("cloud-a", "w") && !b.in_flight("cloud-a", "w"));
         // A listing during the read settles the held one; that read is no
         // baseline, so the shed is read again (the turn kept) and that read admits.
@@ -660,12 +709,15 @@ mod tests {
         t.store(T0 + EXTEND_SETTLE_S, Ordering::SeqCst);
         b.observe("cloud-a", std::slice::from_ref(&w), b.listing_mark());
         assert!(!b.has_unknown("cloud-a", "w") && b.in_flight("cloud-a", "w"));
-        assert_eq!(b.admit("cloud-a", "w", &w), Err(NotAdmitted::Reread));
+        assert_eq!(
+            b.admit("cloud-a", "w", &w, b.now()),
+            Err(NotAdmitted::Reread)
+        );
         assert!(
             b.in_flight("cloud-a", "w"),
             "the turn is kept for the reread"
         );
-        b.admit("cloud-a", "w", &w).unwrap();
+        b.admit("cloud-a", "w", &w, b.now()).unwrap();
         b.finish("cloud-a", "w", None);
         assert!(!b.in_flight("cloud-a", "w"));
     }
@@ -686,9 +738,12 @@ mod tests {
         b.observe("cloud-a", std::slice::from_ref(&applied), b.listing_mark());
         assert!(!b.has_unknown("cloud-a", "w"), "A settled as applied");
         // B's read, sent before that listing, comes back at E.
-        assert_eq!(b.admit("cloud-a", "w", &at_e), Err(NotAdmitted::Reread));
+        assert_eq!(
+            b.admit("cloud-a", "w", &at_e, b.now()),
+            Err(NotAdmitted::Reread)
+        );
         // B reads again: E + 6 h, its baseline.
-        b.admit("cloud-a", "w", &applied).unwrap();
+        b.admit("cloud-a", "w", &applied, b.now()).unwrap();
         b.finish(
             "cloud-a",
             "w",

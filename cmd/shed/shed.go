@@ -492,6 +492,10 @@ func runList(cmd *cobra.Command, args []string) error {
 	}
 
 	var allSheds []listedShed
+	// Only servers whose listing succeeded are recorded: their cached rows for
+	// sheds they no longer list are dropped below, while a server that failed
+	// keeps its rows untouched.
+	var listing listingCache
 
 	if listAll {
 		// Query all servers
@@ -504,6 +508,7 @@ func runList(cmd *cobra.Command, args []string) error {
 				}
 				continue
 			}
+			listing.answer(name, resp.Sheds)
 			for _, shed := range resp.Sheds {
 				allSheds = append(allSheds, listedShed{shed: shed, server: name})
 			}
@@ -514,6 +519,7 @@ func runList(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to list sheds: %w", err)
 		}
+		listing.answer(serverName, resp.Sheds)
 		for _, shed := range resp.Sheds {
 			allSheds = append(allSheds, listedShed{shed: shed, server: serverName})
 		}
@@ -521,14 +527,12 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	// Save the updated cache in ONE locked update: the mutation closure runs
 	// against the fresh on-disk snapshot and then against the in-memory one, so
-	// it has to be a pure function of the config it is handed — collected rows
-	// rather than work interleaved with the calls above, and one timestamp
-	// taken here rather than a fresh time.Now() per application.
+	// it has to be a pure function of the config it is handed — collected
+	// listings rather than work interleaved with the calls above, and one
+	// timestamp taken here rather than a fresh time.Now() per application.
 	cachedAt := time.Now()
 	if err := updateClientConfig(func(c *config.ClientConfig) {
-		for _, s := range allSheds {
-			c.CacheShedAt(s.shed.Name, s.server, s.shed.Status, cachedAt)
-		}
+		listing.apply(c, cachedAt)
 	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)

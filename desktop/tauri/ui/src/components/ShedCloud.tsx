@@ -501,7 +501,7 @@ export function CloudDeleteConfirm({ shed, busy, error, onCancel, onConfirm }: {
   return (
     <Scrim onClose={onCancel} mark="cloud-delete">
       <div ref={root}>
-        <DialogShell icon={Trash2} title={`Delete ${shed.name}?`} onClose={onCancel} width={440}>
+        <DialogShell icon={Trash2} title={`Delete ${shed.name}?`} onClose={onCancel} width={440} alert>
           <p className="text-[14px] leading-snug text-shed-text-secondary" data-delete-words>{CLOUD_DELETE_WORDS}</p>
           {error && (
             <p className="text-[13px] leading-snug" style={{ color: "var(--shed-err-fg)" }} role="alert" data-delete-error>
@@ -509,7 +509,7 @@ export function CloudDeleteConfirm({ shed, busy, error, onCancel, onConfirm }: {
             </p>
           )}
           <div className="flex items-center justify-between pt-1">
-            <button onClick={onCancel} className={dialogBtnSecondary} data-delete-cancel>Cancel</button>
+            <button onClick={onCancel} className={dialogBtnSecondary} data-delete-cancel data-dialog-initial>Cancel</button>
             <button
               onClick={onConfirm}
               disabled={busy}

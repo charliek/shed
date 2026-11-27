@@ -111,7 +111,7 @@ export function RoostConsentDialog({
   useEffect(() => () => reportRoostConsent(null), []);
   return (
     <Scrim onClose={onCancel} mark="roost-consent">
-      <DialogShell icon={Download} title={`${copy.action} roost-session`} sub={copy.what} onClose={onCancel} width={520}>
+      <DialogShell icon={Download} title={`${copy.action} roost-session`} sub={copy.what} onClose={onCancel} width={520} alert>
         <div className="flex flex-col gap-3 font-mono text-[12.5px] leading-relaxed text-shed-text-secondary">
           <div><span className="text-shed-text-muted">Where: </span>{copy.where}</div>
           <div><span className="text-shed-text-muted">From: </span>{copy.from}</div>
@@ -121,7 +121,7 @@ export function RoostConsentDialog({
           )}
         </div>
         <div className="flex items-center justify-between pt-1">
-          <button onClick={onCancel} className={dialogBtnSecondary}>Cancel</button>
+          <button onClick={onCancel} className={dialogBtnSecondary} data-dialog-initial>Cancel</button>
           <button
             onClick={onConfirm}
             className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"

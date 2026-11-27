@@ -330,6 +330,13 @@ class TauriClient(_RcOps, IPCClient):
         (Preferences is a dedicated window, not a modal — see prefs_dump.)"""
         return self.call("ui.modal").get("modal")
 
+    def focus(self) -> dict | None:
+        """Where keyboard focus was after a dialog last opened or closed:
+        `{dialog, active}` — the top dialog's title (None with none open) and the
+        focused control `{tag, text, title, marks, shed, in_dialog}` (None on the
+        page itself) — or None before any dialog opened."""
+        return self.call("ui.focus").get("focus")
+
     def computed_style(self) -> dict | None:
         """A computed-style sample the frontend reported (body bg/color + accent +
         the active light/dark mode), so a test can confirm the WebView applied the

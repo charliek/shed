@@ -351,8 +351,12 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
         click(card(e.payload)?.querySelector("button[data-shed-detail-toggle], button[data-shed-delivery-badge]"));
       }));
       uns.push(await listen<{ server?: unknown; shed?: unknown }>("press-shed-delete", (e) => {
-        click(Array.from(card(e.payload)?.querySelectorAll<HTMLButtonElement>("[data-shed-controls] button") ?? [])
-          .find((b) => b.title === "Delete"));
+        // Focused first, as a key press on it would be, so where the question gives
+        // focus back when it closes is observable (`ui.focus`).
+        const b = Array.from(card(e.payload)?.querySelectorAll<HTMLButtonElement>("[data-shed-controls] button") ?? [])
+          .find((x) => x.title === "Delete");
+        if (b && !b.disabled) b.focus();
+        click(b);
       }));
       if (cancelled) uns.forEach((u) => u());
     })();

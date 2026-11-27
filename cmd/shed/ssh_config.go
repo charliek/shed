@@ -168,9 +168,10 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	// update at the end: the mutation closure has to be a pure function of the
 	// config it is handed (it runs against the fresh on-disk snapshot and then
 	// against the in-memory one), so it cannot be interleaved with the HTTP
-	// calls that produce the rows.
-	type cacheRow struct{ name, server, status string }
-	var cacheRows []cacheRow
+	// calls that produce the rows. Only servers that answered are recorded,
+	// so a refused or unreachable server keeps its cached rows, while an
+	// answering server's rows for sheds it no longer lists are dropped.
+	var listing listingCache
 
 	// A server whose entry the CLI refuses (clienttoken.IsRefusal) is not one
 	// that has no sheds: its refusal is printed, once, whatever the verbosity,
@@ -196,6 +197,7 @@ func getAllShedsInfo() ([]shedInfo, error) {
 			continue
 		}
 		answered++
+		listing.answer(serverName, resp.Sheds)
 
 		for _, shed := range resp.Sheds {
 			result = append(result, shedInfo{
@@ -203,8 +205,6 @@ func getAllShedsInfo() ([]shedInfo, error) {
 				serverName: serverName,
 				server:     &entryCopy,
 			})
-			// Update cache
-			cacheRows = append(cacheRows, cacheRow{shed.Name, serverName, shed.Status})
 		}
 	}
 	if answered == 0 && refused > 0 {
@@ -217,9 +217,7 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	// per-call time.Now() would make those two disagree.
 	cachedAt := time.Now()
 	if err := updateClientConfig(func(c *config.ClientConfig) {
-		for _, r := range cacheRows {
-			c.CacheShedAt(r.name, r.server, r.status, cachedAt)
-		}
+		listing.apply(c, cachedAt)
 	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)

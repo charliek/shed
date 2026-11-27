@@ -932,6 +932,9 @@ impl Handler {
             // Which modal (if any) the frontend has open: "create" | "launch" |
             // null. (Preferences is a dedicated window, not a modal — see prefs.dump.)
             "ui.modal" => Ok(json!({ "modal": self.ui_get("modal") })),
+            // Where keyboard focus was after a dialog last opened or closed:
+            // {dialog, active}, or null before any dialog has opened.
+            "ui.focus" => Ok(json!({ "focus": self.ui_get("dialog_focus") })),
             // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
             // pending}, or null before its first report.
             "ui.badges" => Ok(json!({ "badges": self.ui_get("badges") })),
