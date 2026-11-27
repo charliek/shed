@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.12.0 — 2026-11-27
 
 **Ships:** server, desktop
 
@@ -37,6 +37,8 @@ The account service becomes a credential source for the users it lists, and the 
 - **A stop that sticks.** "Stop answering from here" unbinds and pauses that server in `paused-servers.json`, so the app does not bind itself again; only "Answer from here" lifts it, even if the server leaves the config and comes back meanwhile. A `409 SOURCE_IS_SERVICE` on the delivery stream is a settled state, rechecked every five minutes, not a reconnect loop.
 - **Compare-and-clear and compare-and-swap.** `POST /api/sources/unbind` takes an optional `machine_id`: the binding is cleared only while it still names that machine, else `409 SOURCE_MOVED` and nothing changes (`shed source unbind` sends none, as before). The desktop app's stop sends this machine's id on every unbind, so on a v0.12 server it never clears a machine that took over meanwhile (`source_moved`, or `moved_after_unbind` at the re-check); a v0.11 server gets the plain unbind, without that guarantee. `delivery.set` takes an optional `base`, and a provider's table changed since the form read it is refused `conflict`, unwritten: the Credentials view's Save sends it and, on a conflict, discards the form with its notice. The `SHED_ORIGIN_UNKNOWN` message now says a shed made before v0.12 is recorded by the first successful origin migration (a failed one is retried at the next start), and one made after that by an older server stays unknown.
 - Docs: a new guide, [Credentials from the account service](docs/guides/credentials-from-the-account-service.md); the delivery, security, CLI and API references.
+- **`shed list` forgets deleted sheds.** The shed locations the CLI caches in `~/.shed/config.yaml` (`sheds:`) now drop a shed its server no longer lists, after that server answers; a server that could not be reached keeps its entries. `shed ssh-config` does the same. Before, sheds deleted elsewhere (cloud ones especially) stayed there for good.
+- **Desktop: dialogs hold the keyboard.** Every dialog is a modal for assistive technology and the keyboard: focus moves into it when it opens (a confirmation's Cancel first), Tab stays inside, and focus returns to the control that opened it; with two dialogs open, the one drawn on top has the keyboard.
 - **Images: the `base` and `full` images bake craze 0.5.0** (0.11.0 baked 0.4.1), and the
   tests run against it. In a shed built from them, the desktop's create sheet lists craze's
   `antigravity` provider (Google's Antigravity CLI, `agy`), which craze 0.5.0 added between
