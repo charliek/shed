@@ -341,6 +341,93 @@ func TestClientConfigShedCache(t *testing.T) {
 	}
 }
 
+func TestPruneShedCache(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	row := func(server string) ShedCache {
+		return ShedCache{Server: server, Status: StatusRunning, UpdatedAt: at}
+	}
+	set := func(names ...string) map[string]struct{} {
+		out := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			out[n] = struct{}{}
+		}
+		return out
+	}
+
+	tests := []struct {
+		name   string
+		cache  map[string]ShedCache
+		server string
+		listed map[string]struct{}
+		want   map[string]ShedCache
+	}{
+		{
+			name:   "stale row of the answering server dropped, listed one kept",
+			cache:  map[string]ShedCache{"gone": row("a"), "here": row("a")},
+			server: "a",
+			listed: set("here"),
+			want:   map[string]ShedCache{"here": row("a")},
+		},
+		{
+			name:   "empty listing drops every row of that server",
+			cache:  map[string]ShedCache{"one": row("a"), "two": row("a"), "other": row("b")},
+			server: "a",
+			listed: set(),
+			want:   map[string]ShedCache{"other": row("b")},
+		},
+		{
+			name:   "nil listing is the same as an empty one",
+			cache:  map[string]ShedCache{"one": row("a")},
+			server: "a",
+			listed: nil,
+			want:   map[string]ShedCache{},
+		},
+		{
+			name:   "another server's row with a name the listing lacks is kept",
+			cache:  map[string]ShedCache{"theirs": row("b"), "gone": row("a")},
+			server: "a",
+			listed: set(),
+			want:   map[string]ShedCache{"theirs": row("b")},
+		},
+		{
+			name:   "another server's row with a name the listing has is kept as is",
+			cache:  map[string]ShedCache{"shared": row("b")},
+			server: "a",
+			listed: set("shared"),
+			want:   map[string]ShedCache{"shared": row("b")},
+		},
+		{
+			name:   "listed names with no row add nothing",
+			cache:  map[string]ShedCache{"here": row("a")},
+			server: "a",
+			listed: set("here", "new"),
+			want:   map[string]ShedCache{"here": row("a")},
+		},
+		{
+			name:   "server with no rows changes nothing",
+			cache:  map[string]ShedCache{"x": row("b"), "y": row("c")},
+			server: "a",
+			listed: set(),
+			want:   map[string]ShedCache{"x": row("b"), "y": row("c")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ClientConfig{Servers: map[string]ServerEntry{}, Sheds: tt.cache}
+			cfg.PruneShedCache(tt.server, tt.listed)
+			if len(cfg.Sheds) != len(tt.want) {
+				t.Fatalf("cache = %v, want %v", cfg.Sheds, tt.want)
+			}
+			for name, want := range tt.want {
+				if got, ok := cfg.Sheds[name]; !ok || got != want {
+					t.Errorf("cache[%q] = %+v (present %v), want %+v", name, got, ok, want)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateShedName(t *testing.T) {
 	tests := []struct {
 		name    string

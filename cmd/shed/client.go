@@ -695,6 +695,46 @@ func cacheShedLocation(shedName, serverName, status string) error {
 	})
 }
 
+// listingCache collects what the servers that answered a shed listing said,
+// for one locked cache update after every listing is in. A server that did not
+// answer (unreachable, refused) is never recorded, so its cached rows are left
+// alone: no answer is not "no sheds".
+type listingCache struct {
+	// answered maps each server that answered to the names it listed (an
+	// empty, non-nil set for a server that answered with no sheds).
+	answered map[string]map[string]struct{}
+	rows     []listingCacheRow
+}
+
+type listingCacheRow struct{ name, server, status string }
+
+// answer records one server's successful listing.
+func (l *listingCache) answer(server string, sheds []config.Shed) {
+	if l.answered == nil {
+		l.answered = make(map[string]map[string]struct{})
+	}
+	names := make(map[string]struct{}, len(sheds))
+	for _, sh := range sheds {
+		names[sh.Name] = struct{}{}
+		l.rows = append(l.rows, listingCacheRow{name: sh.Name, server: server, status: sh.Status})
+	}
+	l.answered[server] = names
+}
+
+// apply drops the cached rows each answering server no longer lists, then
+// caches every listed shed at at. It is a pure function of the collected
+// listings and the config it is handed, so it is safe as an Update mutation
+// (which runs it against the fresh on-disk snapshot and then the in-memory
+// one).
+func (l *listingCache) apply(c *config.ClientConfig, at time.Time) {
+	for server, names := range l.answered {
+		c.PruneShedCache(server, names)
+	}
+	for _, r := range l.rows {
+		c.CacheShedAt(r.name, r.server, r.status, at)
+	}
+}
+
 // persistTokenCredential writes a freshly re-minted control token back to the
 // named config entry and saves. It is best-effort: name == "" (no unambiguous
 // config entry) is a no-op, and a Save failure is warned-but-not-fatal — the
