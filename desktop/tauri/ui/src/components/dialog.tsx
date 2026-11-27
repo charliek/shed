@@ -60,7 +60,11 @@ export function Scrim({ onClose, mark, children }: { onClose: () => void; mark?:
 }
 
 /** The open dialogs' cards; the top one keeps Tab inside itself. */
-const openDialogs = new DialogStack<HTMLElement>();
+// On top is the later in the document: every dialog's scrim is at one layer, so the
+// one rendered last is drawn over the others, whichever opened first.
+const openDialogs = new DialogStack<HTMLElement>(
+  (a, b) => (b.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+);
 
 const CONTROLS =
   'a[href], area[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable=""], [contenteditable="true"]';
@@ -115,7 +119,9 @@ function useDialogFocus(card: React.RefObject<HTMLDivElement>, opener: Element |
       hasControl: controls.length > 0,
     });
     const target = { keep: null, marked, body: inBody, first: controls[0], dialog: el }[choice];
-    target?.focus({ preventScroll: true });
+    // A dialog opened under another (drawn below it) takes no focus: the keyboard
+    // stays with the one the eye sees.
+    if (openDialogs.isTop(el)) target?.focus({ preventScroll: true });
     reportDialogFocus(focusReport());
 
     // Window bubble phase, after the focused control's own handlers: a Tab one of

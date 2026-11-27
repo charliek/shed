@@ -84,3 +84,21 @@ test("a dialog pushed again (a remount) is listed once, on top", () => {
   s.remove("a");
   assert.equal(s.top(), "b");
 });
+
+test("the top is the one drawn on top, not the newest: a dialog opened under another stays below", () => {
+  // Drawn order: consent is rendered after (over) create, whichever opened first.
+  const drawn = ["create", "consent"];
+  const s = new DialogStack((a, b) => drawn.indexOf(a) > drawn.indexOf(b));
+  s.push("consent");
+  s.push("create"); // opened while consent is up, but drawn beneath it
+  assert.equal(s.top(), "consent");
+  assert.equal(s.isTop("create"), false);
+  // Consent answered: create is on top and takes the keyboard.
+  s.remove("consent");
+  assert.equal(s.top(), "create");
+  // The other way round: consent over create, closing consent hands it back.
+  s.push("consent");
+  assert.equal(s.top(), "consent");
+  s.remove("consent");
+  assert.equal(s.isTop("create"), true);
+});

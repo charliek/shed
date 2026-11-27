@@ -50,11 +50,15 @@ export function shouldRestore(seen: {
   return seen.openerConnected && !seen.openerIsPage && seen.focusInDialogOrLost;
 }
 
-/** The open dialogs, oldest first. Only the newest (the one on top) keeps Tab
- *  inside itself, so a dialog opened over another takes the keyboard while it is
- *  open and leaves it to the one below when it closes. */
+/** The open dialogs. Only the one on top keeps Tab inside itself, so a dialog
+ *  opened over another takes the keyboard while it is open and leaves it to the one
+ *  below when it closes. "On top" is what the eye sees: `above(a, b)` says whether
+ *  `a` is drawn over `b` (for dialogs at one layer, the later in the document). By
+ *  default the newest is on top. */
 export class DialogStack<T> {
   private open: T[] = [];
+
+  constructor(private readonly above: (a: T, b: T) => boolean = () => true) {}
 
   push(d: T): void {
     this.remove(d);
@@ -66,7 +70,11 @@ export class DialogStack<T> {
   }
 
   top(): T | null {
-    return this.open.length ? this.open[this.open.length - 1] : null;
+    let best: T | null = null;
+    for (const d of this.open) {
+      if (best === null || this.above(d, best)) best = d;
+    }
+    return best;
   }
 
   isTop(d: T): boolean {
